@@ -23,6 +23,12 @@
 #include <string.h>
 
 #include <zlib.h>
+/* The build defines this to 1 when the pack was compressed with zstd;
+ * the zlib reader is the default. */
+#ifndef CRAW_VIEW_LUTS_HAVE_ZSTD
+#define CRAW_VIEW_LUTS_HAVE_ZSTD 0
+#endif
+
 #if CRAW_VIEW_LUTS_HAVE_ZSTD
 #include <zstd.h>
 #endif

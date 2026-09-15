@@ -114,6 +114,13 @@ endif
 subdir('include/craw')
 subdir('lib')
 
+# The viewer's embedded film simulation collection is built ahead of tests/
+# so that tests/test_luts can link the same reader; craw-view picks it up
+# from tools/ through craw_view_luts_dep.
+if get_option('tools').auto() or get_option('tools').enabled()
+    subdir('tools/gui/luts')
+endif
+
 if get_option('tests').auto() or get_option('tests').enabled()
     subdir('tests')
 endif
