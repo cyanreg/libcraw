@@ -60,7 +60,7 @@ which rolls highlights off per channel before the sRGB curve. The
 Panasonic DC-S1M2 per-CCT tables are built in and selected from the
 container's model name; `--tables` loads others from a text file.
 
-`craw-view` is the interactive viewer and exporter built on SDL2, nuklear
+`craw-view` is the interactive viewer and exporter built on SDL3, nuklear
 and libplacebo, when those are found. It decodes with FFmpeg's Vulkan
 hwaccel on libplacebo's device, runs libcraw on the same device, reads the
 file on its own thread and loops by default (`--no-loop`). Space plays and

@@ -1,0 +1,643 @@
+/* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
+
+#ifndef CRAW_VIEW_H
+#define CRAW_VIEW_H
+
+/* craw-view: interactive viewer and exporter for camera raw clips.
+ *
+ * The whole program runs on a single VkDevice that libplacebo creates: the
+ * decoder (FFmpeg's Vulkan hwaccel), the raw pipeline (libcraw) and the
+ * display (libplacebo's renderer) all touch the same images, so a frame is
+ * never copied to the host between the bitstream and the screen. */
+
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+/* libplacebo only needs vkGetInstanceProcAddr; everything this tool calls
+ * itself comes from the loader we link against. The Vulkan header has to be
+ * included before libplacebo's libav helper for AVVkFrame support. */
+#include <vulkan/vulkan.h>
+
+#include <SDL3/SDL.h>
+
+#include <libplacebo/log.h>
+#include <libplacebo/vulkan.h>
+#include <libplacebo/renderer.h>
+#include <libplacebo/swapchain.h>
+#include <libplacebo/shaders/lut.h>
+
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+
+#include "audio.h"
+
+#include <craw/craw.h>
+#include <craw/vulkan.h>
+#include <craw/pipeline.h>
+#include <craw/profile.h>
+#include <craw/awb.h>
+
+#define VIEW_MAX_PATH 1024
+
+/* The panel sits on the right at a fixed width; the picture gets whatever
+ * is left of the window. */
+#define VIEW_PANEL_WIDTH  360.0f
+#define VIEW_PANEL_MARGIN 12.0f
+
+/* Zoom steps by a quarter octave per notch, stops at fit and at eight times
+ * one-to-one, and lands exactly on one-to-one when it passes it. */
+#define VIEW_ZOOM_STEP 1.189207115f     /* 2^(1/4) */
+#define VIEW_ZOOM_MAX  8.0f
+
+/* Queue families enabled on top of the one this tool uses. The compute and
+ * transfer ones exist so that FFmpeg sees more than one family and
+ * allocates its frames with VK_SHARING_MODE_CONCURRENT: with a single
+ * family it tracks an exclusive owner and then emits barriers that release
+ * ownership to VK_QUEUE_FAMILY_IGNORED, which is not a legal transfer. The
+ * video decode one is what lets FFmpeg's Vulkan HEVC hwaccel start at all. */
+#define VIEW_EXTRA_QUEUES (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT | \
+                           VK_QUEUE_VIDEO_DECODE_BIT_KHR)
+
+/* ------------------------------------------------------------- the look */
+
+enum view_wb {
+    VIEW_WB_AS_SHOT = 0,
+    VIEW_WB_AUTO,
+    VIEW_WB_MANUAL,
+};
+
+/* Everything the user can change that alters the picture. Both the GPU
+ * pipeline and the display path read it, so it lives in one struct and the
+ * panel writes it in place. */
+struct view_look {
+    enum view_wb wb;
+    CRAWIlluminant manual;      /* for VIEW_WB_MANUAL */
+
+    float ei;                   /* working exposure index, 0: as shot */
+    float exposure;             /* bias in stops on top of ei */
+
+    enum CRAWDebayer debayer;
+
+    int tone_map;               /* index into view_tone_maps[] */
+    int gamut_map;              /* index into view_gamut_maps[] */
+
+    char lut_path[VIEW_MAX_PATH];
+    enum pl_lut_type lut_type;
+    /* Index into view_lut_spaces[]; anything but 0 makes the LUT a
+     * conversion from that space to a BT.709 display. */
+    int lut_space;
+
+    /* Measure the real peak of every frame instead of tone mapping against
+     * the sensor clip the profile implies. */
+    bool peak_detect;
+    int peak_detect_flag;       /* nuklear's checkbox wants an int */
+};
+
+/* Everything the raw pipeline pass depends on, kept for the picture on
+ * screen: once the look differs from it while paused, the frame goes
+ * through the pipeline again. */
+struct view_pipeline_look {
+    enum view_wb wb;
+    CRAWIlluminant manual;
+    CRAWIlluminant illum;       /* the auto track that was applied */
+    bool have_illum;
+    float ei, exposure, ambience;
+    enum CRAWDebayer debayer;
+};
+
+struct view_name_map {
+    const char *name;
+    int value;
+};
+
+/* The standard third-stop ISO list Apple's plug-in restricts the working
+ * index to; see DESIGN.md 9b. */
+extern const float view_iso_list[];
+extern const int view_nb_iso;
+
+extern const char *const view_debayer_names[];
+extern const char *const view_lut_space_names[];
+extern const int view_nb_lut_spaces;
+extern const char *const view_tone_map_names[];
+extern const char *const view_gamut_map_names[];
+extern const int view_nb_tone_maps;
+extern const int view_nb_gamut_maps;
+
+const struct pl_tone_map_function *view_tone_map(int idx);
+const struct pl_gamut_map_function *view_gamut_map(int idx);
+
+/* ------------------------------------------------------------- decoding */
+
+/* Demuxed video packets waiting for the decoder. A 5.8K ProRes RAW HQ
+ * packet is five to eight megabytes and the medium may be a card reader, so
+ * the queue is bounded by both count and bytes and holds roughly a second
+ * and a half of playback. */
+#define VIEW_PKTQ_MAX   48
+#define VIEW_PKTQ_BYTES (512u << 20)
+
+struct view_reader {
+    SDL_Thread *thread;
+    SDL_Mutex *lock;
+    SDL_Condition *wake;             /* the reader waits here for room */
+    SDL_Condition *ready;            /* the main loop waits here for a seek */
+
+    AVPacket *q[VIEW_PKTQ_MAX];
+    int head, count;
+    size_t bytes;
+
+    bool eof;                   /* the file is exhausted */
+    bool quit;
+    bool seek_pending;          /* the main loop asked for a seek */
+    int64_t seek_ts;
+    int64_t serial;             /* bumped on every seek, to drop stale packets */
+
+    /* Queue depth averaged over the reader's own pushes: sampling it from
+     * the render loop only ever catches the moment after a packet has been
+     * taken, which is always near empty and says nothing. */
+    int64_t depth_sum, depth_n;
+};
+
+struct view_decoder {
+    AVFormatContext *fmt;
+    AVCodecContext *dec;
+    AVBufferRef *hw_device;
+    AVPacket *pkt;
+    int stream_index;
+    bool draining;
+    bool eof;
+
+    /* Time the main loop spent waiting for the reader thread since the last
+     * report. Reading itself happens off the render loop entirely. */
+    double read_ms;
+
+    struct view_reader reader;
+    bool pkt_held;              /* d->pkt holds one the decoder refused */
+    /* Set when the codec context was rebuilt: its frame pool is new, so
+     * every VkImageView cached for the old images is now dangling. */
+    bool frames_reset;
+
+    /* Bayer source that goes through libcraw, as opposed to a camera clip
+     * that is already demosaiced and encoded. Decided by codec id: nothing
+     * in the container metadata is trustworthy for this, since a ProRes RAW
+     * clip's Panasonic XML describes the same capture gamma and gamut as a
+     * V-Log recording would. */
+    bool raw;
+    const char *codec_name;
+    /* Whether the frames actually came back on the GPU. Only known once one
+     * has been decoded. */
+    bool hwaccel;
+    bool know_hwaccel;
+    bool verbose;
+
+    AVRational time_base;
+    AVRational frame_rate;
+    int64_t nb_frames;          /* best estimate, 0 if unknown */
+
+    /* Container metadata craw-process also reads. */
+    float meta_as_shot_ei;
+    char model[256];
+};
+
+/* --------------------------------------------------------------- the gpu */
+
+/* Cached VkImageViews for the decoder's frame pool. FFmpeg recycles a
+ * handful of AVVkFrames, so a tiny linear cache keyed on the VkImage saves
+ * creating a view per frame without any lifetime tracking. */
+#define VIEW_MAX_SRC_VIEWS 32
+
+struct view_src_view {
+    VkImage image;
+    VkImageView view;
+};
+
+/* Frames in flight. Each slot owns an output texture, a command buffer and
+ * a fence, so recording frame N + 1 never waits for frame N: the only fence
+ * waited on is the one belonging to the slot about to be reused, which by
+ * then is a whole frame old. libcraw's intermediates need no such thing -
+ * successive recordings on one queue are ordered by the pipeline's own
+ * barriers - and the histogram is kept in its own rotation of slots. */
+#define VIEW_SLOTS 2
+
+struct view_slot {
+    pl_tex tex;
+    VkImage image;
+    VkImageView view;
+    VkCommandBuffer cmd;
+    VkFence fence;
+    bool busy;
+};
+
+struct view_gpu {
+    /* libplacebo owns the device. */
+    pl_log log;
+    pl_vk_inst inst;
+    VkSurfaceKHR surface;
+    pl_vulkan vk;
+    pl_gpu gpu;
+    pl_swapchain sw;
+    pl_renderer rr;
+
+    /* The single queue family everything runs on: libplacebo's async
+     * transfer and compute are turned off so that graphics, compute and
+     * transfer are all the same family and no image ever changes owner. */
+    uint32_t qf;
+    VkDeviceQueueCreateFlags queue_flags;
+    VkQueue queue;
+    VkCommandPool pool;
+    VkQueryPool queries;
+    double timestamp_period;    /* nanoseconds per timestamp tick */
+
+    /* libcraw */
+    CRAWContext *ctx;
+    CRAWPipeline *pipe;
+    uint32_t width, height;
+    enum CRAWDebayer pipe_debayer;
+
+    /* The pipeline's output: one libplacebo texture per slot, held for the
+     * duration of libcraw's submission into it. */
+    struct view_slot slots[VIEW_SLOTS];
+    int slot;                   /* the next one to record into */
+    int display_slot;           /* the one holding the picture on screen */
+    int64_t submitted;
+    VkSemaphore out_sem;        /* timeline, chains hold -> libcraw -> release */
+    uint64_t out_value;
+
+    struct view_src_view src_views[VIEW_MAX_SRC_VIEWS];
+    int nb_src_views;
+
+    /* The non-raw path: libplacebo maps the decoded frame itself, whether
+     * it came back as an AVVkFrame on this device or in system memory, and
+     * the mapping stays alive until the next one replaces it so that a
+     * paused window can keep redrawing it. */
+    struct pl_frame mapped;
+    pl_tex map_tex[4];
+    bool have_mapped;
+
+    /* Scene-linear exposure for the non-raw path, as an mpv user shader on
+     * the LINEAR hook. Regenerated when the value changes. */
+    const struct pl_hook *exposure_hook;
+    float exposure_hook_gain;
+
+    /* The nuklear overlay, composited by the renderer. One per slot, so the
+     * backend's command buffer for a given index is never re-recorded while
+     * it is still in flight and no full drain is needed between frames. The
+     * previous set outlives a resize until nuklear has rebuilt the
+     * framebuffers that still point at it. */
+    pl_tex ui_tex[VIEW_SLOTS];
+    VkImageView ui_views[VIEW_SLOTS];   /* nuklear keeps this array's address */
+    pl_tex ui_tex_old[VIEW_SLOTS];
+    VkImageView ui_views_old[VIEW_SLOTS];
+    int ui_slot;
+    VkFormat ui_format;
+    int ui_w, ui_h;
+
+    /* Offscreen export target, with a renderer of its own so that the peak
+     * detection state an export walks through is not interleaved with the
+     * one the window is driving. */
+    pl_renderer rr_export;
+    pl_tex export_tex;
+    int export_w, export_h;
+
+    double last_gpu_ms;
+    /* What libplacebo's peak detection measured for the last displayed
+     * frame, in nits; 0 when it has nothing to report. */
+    double measured_peak;
+};
+
+/* --------------------------------------------------------- program state */
+
+struct view_cfg {
+    const char *input;
+    const char *device;         /* physical device name substring */
+    bool verbose;
+    bool debug;                 /* validation layer */
+    bool bench;                 /* decode as fast as the GPU allows */
+
+    const char *profile;        /* built-in per-CCT table set */
+    const char *tables;         /* per-CCT tables from a text file */
+
+    bool loop;                  /* start again at the end; --no-loop turns it off */
+    int64_t loops;              /* stop and quit after N passes, 0: endless */
+    const char *audio_dump;
+    const char *audio_map;
+
+    /* Headless export: run the loop without a window. */
+    bool headless;
+    int64_t export_start, export_end;
+    char export_dir[VIEW_MAX_PATH];
+};
+
+struct view_awb {
+    CRAWAwbSmoother *smoother;
+    CRAWAwbParams params;
+    CRAWAwbEstimate last;
+    CRAWIlluminant illum;
+    bool have_illum;
+};
+
+struct view_export {
+    bool active;
+    int64_t first, last, next;
+    char dir[VIEW_MAX_PATH];
+    int64_t done;
+    char status[128];
+
+    /* One full resolution RGBA16 frame, grown once and kept. */
+    uint16_t *rgba;
+    size_t rgba_values;
+};
+
+/* Where a frame's wall time goes. Accumulated per frame and averaged over
+ * the reporting interval; printed with -v and --bench. */
+struct view_timing {
+    double read;        /* av_read_frame, i.e. the medium */
+    double decode;      /* everything else in the decoder */
+    double submit;      /* recording and submitting the raw pipeline */
+    double fence;       /* waiting for that submission */
+    double map;         /* handing a decoded frame to libplacebo */
+    double ui;          /* building and drawing the panel */
+    double finish;      /* pl_gpu_finish */
+    double render;      /* pl_render_image and the swapchain submit */
+    double present;     /* swap buffers */
+    int64_t frames;
+    int64_t starved;    /* iterations with nothing decoded yet */
+};
+
+/* Where the picture is shown and how much of it. `zoom` is screen pixels
+ * per source pixel; `fit` means it is recomputed from the window every
+ * frame. The centre is in source pixels. Nothing here reaches the pipeline
+ * or the export: it only chooses the two rectangles handed to
+ * pl_render_image. */
+struct view_zoom {
+    float zoom;
+    bool fit;
+    float cx, cy;
+    bool dragging;
+    float drag_x, drag_y;
+};
+
+/* How well the picture is keeping up with the master clock. */
+struct view_sync {
+    double diff;                /* clock minus frame pts at present time */
+    double max_abs;             /* over every presented frame */
+    double max_abs_settled;     /* ignoring the first few of each run */
+    int64_t presented;
+    int64_t dropped;
+    int64_t run_frames;         /* since the last start or seek */
+};
+
+struct view_state {
+    struct view_cfg cfg;
+    struct view_look look;
+    struct view_gpu gpu;
+    struct view_decoder dec;
+    struct view_audio audio;
+    struct view_awb awb;
+    struct view_export exp;
+    struct view_sync sync;
+    struct view_timing timing;
+    struct view_zoom view;
+
+    /* Keyboard focus through the panel's adjustable rows. `row` counts them
+     * as the panel is laid out; `adjust` is the pending Left/Right step,
+     * consumed by whichever row is focused. */
+    int focus;
+    int ui_row, ui_rows;
+    int adjust;
+    bool adjust_coarse;
+    bool ui_edit_active;        /* a text field is being typed into */
+
+    CRAWProfile base;           /* tables, no per-frame data */
+    CRAWProfile prof;           /* base plus the current frame's side data */
+    bool have_prof;
+
+    void *win;                  /* SDL_Window, NULL when headless */
+    bool sdl_init;
+    int win_w, win_h;           /* window points, which mouse events use */
+
+    /* The picture on screen stays referenced until the next decode, so a
+     * grade change while paused can replay it without touching the file. */
+    AVFrame *frame;
+    int64_t index;              /* frame number of the picture on screen */
+    double pts;
+    bool have_frame;
+    struct view_pipeline_look processed;    /* what it was processed with */
+    bool playing;
+    bool need_frame;            /* decode one more even while paused */
+    int64_t seek_to;            /* >= 0: seek before the next decode */
+    int64_t seek_target;        /* the frame a seek is still looking for */
+    int seek_tries;
+
+    struct pl_custom_lut *lut;
+    char lut_error[128];
+
+    /* Volume as the panel holds it; the callback ramps towards it.
+     * nuklear's checkbox wants an int, so the flag is mirrored. */
+    float volume;
+    bool mute;
+    int mute_flag;
+
+    /* The wall clock that stands in for the audio clock on a silent clip. */
+    double wall_pts;
+    int64_t wall_t0;
+    /* The first picture pays for the pipeline's shaders and libplacebo's;
+     * the audio only starts once that is behind us, or the clock would run
+     * away and the first second would be spent dropping frames. */
+    bool warm;
+    int64_t loops_done;
+    /* How often the reader could not keep up, for -v. */
+    int64_t starved;
+
+    /* Timing, for -v and --bench. */
+    double decode_ms;
+    double fps;                 /* displayed frames per second */
+    double proc_fps;            /* pictures pushed through the pipeline */
+    double loop_period;         /* smoothed wall time between iterations */
+    double step_cost;           /* smoothed decode plus pipeline time */
+};
+
+/* ----------------------------------------------------------- gpu.c */
+
+/* `sdl_window` may be NULL, which builds a headless device with no
+ * surface, no swapchain and no UI. */
+int  view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg,
+                   void *sdl_window);
+void view_gpu_close(struct view_gpu *g);
+
+/* Creates or resizes the pipeline and the output texture. */
+int  view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
+                     enum CRAWDebayer debayer);
+
+/* Records one decoded hardware frame through libcraw and submits it,
+ * without waiting for the result. */
+int  view_gpu_process(struct view_gpu *g, const AVFrame *frame,
+                      const CRAWFrameParams *fp, struct view_timing *tm);
+
+/* Waits for the submission before the last one, which is what the auto
+ * white balance histogram of the previous frame needs. Normally returns at
+ * once: that frame has had a whole frame period to retire. */
+int  view_gpu_wait_prev(struct view_gpu *g, struct view_timing *tm);
+
+/* The non-raw path: hands the decoded frame to libplacebo. Takes its own
+ * reference, so the caller may unref immediately. */
+int  view_gpu_map(struct view_gpu *g, AVFrame *frame, AVStream *stream,
+                  struct view_timing *tm);
+void view_gpu_unmap(struct view_gpu *g);
+
+/* Forgets the cached views of the decoder's frame pool, which a rebuilt
+ * decoder replaces wholesale. */
+void view_gpu_drop_src_views(struct view_gpu *g);
+
+/* Points `lut` at the colour spaces the LUT input selector names, so that a
+ * conversion LUT is applied in the space it was authored for. */
+void view_lut_apply_space(struct pl_custom_lut *lut, int space);
+
+/* What libplacebo makes of the current source's peak, in nits. */
+float view_gpu_infer_ceiling(const struct view_gpu *g);
+
+/* Builds the source pl_frame for the last processed picture. `ceiling` is
+ * the highest value the pipeline can have produced, in nits. */
+void view_gpu_image(const struct view_gpu *g, struct pl_frame *out,
+                    float ceiling);
+
+/* Forgets the peak detection track, for when continuity breaks. */
+void view_gpu_reset_peak(struct view_gpu *g, bool export_renderer);
+
+/* Renders to the swapchain, with `ui` composited on top when non-NULL. */
+int  view_gpu_display(struct view_gpu *g, struct view_state *st);
+
+/* Renders to an offscreen sRGB texture and downloads it as 16 bit RGB. */
+int  view_gpu_render_export(struct view_gpu *g, struct view_state *st,
+                            uint16_t *rgba);
+
+/* The overlay texture nuklear draws into. On a resize the previous texture
+ * and view are kept until view_gpu_ui_drop_old(), which must be called once
+ * nuklear has rebuilt its framebuffers from the new view. */
+int  view_gpu_ui_resize(struct view_gpu *g, int w, int h);
+void view_gpu_ui_drop_old(struct view_gpu *g);
+
+/* The queue lock libplacebo, FFmpeg and we all go through. */
+void view_gpu_lock(struct view_gpu *g);
+void view_gpu_unlock(struct view_gpu *g);
+
+/* ----------------------------------------------------------- decode.c */
+
+int  view_decoder_open(struct view_decoder *d, const char *path,
+                       struct view_gpu *g, bool verbose);
+void view_decoder_close(struct view_decoder *d);
+
+/* 0: a frame, 1: end of stream, negative: an error. */
+int  view_decoder_next(struct view_decoder *d, AVFrame *frame);
+
+int  view_decoder_seek(struct view_decoder *d, int64_t frame_index);
+
+/* Mean queue depth since the last call, as the reader itself saw it. */
+double view_decoder_queued(struct view_decoder *d);
+
+/* Fills `p` from the frame's AV_FRAME_DATA_RAW_COLOR_PARAMS side data. */
+int  view_profile_from_frame(CRAWProfile *p, const AVFrame *frame);
+
+/* ----------------------------------------------------------- export.c */
+
+/* Packs interleaved RGBA16 host pixels into a 16 bit RGB PNG. */
+int  view_export_png(const char *path, const uint16_t *rgba,
+                     uint32_t w, uint32_t h);
+int  view_export_step(struct view_state *st);
+void view_export_begin(struct view_state *st, int64_t first, int64_t last,
+                       const char *dir);
+
+/* ----------------------------------------------------------- ui.c */
+
+int  view_ui_open(struct view_state *st, void *sdl_window);
+void view_ui_close(struct view_state *st);
+/* True while nuklear owns the keyboard (a text field has focus). */
+bool view_ui_wants_keys(const struct view_state *st);
+/* Feeds one SDL_Event; returns true when nuklear consumed it. */
+bool view_ui_event(void *sdl_event);
+void view_ui_input_begin(void);
+void view_ui_input_end(void);
+/* Lays out the panel, reading and writing `st`. */
+void view_ui_build(struct view_state *st);
+/* Draws the panel into the overlay texture, chaining libplacebo's
+ * semaphores around nuklear's own submission. */
+int  view_ui_render(struct view_state *st);
+int  view_ui_resize(struct view_state *st, int w, int h);
+/* Moves to the next overlay image, after the frame that used this one has
+ * been handed to the swapchain. */
+void view_ui_rotate(struct view_gpu *g);
+
+/* ----------------------------------------------------------- main.c */
+
+/* Total gain applied by the pipeline, i.e. what a pipeline value of 1.0 is
+ * worth against the sensor clip. Used for the mastering metadata. */
+float view_total_gain(const struct view_state *st);
+
+/* The highest value the pipeline can produce, in nits: diffuse white times
+ * the gain and the exposure bias, times the headroom the camera matrix adds
+ * for a fully saturated clipped pixel. This is the ceiling libplacebo is
+ * told about; peak detection measures the real per-frame peak below it. On
+ * the non-raw path there is no such calculation and libplacebo's own
+ * inference is reported instead. */
+float view_peak_ceiling(const struct view_state *st);
+
+/* Linear gain the non-raw path's exposure hook applies: the bias in stops
+ * times the working exposure index over the as-shot one, which is the same
+ * model the raw path hands to libcraw. */
+float view_video_exposure(const struct view_state *st);
+
+/* Fills the per-frame parameters from the look and the current profile. */
+void view_frame_params(const struct view_state *st, CRAWFrameParams *fp);
+
+/* The pipeline-relevant part of the current look, and whether two of them
+ * would give the same picture. */
+struct view_pipeline_look view_pipeline_look(const struct view_state *st);
+bool view_pipeline_look_equal(const struct view_pipeline_look *a,
+                              const struct view_pipeline_look *b);
+
+/* Runs the picture on screen through the pipeline again with the current
+ * look. A no-op for an already developed clip, whose grade is applied at
+ * display time, and while no picture is held. */
+int  view_replay_frame(struct view_state *st);
+
+void view_log(const struct view_state *st, const char *fmt, ...)
+              craw_printf_format(2, 3);
+
+/* Decodes the next picture and runs it through the pipeline.
+ * 0: a frame, 1: end of stream, 2: the frame was too late to be worth
+ * processing and was dropped, so call again, 3: the reader has not caught
+ * up and there is nothing to decode yet; negative: an error. */
+int  view_step_frame(struct view_state *st);
+
+/* The master clock, in seconds on the clip's timeline: the audio clock
+ * when there is audio, wall time since the last start or seek otherwise. */
+double view_clock(struct view_state *st);
+
+/* The .cube LUT named by look.lut_path. */
+int  view_lut_load(struct view_state *st);
+void view_lut_clear(struct view_state *st);
+
+/* The directory the clip lives in, for the default export target. */
+const char *view_clip_dir(const struct view_state *st);
+
+/* The part of the window the picture gets: everything left of the panel. */
+void view_picture_area(const struct view_state *st, pl_rect2df *out);
+
+/* Screen pixels per source pixel at the current setting, resolving "fit". */
+float view_zoom_scale(const struct view_state *st);
+
+/* The rectangles pl_render_image is given: `src` in source pixels, `dst` in
+ * window pixels. */
+void view_zoom_rects(const struct view_state *st, pl_rect2df *src, pl_rect2df *dst);
+
+/* Zoom by `notches` quarter-octaves about a window position, or about the
+ * centre of the picture area when `at_cursor` is false. */
+void view_zoom_by(struct view_state *st, float notches, int sx, int sy,
+                  bool at_cursor);
+void view_zoom_reset(struct view_state *st, bool one_to_one);
+/* Pan by a fraction of the visible area, or by a screen-pixel delta. */
+void view_pan_fraction(struct view_state *st, float fx, float fy);
+void view_pan_pixels(struct view_state *st, int dx, int dy);
+
+#endif /* CRAW_VIEW_H */
