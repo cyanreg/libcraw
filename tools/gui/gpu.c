@@ -1206,7 +1206,12 @@ static void view_render_params(struct view_state *st,
      * defaults for the smoothing window, the scene cut thresholds and the
      * percentile are kept: nothing measured here argues with them. */
     rp->peak_detect_params = st->look.peak_detect ? pdp : NULL;
-    rp->lut = st->lut;
+    /* A user .cube goes on the image as asked; a film simulation never
+     * does: it is a display-referred sRGB look and belongs on the target
+     * frame, after tone mapping, in the output's own encoding (see
+     * view_gpu_display and view_gpu_render_export). On the image it would
+     * land on the scene-linear scRGB source and mean nothing. */
+    rp->lut = st->look.film_sim >= 0 ? NULL : st->lut;
     rp->lut_type = st->look.lut_space > 0 ? PL_LUT_CONVERSION : st->look.lut_type;
 
     /* Only the non-raw path needs a shader for exposure; on the raw path
@@ -1251,6 +1256,13 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
 
     pl_frame_from_swapchain(&target, &sw_frame);
     view_render_params(st, &rp, &cmp, &pdp, &adj, &hook);
+
+    /* The film simulation is applied to the encoded output, which for an
+     * SDR window is the sRGB these CLUTs were built for. */
+    if (st->look.film_sim >= 0 && st->lut) {
+        target.lut = st->lut;
+        target.lut_type = PL_LUT_NATIVE;
+    }
 
     if (st->have_frame) {
         pl_rect2df src, dst;
@@ -1383,6 +1395,13 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
         .color = pl_color_space_srgb,
         .crop  = { 0, 0, (float)g->width, (float)g->height },
     };
+
+    /* Same place as on screen: the film simulation goes on the sRGB
+     * encoded output, not on the scene-linear image. */
+    if (st->look.film_sim >= 0 && st->lut) {
+        target.lut = st->lut;
+        target.lut_type = PL_LUT_NATIVE;
+    }
 
     /* The export has its own renderer so that the peak detection track it
      * walks through depends only on the exported frames: the same range
