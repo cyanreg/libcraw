@@ -1212,17 +1212,17 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
     /* An already developed clip has no mosaic: there is nothing to balance
      * and nothing to debayer, so those sections are not offered at all. */
-    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "White balance", NK_MAXIMIZED)) {
+    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "White balance", NK_MINIMIZED)) {
         view_panel_wb(ctx, st);
         nk_tree_pop(ctx);
     }
 
-    if (nk_tree_push(ctx, NK_TREE_TAB, "Exposure", NK_MAXIMIZED)) {
+    if (nk_tree_push(ctx, NK_TREE_TAB, "Exposure", NK_MINIMIZED)) {
         view_panel_exposure(ctx, st);
         nk_tree_pop(ctx);
     }
 
-    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "Debayer", NK_MAXIMIZED)) {
+    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "Debayer", NK_MINIMIZED)) {
         int dbg = (int)lk->debayer;
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 3);
@@ -1234,7 +1234,7 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         nk_tree_pop(ctx);
     }
 
-    if (nk_tree_push(ctx, NK_TREE_TAB, "Look", NK_MAXIMIZED)) {
+    if (nk_tree_push(ctx, NK_TREE_TAB, "Look", NK_MINIMIZED)) {
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
         view_adjust_cycle(st, view_row(st, ctx), &lk->tone_map, view_nb_tone_maps);
         nk_label(ctx, "tone map", NK_TEXT_LEFT);
@@ -1262,34 +1262,30 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
         view_panel_film_sim(ctx, st);
 
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        nk_label(ctx, "CUBE LUT", NK_TEXT_LEFT);
-        if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, lk->lut_path,
-                                           sizeof(lk->lut_path),
-                                           nk_filter_default) & NK_EDIT_ACTIVE)
-            st->ui_edit_active = true;
-
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 3);
-        if (nk_button_label(ctx, "Load"))
-            view_lut_load(st);
-        if (nk_button_label(ctx, "Clear"))
-            view_lut_clear(st);
-        sel = lk->lut_type == PL_LUT_NORMALIZED ? 1 : 0;
-        view_adjust_cycle(st, view_row(st, ctx), &sel, 2);
-        {
+        /* A user .cube comes from --lut on the command line; the panel only
+         * shows it, and its two settings, while one is loaded. */
+        if (st->lut && lk->film_sim < 0) {
+            const char *base = strrchr(lk->lut_path, '/');
             static const char *lut_types[] = { "native", "normalized" };
+
+            nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+            nk_labelf(ctx, NK_TEXT_LEFT, "cube: %s", base ? base + 1 : lk->lut_path);
+
+            nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+            sel = lk->lut_type == PL_LUT_NORMALIZED ? 1 : 0;
+            view_adjust_cycle(st, view_row(st, ctx), &sel, 2);
+            nk_label(ctx, "LUT type", NK_TEXT_LEFT);
             sel = nk_combo(ctx, lut_types, 2, sel, 20, nk_vec2(140, 60));
             lk->lut_type = sel ? PL_LUT_NORMALIZED : PL_LUT_NATIVE;
-        }
 
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        view_adjust_cycle(st, view_row(st, ctx), &lk->lut_space, view_nb_lut_spaces);
-        nk_label(ctx, "LUT input", NK_TEXT_LEFT);
-        sel = nk_combo(ctx, view_lut_space_names, view_nb_lut_spaces,
-                       lk->lut_space, 20, nk_vec2(160, 120));
-        if (sel != lk->lut_space) {
-            lk->lut_space = sel;
-            view_lut_apply_space(st->lut, sel);
+            view_adjust_cycle(st, view_row(st, ctx), &lk->lut_space, view_nb_lut_spaces);
+            nk_label(ctx, "LUT input", NK_TEXT_LEFT);
+            sel = nk_combo(ctx, view_lut_space_names, view_nb_lut_spaces,
+                           lk->lut_space, 20, nk_vec2(160, 120));
+            if (sel != lk->lut_space) {
+                lk->lut_space = sel;
+                view_lut_apply_space(st->lut, sel);
+            }
         }
 
         if (st->lut_error[0]) {
