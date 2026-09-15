@@ -56,10 +56,28 @@
 #include <libplacebo/gpu.h>
 
 #include "view.h"
+/* The embedded film simulation collection is optional: without it the row
+ * and its menu compile out and the panel says so. */
+#ifndef CRAW_VIEW_HAVE_LUTS
+#define CRAW_VIEW_HAVE_LUTS 0
+#endif
+
+#if CRAW_VIEW_HAVE_LUTS
+#include "luts.h"
+#endif
 
 #define VIEW_UI_WIDTH  VIEW_PANEL_WIDTH
 #define VIEW_UI_MARGIN VIEW_PANEL_MARGIN
 #define VIEW_ROW       24.0f
+
+/* The cascading menu's own metrics. Its rows are tighter than the panel's:
+ * a film category can hold twenty-six stocks and the column still has to
+ * fit in a modest window. */
+#define VIEW_MENU_ROW   20.0f
+#define VIEW_MENU_PAD    4.0f
+#define VIEW_MENU_MIN_W 110.0f
+#define VIEW_MENU_MAX_W 330.0f
+#define VIEW_MENU_ARROW 16.0f
 
 #define VIEW_NK_VERTEX_BUFFER (512 * 1024)
 #define VIEW_NK_INDEX_BUFFER  (128 * 1024)
@@ -212,14 +230,14 @@ static int view_step(struct view_state *st, bool focused)
 }
 
 static void view_adjust_float(struct view_state *st, bool focused, float *v,
-                              float fine, float coarse, float lo, float hi)
+                              float step, float lo, float hi)
 {
     int adj = view_step(st, focused);
 
     if (adj) {
-        *v = CRAW_CLAMP(*v + (float)adj * (st->adjust_coarse ? coarse : fine), lo, hi);
+        *v = CRAW_CLAMP(*v + (float)adj * step, lo, hi);
         /* Three sixths of a stop back from a half is not -0.00. */
-        if (fabsf(*v) < fine * 1e-3f)
+        if (fabsf(*v) < step * 1e-3f)
             *v = 0.0f;
     }
 }
@@ -232,29 +250,677 @@ static void view_adjust_cycle(struct view_state *st, bool focused, int *v, int n
         *v = (*v + adj + n) % n;
 }
 
+/* ------------------------------------------- the film simulation menu */
+
+#if CRAW_VIEW_HAVE_LUTS
+
+/* nuklear has popups and groups but nothing cascading, and its windows
+ * hand input to whichever one the pointer last activated, which is not how
+ * a menu behaves: every column has to keep reacting while the panel
+ * underneath is still the window nuklear considers active. So the columns
+ * are NK_WINDOW_NO_INPUT windows — nuklear draws, borders and clips them,
+ * and skips them entirely when it decides who owns the pointer — and the
+ * hover, click and scroll logic below works straight off the pointer
+ * position against rectangles this file computes. That also keeps the
+ * columns in creation order, which is drawing order, so they always sit on
+ * top of the panel built before them. */
+
+/* The film whose renderings column 3 lists, or NULL when the path does not
+ * reach that far. */
+static const ViewLutFilm *view_menu_film(const struct view_state *st)
+{
+    const struct view_lut_menu *m = &st->menu;
+    const ViewLutFilmCategory *c;
+
+    if (m->sel[0] != 0 || m->sel[1] < 0 || m->sel[2] < 0)
+        return NULL;
+    c = view_lut_film_category(m->sel[1]);
+    if (!c || m->sel[2] >= c->n_films)
+        return NULL;
+
+    return view_lut_film(c->first_film + m->sel[2]);
+}
+
+/* A leaf column's entries are renderings, so clicking one selects. */
+static bool view_menu_leaf(const struct view_state *st, int col)
+{
+    return (st->menu.sel[0] == 1 && col == 2) ||
+           (st->menu.sel[0] == 0 && col == 3);
+}
+
+static int view_menu_count(const struct view_state *st, int col)
+{
+    const struct view_lut_menu *m = &st->menu;
+    const ViewLutFilmCategory *fc;
+    const ViewLutLookCategory *lc;
+    const ViewLutFilm *f;
+
+    switch (col) {
+    case 0:
+        return 2;
+    case 1:
+        if (m->sel[0] < 0)
+            return 0;
+        return m->sel[0] == 0 ? view_luts_film_category_count()
+                              : view_luts_look_category_count();
+    case 2:
+        if (m->sel[0] < 0 || m->sel[1] < 0)
+            return 0;
+        if (m->sel[0] == 0) {
+            fc = view_lut_film_category(m->sel[1]);
+            return fc ? fc->n_films : 0;
+        }
+        lc = view_lut_look_category(m->sel[1]);
+        return lc ? lc->n_luts : 0;
+    case 3:
+        f = view_menu_film(st);
+        return f ? f->n_luts : 0;
+    default:
+        return 0;
+    }
+}
+
+/* The rendering an entry of a leaf column stands for, or -1. */
+static int view_menu_lut(const struct view_state *st, int col, int i)
+{
+    const ViewLutLookCategory *lc;
+    const ViewLutFilm *f;
+
+    if (!view_menu_leaf(st, col) || i < 0 || i >= view_menu_count(st, col))
+        return -1;
+
+    if (col == 2) {
+        lc = view_lut_look_category(st->menu.sel[1]);
+        return lc && lc->luts ? (int)lc->luts[i] : -1;
+    }
+
+    f = view_menu_film(st);
+    return f ? f->first_lut + i : -1;
+}
+
+static void view_menu_label(const struct view_state *st, int col, int i,
+                            char *buf, size_t n)
+{
+    const struct view_lut_menu *m = &st->menu;
+    const ViewLutFilmCategory *fc;
+    const ViewLutLookCategory *lc;
+    const ViewLutFilm *f;
+    const ViewLut *l;
+
+    buf[0] = '\0';
+
+    switch (col) {
+    case 0:
+        snprintf(buf, n, "%s", i == 0 ? "Films" : "Looks");
+        return;
+
+    case 1:
+        if (m->sel[0] == 0) {
+            fc = view_lut_film_category(i);
+            if (fc)
+                snprintf(buf, n, "%s", fc->name);
+        } else {
+            lc = view_lut_look_category(i);
+            if (lc)
+                snprintf(buf, n, "%s", lc->name);
+        }
+        return;
+
+    case 2:
+        if (m->sel[0] == 0) {
+            fc = view_lut_film_category(m->sel[1]);
+            f = fc ? view_lut_film(fc->first_film + i) : NULL;
+            if (f)
+                snprintf(buf, n, "%s", f->name);
+            return;
+        }
+        /* A look cuts across films, so without the stock on the row the
+         * rendering's name says nothing about what it is emulating. */
+        l = view_lut_get(view_menu_lut(st, col, i));
+        f = l ? view_lut_film(l->film) : NULL;
+        if (l && f)
+            snprintf(buf, n, "%s \xc2\xb7 %s", l->name, f->name);
+        return;
+
+    case 3:
+        l = view_lut_get(view_menu_lut(st, col, i));
+        if (l && l->label[0])
+            snprintf(buf, n, "%s \xc2\xb7 %s", l->name, l->label);
+        else if (l)
+            snprintf(buf, n, "%s", l->name);
+        return;
+
+    default:
+        return;
+    }
+}
+
+static float view_menu_width(struct nk_context *ctx,
+                             const struct view_state *st, int col)
+{
+    const struct nk_user_font *font = ctx->style.font;
+    int n = view_menu_count(st, col);
+    float text = 0.0f, w;
+
+    for (int i = 0; i < n; i++) {
+        char buf[192];
+        float tw;
+
+        view_menu_label(st, col, i, buf, sizeof(buf));
+        tw = font->width(font->userdata, font->height, buf, (int)strlen(buf));
+        if (tw > text)
+            text = tw;
+    }
+
+    w = text + 2 * VIEW_MENU_PAD + 6.0f +
+        (view_menu_leaf(st, col) ? 0.0f : VIEW_MENU_ARROW);
+
+    return CRAW_CLAMP(w, VIEW_MENU_MIN_W, VIEW_MENU_MAX_W);
+}
+
+/* Places the columns. The first hangs off the panel row, each next one
+ * beside the entry that opened it, and none of them may leave the window:
+ * the cascade runs left when there is no room on the right, and a column
+ * taller than the window scrolls instead of growing. */
+static void view_menu_layout(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_lut_menu *m = &st->menu;
+    float winw = (float)st->gpu.ui_w;
+    float winh = (float)st->gpu.ui_h;
+    const float margin = VIEW_UI_MARGIN;
+    int dir;
+
+    /* How far the highlighted path reaches. A column opens only once its
+     * parent entry is highlighted and actually has children. */
+    m->cols = 1;
+    for (int c = 0; c + 1 < VIEW_MENU_COLS; c++) {
+        if (m->sel[c] < 0 || view_menu_leaf(st, c) ||
+            view_menu_count(st, c + 1) <= 0)
+            break;
+        m->cols = c + 2;
+    }
+
+    dir = (m->ax + m->aw + view_menu_width(ctx, st, 0) <= winw - margin) ? 1 : -1;
+
+    for (int c = 0; c < m->cols; c++) {
+        float w = view_menu_width(ctx, st, c);
+        float full = (float)view_menu_count(st, c) * VIEW_MENU_ROW +
+                     2 * VIEW_MENU_PAD;
+        float h = CRAW_MIN(full, winh - 2 * margin);
+        float maxs = CRAW_MAX(0.0f, full - h);
+        float s, x, y;
+
+        if (c == 0) {
+            x = dir > 0 ? m->ax + m->aw : m->ax - w;
+            y = m->ay;
+        } else {
+            x = dir > 0 ? m->x[c - 1] + m->w[c - 1] : m->x[c - 1] - w;
+            /* Line the column up with the row that opened it, the way a
+             * submenu hangs off its parent entry. */
+            y = m->y[c - 1] + VIEW_MENU_PAD - m->scroll[c - 1] +
+                (float)m->sel[c - 1] * VIEW_MENU_ROW;
+        }
+
+        m->x[c] = CRAW_CLAMP(x, margin, CRAW_MAX(margin, winw - margin - w));
+        m->y[c] = CRAW_CLAMP(y, margin, CRAW_MAX(margin, winh - margin - h));
+        m->w[c] = w;
+        m->h[c] = h;
+
+        s = CRAW_CLAMP(m->scroll[c], 0.0f, maxs);
+        /* Keyboard navigation must keep its highlight on screen. */
+        if (m->kb == c && m->sel[c] >= 0) {
+            float top = (float)m->sel[c] * VIEW_MENU_ROW;
+            float inner = h - 2 * VIEW_MENU_PAD;
+
+            if (top < s)
+                s = top;
+            else if (top + VIEW_MENU_ROW > s + inner)
+                s = top + VIEW_MENU_ROW - inner;
+            s = CRAW_CLAMP(s, 0.0f, maxs);
+        }
+        m->scroll[c] = s;
+    }
+}
+
+/* The rectangle of entry `i` of column `c`, in window pixels. */
+static struct nk_rect view_menu_entry(const struct view_lut_menu *m, int c, int i)
+{
+    return nk_rect(m->x[c] + 1.0f,
+                   m->y[c] + VIEW_MENU_PAD +
+                   (float)i * VIEW_MENU_ROW - m->scroll[c],
+                   m->w[c] - 2.0f, VIEW_MENU_ROW);
+}
+
+static void view_menu_descend(struct view_state *st, int col, int i)
+{
+    struct view_lut_menu *m = &st->menu;
+
+    if (m->sel[col] == i)
+        return;
+
+    m->sel[col] = i;
+    /* A different parent invalidates everything below it. */
+    for (int k = col + 1; k < VIEW_MENU_COLS; k++) {
+        m->sel[k] = -1;
+        m->scroll[k] = 0.0f;
+    }
+}
+
+/* Pointer pass: hover moves the highlight and opens the next column, a
+ * click on a leaf selects, the wheel scrolls the column under the pointer.
+ * Returns the rendering to select, or -1. */
+static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
+                             bool *over)
+{
+    struct view_lut_menu *m = &st->menu;
+    struct nk_input *in = &ctx->input;
+    struct nk_vec2 p = in->mouse.pos;
+    int pick = -1;
+
+    *over = false;
+
+    for (int c = 0; c < m->cols; c++) {
+        struct nk_rect r = nk_rect(m->x[c], m->y[c], m->w[c], m->h[c]);
+        int n = view_menu_count(st, c);
+        bool leaf = view_menu_leaf(st, c);
+
+        if (!NK_INBOX(p.x, p.y, r.x, r.y, r.w, r.h))
+            continue;
+        *over = true;
+
+        /* A column taller than the window takes the wheel itself, so the
+         * picture underneath neither zooms nor scrolls. */
+        if (in->mouse.scroll_delta.y != 0.0f) {
+            float full = (float)n * VIEW_MENU_ROW + 2 * VIEW_MENU_PAD;
+
+            m->scroll[c] = CRAW_CLAMP(m->scroll[c] -
+                                      in->mouse.scroll_delta.y * VIEW_MENU_ROW * 2.0f,
+                                      0.0f, CRAW_MAX(0.0f, full - m->h[c]));
+            in->mouse.scroll_delta.y = 0.0f;
+        }
+
+        for (int i = 0; i < n; i++) {
+            struct nk_rect e = view_menu_entry(m, c, i);
+
+            if (p.y < e.y || p.y >= e.y + e.h)
+                continue;
+            /* Only rows fully inside the column count, or the half row
+             * peeking out of a scrolled list would take clicks. */
+            if (e.y < r.y || e.y + e.h > r.y + r.h)
+                break;
+
+            m->kb = -1;             /* the pointer has taken over */
+            view_menu_descend(st, c, i);
+            if (leaf && nk_input_is_mouse_click_in_rect(in, NK_BUTTON_LEFT, e))
+                pick = view_menu_lut(st, c, i);
+            break;
+        }
+    }
+
+    return pick;
+}
+
+static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_lut_menu *m = &st->menu;
+    const struct nk_user_font *font = ctx->style.font;
+
+    nk_style_push_vec2(ctx, &ctx->style.window.padding, nk_vec2(0.0f, 0.0f));
+    nk_style_push_style_item(ctx, &ctx->style.window.fixed_background,
+                             nk_style_item_color(nk_rgba(34, 34, 40, 255)));
+
+    for (int c = 0; c < m->cols; c++) {
+        struct nk_rect r = nk_rect(m->x[c], m->y[c], m->w[c], m->h[c]);
+        struct nk_command_buffer *out;
+        int n = view_menu_count(st, c);
+        bool leaf = view_menu_leaf(st, c);
+        char name[32];
+
+        snprintf(name, sizeof(name), "craw-view-lutmenu-%d", c);
+        if (!nk_begin(ctx, name, r,
+                      NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR |
+                      NK_WINDOW_NO_INPUT)) {
+            nk_end(ctx);
+            continue;
+        }
+        out = nk_window_get_canvas(ctx);
+
+        for (int i = 0; i < n; i++) {
+            struct nk_rect e = view_menu_entry(m, c, i);
+            struct nk_rect t;
+            char buf[192];
+            bool on = m->sel[c] == i;
+
+            if (e.y + e.h <= r.y || e.y >= r.y + r.h)
+                continue;           /* scrolled out of the column */
+
+            view_menu_label(st, c, i, buf, sizeof(buf));
+            if (on)
+                nk_fill_rect(out, e, 2.0f,
+                             m->kb == c ? nk_rgba(64, 92, 140, 255)
+                                        : nk_rgba(52, 66, 96, 255));
+
+            t = nk_rect(e.x + VIEW_MENU_PAD, e.y, e.w - 2 * VIEW_MENU_PAD, e.h);
+            nk_draw_text(out, t, buf, (int)strlen(buf), font,
+                         nk_rgba(0, 0, 0, 0), nk_rgba(226, 226, 232, 255));
+
+            /* The mark that says this entry opens another column. Plain
+             * ASCII: nuklear's built-in font atlas only bakes Latin-1, so
+             * a typographic arrow would come out as a missing glyph. */
+            if (!leaf) {
+                const char *arrow = ">";
+
+                t = nk_rect(e.x + e.w - VIEW_MENU_ARROW, e.y,
+                            VIEW_MENU_ARROW - VIEW_MENU_PAD, e.h);
+                nk_draw_text(out, t, arrow, (int)strlen(arrow), font,
+                             nk_rgba(0, 0, 0, 0), nk_rgba(150, 150, 160, 255));
+            }
+        }
+
+        /* A scrolled column says so, or a list cut off at the window edge
+         * looks like the whole list. */
+        if ((float)n * VIEW_MENU_ROW + 2 * VIEW_MENU_PAD > r.h) {
+            float full = (float)n * VIEW_MENU_ROW + 2 * VIEW_MENU_PAD;
+            float frac = r.h / full;
+            struct nk_rect bar = nk_rect(r.x + r.w - 3.0f,
+                                         r.y + r.h * (m->scroll[c] / full),
+                                         2.0f, r.h * frac);
+
+            nk_fill_rect(out, bar, 1.0f, nk_rgba(110, 110, 124, 255));
+        }
+
+        nk_end(ctx);
+    }
+
+    nk_style_pop_style_item(ctx);
+    nk_style_pop_vec2(ctx);
+}
+
+void view_ui_menu_open(struct view_state *st)
+{
+    struct view_lut_menu *m = &st->menu;
+    const ViewLut *l = view_lut_get(st->look.film_sim);
+
+    if (m->open)
+        return;
+
+    m->open = true;
+    m->cols = 1;
+    m->kb = 0;
+    for (int c = 0; c < VIEW_MENU_COLS; c++) {
+        m->sel[c] = -1;
+        m->scroll[c] = 0.0f;
+    }
+
+    /* Open on what is already selected, so Enter then the arrows walks on
+     * from the current look rather than from the top of the list. */
+    if (l) {
+        const ViewLutFilm *f = view_lut_film(l->film);
+        const ViewLutFilmCategory *c = f ? view_lut_film_category(f->category) : NULL;
+
+        if (f && c) {
+            m->sel[0] = 0;
+            m->sel[1] = f->category;
+            m->sel[2] = 0;
+            for (int i = 0; i < c->n_films; i++) {
+                const ViewLutFilm *g = view_lut_film(c->first_film + i);
+
+                if (g == f) {
+                    m->sel[2] = i;
+                    break;
+                }
+            }
+            m->sel[3] = st->look.film_sim - f->first_lut;
+            m->kb = 3;
+        }
+    }
+}
+
+void view_ui_menu_close(struct view_state *st)
+{
+    st->menu.open = false;
+    st->menu.cols = 0;
+    st->menu.kb = -1;
+}
+
+bool view_ui_menu_covers(const struct view_state *st, float x, float y)
+{
+    const struct view_lut_menu *m = &st->menu;
+    float sx = st->win_w > 0 ? (float)st->gpu.ui_w / (float)st->win_w : 1.0f;
+    float sy = st->win_h > 0 ? (float)st->gpu.ui_h / (float)st->win_h : 1.0f;
+
+    if (!m->open)
+        return false;
+
+    /* SDL reports window points, the panel and the menu live in drawable
+     * pixels; the two differ under a fractional scale. */
+    x *= sx;
+    y *= sy;
+
+    for (int c = 0; c < m->cols; c++)
+        if (NK_INBOX(x, y, m->x[c], m->y[c], m->w[c], m->h[c]))
+            return true;
+
+    return false;
+}
+
+bool view_ui_menu_key(struct view_state *st, int key)
+{
+    struct view_lut_menu *m = &st->menu;
+    int c, n;
+
+    if (!m->open)
+        return false;
+
+    if (key == SDLK_ESCAPE) {
+        view_ui_menu_close(st);
+        return true;
+    }
+
+    /* The pointer may have been driving; a key takes it back at whatever
+     * depth the columns are already open to. */
+    if (m->kb < 0)
+        m->kb = CRAW_MAX(m->cols - 1, 0);
+    c = CRAW_CLAMP(m->kb, 0, m->cols - 1);
+    n = view_menu_count(st, c);
+
+    switch (key) {
+    case SDLK_UP:
+    case SDLK_DOWN:
+        if (n > 0) {
+            int i = m->sel[c];
+
+            if (i < 0)
+                i = key == SDLK_DOWN ? 0 : n - 1;
+            else
+                i = (i + (key == SDLK_DOWN ? 1 : -1) + n) % n;
+            view_menu_descend(st, c, i);
+            m->kb = c;
+        }
+        return true;
+
+    case SDLK_RIGHT:
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        if (m->sel[c] < 0 && n > 0)
+            view_menu_descend(st, c, 0);
+        if (view_menu_leaf(st, c)) {
+            int ix = view_menu_lut(st, c, m->sel[c]);
+
+            /* Right on a leaf has nowhere to go; only Enter selects. */
+            if (key != SDLK_RIGHT && ix >= 0) {
+                view_lut_select_film(st, ix);
+                view_ui_menu_close(st);
+            }
+            return true;
+        }
+        /* Step into the column this entry opens, highlighting its first
+         * row so the next key has something to move from. */
+        if (view_menu_count(st, c + 1) > 0) {
+            if (m->sel[c + 1] < 0)
+                m->sel[c + 1] = 0;
+            m->kb = c + 1;
+        }
+        return true;
+
+    case SDLK_LEFT:
+        if (c > 0) {
+            m->kb = c - 1;
+        } else {
+            view_ui_menu_close(st);
+        }
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+/* Left and Right on the focused row step through the renderings of the
+ * film category the current selection belongs to. Films are contiguous
+ * inside a category and renderings inside a film, so that whole category
+ * is one run of indices and a step is one index inside it. */
+static void view_menu_step(struct view_state *st, int adj)
+{
+    int n = view_luts_count();
+    int cur = st->look.film_sim;
+    int lo = 0, hi = n - 1;
+    const ViewLut *l;
+    const ViewLutFilm *f;
+    const ViewLutFilmCategory *c;
+
+    if (!adj || n <= 0)
+        return;
+
+    if (cur < 0 || cur >= n) {
+        view_lut_select_film(st, adj > 0 ? 0 : n - 1);
+        return;
+    }
+
+    l = view_lut_get(cur);
+    f = l ? view_lut_film(l->film) : NULL;
+    c = f ? view_lut_film_category(f->category) : NULL;
+    if (c && c->n_films > 0) {
+        const ViewLutFilm *a = view_lut_film(c->first_film);
+        const ViewLutFilm *z = view_lut_film(c->first_film + c->n_films - 1);
+
+        if (a && z) {
+            lo = a->first_lut;
+            hi = z->first_lut + z->n_luts - 1;
+        }
+    }
+
+    view_lut_select_film(st, CRAW_CLAMP(cur + adj, lo, hi));
+}
+
+/* The panel row. Hovering or clicking it opens the menu; the menu itself
+ * is built after the panel so that it draws on top. */
+static void view_panel_film_sim(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_lut_menu *m = &st->menu;
+    struct nk_rect content = nk_window_get_content_region(ctx);
+    struct nk_rect b;
+    bool focused;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    focused = view_row(st, ctx);
+    m->row = st->ui_row - 1;        /* view_row() has already stepped it */
+    view_menu_step(st, view_step(st, focused));
+
+    nk_label(ctx, "film simulation", NK_TEXT_LEFT);
+
+    b = nk_widget_bounds(ctx);
+    /* The menu hangs off the whole row rather than the button, so that it
+     * opens flush with the panel's edge instead of halfway across it. */
+    m->ax = content.x;
+    m->aw = content.w;
+    m->ay = b.y;
+    m->ah = b.h;
+    m->anchored = true;
+
+    if (nk_button_label(ctx, view_lut_film_name(st))) {
+        if (m->open)
+            view_ui_menu_close(st);
+        else
+            view_ui_menu_open(st);
+        m->kb = -1;
+    } else if (!m->open &&
+               nk_input_is_mouse_hovering_rect(&ctx->input,
+                                               nk_rect(m->ax, m->ay, m->aw, m->ah))) {
+        view_ui_menu_open(st);
+        m->kb = -1;
+    }
+}
+
+/* Runs the whole menu for this frame: pointer first so that the cascade
+ * reacts in the same frame the pointer moved, then the layout it implies,
+ * then the drawing. */
+static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_lut_menu *m = &st->menu;
+    bool over = false;
+    int pick;
+
+    if (!m->open || !m->anchored)
+        return;
+
+    pick = view_menu_pointer(ctx, st, &over);
+    if (pick >= 0) {
+        view_lut_select_film(st, pick);
+        view_ui_menu_close(st);
+        return;
+    }
+
+    /* The pointer leaving the menu and the row closes it, but only while
+     * the pointer is the thing driving: a menu opened with Enter stays up
+     * wherever the pointer happens to be sitting. */
+    if (m->kb < 0 && !over &&
+        !nk_input_is_mouse_hovering_rect(&ctx->input,
+                                         nk_rect(m->ax, m->ay, m->aw, m->ah))) {
+        view_ui_menu_close(st);
+        return;
+    }
+
+    view_menu_layout(ctx, st);
+    view_menu_draw(ctx, st);
+}
+
+#else /* !CRAW_VIEW_HAVE_LUTS */
+
+void view_ui_menu_open(struct view_state *st) { (void)st; }
+void view_ui_menu_close(struct view_state *st) { (void)st; }
+bool view_ui_menu_key(struct view_state *st, int key) { (void)st; (void)key; return false; }
+
+bool view_ui_menu_covers(const struct view_state *st, float x, float y)
+{
+    (void)st; (void)x; (void)y;
+    return false;
+}
+
+static void view_panel_film_sim(struct nk_context *ctx, struct view_state *st)
+{
+    (void)st;
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    nk_label(ctx, "film simulation", NK_TEXT_LEFT);
+    nk_label(ctx, "not built in", NK_TEXT_LEFT);
+}
+
+static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
+{
+    (void)ctx; (void)st;
+}
+
+#endif /* CRAW_VIEW_HAVE_LUTS */
+
 static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
 {
     int64_t total = st->dec.nb_frames;
     int pos;
 
-    nk_layout_row_dynamic(ctx, VIEW_ROW, 4);
-    if (nk_button_label(ctx, st->playing ? "Pause" : "Play"))
-        st->playing = !st->playing;
-    if (nk_button_label(ctx, "|<")) {
-        st->playing = false;
-        st->seek_to = st->index > 0 ? st->index - 1 : 0;
-        st->need_frame = true;
-    }
-    if (nk_button_label(ctx, ">|")) {
-        st->playing = false;
-        st->need_frame = true;
-    }
-    if (nk_button_label(ctx, "<<")) {
-        st->playing = false;
-        st->seek_to = 0;
-        st->need_frame = true;
-    }
-
+    /* No transport buttons: the keyboard is the transport. Space plays and
+     * pauses, Shift with Page Up and Page Down are the ends of the clip and
+     * Shift with Left and Right steps a second. The scrub bar stays,
+     * because dragging to a frame is the one thing keys are bad at. */
     if (total > 1) {
         bool f;
         int adj;
@@ -264,8 +930,7 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
         f = view_row(st, ctx);
         adj = view_step(st, f);
         if (adj) {
-            pos = (int)CRAW_CLAMP((int64_t)pos + adj * (st->adjust_coarse ? 10 : 1),
-                                  0, total - 1);
+            pos = (int)CRAW_CLAMP((int64_t)pos + adj, 0, total - 1);
             st->playing = false;
             st->seek_to = pos;
             st->need_frame = true;
@@ -316,7 +981,7 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
                   e->confidence, view_wb_source_name(e->source), e->spread_mired);
 
         view_adjust_float(st, view_row(st, ctx), &st->awb.params.ambience,
-                          0.05f, 0.2f, 0.0f, 1.0f);
+                          0.05f, 0.0f, 1.0f);
         nk_property_float(ctx, "#ambience", 0.0f, &st->awb.params.ambience, 1.0f,
                           0.05f, 0.005f);
         break;
@@ -324,12 +989,12 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
 
     case VIEW_WB_MANUAL:
         view_adjust_float(st, view_row(st, ctx), &lk->manual.cct,
-                          100.0f, 500.0f, 2000.0f, 11500.0f);
+                          100.0f, 2000.0f, 11500.0f);
         nk_property_float(ctx, "#CCT (K)", 2000.0f, &lk->manual.cct, 11500.0f,
                           50.0f, 5.0f);
         nk_slider_float(ctx, 2000.0f, &lk->manual.cct, 11500.0f, 10.0f);
         view_adjust_float(st, view_row(st, ctx), &lk->manual.tint,
-                          0.01f, 0.05f, -0.2f, 0.2f);
+                          0.01f, -0.2f, 0.2f);
         nk_property_float(ctx, "#tint", -0.2f, &lk->manual.tint, 0.2f, 0.005f, 0.0005f);
         nk_slider_float(ctx, -0.2f, &lk->manual.tint, 0.2f, 0.002f);
         break;
@@ -366,12 +1031,9 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
         /* The standard list is already a third of a stop per entry, so a
-         * step of one entry is a step of a third; coarse moves a stop. */
+         * step of one entry is a step of a third of a stop. */
         pick = sel;
-        view_adjust_cycle(st, view_row(st, ctx), &pick,
-                          nb_items);
-        if (st->adjust_coarse && pick != sel)
-            pick = (int)CRAW_CLAMP(sel + (pick > sel ? 3 : -3), 0, nb_items - 1);
+        view_adjust_cycle(st, view_row(st, ctx), &pick, nb_items);
         nk_label(ctx, "exposure index", NK_TEXT_LEFT);
         {
             int chosen = nk_combo(ctx, items, nb_items, pick, 20, nk_vec2(140, 260));
@@ -382,7 +1044,7 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     view_adjust_float(st, view_row(st, ctx), &lk->exposure,
-                      1.0f / 6.0f, 1.0f, -3.0f, 3.0f);
+                      1.0f / 6.0f, -3.0f, 3.0f);
     nk_property_float(ctx, "#bias (stops)", -3.0f, &lk->exposure, 3.0f, 0.1f, 0.01f);
     nk_slider_float(ctx, -3.0f, &lk->exposure, 3.0f, 0.05f);
     nk_labelf(ctx, NK_TEXT_LEFT, "gain %.2f, ceiling %.0f nits",
@@ -431,7 +1093,7 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         nk_checkbox_label(ctx, "mute", &st->mute_flag);
         st->mute = st->mute_flag != 0;
         view_adjust_float(st, view_row(st, ctx), &st->volume,
-                          0.05f, 0.2f, 0.0f, 1.0f);
+                          0.05f, 0.0f, 1.0f);
         nk_slider_float(ctx, 0.0f, &st->volume, 1.0f, 0.01f);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
@@ -491,6 +1153,8 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
                       st->gpu.measured_peak, view_peak_ceiling(st));
         else
             nk_labelf(ctx, NK_TEXT_LEFT, "ceiling %.0f nits", view_peak_ceiling(st));
+
+        view_panel_film_sim(ctx, st);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
         nk_label(ctx, "CUBE LUT", NK_TEXT_LEFT);
@@ -578,6 +1242,7 @@ void view_ui_build(struct view_state *st)
      * with the mode, so the focus is clamped to what was there last time. */
     st->ui_row = 0;
     st->ui_edit_active = false;
+    st->menu.anchored = false;
     if (st->ui_rows > 0)
         st->focus = (st->focus % st->ui_rows + st->ui_rows) % st->ui_rows;
 
@@ -588,6 +1253,15 @@ void view_ui_build(struct view_state *st)
         view_panel(view_nk, st);
 
     nk_end(view_nk);
+
+    /* The menu's columns are built after the panel, which is what puts
+     * them on top of it: nuklear draws its windows in list order and
+     * NK_WINDOW_NO_INPUT keeps that order from ever being shuffled. The
+     * row scrolling out of view, or its whole section collapsing, takes
+     * the menu with it rather than leaving it hanging off nothing. */
+    if (st->menu.open && !st->menu.anchored)
+        view_ui_menu_close(st);
+    view_menu_frame(view_nk, st);
 
     /* The layout pass is what discovers whether an edit field took the
      * keyboard, and SDL3 sends no text events to a window that has not

@@ -84,6 +84,10 @@ struct view_look {
     int gamut_map;              /* index into view_gamut_maps[] */
 
     char lut_path[VIEW_MAX_PATH];
+    /* The embedded film simulation, or -1 for none. Mutually exclusive
+     * with lut_path: one LUT is active at a time, so picking a film
+     * simulation clears the path and loading a path clears this. */
+    int film_sim;
     enum pl_lut_type lut_type;
     /* Index into view_lut_spaces[]; anything but 0 makes the LUT a
      * conversion from that space to a BT.709 display. */
@@ -110,6 +114,41 @@ struct view_pipeline_look {
 struct view_name_map {
     const char *name;
     int value;
+};
+
+/* The cascading film simulation menu: one column per level, each opening
+ * the next beside it, the way the Windows XP start menu and RawTherapee's
+ * film simulation picker do. Four levels is the deepest it goes:
+ *
+ *   column 0   Films | Looks
+ *   column 1   the branch's categories
+ *   column 2   Films: the category's film stocks   Looks: renderings (leaf)
+ *   column 3   Films: the film's renderings (leaf)
+ *
+ * The geometry is kept in plain floats rather than nuklear rectangles so
+ * that this header stays free of nuklear, which only ui.c includes. */
+#define VIEW_MENU_COLS 4
+
+struct view_lut_menu {
+    bool open;
+    /* The highlighted entry of each column. Column 0 chooses the branch
+     * (0 Films, 1 Looks) and the rest follow from it; -1 means nothing is
+     * highlighted yet, which keeps every column to its right shut. */
+    int sel[VIEW_MENU_COLS];
+    int cols;                   /* how many are on screen */
+    /* The column the keyboard is in, or -1 while the pointer is driving.
+     * A menu opened with Enter must not close because the pointer happens
+     * to be somewhere else, so the two modes are kept apart. */
+    int kb;
+    float scroll[VIEW_MENU_COLS];
+    float x[VIEW_MENU_COLS], y[VIEW_MENU_COLS];
+    float w[VIEW_MENU_COLS], h[VIEW_MENU_COLS];
+
+    /* The panel row the menu hangs off, in window pixels, and its index in
+     * the focus ring so that Enter on it opens the menu. */
+    float ax, ay, aw, ah;
+    bool anchored;
+    int row;
 };
 
 /* The standard third-stop ISO list Apple's plug-in restricts the working
@@ -406,8 +445,8 @@ struct view_state {
     int focus;
     int ui_row, ui_rows;
     int adjust;
-    bool adjust_coarse;
     bool ui_edit_active;        /* a text field is being typed into */
+    struct view_lut_menu menu;
 
     CRAWProfile base;           /* tables, no per-frame data */
     CRAWProfile prof;           /* base plus the current frame's side data */
@@ -568,6 +607,18 @@ int  view_ui_resize(struct view_state *st, int w, int h);
  * been handed to the swapchain. */
 void view_ui_rotate(struct view_gpu *g);
 
+/* The film simulation menu. It owns its own hit testing rather than going
+ * through nuklear's widgets, because a cascade is not a thing nuklear has
+ * and the columns have to keep taking the pointer while the panel below
+ * them is what nuklear considers active. */
+void view_ui_menu_open(struct view_state *st);
+void view_ui_menu_close(struct view_state *st);
+/* Handles one key while the menu is open; true when it consumed it. */
+bool view_ui_menu_key(struct view_state *st, int key);
+/* True when the open menu covers that point, given in window points the
+ * way SDL reports them. The picture must not zoom or pan underneath it. */
+bool view_ui_menu_covers(const struct view_state *st, float x, float y);
+
 /* ----------------------------------------------------------- main.c */
 
 /* Total gain applied by the pipeline, i.e. what a pipeline value of 1.0 is
@@ -617,6 +668,13 @@ double view_clock(struct view_state *st);
 /* The .cube LUT named by look.lut_path. */
 int  view_lut_load(struct view_state *st);
 void view_lut_clear(struct view_state *st);
+
+/* Selects one embedded film simulation by its index in the pack, which
+ * materializes it as .cube text and hands that to the same parser a user
+ * LUT goes through. Clears look.lut_path: one LUT is active at a time. */
+int  view_lut_select_film(struct view_state *st, int index);
+/* The name to print for the current selection, or "none". */
+const char *view_lut_film_name(const struct view_state *st);
 
 /* The directory the clip lives in, for the default export target. */
 const char *view_clip_dir(const struct view_state *st);

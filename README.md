@@ -65,12 +65,27 @@ and libplacebo, when those are found. It decodes with FFmpeg's Vulkan
 hwaccel on libplacebo's device, runs libcraw on the same device, reads the
 file on its own thread and loops by default (`--no-loop`). Space plays and
 pauses; Up and Down walk the panel's rows and Left and Right adjust the
-focused one (Control for a coarser step); Page Up and Page Down go to the
-first and last frame; the wheel zooms about the pointer, Shift with Page
-Up and Page Down zooms about the centre, Shift with the arrows or a left
-drag pans, Tab or `0` fits the picture again and `1` is one to one. Zoom and pan only touch the view,
-never the export. With four mono audio tracks the last two are taken as the
-stereo pair (`--audio-map` overrides). `craw-view -h` lists the options.
+focused one; Shift with Left and Right seeks one second; Page Up and Page
+Down zoom in and out, and Shift with them goes to the first and last frame;
+Control with the arrows pans; Tab or `0` fits the picture again and `1` is
+one to one; Enter opens the film simulation menu on its row and Escape
+closes it; the wheel zooms about the pointer and a left drag pans; `m`
+mutes; `q`, or Escape with no menu open, quits. Zoom and pan only touch the
+view, never the export. With four mono audio tracks the last two are taken
+as the stereo pair (`--audio-map` overrides). `craw-view -h` lists the
+options.
+
+It also carries 296 film simulation LUTs from
+[filmgrid.org](https://filmgrid.org/), which derive from the open-source
+G'MIC film emulation collection — see `tools/gui/luts/LICENSE.md` for the
+provenance and the attribution they carry. The panel's "film simulation"
+row opens a cascading menu over the same two category trees the site uses,
+Films (colour negative, slide, black and white, instant, cinema print,
+Fujifilm simulations) and Looks (warm, cool, vintage, cinematic and so on).
+`--lut` takes a rendering's name or slug as well as a file path, and
+`--list-luts` prints both trees. The `.cube` files live in the tree; the
+compact pack that ends up in the executable is built by
+`tools/luts_build.py` at build time.
 
 ## Layout
 

@@ -63,6 +63,21 @@ if craw_tools_ffmpeg
         gui_args += '-DCRAW_VIEW_HAVE_AUDIO=0'
     endif
 
+    # The embedded film simulation collection, built by the top level's
+    # subdir('tools/gui/luts') ahead of tests/ so that tests/test_luts can
+    # link the same reader. Only the dependency is added here, and only
+    # when the collection is really there: craw_view_luts_dep is a disabler
+    # otherwise, and a disabler anywhere in an executable's dependency list
+    # disables the whole target, which would make craw-view vanish from a
+    # checkout without the .cube files instead of merely building without
+    # the menu.
+    if craw_view_luts_found
+        gui_args += '-DCRAW_VIEW_HAVE_LUTS=1'
+        gui_deps += craw_view_luts_dep
+    else
+        gui_args += '-DCRAW_VIEW_HAVE_LUTS=0'
+    endif
+
     executable('craw-process',
         'craw-process.c',
         'profiles.c',
@@ -99,6 +114,8 @@ if craw_tools_ffmpeg
             ] + gui_deps,
             install: true,
         )
+
+        # test(): it needs a GPU and it writes pictures a person looks at.
     endif
 endif
 

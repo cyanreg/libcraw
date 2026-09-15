@@ -24,6 +24,16 @@
 #include "view.h"
 #include "../profiles.h"
 
+/* The embedded film simulation collection is optional; without it --lut
+ * only takes a file and --list-luts says there is nothing to list. */
+#ifndef CRAW_VIEW_HAVE_LUTS
+#define CRAW_VIEW_HAVE_LUTS 0
+#endif
+
+#if CRAW_VIEW_HAVE_LUTS
+#include "luts.h"
+#endif
+
 #define VIEW_WINDOW_W 1600
 #define VIEW_WINDOW_H 900
 
@@ -207,6 +217,149 @@ void view_lut_clear(struct view_state *st)
     pl_lut_free(&st->lut);
     st->lut_error[0] = '\0';
     st->look.lut_path[0] = '\0';
+    st->look.film_sim = -1;
+}
+
+const char *view_lut_film_name(const struct view_state *st)
+{
+#if CRAW_VIEW_HAVE_LUTS
+    const ViewLut *l = view_lut_get(st->look.film_sim);
+
+    if (l)
+        return l->name;
+#else
+    (void)st;
+#endif
+    return "none";
+}
+
+#if CRAW_VIEW_HAVE_LUTS
+
+int view_lut_select_film(struct view_state *st, int index)
+{
+    const ViewLut *l = view_lut_get(index);
+    char *text = NULL;
+    size_t len = 0;
+    int ret;
+
+    st->lut_error[0] = '\0';
+
+    if (!l) {
+        snprintf(st->lut_error, sizeof(st->lut_error), "no such film simulation");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    /* The pack stores the LUT quantized; this is the one place it is
+     * expanded, and only ever for the rendering that was picked. */
+    ret = view_luts_cube_text(index, &text, &len);
+    if (ret < 0) {
+        snprintf(st->lut_error, sizeof(st->lut_error), "cannot unpack the LUT");
+        return ret;
+    }
+
+    pl_lut_free(&st->lut);
+    st->lut = pl_lut_parse_cube(st->gpu.log, text, len);
+    view_luts_cube_free(text);
+    if (!st->lut) {
+        snprintf(st->lut_error, sizeof(st->lut_error), "the packed LUT did not parse");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    /* One LUT at a time: a film simulation and a user .cube would
+     * otherwise both claim the renderer's single LUT slot. */
+    st->look.lut_path[0] = '\0';
+    st->look.film_sim = index;
+    view_lut_apply_space(st->lut, st->look.lut_space);
+
+    view_log(st, "film simulation: %s (%s, %s) %dx%dx%d\n", l->name,
+             view_lut_film(l->film)->name, l->label,
+             st->lut->size[0], st->lut->size[1], st->lut->size[2]);
+
+    return 0;
+}
+
+/* Prints both category trees, indented, the way the menu walks them. */
+static void view_list_luts(void)
+{
+    printf("Films\n");
+    for (int ci = 0; ci < view_luts_film_category_count(); ci++) {
+        const ViewLutFilmCategory *c = view_lut_film_category(ci);
+
+        printf("  %s\n", c->name);
+        for (int fi = c->first_film; fi < c->first_film + c->n_films; fi++) {
+            const ViewLutFilm *f = view_lut_film(fi);
+
+            printf("    %s\n", f->name);
+            for (int i = f->first_lut; i < f->first_lut + f->n_luts; i++) {
+                const ViewLut *l = view_lut_get(i);
+
+                printf("      %-24s %-18s %s\n", l->name, l->label, l->slug);
+            }
+        }
+    }
+
+    printf("Looks\n");
+    for (int ci = 0; ci < view_luts_look_category_count(); ci++) {
+        const ViewLutLookCategory *c = view_lut_look_category(ci);
+
+        printf("  %s\n", c->name);
+        for (int i = 0; i < c->n_luts; i++) {
+            const ViewLut *l = view_lut_get((int)c->luts[i]);
+
+            printf("    %-24s %-26s %s\n", l->name,
+                   view_lut_film(l->film)->name, l->slug);
+        }
+    }
+}
+
+#else /* !CRAW_VIEW_HAVE_LUTS */
+
+int view_lut_select_film(struct view_state *st, int index)
+{
+    (void)index;
+    snprintf(st->lut_error, sizeof(st->lut_error),
+             "built without the film simulation collection");
+    return CRAW_ERROR(ENOTSUP);
+}
+
+static void view_list_luts(void)
+{
+    printf("This build carries no film simulation collection.\n");
+}
+
+#endif /* CRAW_VIEW_HAVE_LUTS */
+
+/* Resolves what --lut was given. A real file always wins, so a rendering
+ * whose name happens to collide with something on disk can never shadow
+ * it; failing that the name is looked up in the embedded collection by
+ * slug and then by display name. */
+static int view_lut_startup(struct view_state *st)
+{
+    FILE *f;
+
+    if (!st->look.lut_path[0])
+        return 0;
+
+    f = fopen(st->look.lut_path, "rb");
+    if (f) {
+        fclose(f);
+        return view_lut_load(st);
+    }
+
+#if CRAW_VIEW_HAVE_LUTS
+    {
+        int ix = view_luts_find(st->look.lut_path);
+
+        if (ix >= 0)
+            return view_lut_select_film(st, ix);
+    }
+    snprintf(st->lut_error, sizeof(st->lut_error),
+             "no such file and no such film simulation");
+#else
+    snprintf(st->lut_error, sizeof(st->lut_error), "cannot open the LUT");
+#endif
+
+    return CRAW_ERROR(ENOENT);
 }
 
 int view_lut_load(struct view_state *st)
@@ -261,6 +414,8 @@ int view_lut_load(struct view_state *st)
         goto fail;
     }
 
+    /* One LUT at a time: loading a file drops any film simulation. */
+    st->look.film_sim = -1;
     view_lut_apply_space(st->lut, st->look.lut_space);
 
     view_log(st, "loaded the LUT %s (%dx%dx%d)\n", st->look.lut_path,
@@ -807,7 +962,10 @@ static void view_usage(FILE *f)
 "  --debayer METHOD    bilinear, mhc or rcd (default: rcd)\n"
 "  --tone-map NAME     bt.2390, spline, reinhard or clip (default: bt.2390)\n"
 "  --gamut-map NAME    perceptual, softclip, relative, clip or desaturate\n"
-"  --lut FILE          a .cube LUT applied by the renderer\n"
+"  --lut NAME          a .cube LUT applied by the renderer: a file, or the\n"
+"                      name or slug of one of the embedded film simulations\n"
+"                      (a file of that name wins). --list-luts prints them\n"
+"  --list-luts         print the embedded film simulation trees and exit\n"
 "  --lut-type TYPE     native (gamma light) or normalized (linear light)\n"
 "  --lut-space SPACE   the colour space the LUT was authored for: native\n"
 "                      (the toggle above), bt709, hlg2020 or linear2020.\n"
@@ -828,11 +986,13 @@ static void view_usage(FILE *f)
 "Audio is the master clock. The clip's PCM track plays through SDL3 with\n"
 "5 ms fades at every boundary; a silent clip falls back to wall time.\n"
 "\n"
-"Keys: space play/pause; up/down move through the panel and left/right\n"
-"adjust the focused row (control for a coarser step); page up and page down\n"
-"go to the first and last frame; shift with page up/down zooms and shift\n"
+"Keys: space play/pause; up/down walk the panel rows; left/right adjust the\n"
+"focused row; shift with left/right seeks one second; page up/down zoom in\n"
+"and out; shift with page up/down goes to the first and last frame; control\n"
 "with the arrows pans; tab or 0 fits the picture again, 1 is one to one;\n"
-"the wheel zooms about the pointer and dragging pans; m mutes, q quits.\n",
+"enter opens the film simulation menu on its row and escape closes it;\n"
+"the wheel zooms about the pointer and dragging pans; m mutes; q, or escape\n"
+"with no menu open, quits.\n",
     craw_tool_profile_builtin_list());
 }
 
@@ -858,6 +1018,7 @@ enum {
     VIEW_OPT_AUDIO_MAP,
     VIEW_OPT_NO_PEAK,
     VIEW_OPT_ZOOM,
+    VIEW_OPT_LIST_LUTS,
 };
 
 static int view_parse_args(struct view_state *st, int argc, char **argv,
@@ -876,6 +1037,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "lut",      required_argument, NULL, VIEW_OPT_LUT       },
         { "lut-type", required_argument, NULL, VIEW_OPT_LUT_TYPE  },
         { "lut-space", required_argument, NULL, VIEW_OPT_LUT_SPACE },
+        { "list-luts", no_argument,       NULL, VIEW_OPT_LIST_LUTS },
         { "profile",  required_argument, NULL, VIEW_OPT_PROFILE   },
         { "tables",   required_argument, NULL, VIEW_OPT_TABLES    },
         { "export",   required_argument, NULL, VIEW_OPT_EXPORT    },
@@ -993,6 +1155,9 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return ret;
             st->look.lut_space = v;
             break;
+        case VIEW_OPT_LIST_LUTS:
+            view_list_luts();
+            return 1;
         case VIEW_OPT_PROFILE:
             *profile = optarg;
             break;
@@ -1116,31 +1281,57 @@ static bool view_over_picture(const struct view_state *st, float x, float y)
     pl_rect2df area;
     int px, py;
 
+    /* The film simulation menu hangs over the picture, so while it is open
+     * the wheel scrolls its columns and a click picks a rendering rather
+     * than zooming and dragging what is behind it. */
+    if (view_ui_menu_covers(st, x, y))
+        return false;
+
     view_mouse_pos(st, x, y, &px, &py);
     view_picture_area(st, &area);
 
     return (float)px < area.x1;
 }
 
-/* Space plays, Up and Down walk the panel, Left and Right adjust the row
- * they land on, Page Up and Page Down are the ends of the clip. Shift always
- * means the picture: the arrows pan (a no-op while the picture fits) and
- * Page Up and Page Down zoom; Control gives the arrows a coarser step. A key
- * that toggles or seeks acts once per press, the ones that step act on every
- * repeat. */
+/* One second of the clip, in frames: what Shift with Left or Right moves. */
+static int64_t view_seek_second(const struct view_state *st)
+{
+    double fps = av_q2d(st->dec.frame_rate);
+
+    return fps > 0.0 ? (int64_t)(fps + 0.5) : 25;
+}
+
+/* Seeks relative to the picture on screen without touching the transport:
+ * a clip that was playing keeps playing from where it lands. */
+static void view_seek_by(struct view_state *st, int64_t frames)
+{
+    int64_t last = CRAW_MAX(st->dec.nb_frames - 1, 0);
+
+    st->seek_to = CRAW_CLAMP(st->index + frames, 0, last);
+    st->need_frame = true;
+}
+
+/* Space plays; Up and Down walk the panel and Left and Right adjust the row
+ * they land on; Shift with Left or Right seeks a second; Page Up and Page
+ * Down zoom and Shift with them goes to the ends of the clip; Control with
+ * the arrows pans, which only does anything while the picture is larger
+ * than its area. A key that toggles or seeks acts once per press, the ones
+ * that step act on every repeat. */
 static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *running)
 {
     bool shift = (e->key.mod & SDL_KMOD_SHIFT) != 0;
     bool ctrl = (e->key.mod & SDL_KMOD_CTRL) != 0;
-    bool pan = shift;
     bool repeat = e->key.repeat;
-
-    st->adjust_coarse = ctrl;
 
     view_log(st, "key: %s (scancode %d, sym 0x%x, mod 0x%x%s)\n",
              SDL_GetKeyName(e->key.key), (int)e->key.scancode,
              (unsigned)e->key.key, (unsigned)e->key.mod,
              repeat ? ", repeat" : "");
+
+    /* An open film simulation menu owns the arrows, Enter and Escape; it
+     * says so itself, and says nothing while it is closed. */
+    if (view_ui_menu_key(st, (int)e->key.key))
+        return;
 
     switch (e->key.key) {
     case SDLK_SPACE:
@@ -1149,47 +1340,55 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
         break;
 
     case SDLK_UP:
-        if (pan)
+        if (ctrl)
             view_pan_fraction(st, 0.0f, -0.125f);
         else if (st->ui_rows > 0)
             st->focus = (st->focus - 1 + st->ui_rows) % st->ui_rows;
         break;
     case SDLK_DOWN:
-        if (pan)
+        if (ctrl)
             view_pan_fraction(st, 0.0f, 0.125f);
         else if (st->ui_rows > 0)
             st->focus = (st->focus + 1) % st->ui_rows;
         break;
 
     case SDLK_LEFT:
-        if (pan)
+        if (ctrl)
             view_pan_fraction(st, -0.125f, 0.0f);
+        else if (shift)
+            view_seek_by(st, -view_seek_second(st));
         else
             st->adjust = -1;
         break;
     case SDLK_RIGHT:
-        if (pan)
+        if (ctrl)
             view_pan_fraction(st, 0.125f, 0.0f);
+        else if (shift)
+            view_seek_by(st, view_seek_second(st));
         else
             st->adjust = 1;
         break;
 
     case SDLK_PAGEUP:
         if (shift) {
+            if (!repeat) {
+                st->playing = false;
+                st->seek_to = 0;
+                st->need_frame = true;
+            }
+        } else {
             view_zoom_by(st, 1.0f, 0, 0, false);
-        } else if (!repeat) {
-            st->playing = false;
-            st->seek_to = 0;
-            st->need_frame = true;
         }
         break;
     case SDLK_PAGEDOWN:
         if (shift) {
+            if (!repeat) {
+                st->playing = false;
+                st->seek_to = CRAW_MAX(st->dec.nb_frames - 1, 0);
+                st->need_frame = true;
+            }
+        } else {
             view_zoom_by(st, -1.0f, 0, 0, false);
-        } else if (!repeat) {
-            st->playing = false;
-            st->seek_to = CRAW_MAX(st->dec.nb_frames - 1, 0);
-            st->need_frame = true;
         }
         break;
 
@@ -1206,6 +1405,13 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
             st->seek_to = CRAW_MAX(st->dec.nb_frames - 1, 0);
             st->need_frame = true;
         }
+        break;
+
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        /* Enter only means anything on the row that owns the menu. */
+        if (!repeat && st->focus == st->menu.row)
+            view_ui_menu_open(st);
         break;
 
     case SDLK_TAB:
@@ -1307,8 +1513,8 @@ static int view_run_window(struct view_state *st)
     if (ret < 0)
         return ret;
 
-    if (st->look.lut_path[0])
-        view_lut_load(st);
+    if (view_lut_startup(st) < 0)
+        fprintf(stderr, "--lut %s: %s\n", st->look.lut_path, st->lut_error);
 
     fps_t0 = av_gettime_relative();
     iter_t0 = fps_t0;
@@ -1637,12 +1843,10 @@ static int view_run_headless(struct view_state *st)
     if (ret < 0)
         return ret;
 
-    if (st->look.lut_path[0]) {
-        ret = view_lut_load(st);
-        if (ret < 0) {
-            fprintf(stderr, "--lut %s: %s\n", st->look.lut_path, st->lut_error);
-            return ret;
-        }
+    ret = view_lut_startup(st);
+    if (ret < 0) {
+        fprintf(stderr, "--lut %s: %s\n", st->look.lut_path, st->lut_error);
+        return ret;
     }
 
     view_export_begin(st, st->cfg.export_start, st->cfg.export_end,
@@ -1672,15 +1876,27 @@ int main(int argc, char **argv)
         .tone_map  = 0,
         .gamut_map = 0,
         .lut_type  = PL_LUT_NATIVE,
+        .film_sim  = -1,
         .peak_detect = true,
         .peak_detect_flag = 1,
     };
+    st.menu.kb = -1;
+    for (int i = 0; i < VIEW_MENU_COLS; i++)
+        st.menu.sel[i] = -1;
     st.seek_to = -1;
     st.seek_target = -1;
     st.playing = true;
     st.cfg.loop = true;
     st.view.fit = true;
     st.volume = 1.0f;
+#if CRAW_VIEW_HAVE_LUTS
+    /* Reads the pack's tables, which is all pointer arithmetic over the
+     * embedded array; nothing is decompressed until a rendering is picked.
+     * It has to happen before the arguments, because --list-luts and
+     * --lut NAME both walk those tables. */
+    if (view_luts_init() < 0)
+        fprintf(stderr, "the embedded film simulation pack did not load\n");
+#endif
 
     ret = view_parse_args(&st, argc, argv, &profile, &tables);
     if (ret)
