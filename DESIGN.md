@@ -502,3 +502,315 @@ Contract files, owned by the integrator: everything under `include/`,
   `tests/test_ref_debayer.c`, `tests/test_awb.c`.
 
 Anyone needing a change to a contract file reports it instead of editing.
+
+## 13. Film grain emulation
+
+`tools/gui/grain.c` and `grain.h` turn a gauge and a stock into parameters
+for libplacebo's film grain shaders. `tools/grain/grain_preview.c` is the
+headless proof: it renders a chart and a developed frame through the same
+`pl_render_image` path craw-view uses, measures what came out and writes
+contact sheets. Every number below is from that tool unless it is marked as
+a citation, and `--calibrate` re-measures the two tables `grain.c` carries
+against whatever libplacebo is installed.
+
+### 13.1 What libplacebo does, and where
+
+`pl_needs_film_grain` / `pl_shader_film_grain` implement AV1 section 7.18.3
+and H.274 (SMPTE RDD 5) model 0. `pl_renderer` applies `pl_frame.film_grain`
+in `plane_film_grain()`, inside the per-plane setup, in the order
+*deband -> film grain -> user hooks*: at the **source plane's own
+resolution**, in the **source representation**, before colour conversion,
+before the main scaler and before tone mapping.
+
+Both models work on RGB: `channel_map()` sends G to the model's luma channel,
+B to Cb and R to Cr. Luma-only parameters therefore give **green-only
+grain**, so anything driving these shaders with an RGB image has to fill the
+chroma channels too.
+
+Neither model has a notion of floating point. `bit_depth()` falls back to 8
+when `repr.bits` is unset, which is the case for our RGBA16F frames, so the
+grain is quantised to 8-bit steps of the signal - with the scaling function's
+own resolution on top of that, fine enough not to matter here. What does
+matter is the range: the AV1 shader ends every component with
+`clamp(color, 0.0, 1.0)` for full-range material. A scRGB RGBA16F frame whose
+diffuse white is 1.0 would have every highlight above it clipped flat. The
+H.274 shader has no clamp at all, but matches intensity intervals against
+8-bit bounds in [0,1], so a value above 1.0 falls outside every interval and
+silently gets no grain. Neither failure is acceptable on the display path.
+
+Two implementation details found by reading and then confirmed by
+measurement, both worth reporting upstream:
+
+- **libplacebo's H.274 shader mis-assigns components for RGB.** It loops over
+  the picture's components, maps each to a grain channel with
+  `channel_map()`, and then subscripts `color[]` with that *channel* index
+  rather than the component index. For YCbCr the two coincide; for RGB the
+  effect is that model component 0 lands on red, 1 on green, 2 on blue.
+  Measured: with only component 0 present, green came back with no grain and
+  red carried it. The AV1 shader does this correctly. `build_h274()` works
+  around it and says so.
+- **libplacebo's H.274 shader does no deblocking** - there is a
+  `// TODO: Deblocking?` where it would go - and lays grain down as 16x16
+  patches cut from the 64x64 database with no blending between patches. It
+  also indexes that database transposed relative to how it fills it, so the
+  horizontal and vertical cut-off frequencies are swapped; harmless while
+  they are equal, which is all this model asks for.
+
+### 13.2 The physical model
+
+Film grain differs between gauges for one reason: a smaller frame is
+magnified more to fill the same screen. Two numbers follow.
+
+**Blob size.** Pixel pitch measured on the film is
+`p = 1000 * frame_width_mm / output_width_px` micrometres, and a dye cloud of
+diameter `d` covers `d/p` pixels. Below one pixel the field is white noise.
+
+**Amplitude.** Granularity is published as *diffuse RMS granularity*: the
+standard deviation of density through a 48 um aperture at a net density of
+1.0, times 1000. Selwyn's law - `sigma * sqrt(2A) = G` for aperture area A -
+makes sigma scale as `1/a`, so
+
+    sigma_D(a) = (rms48 / 1000) * 48 / a,   a = max(p, d)
+
+The clamp at `a = d` is the physics: once the aperture is smaller than one
+dye cloud you are no longer averaging clouds and the fluctuation saturates.
+A density fluctuation is a transmittance ratio, so the relative fluctuation
+of linear light is `ln(10) * sigma_D`, and with a display encoding
+`v = L^(1/gamma)` the absolute amplitude the shader has to add is
+`rho * v / gamma`. `signal_amp()` does that conversion; gamma is taken as
+2.2, which sRGB is within a percent of over the range that matters.
+
+The consequence worth internalising is that at a given output resolution the
+gauges mostly share one amplitude - the Selwyn clamp saturates for every
+gauge whose pixel is smaller than a dye cloud - and differ in blob size. That
+is correct. Coarse grain looks far stronger than fine grain of the same
+per-pixel standard deviation because the eye integrates over an area.
+
+### 13.3 Gauge table
+
+Camera apertures, with the standard each comes from in
+`craw_grain_gauge_source()`. Blob sizes are for a 13 um dye cloud (the
+VISION3 500T entry); "src" is the 5760-wide S1II source.
+
+| gauge | width mm | blob @5760 | @3840 | @1920 | standard |
+|---|---|---|---|---|---|
+| Regular 8 | 4.80 | 15.60 | 10.40 | 5.20 | SMPTE ST 231; sources give 4.80-4.88 |
+| Super 8 | 5.69 | 13.16 | 8.77 | 4.39 | SMPTE ST 157:1999 |
+| 16 mm | 10.26 | 7.30 | 4.87 | 2.43 | SMPTE ST 7:2004 / ISO 69:1998 |
+| Super 16 | 12.52 | 5.98 | 3.99 | 1.99 | SMPTE ST 201:1996 / ISO 5768 |
+| 35 mm 2-perf | 22.00 | 3.40 | 2.27 | 1.13 | Techniscope; no standard exists |
+| 35 mm 3-perf | 24.89 | 3.01 | 2.01 | 1.00 | ISO 2906:2002 style D |
+| 35 mm Academy | 21.95 | 3.41 | 2.27 | 1.14 | SMPTE ST 59 / ISO 2906 style A |
+| Super 35 | 24.89 | 3.01 | 2.01 | 1.00 | never standardised by SMPTE |
+| 65 mm 5-perf | 52.63 | 1.42 | 0.95 | 0.47 | Todd-AO; another source says 48.59 |
+| IMAX 15-perf | 70.41 | 1.06 | 0.71 | 0.35 | IMAX camera aperture, proprietary |
+
+### 13.4 The resolution problem, and the two paths
+
+Measured reach of the two models, as the full width at half maximum of the
+grain's autocorrelation, at the resolution grain is generated at:
+
+| asked for | AV1 gives | its amplitude | H.274 gives | its amplitude |
+|---|---|---|---|---|
+| 1.00 px | 1.00 px | 1.02 | 1.06 px | 1.00 |
+| 2.01 | 2.16 | 1.00 | 2.07 | 1.00 |
+| 4.01 | 4.15 | 0.97 | 3.62 | 1.00 |
+| 5.67 | 5.70 | 0.97 | 5.82 | 1.00 |
+| 8.02 | 7.69 | 0.95 | 5.82 | 1.00 |
+
+Put that beside the gauge table. At **1080p** every gauge wants between 0.35
+and 5.2 px and AV1 covers all of it. At the **5760 source** Regular 8 and
+Super 8 want 13 to 16 px and nothing reaches 8, so they come out about three
+times too fine. Worse, grain that coarse at 5760 is then reduced 3:1 for a
+1080p window, which aliases the 64x64 template's own repeat down to a visible
+regular weave about 10 px across - `sheet_paths_grain.png` shows it plainly,
+a woven pattern on the source-path row against clean organic grain on the
+output-path row. Add the AV1 clamp to [0,1] on an HDR frame and the native
+path is not usable as the default.
+
+So there are two paths and the API makes the choice explicit:
+
+- **`CRAW_GRAIN_PATH_OUTPUT`** (default): a `pl_hook` at
+  `PL_HOOK_PRE_OUTPUT` that calls libplacebo's own `pl_shader_film_grain()`
+  on the hook's texture. A probe hook confirms rather than assumes what
+  arrives there: for a 1920x1080 target the texture is 1920x1080, so target
+  resolution, and its transfer is `PL_COLOR_TRC_SRGB`, so display encoded and
+  in [0,1] by construction, which makes the shaders' clamps free. That it
+  runs after colour management and the main scaler and before blending and
+  rotation is from reading `pass_output_target()`, not from the probe.
+  Because the synthesis is libplacebo's, this path is not a reimplementation
+  - only the resolution and the domain differ.
+- **`CRAW_GRAIN_PATH_SOURCE`**: fills `pl_frame.film_grain`. Physically the
+  most correct place, since the display pixel then averages film area by
+  itself, and the right choice for SDR material already in [0,1] rendered at
+  or near its own resolution. Measured at 1920 from a 5760 source it delivers
+  0.0054 where the output path delivers 0.0077, i.e. about 30% less, and the
+  weave above.
+
+### 13.5 Parameter mapping
+
+**Blob size -> AR coefficients.** A separable first-order filter
+`g = w + a*g[x-1] + a*g[y-1] - a^2*g[y-1][x-1]` has autocorrelation
+`a^|dx| * a^|dy|`, so one number steers the blob. `ar_coeff_shift` is 7:
+coefficients then reach 0.992 in steps of 1/128, where shift 6 would reach
+1.98 in twice the step and shift 8 tops out at 0.496, too low for coarse
+grain. `ar_solve()` bisects over the achievable integers against a
+*measured* blob size, because the analytic inversion `a = 0.5^(2/b)` drifts
+up to 30% at the coarse end.
+
+A lag-3 filter is not the way to make big grain, despite its seven pixel
+support: with coefficients small enough to stay stable it still produces an
+autocorrelation about one pixel wide (measured: all 24 coefficients at 20
+with shift 9 gives 1.1 px). libaom's photon noise tables use lag 0.
+
+**Amplitude -> scaling function.** With `scaling_shift` 8 and
+`grain_scale_shift` 0 at 8 bits the template is the Gaussian sequence
+(sigma 512) shifted right by 4, so sigma is 32 in 8-bit units and a scaling
+point of `y` contributes `y * 32 / (256 * 255) = y / 2040` of full scale.
+libaom's `examples/photon_noise_table.c` independently arrives at
+`y = round(255 * 7.88 * sigma)`, i.e. `y = 2009 * sigma`, from a photon shot
+noise derivation; 2040 against 2009 is the calibration anchor for this file.
+
+`grain.c` does not use the 2040 constant, because the AR filter changes the
+template's variance. It generates the template exactly as the spec does,
+synthesises a 192x192 piece of the field the shader will build from it - 32x32
+blocks, the spec's per-row LFSR offsets, the 27/17 overlap - and solves
+against *that*. Measuring the 64x64 template alone is not enough: subtracting
+a 64x64 window's own mean removes the lowest frequencies, which is where a
+coarse filter keeps most of its energy, and it made a five pixel grain come
+out 40% low against the GPU.
+
+**grain_scale_shift.** Chosen from the target blob size
+(`gss_for_blob()`), not from a clipping test at the strongest coefficient -
+testing there finds that a = 0.93 clips at every shift below 3 and then
+solves the whole problem at shift 3, where the template is so quiet the
+scaling function saturates before reaching the amplitude asked for.
+
+**Response.** Four shapes, defined as amplitude against display-encoded
+level and normalised so that mid grey always gets the physical amplitude,
+whichever response is chosen:
+
+| response | shape | measured at 2% / 18% / 50% / 90% scene |
+|---|---|---|
+| Negative | `x^1.1`, capped at 1.8 | 0.0049 / 0.0146 / 0.0211 / 0.0251 |
+| Print | Gaussian about mid grey, width 0.42 | 0.0093 / 0.0174 / 0.0179 / 0.0160 |
+| Reversal | asymmetric Gaussian peaked at 0.30 | 0.0238 / 0.0268 / 0.0130 / 0.0061 |
+| Flat | constant | 0.0185 / 0.0185 / 0.0185 / 0.0185 |
+
+Negative is the one with a physical derivation: Nutting's law puts
+granularity at roughly `sqrt(D)` and on a camera negative density follows
+scene exposure, so an inverted scan is grainiest in its highlights and clean
+at black. Print and Reversal are **modelled shapes, not measurements** - the
+print's transfer curve has slope only through its middle so the negative's
+grain is swallowed in its toe and shoulder, and a reversal stock keeps its
+silver where the scene was dark. The widths and the peak position were chosen
+by eye and are the most obvious thing to refine.
+
+**Chroma.** The three dye layers' grain is largely independent, which is why
+colour negative grain is coloured. `chroma` sets both the amplitude relative
+to luma and, through the AV1 chroma AR filter's luma cross term, how
+correlated the three channels are: 0 gives one monochrome grain, 1 gives
+three independent ones. The chroma templates are measured separately rather
+than reusing the luma standard deviation, because the cross term is injected
+*into* the recursion and therefore comes out filtered twice - with a strong
+filter that more than doubled the chroma amplitude, which measurement caught
+as "colour grain louder than luma grain".
+
+**Seed.** A new seed every frame makes the grain boil. Measured: two seeds
+give the same standard deviation (0.0123 and 0.0125) and an rms difference of
+0.0246, i.e. `sqrt(2)` times either, so the two frames' grain is fully
+independent. On AV1 only the low 16 bits reach the template, which libplacebo
+regenerates and re-uploads whenever the seed changes; H.274's database does
+not depend on the seed at all, so boiling is free there.
+
+### 13.6 Calibrated, guessed, and unknown
+
+**Calibrated against published data.** Only four stocks have a published
+diffuse RMS granularity: Double-X 5222 at 14 (Kodak H-1-5222, March 2022, net
+density 1.0, 48 um), Tri-X 400 at 17 (Kodak F-4017, February 2016), Tri-X 320
+at 16 (same sheet), and still Ektachrome E100 at 8 (Kodak E-4000, August
+2018, *gross* density 1.0 - the sheets are not consistent about that).
+
+**Not published at all.** Kodak's motion picture colour negative data sheets
+give a "Diffuse rms Granularity" *curve* and no number, for every VISION3
+stock and for cine Ektachrome 100D, and that has been true back through
+VISION2 and the 1996 VISION 500T sheet. The VISION3 entries in `stocks[]`
+(50D 3, 200T and 250D 4, 500T 6) are **estimates**, ranked by speed, and each
+carries a `source` string saying so. Kodak's still colour negatives publish
+Print Grain Index instead, which their own literature says "cannot be
+compared to rms granularity"; Portra 400's PGI of 59 at 8x10 inverts through
+Kane & Cookingham's published fit
+(`Gi = 100.8*log10(sigma) - 44.3` at mean visual density 0.8, IS&T PICS 1998)
+to a print granularity of 10.6, but that is a *print* number at 8.8x
+magnification and the film-to-print step (Einhaus 1990) could not be
+obtained, so Portra 400's 9 is an estimate too.
+
+**Unknown.** The dye cloud diameter. 10-15 um is repeated everywhere and
+could not be traced to any primary source. What is documented is 0.2-2 um for
+individual silver halide grains (tabular grain patent literature), a
+single-source claim of "often 25 microns" for dye clouds, and an unpinned
+patent range of 3-20 um. The table uses 10-16 um by stock. **Every blob size
+in this section scales linearly with that number**, so it is the single most
+valuable thing to pin down.
+
+Also worth recording: a search found **no publicly available AV1 film grain
+preset calibrated to a named film stock** - not in grav1synth, not in
+SVT-AV1's or rav1e's documentation, not in the community threads. The
+"photon noise" tables everyone uses are a sensor shot noise model with an
+ISO knob, not a film measurement.
+
+### 13.7 Measured against intended
+
+All at 1920 output, VISION3 500T, print response, measured on a flat 18%
+patch that tone maps to an encoded 0.401. "want" is `craw_grain_sigma_at()`
+evaluated at the level the patch actually landed on.
+
+| gauge | want px | got px | want sd | got sd | ratio | chroma/luma |
+|---|---|---|---|---|---|---|
+| Regular 8 | 5.20 | 5.71 | 0.01089 | 0.01061 | 0.97 | 0.78 |
+| Super 8 | 4.39 | 4.55 | 0.01092 | 0.01054 | 0.97 | 0.73 |
+| 16 mm | 2.43 | 2.62 | 0.01090 | 0.01079 | 0.99 | 0.69 |
+| Super 16 | 1.99 | 2.16 | 0.01088 | 0.01085 | 1.00 | 0.66 |
+| 35 mm 2-perf | 1.13 | 1.15 | 0.01089 | 0.01115 | 1.02 | 0.62 |
+| Super 35 | 1.00 | 1.00 | 0.01090 | 0.01111 | 1.02 | 0.62 |
+| 65 mm 5-perf | 0.47 | 1.00 | 0.00518 | 0.00528 | 1.02 | 0.62 |
+| IMAX 15-perf | 0.35 | 1.00 | 0.00388 | 0.00396 | 1.02 | 0.62 |
+
+Amplitude within 3% everywhere, blob size within 10% except where the gauge
+asks for less than a pixel and gets white noise, which is correct. The
+residual few percent is seed-to-seed variation: a 64x64 template holds only
+about `(64/blob)^2` independent blobs, so at the coarse end any one frame's
+realised variance strays a few percent from the process's. `ar_eval()`
+averages three seeds to take the bias out of the solve; the per-frame wander
+is a property of the model.
+
+Amount 0 leaves a standard deviation of 0.00002, i.e. nothing.
+
+### 13.8 Open questions
+
+- **The dye cloud diameter** (13.6). Everything scales with it.
+- **The VISION3 granularity numbers** are estimates. Kodak's curves could be
+  read off the data sheets properly - they are graphs of granularity against
+  density, which would also give a measured response shape instead of the
+  modelled ones.
+- **Print and Reversal response shapes** were chosen by eye. A real print
+  stock's transfer curve, cascaded with the negative's granularity curve,
+  would replace both with something derived.
+- **H.274's intensity intervals are placed linearly** in the stored signal.
+  On the source path, where the signal is scene-linear, a steep response can
+  land a sixth of a step out at the reference level. Placing the boundaries
+  perceptually - which H.274 allows, they are arbitrary - would fix it.
+- **The AV1 template's white noise floor.** The AR recursion always adds one
+  unfiltered copy of the white noise on top of the smoothed part, so coarse
+  grain carries a fine texture at roughly `1/gain` relative amplitude. It is
+  visible in the amplified sheets as a faint cross-hatch over the blobs. Real
+  film has a fine component too, so this may be a feature; it has not been
+  compared against a scan.
+- **`grain_preview` does not check temporal behaviour on a moving picture.**
+  Boil is verified as two independent still frames. Whether a per-frame seed
+  at 24 or 60 fps reads as film boil or as digital noise is a judgement that
+  needs the viewer.
+- **Frame mixing.** `PL_HOOK_PRE_OUTPUT` runs once per output frame, after
+  mixing, so grain is not blurred between input frames. That follows from
+  where `pass_output_target()` sits and has not been measured with
+  `pl_render_image_mix`.

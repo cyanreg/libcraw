@@ -66,3 +66,17 @@ if is_variable('craw_view_luts_dep')
                   meson.project_source_root() / 'tools' / 'gui' / 'luts' + '"' ])
     test('test_luts', exe, timeout: 300)
 endif
+
+# The film grain parameter model. It lives in tools/gui/ because that is
+# where craw-view uses it from, but it has no SDL and no nuklear in it, so
+# the test builds it directly. libplacebo is asked for again here rather
+# than reused from tools/, because meson walks tests/ first.
+grain_placebo = dependency('libplacebo', version: '>=7.349', required: false)
+if grain_placebo.found()
+    exe = executable('test_grain',
+        'test_grain.c',
+        '../tools/gui/grain.c',
+        include_directories: include_directories('../tools/gui'),
+        dependencies: [ grain_placebo, cc.find_library('m', required: false) ])
+    test('test_grain', exe, timeout: 300)
+endif
