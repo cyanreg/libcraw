@@ -70,6 +70,7 @@ static void view_ring_reset(struct view_audio *a)
     a->played = 0;
     a->have_base_pts = false;
     a->base_pts = 0.0;
+    a->ended = false;
     a->decay = 0.0f;
     memset(a->last_out, 0, sizeof(a->last_out));
 }
@@ -945,6 +946,23 @@ double view_audio_clock(struct view_audio *a)
     t = a->base_pts + ((double)a->played - backlog) / VIEW_AUDIO_RATE
       - a->device_latency + since;
 
+    /* Past the end of the track that cursor stands still, and a video that
+     * outlasts its audio (the FX6 clip's does, by 15 ms) would never reach
+     * its own end: the clock then runs on wall time from where the audio
+     * left it, while playing. */
+    if (a->eof && a->state == VIEW_AUDIO_IDLE && !a->fill) {
+        uint64_t now = SDL_GetTicksNS();
+
+        if (!a->ended) {
+            a->ended = true;
+            a->ended_clock = t;
+            a->ended_ns = now;
+        }
+        t = a->ended_clock;
+        if (a->playing)
+            t += (double)(now - a->ended_ns) / 1.0e9;
+    }
+
     SDL_UnlockMutex(a->lock);
 
     return t;
@@ -998,11 +1016,15 @@ int view_audio_play(struct view_audio *a)
     SDL_ClearAudioStream(a->stream);
 
     SDL_LockMutex(a->lock);
-    a->state = VIEW_AUDIO_FADE_IN;
+    /* Resuming past the end of the track has nothing to fade in; staying
+     * idle keeps the clock on its wall-time run from where it was paused. */
+    a->state = a->ended ? VIEW_AUDIO_IDLE : VIEW_AUDIO_FADE_IN;
     a->fade_pos = 0;
     a->in_underrun = false;
     a->pushed = 0;
     a->handover_ns = SDL_GetTicksNS();
+    if (a->ended)
+        a->ended_ns = a->handover_ns;
     SDL_UnlockMutex(a->lock);
 
     SDL_ResumeAudioStreamDevice(a->stream);
@@ -1041,6 +1063,15 @@ void view_audio_pause(struct view_audio *a)
     if (!a->fill)
         a->state = VIEW_AUDIO_IDLE;
 
+    /* Past the end of the track the clock runs on wall time: fold what has
+     * elapsed into its anchor, so that pausing freezes it and resuming
+     * continues from there. */
+    if (a->ended) {
+        uint64_t now = SDL_GetTicksNS();
+
+        a->ended_clock += (double)(now - a->ended_ns) / 1.0e9;
+        a->ended_ns = now;
+    }
     SDL_UnlockMutex(a->lock);
 
     /* The device is only stopped once the ramp has actually been rendered

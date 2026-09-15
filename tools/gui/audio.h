@@ -134,6 +134,14 @@ struct view_audio {
      * interpolated across the device's buffer instead of stepping once per
      * pull. */
     uint64_t handover_ns;
+    /* Once the track has been played to its end the cursor above stops; a
+     * clip whose video outlasts its audio still needs the clock to move,
+     * so from that moment it runs on wall time from where the audio left
+     * it. `ended_clock` is the value at that moment plus whatever elapsed
+     * while playing, `ended_ns` the wall time it was last anchored at. */
+    bool ended;
+    double ended_clock;
+    uint64_t ended_ns;
 
     /* What the callback renders into before handing it to the stream,
      * grown once to the largest pull SDL has asked for. */
