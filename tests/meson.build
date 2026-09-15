@@ -48,3 +48,21 @@ foreach t : [ 'test_pipeline' ]
         c_args: [ '-DTEST_SOURCE_DIR="' + meson.current_source_dir() + '"' ])
     test(t, exe, timeout: 300)
 endforeach
+
+# The embedded film simulation collection. Its pack is built by
+# tools/gui/luts/meson.build; this test only exists once that has been
+# processed, which — because meson walks subdir() in order and tests/ comes
+# before tools/ — means the hook line has to run before subdir('tests'):
+#
+#     subdir('tools/gui/luts')   in the top level meson.build, or
+#     subdir('gui/luts')         in tools/meson.build, with tests moved after
+#
+# Until then this is simply skipped, so a checkout without the hook, without
+# the .cube files or without zlib still builds and tests everything else.
+if is_variable('craw_view_luts_dep')
+    exe = executable('test_luts', 'test_luts.c',
+        dependencies: [ craw_view_luts_dep, cc.find_library('m', required: false) ],
+        c_args: [ '-DTEST_LUTS_DIR="' +
+                  meson.project_source_root() / 'tools' / 'gui' / 'luts' + '"' ])
+    test('test_luts', exe, timeout: 300)
+endif
