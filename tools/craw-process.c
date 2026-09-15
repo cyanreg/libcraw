@@ -1088,7 +1088,10 @@ static int tool_decoder_open(struct tool_decoder *d, const char *path, bool verb
 
     /* Software decode only in this version; a Vulkan hwaccel would hand the
      * pipeline its input image directly and skip the round trip entirely. */
-    d->dec->thread_count = 0;
+    /* One thread: ProRes RAW frame threading keeps a 35 MB Bayer frame in
+     * flight per thread, which on a many-core machine is gigabytes for a
+     * tool that hands every frame to the GPU anyway. */
+    d->dec->thread_count = 1;
 
     ret = avcodec_open2(d->dec, codec, NULL);
     if (ret < 0) {
