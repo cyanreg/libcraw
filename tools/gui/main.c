@@ -1140,6 +1140,14 @@ static void view_usage(FILE *f)
 "                      BT.709 display.\n"
 "  --no-peak-detect    tone map against the profile's sensor clip instead of\n"
 "                      the peak libplacebo measures per frame\n"
+"  --softlight PERCENT blend the picture with itself through the soft light\n"
+"                      blend mode, 0 to 100 (default: 0, off)\n"
+"  --vibrance PASTELS[,SATURATED[,THRESHOLD]]\n"
+"                      raise chroma, more on pastel colours than on already\n"
+"                      saturated ones. The two amounts run -100 to 100 and\n"
+"                      one number sets both; THRESHOLD, 0 to 100, is the\n"
+"                      chroma they meet at (default: 45). The panel also\n"
+"                      has the skin protection and gamut toggles\n"
 "  --grain GAUGE[,STOCK][:AMOUNT]\n"
 "                      film grain, e.g. super8, 16mm,500t or super35,50d:0.6.\n"
 "                      Gauges: regular8, super8, 16mm, super16, 2perf, 3perf,\n"
@@ -1206,6 +1214,8 @@ enum {
     VIEW_OPT_ZOOM,
     VIEW_OPT_LIST_LUTS,
     VIEW_OPT_GRAIN,
+    VIEW_OPT_SOFTLIGHT,
+    VIEW_OPT_VIBRANCE,
 };
 
 static int view_parse_args(struct view_state *st, int argc, char **argv,
@@ -1238,6 +1248,8 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "no-peak-detect", no_argument,   NULL, VIEW_OPT_NO_PEAK   },
         { "zoom",     required_argument, NULL, VIEW_OPT_ZOOM      },
         { "grain",    required_argument, NULL, VIEW_OPT_GRAIN     },
+        { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
+        { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
         { "help",     no_argument,       NULL, 'h'                },
         { NULL,       0,                 NULL, 0                  },
     };
@@ -1298,6 +1310,14 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             break;
         case VIEW_OPT_GRAIN:
             if ((ret = view_grain_parse(&st->grain, optarg)) < 0)
+                return ret;
+            break;
+        case VIEW_OPT_SOFTLIGHT:
+            if ((ret = view_adjust_parse_softlight(&st->adjustments, optarg)) < 0)
+                return ret;
+            break;
+        case VIEW_OPT_VIBRANCE:
+            if ((ret = view_adjust_parse_vibrance(&st->adjustments, optarg)) < 0)
                 return ret;
             break;
         case VIEW_OPT_WB:
@@ -2057,6 +2077,7 @@ static void view_close(struct view_state *st)
     view_decoder_close(&st->dec);
     /* The grain hooks hold shader objects, so they go before the pl_gpu. */
     view_grain_close(&st->grain);
+    view_adjust_close(&st->adjustments);
     view_gpu_close(&st->gpu);
 
     if (st->win)
@@ -2145,6 +2166,7 @@ int main(int argc, char **argv)
     st.volume = 1.0f;
     /* Before the arguments, so that --grain overrides the defaults. */
     view_grain_defaults(&st.grain);
+    view_adjust_defaults(&st.adjustments);
 
 #if CRAW_VIEW_HAVE_LUTS
     /* Reads the pack's tables, which is all pointer arithmetic over the

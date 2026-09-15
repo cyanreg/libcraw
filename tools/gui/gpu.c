@@ -32,6 +32,7 @@
 #include <libplacebo/utils/libav.h>
 
 #include "view.h"
+#include "adjust.h"
 #include "grain_ui.h"
 
 /* BT.2408 diffuse white; a pipeline value of 1.0 is diffuse white, so the
@@ -1179,6 +1180,20 @@ void view_gpu_image(const struct view_gpu *g, struct pl_frame *out,
     };
 }
 
+/* The hook state for one of the two renderers, made on first use the way
+ * the grain's is: the pl_gpu has to exist first, and a viewer that never
+ * exports never builds the export one. */
+static craw_adjust *view_adjust_state(struct view_state *st, bool export_path)
+{
+    craw_adjust **slot = export_path ? &st->adjustments.state_export
+                                     : &st->adjustments.state;
+
+    if (!*slot && st->gpu.gpu)
+        *slot = craw_adjust_create(st->gpu.gpu);
+
+    return *slot;
+}
+
 static void view_render_params(struct view_state *st,
                                struct pl_render_params *rp,
                                struct pl_color_map_params *cmp,
@@ -1212,17 +1227,20 @@ static void view_render_params(struct view_state *st,
      * percentile are kept: nothing measured here argues with them. */
     rp->peak_detect_params = st->look.peak_detect ? pdp : NULL;
     /* A user .cube goes on the image as asked; a film simulation never
-     * does: it is a display-referred sRGB look and belongs on the target
-     * frame, after tone mapping, in the output's own encoding (see
-     * view_gpu_display and view_gpu_render_export). On the image it would
-     * land on the scene-linear scRGB source and mean nothing. */
+     * does: it is a display-referred sRGB look and belongs after tone
+     * mapping, in the output's own encoding. It used to ride on the target
+     * frame, which libplacebo applies at the very end of its output pass -
+     * after every PL_HOOK_PRE_OUTPUT hook - so nothing could ever be put in
+     * front of it. It is now the first of the adjustment hooks below, on
+     * the same values and through the same pl_shader_custom_lut, so that
+     * vibrance and soft light can follow it the way they follow film
+     * simulation in RawTherapee. */
     rp->lut = st->look.film_sim >= 0 ? NULL : st->lut;
     rp->lut_type = st->look.lut_space > 0 ? PL_LUT_CONVERSION : st->look.lut_type;
 
     /* Only the non-raw path needs a shader for exposure; on the raw path
      * libcraw has already applied it, and the scRGB scale below would be
      * the wrong place for it anyway. */
-    hook[0] = hook[1] = NULL;
     int nb_hooks = 0;
     if (!st->dec.raw) {
         const struct pl_hook *h = view_exposure_hook(&st->gpu,
@@ -1231,16 +1249,47 @@ static void view_render_params(struct view_state *st,
             hook[nb_hooks++] = h;
     }
 
-    /* Film grain runs at PL_HOOK_PRE_OUTPUT, so it lands on the picture
-     * after scaling and colour management: what the grain is applied to is
-     * what is on screen, at the size it is on screen. That is also why the
-     * two hooks can share one array without caring about the order - they
-     * hook different stages. The export path gets its own shader state and
-     * its own frame-index seed, so exporting a range twice gives the same
-     * files. */
+    /* The display-referred chain, all four of it at PL_HOOK_PRE_OUTPUT, so
+     * everything here lands on the picture after scaling and colour
+     * management: what is graded is what is on screen, at the size it is on
+     * screen. libplacebo runs the hooks of one stage in the order of this
+     * array, so the array is the order, and the order is RawTherapee's -
+     * film simulation in its RGB stage, vibrance in the Lab stage after it,
+     * soft light late in that same stage - with the grain last because
+     * grain is a property of the medium and everything above it is a
+     * property of the grade.
+     *
+     * Each hook is left off entirely when its parameters would make it an
+     * identity, so the defaults cost nothing and change nothing.
+     *
+     * The export path gets its own shader state throughout - and, for the
+     * grain, its own frame-index seed - so exporting a range twice gives
+     * the same files. */
     {
-        const struct pl_hook *h = view_grain_hook(st, export_path);
-        if (h)
+        craw_adjust *aj = view_adjust_state(st, export_path);
+        const struct pl_hook *h;
+
+        if (aj) {
+            if (st->look.film_sim >= 0 && st->lut &&
+                (h = craw_adjust_lut(aj, st->lut)))
+                hook[nb_hooks++] = h;
+
+            const struct craw_vibrance_params vp = {
+                .pastels      = st->adjustments.pastels,
+                .saturated    = st->adjustments.saturated,
+                .threshold    = st->adjustments.threshold,
+                .protect_skin = st->adjustments.protect_skin,
+                .avoid_shift  = st->adjustments.avoid_shift,
+            };
+
+            if ((h = craw_adjust_vibrance(aj, &vp)))
+                hook[nb_hooks++] = h;
+
+            if ((h = craw_adjust_softlight(aj, st->adjustments.softlight)))
+                hook[nb_hooks++] = h;
+        }
+
+        if ((h = view_grain_hook(st, export_path)))
             hook[nb_hooks++] = h;
     }
 
@@ -1269,7 +1318,7 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
     struct pl_peak_detect_params pdp;
     struct pl_color_adjustment adj;
     struct pl_hdr_metadata measured;
-    const struct pl_hook *hook[2];
+    const struct pl_hook *hook[VIEW_MAX_HOOKS];
     struct pl_frame image, target;
     struct pl_overlay overlay;
     struct pl_overlay_part part;
@@ -1279,13 +1328,6 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
 
     pl_frame_from_swapchain(&target, &sw_frame);
     view_render_params(st, &rp, &cmp, &pdp, &adj, hook, false);
-
-    /* The film simulation is applied to the encoded output, which for an
-     * SDR window is the sRGB these CLUTs were built for. */
-    if (st->look.film_sim >= 0 && st->lut) {
-        target.lut = st->lut;
-        target.lut_type = PL_LUT_NATIVE;
-    }
 
     if (st->have_frame) {
         pl_rect2df src, dst;
@@ -1363,7 +1405,7 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
     struct pl_color_map_params cmp;
     struct pl_peak_detect_params pdp;
     struct pl_color_adjustment adj;
-    const struct pl_hook *hook[2];
+    const struct pl_hook *hook[VIEW_MAX_HOOKS];
     struct pl_frame image, target;
     pl_fmt fmt;
     int cx, cy, cw, ch;
@@ -1429,13 +1471,6 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
         .color = pl_color_space_srgb,
         .crop  = { 0, 0, (float)cw, (float)ch },
     };
-
-    /* Same place as on screen: the film simulation goes on the sRGB
-     * encoded output, not on the scene-linear image. */
-    if (st->look.film_sim >= 0 && st->lut) {
-        target.lut = st->lut;
-        target.lut_type = PL_LUT_NATIVE;
-    }
 
     /* The export has its own renderer so that the peak detection track it
      * walks through depends only on the exported frames: the same frame

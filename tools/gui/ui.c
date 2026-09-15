@@ -1133,6 +1133,75 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
  * way to take it back. The rectangle is in source pixels, so the readout
  * says which region of the frame the export will write whatever the window
  * is doing with it. */
+/* The "Adjustments" section: soft light and vibrance, the two RawTherapee
+ * tools adjust.c reimplements. It sits between Look and Film grain because
+ * that is where the hooks sit in the render: after the film simulation the
+ * Look section chooses, before the grain. */
+static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_adjust *a = &st->adjustments;
+    char buf[128];
+
+    /* Open when something is already on, which after --softlight or
+     * --vibrance it is. nuklear remembers the state per title from the
+     * first frame on, so this only decides where the section starts. */
+    if (!nk_tree_push(ctx, NK_TREE_TAB, "Adjustments",
+                      (a->softlight > 0.0f || a->pastels != 0.0f ||
+                       a->saturated != 0.0f) ? NK_MAXIMIZED : NK_MINIMIZED))
+        return;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%s",
+              view_adjust_summary(a, buf, sizeof(buf)));
+
+    /* Soft light first, even though it runs last: it is the one control
+     * most people came for, and the panel is not the pipeline. */
+    view_adjust_float(st, view_row(st, ctx), &a->softlight, 5.0f, 0.0f, 100.0f);
+    nk_property_float(ctx, "#soft light", 0.0f, &a->softlight, 100.0f,
+                      5.0f, 0.25f);
+
+    view_adjust_float(st, view_row(st, ctx), &a->pastels, 5.0f, -100.0f, 100.0f);
+    nk_property_float(ctx, "#pastels", -100.0f, &a->pastels, 100.0f,
+                      5.0f, 0.25f);
+
+    view_adjust_float(st, view_row(st, ctx), &a->saturated, 5.0f, -100.0f, 100.0f);
+    nk_property_float(ctx, "#saturated", -100.0f, &a->saturated, 100.0f,
+                      5.0f, 0.25f);
+
+    view_adjust_float(st, view_row(st, ctx), &a->threshold, 5.0f, 0.0f, 100.0f);
+    nk_property_float(ctx, "#threshold", 0.0f, &a->threshold, 100.0f,
+                      5.0f, 0.25f);
+
+    /* One focus row per nuklear row, each filling both columns: view_row()
+     * draws its ring across the whole content width, so two focusable
+     * widgets sharing one row would have the second one's ring painted over
+     * the first one's widget. */
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    {
+        bool f = view_row(st, ctx);
+
+        if (view_step(st, f))
+            a->protect_skin_flag = !a->protect_skin_flag;
+    }
+    nk_checkbox_label(ctx, "protect skin", &a->protect_skin_flag);
+    a->protect_skin = a->protect_skin_flag != 0;
+    nk_label(ctx, a->protect_skin ? "warm hues held back" : "every hue alike",
+             NK_TEXT_LEFT);
+
+    {
+        bool f = view_row(st, ctx);
+
+        if (view_step(st, f))
+            a->avoid_shift_flag = !a->avoid_shift_flag;
+    }
+    nk_checkbox_label(ctx, "avoid colour shift", &a->avoid_shift_flag);
+    a->avoid_shift = a->avoid_shift_flag != 0;
+    nk_label(ctx, a->avoid_shift ? "chroma kept in gamut" : "chroma clipped",
+             NK_TEXT_LEFT);
+
+    nk_tree_pop(ctx);
+}
+
 static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
 {
     int x, y, w, h;
@@ -1294,6 +1363,8 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         }
         nk_tree_pop(ctx);
     }
+
+    view_panel_adjust(ctx, st);
 
     view_panel_grain(ctx, st);
 

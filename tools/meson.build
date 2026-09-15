@@ -110,6 +110,7 @@ if craw_tools_ffmpeg
             'gui/still.c',
             'gui/grain.c',
             'gui/grain_ui.c',
+            'gui/adjust.c',
             'profiles.c',
             c_args: gui_args,
             include_directories: [ craw_inc ],

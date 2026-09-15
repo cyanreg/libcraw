@@ -12,6 +12,7 @@
 
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* libplacebo only needs vkGetInstanceProcAddr; everything this tool calls
@@ -45,6 +46,11 @@
  * is left of the window. */
 #define VIEW_PANEL_WIDTH  360.0f
 #define VIEW_PANEL_MARGIN 12.0f
+
+/* Hooks handed to one pl_render_params: the non-raw path's exposure on the
+ * LINEAR stage, then the film simulation LUT, vibrance, soft light and film
+ * grain, all four at PL_HOOK_PRE_OUTPUT and in that order. */
+#define VIEW_MAX_HOOKS 5
 
 /* Zoom steps by a quarter octave per notch, stops at fit and at eight times
  * one-to-one, and lands exactly on one-to-one when it passes it. */
@@ -461,6 +467,33 @@ struct view_sync {
     int64_t run_frames;         /* since the last start or seek */
 };
 
+/* Soft light and vibrance, as the panel holds them: the two RawTherapee
+ * tools, reimplemented in adjust.c. Like the grain, none of it reaches the
+ * raw pipeline - all three hooks run at PL_HOOK_PRE_OUTPUT, after scaling
+ * and colour management, which is where RawTherapee's own display-referred
+ * stage sits too. The film simulation LUT joins them there so that vibrance
+ * and soft light can be applied behind it, in RawTherapee's order. */
+typedef struct craw_adjust craw_adjust;
+
+struct view_adjust {
+    /* Soft light strength as a percentage, 0 for off. */
+    float softlight;
+
+    /* Vibrance. Both amounts at zero is off, whatever the rest say. */
+    float pastels;              /* -100..100 */
+    float saturated;            /* -100..100 */
+    float threshold;            /* 0..100, the chroma the two meet at */
+    bool protect_skin;
+    int protect_skin_flag;      /* nuklear's checkbox wants an int */
+    bool avoid_shift;
+    int avoid_shift_flag;
+
+    /* One per renderer, the way the display and the export each own a
+     * pl_renderer: the LUT hook holds the uploaded 3D texture between
+     * frames and the two must not share it. Owned by gpu.c. */
+    craw_adjust *state, *state_export;
+};
+
 /* Film grain, as the panel holds it. grain.c turns this into the parameters
  * libplacebo's grain shaders take and grain_ui.c does the turning; nothing
  * here reaches the raw pipeline, because the grain is applied at
@@ -501,6 +534,7 @@ struct view_state {
     struct view_zoom view;
     struct view_crop crop;
     struct view_grain grain;
+    struct view_adjust adjustments;
 
     /* Keyboard focus through the panel's adjustable rows. `row` counts them
      * as the panel is laid out; `adjust` is the pending Left/Right step,
@@ -685,6 +719,25 @@ bool view_ui_menu_key(struct view_state *st, int key);
 /* True when the open menu covers that point, given in window points the
  * way SDL reports them. The picture must not zoom or pan underneath it. */
 bool view_ui_menu_covers(const struct view_state *st, float x, float y);
+
+/* ----------------------------------------------------------- adjust.c */
+
+/* Soft light off and vibrance neutral: every parameter at a value that
+ * leaves the hooks unattached, so the defaults are an absence rather than
+ * an identity pass. */
+void view_adjust_defaults(struct view_adjust *a);
+
+/* `--softlight PERCENT` and `--vibrance PASTELS[,SATURATED[,THRESHOLD]]`.
+ * Return 0 or a negative errno, having printed what was wrong. */
+int  view_adjust_parse_softlight(struct view_adjust *a, const char *arg);
+int  view_adjust_parse_vibrance(struct view_adjust *a, const char *arg);
+
+/* Releases both renderers' hook state. Call before the pl_gpu goes away. */
+void view_adjust_close(struct view_adjust *a);
+
+/* One line for the panel's readout. Returns `buf`. */
+const char *view_adjust_summary(const struct view_adjust *a, char *buf,
+                                size_t n);
 
 /* ----------------------------------------------------------- main.c */
 
