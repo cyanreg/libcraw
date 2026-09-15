@@ -38,9 +38,15 @@ swresample = dependency('libswresample', required: false)
 # The still exporter converts the rendered RGBA16 into whatever the encoder
 # the file name picks will take, which for a JPEG or an AVIF is YUV.
 swscale = dependency('libswscale', required: false)
+# The clip metadata a camera writes into the container is an XML document -
+# Panasonic's, and ARRIRAW's is another - and the values in it decide how
+# the picture is read. Hand-matching elements in a blob is the kind of thing
+# that works until a camera indents differently, so it is parsed properly.
+libxml = dependency('libxml-2.0', required: false)
 
 craw_tools_ffmpeg = libavformat_dep.found() and libavcodec_dep.found() and libavutil_dep.found()
-craw_tools_gui = craw_tools_ffmpeg and sdl3.found() and placebo.found() and swscale.found()
+craw_tools_gui = craw_tools_ffmpeg and sdl3.found() and placebo.found() and \
+                 swscale.found() and libxml.found()
 
 if craw_tools_ffmpeg
     tools_args = []
@@ -117,6 +123,7 @@ if craw_tools_ffmpeg
             dependencies: [
                 craw_dep, vulkan_dep, sdl3, placebo,
                 libavformat_dep, libavcodec_dep, libavutil_dep, swscale,
+                libxml,
                 cc.find_library('m', required: false),
             ] + gui_deps,
             install: true,

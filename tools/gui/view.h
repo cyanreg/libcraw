@@ -265,6 +265,11 @@ struct view_decoder {
      * absent or does not carry the element. */
     char capture_gamma[32];
     char capture_gamut[32];
+    /* The essence list's own name for what was recorded - "H265_420_LongGOP"
+     * or "ProRes_RAW" - which nothing is decided by and which -v prints
+     * because it is the clearest confirmation that `raw` below and the
+     * capture gamma above are two different questions. */
+    char essence_codec[32];
 
     /* A developed clip whose XML says V-Log in V-Gamut, which is the one
      * case where the stream's own colour tags have to be overridden: the

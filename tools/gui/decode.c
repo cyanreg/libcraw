@@ -21,6 +21,10 @@
 #include <libavutil/raw_color_params.h>
 #include <libavutil/time.h>
 
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+#include <libxml/xpath.h>
+
 #include "view.h"
 #include "../profiles.h"
 
@@ -218,49 +222,119 @@ static enum AVPixelFormat view_get_format(AVCodecContext *avc,
     return fmts[0];
 }
 
-/* The text of one XML element, with the surrounding whitespace dropped.
+/* ------------------------------------------------- the clip metadata XML */
+
+/* Cameras write their acquisition record into the container as an XML
+ * document - Panasonic's `com.panasonic.Semi-Pro.metadata.xml` here, and
+ * ARRI's is another - and what it says decides how the picture is read, so
+ * it is parsed rather than pattern-matched.
  *
- * A parser would be the honest answer to a document, but this one is a
- * fixed two-kilobyte record a camera writes into a metadata dictionary
- * entry, and the three values wanted from it are leaf elements with no
- * attributes and no namespace prefix. Matching `<Tag>` and the `</Tag>`
- * after it is the whole grammar that needs supporting, and it costs no
- * dependency. Anything unexpected - a missing end tag, a value longer than
- * the buffer - reads as absent rather than as something made up. */
-static bool view_xml_text(const char *xml, const char *tag, char *out, size_t size)
+ * Every expression below matches on local names instead of registering the
+ * document's prefixes. That is not laziness about namespaces: the two
+ * subtrees are in different ones to begin with - ClipMain in
+ * `urn:schemas-Professional-Plug-in:Semi-Pro:ClipMetadata` and
+ * AcquisitionMetadata in `urn:schemas-Professional-Plug-in:P2:CameraMetadata`
+ * - and the first of those carries a schema version in the URI that the
+ * camera really does change: the HEVC clips say v1.0 and the ProRes RAW
+ * clip out of the same body says v1.2. Pinning the URI would make the next
+ * firmware release read as a clip with no metadata at all. The path is kept
+ * full so that the element is still matched in its own context. */
+#define VIEW_XP_CUM "//*[local-name()='CameraUnitMetadata']"
+#define VIEW_XP_ESS "//*[local-name()='EssenceList']/*[local-name()='Video']"
+
+/* The text of the first node an expression selects, whitespace trimmed.
+ * Anything unexpected - no match, an empty element, a value longer than the
+ * buffer - leaves `out` alone, so a field reads as absent rather than as
+ * something made up. */
+static bool view_xpath_text(xmlXPathContextPtr xp, const char *expr,
+                            char *out, size_t size)
 {
-    char open[32], close[32];
-    const char *b, *e;
-    size_t n;
+    xmlXPathObjectPtr obj = xmlXPathEvalExpression((const xmlChar *)expr, xp);
+    xmlChar *text;
+    bool ok = false;
 
-    if (!xml)
+    if (!obj)
         return false;
 
-    snprintf(open, sizeof(open), "<%s>", tag);
-    snprintf(close, sizeof(close), "</%s>", tag);
+    if (obj->type == XPATH_NODESET && obj->nodesetval &&
+        obj->nodesetval->nodeNr > 0 &&
+        (text = xmlNodeGetContent(obj->nodesetval->nodeTab[0]))) {
+        const char *b = (const char *)text;
+        const char *e = b + strlen(b);
+        size_t n;
 
-    b = strstr(xml, open);
-    if (!b)
-        return false;
-    b += strlen(open);
+        while (b < e && (unsigned char)*b <= ' ')
+            b++;
+        while (e > b && (unsigned char)e[-1] <= ' ')
+            e--;
 
-    e = strstr(b, close);
-    if (!e)
-        return false;
+        n = (size_t)(e - b);
+        if (n && n < size) {
+            memcpy(out, b, n);
+            out[n] = '\0';
+            ok = true;
+        }
 
-    while (b < e && (unsigned char)*b <= ' ')
-        b++;
-    while (e > b && (unsigned char)e[-1] <= ' ')
-        e--;
+        xmlFree(text);
+    }
 
-    n = (size_t)(e - b);
-    if (!n || n >= size)
-        return false;
+    xmlXPathFreeObject(obj);
 
-    memcpy(out, b, n);
-    out[n] = '\0';
+    return ok;
+}
 
-    return true;
+/* Reads one such document. Networked entity loading is off: this is a blob
+ * out of a file the user opened, and it must not become a fetch. */
+static void view_read_clip_xml(struct view_decoder *d, const char *xml)
+{
+    xmlDocPtr doc;
+    xmlXPathContextPtr xp;
+    char iso[32];
+
+    /* Idempotent, and matched by the xmlCleanupParser() in
+     * view_decoder_close(): one decoder is opened per run and nothing else
+     * in the program uses libxml2, so the global state is set up once and
+     * released once. */
+    xmlInitParser();
+
+    doc = xmlReadMemory(xml, (int)strlen(xml), NULL, NULL,
+                        XML_PARSE_NONET | XML_PARSE_NOERROR |
+                        XML_PARSE_NOWARNING);
+    if (!doc) {
+        if (d->verbose)
+            fprintf(stderr, "the clip metadata XML did not parse; only the "
+                            "stream's own colour tags are left\n");
+        return;
+    }
+
+    xp = xmlXPathNewContext(doc);
+    if (xp) {
+        view_xpath_text(xp, VIEW_XP_CUM "/*[local-name()='Gamma']"
+                            "/*[local-name()='CaptureGamma']",
+                        d->capture_gamma, sizeof(d->capture_gamma));
+        view_xpath_text(xp, VIEW_XP_CUM "/*[local-name()='Gamut']"
+                            "/*[local-name()='CaptureGamut']",
+                        d->capture_gamut, sizeof(d->capture_gamut));
+
+        /* What was recorded, in the camera's words: `H265_420_LongGOP` or
+         * `ProRes_RAW`. Nothing is decided by it - the codec id is what
+         * says whether a clip is Bayer - but it is the clearest
+         * confirmation of that rule there is, so -v prints it. */
+        view_xpath_text(xp, VIEW_XP_ESS "/*[local-name()='Codec']",
+                        d->essence_codec, sizeof(d->essence_codec));
+
+        /* The as-shot exposure index, for a clip that has no RDD 18 keys at
+         * all - which is every HEVC clip this camera writes. What the
+         * exposure section re-rates against. */
+        if (!(d->meta_as_shot_ei > 0.0f) &&
+            view_xpath_text(xp, VIEW_XP_CUM "/*[local-name()='ISOSensitivity']",
+                            iso, sizeof(iso)))
+            d->meta_as_shot_ei = (float)atof(iso);
+
+        xmlXPathFreeContext(xp);
+    }
+
+    xmlFreeDoc(doc);
 }
 
 /* The camera model and the as-shot ISO hide in whichever metadata
@@ -283,32 +357,26 @@ static void view_read_metadata(struct view_decoder *d)
             snprintf(d->model, sizeof(d->model), "%s", e->value);
     }
 
-    /* The Panasonic clip XML, `com.panasonic.Semi-Pro.metadata.xml`. It is
-     * the only record of what the camera was actually recording: an HEVC
-     * V-Log clip carries a BT.709 VUI - primaries, transfer and matrix all
-     * 709 - which is true of the matrix and false of the other two. Every
-     * entry in both dictionaries is scanned rather than the one key, so a
-     * muxer that files the blob somewhere else still works. */
-    for (int i = 0; i < 2; i++) {
+    /* The Panasonic clip XML. It is the only record of what the camera was
+     * actually recording: an HEVC V-Log clip carries a BT.709 VUI -
+     * primaries, transfer and matrix all 709 - which is true of the matrix
+     * and false of the other two. The key is looked up by name first and
+     * then any entry that opens like a document is tried, so a muxer that
+     * files the blob somewhere else still works. */
+    for (int i = 0; i < 2 && !d->capture_gamma[0]; i++) {
+        const AVDictionaryEntry *e;
+
+        e = av_dict_get(dicts[i], "com.panasonic.Semi-Pro.metadata.xml", NULL, 0);
+        if (e)
+            view_read_clip_xml(d, e->value);
+    }
+
+    for (int i = 0; i < 2 && !d->capture_gamma[0]; i++) {
         const AVDictionaryEntry *e = NULL;
 
-        while ((e = av_dict_iterate(dicts[i], e))) {
-            char iso[32];
-
-            if (!d->capture_gamma[0])
-                view_xml_text(e->value, "CaptureGamma", d->capture_gamma,
-                              sizeof(d->capture_gamma));
-            if (!d->capture_gamut[0])
-                view_xml_text(e->value, "CaptureGamut", d->capture_gamut,
-                              sizeof(d->capture_gamut));
-
-            /* The as-shot exposure index, for a clip that has no RDD 18
-             * keys at all - which is every clip this camera writes. What
-             * the exposure section re-rates against. */
-            if (!(d->meta_as_shot_ei > 0.0f) &&
-                view_xml_text(e->value, "ISOSensitivity", iso, sizeof(iso)))
-                d->meta_as_shot_ei = (float)atof(iso);
-        }
+        while ((e = av_dict_iterate(dicts[i], e)))
+            if (e->value && !strncmp(e->value, "<?xml", 5))
+                view_read_clip_xml(d, e->value);
     }
 
     /* The one clip the tags have to be overridden for. The codec comes
@@ -411,10 +479,13 @@ int view_decoder_open(struct view_decoder *d, const char *path,
                 d->frame_rate.den ? av_q2d(d->frame_rate) : 0.0, d->nb_frames,
                 d->model[0] ? d->model : "(unknown)", d->meta_as_shot_ei);
 
-    if (verbose && (d->capture_gamma[0] || d->capture_gamut[0]))
-        fprintf(stderr, "clip metadata: capture gamma `%s`, gamut `%s`%s\n",
+    if (verbose && (d->capture_gamma[0] || d->capture_gamut[0] ||
+                    d->essence_codec[0]))
+        fprintf(stderr, "clip metadata: capture gamma `%s`, gamut `%s`, "
+                        "essence `%s`%s\n",
                 d->capture_gamma[0] ? d->capture_gamma : "(none)",
                 d->capture_gamut[0] ? d->capture_gamut : "(none)",
+                d->essence_codec[0] ? d->essence_codec : "(none)",
                 d->vlog ? ", overriding the stream's colour tags"
                         : d->raw ? ", raw: the pipeline develops it" : "");
 
@@ -428,6 +499,11 @@ void view_decoder_close(struct view_decoder *d)
     avcodec_free_context(&d->dec);
     av_buffer_unref(&d->hw_device);
     avformat_close_input(&d->fmt);
+    /* Pairs with the xmlInitParser() in view_read_clip_xml(). Safe when no
+     * document was ever read, and this is the last use of libxml2 in the
+     * program either way: the clip is what it parses, and the clip is
+     * closing. */
+    xmlCleanupParser();
 }
 
 /* The audio has its own reader (see audio.h), so everything that is not a
