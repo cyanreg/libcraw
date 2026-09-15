@@ -35,16 +35,24 @@ clip, OCIO-generated transforms, LUTs, other CFA phases, ARRIRAW and BRAW
 profiles, and lens correction. (The GUI, craw-view, exists under tools/gui as a consumer of
 the library: it is not part of the library's scope.) On the last one: Panasonic ProRes RAW frames carry a
 per-frame `com.panasonic.Semi-Pro.optical_correction` record in the
-vendor metadata after the last tile (version 3: per channel R, G, B a
+vendor metadata after the last tile, framed as a `psim` record (be32 size
+counting itself and the fourcc, then the fourcc, a Pascal-string key, and
+the payload) in the list that `eomd` terminates. Payload: a be32 version,
+3 in every frame seen, then 20 big-endian doubles, per channel R, G, B a
 radial polynomial k0..k3 plus two zero pads, then the optical centre in
-normalized frame coordinates, all big-endian doubles). The coefficients
+normalized frame coordinates, always exactly (0.5, 0.5). The coefficients
 follow zoom and focus frame by frame and encode distortion with lateral
 chromatic aberration in the destination-to-source convention,
-`r_src = r_dst * (k0 + k1 r^2 + k2 r^4 + k3 r^6)` per channel, with k0
-below 1.0 acting as the crop that keeps a pincushion correction inside the
-frame. Vignetting is not in the record. A lens stage would be a per-channel
-resampling warp after the debayer and before any scaling, fed through the
-profile or per-frame params.
+`r_src = r_dst * (k0 + k1 r^2 + k2 r^4 + k3 r^6)` per channel, with r
+normalized by the coded frame's half diagonal so r = 1 is the corner, and
+k0 below 1.0 acting as the crop that keeps a pincushion correction inside
+the frame. Vignetting is not in the record. The layout, the direction and
+the normalization are confirmed against Panasonic's own in-camera
+distortion block in RW2 stills of the same lens at the same focal length;
+`tools/prr_lens.py` extracts the record and `tools/prr_lens.md` is the
+derivation. A lens stage would be a per-channel resampling warp after the
+debayer and before any scaling, fed through the profile or per-frame
+params.
 
 ## 2. Conventions
 
