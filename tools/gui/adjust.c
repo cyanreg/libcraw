@@ -8,6 +8,7 @@
 #include <libplacebo/common.h>
 #include <libplacebo/dispatch.h>
 #include <libplacebo/shaders/colorspace.h>
+#include <libplacebo/shaders/sampling.h>
 
 #include <craw/utils.h>
 
@@ -18,7 +19,7 @@
  * sources; this file is the shaders and the plumbing that hands them to
  * pl_renderer.
  *
- * All three are PL_HOOK_SIG_COLOR, so each one appends its instructions to
+ * All three take the stage as a texture and give a texture back, appending to
  * the shader the renderer is already building rather than finishing it into
  * a texture and starting another. Nothing here reads a neighbouring pixel,
  * so there is nothing to gain from a texture and a whole FBO round trip to
@@ -86,6 +87,53 @@ static void adjust_mat3(const pl_matrix3x3 *m, float out[9])
     }
 }
 
+/* The stage arrives as a texture. A colour-only shader at this stage
+ * carries no output size of its own, and libplacebo refuses a hook whose
+ * shader does not report the stage's size ("tried resizing non-resizable
+ * stage"), so each hook samples the texture directly, which declares
+ * exactly that size, and appends its colour work to the sampler. */
+static pl_shader adjust_begin(const struct pl_hook_params *hp)
+{
+    pl_shader sh;
+
+    if (!hp->tex)
+        return NULL;
+
+    sh = pl_dispatch_begin(hp->dispatch);
+    if (!sh)
+        return NULL;
+
+    if (!pl_shader_sample_direct(sh, pl_sample_src( .tex = hp->tex )))
+        return NULL;
+
+    return sh;
+}
+
+/* Renders the finished shader into a hook texture of the stage's size and
+ * hands that back. A colour-only result would be refused: the sampler
+ * leaves the shader's output size unset and libplacebo checks it against
+ * the stage, which is what the grain hook avoids the same way. */
+static struct pl_hook_res adjust_finish(const struct pl_hook_params *hp,
+                                        pl_shader sh)
+{
+    pl_tex out = hp->get_tex(hp->priv, hp->tex->params.w, hp->tex->params.h);
+
+    if (!out || !pl_dispatch_finish(hp->dispatch, pl_dispatch_params(
+            .shader = &sh, .target = out))) {
+        pl_dispatch_abort(hp->dispatch, &sh);
+        return (struct pl_hook_res) { .failed = true };
+    }
+
+    return (struct pl_hook_res) {
+        .output     = PL_HOOK_SIG_TEX,
+        .tex        = out,
+        .repr       = hp->repr,
+        .color      = hp->color,
+        .components = hp->components,
+        .rect       = hp->rect,
+    };
+}
+
 /* ---------------------------------------------------------------- LUT */
 
 static struct pl_hook_res adjust_lut_fn(void *priv,
@@ -93,23 +141,20 @@ static struct pl_hook_res adjust_lut_fn(void *priv,
 {
     craw_adjust *a = priv;
 
-    if (!a->lut || !hp->sh)
+    if (!a->lut)
+        return (struct pl_hook_res) { .failed = true };
+
+    pl_shader sh = adjust_begin(hp);
+    if (!sh)
         return (struct pl_hook_res) { .failed = true };
 
     /* The same call libplacebo makes for `pl_frame.lut` at PL_LUT_NATIVE,
      * on the same values: between here and there it runs only
      * pl_shader_encode_color(), which for a full range RGB target whose
      * sample and colour depths agree skips itself entirely. */
-    pl_shader_custom_lut(hp->sh, a->lut, &a->lut_state);
+    pl_shader_custom_lut(sh, a->lut, &a->lut_state);
 
-    return (struct pl_hook_res) {
-        .output     = PL_HOOK_SIG_COLOR,
-        .sh         = hp->sh,
-        .repr       = hp->repr,
-        .color      = hp->color,
-        .components = hp->components,
-        .rect       = hp->rect,
-    };
+    return adjust_finish(hp, sh);
 }
 
 const struct pl_hook *craw_adjust_lut(craw_adjust *a,
@@ -150,10 +195,14 @@ static struct pl_hook_res adjust_soft_fn(void *priv,
         { .var = pl_var_float("craw_soft"), .data = &mix, .dynamic = true },
     };
 
-    if (!hp->sh || hp->components < 3)
+    if (hp->components < 3)
         return (struct pl_hook_res) { .failed = true };
 
-    if (!pl_shader_custom(hp->sh, &(struct pl_custom_shader) {
+    pl_shader sh = adjust_begin(hp);
+    if (!sh)
+        return (struct pl_hook_res) { .failed = true };
+
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
             .description   = "craw soft light",
             .input         = PL_SHADER_SIG_COLOR,
             .output        = PL_SHADER_SIG_COLOR,
@@ -163,14 +212,7 @@ static struct pl_hook_res adjust_soft_fn(void *priv,
         }))
         return (struct pl_hook_res) { .failed = true };
 
-    return (struct pl_hook_res) {
-        .output     = PL_HOOK_SIG_COLOR,
-        .sh         = hp->sh,
-        .repr       = hp->repr,
-        .color      = hp->color,
-        .components = hp->components,
-        .rect       = hp->rect,
-    };
+    return adjust_finish(hp, sh);
 }
 
 const struct pl_hook *craw_adjust_softlight(craw_adjust *a, float strength)
@@ -291,7 +333,11 @@ static struct pl_hook_res adjust_vib_fn(void *priv,
     char body[4096];
     float vib[4], skin;
 
-    if (!hp->sh || hp->components < 3)
+    if (hp->components < 3)
+        return (struct pl_hook_res) { .failed = true };
+
+    pl_shader sh = adjust_begin(hp);
+    if (!sh)
         return (struct pl_hook_res) { .failed = true };
 
     /* The matrices follow the target's primaries, which do not move once a
@@ -357,9 +403,9 @@ static struct pl_hook_res adjust_vib_fn(void *priv,
     /* Oklab is a linear-light space, so the display encoding has to come
      * off and go back on around it. libplacebo's own transfer function
      * shaders do it for whatever the target turned out to be. */
-    pl_shader_linearize(hp->sh, &csp);
+    pl_shader_linearize(sh, &csp);
 
-    if (!pl_shader_custom(hp->sh, &(struct pl_custom_shader) {
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
             .description   = "craw vibrance",
             .input         = PL_SHADER_SIG_COLOR,
             .output        = PL_SHADER_SIG_COLOR,
@@ -370,16 +416,9 @@ static struct pl_hook_res adjust_vib_fn(void *priv,
         }))
         return (struct pl_hook_res) { .failed = true };
 
-    pl_shader_delinearize(hp->sh, &csp);
+    pl_shader_delinearize(sh, &csp);
 
-    return (struct pl_hook_res) {
-        .output     = PL_HOOK_SIG_COLOR,
-        .sh         = hp->sh,
-        .repr       = hp->repr,
-        .color      = hp->color,
-        .components = hp->components,
-        .rect       = hp->rect,
-    };
+    return adjust_finish(hp, sh);
 }
 
 const struct pl_hook *craw_adjust_vibrance(craw_adjust *a,
@@ -410,21 +449,21 @@ craw_adjust *craw_adjust_create(pl_gpu gpu)
      * the video only - an overlay drawn later is not graded. */
     a->lut_hook = (struct pl_hook) {
         .stages    = PL_HOOK_PRE_OUTPUT,
-        .input     = PL_HOOK_SIG_COLOR,
+        .input     = PL_HOOK_SIG_TEX,
         .priv      = a,
         .hook      = adjust_lut_fn,
         .signature = 0x6372617766696C6DULL,     /* "crawfilm" */
     };
     a->vib_hook = (struct pl_hook) {
         .stages    = PL_HOOK_PRE_OUTPUT,
-        .input     = PL_HOOK_SIG_COLOR,
+        .input     = PL_HOOK_SIG_TEX,
         .priv      = a,
         .hook      = adjust_vib_fn,
         .signature = 0x6372617776696272ULL,     /* "crawvibr" */
     };
     a->soft_hook = (struct pl_hook) {
         .stages    = PL_HOOK_PRE_OUTPUT,
-        .input     = PL_HOOK_SIG_COLOR,
+        .input     = PL_HOOK_SIG_TEX,
         .priv      = a,
         .hook      = adjust_soft_fn,
         .signature = 0x637261777366746CULL,     /* "crawsftl" */
