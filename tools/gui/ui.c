@@ -56,6 +56,8 @@
 #include <libplacebo/gpu.h>
 
 #include "view.h"
+#include "grain_ui.h"
+
 /* The embedded film simulation collection is optional: without it the row
  * and its menu compile out and the panel says so. */
 #ifndef CRAW_VIEW_HAVE_LUTS
@@ -73,8 +75,14 @@
 /* The cascading menu's own metrics. Its rows are tighter than the panel's:
  * a film category can hold twenty-six stocks and the column still has to
  * fit in a modest window. */
-#define VIEW_MENU_ROW   20.0f
+#define VIEW_MENU_ROW   22.0f
 #define VIEW_MENU_PAD    4.0f
+#define VIEW_MENU_XPAD   8.0f
+/* How long the pointer has to rest on an entry before its submenu opens,
+ * and how long an already open submenu survives the pointer sweeping
+ * across its siblings on the way over to it. */
+#define VIEW_MENU_OPEN_US  150000
+#define VIEW_MENU_GUARD_US 300000
 #define VIEW_MENU_MIN_W 110.0f
 #define VIEW_MENU_MAX_W 330.0f
 #define VIEW_MENU_ARROW 16.0f
@@ -412,7 +420,7 @@ static float view_menu_width(struct nk_context *ctx,
             text = tw;
     }
 
-    w = text + 2 * VIEW_MENU_PAD + 6.0f +
+    w = text + 2 * VIEW_MENU_XPAD + 6.0f +
         (view_menu_leaf(st, col) ? 0.0f : VIEW_MENU_ARROW);
 
     return CRAW_CLAMP(w, VIEW_MENU_MIN_W, VIEW_MENU_MAX_W);
@@ -441,6 +449,9 @@ static void view_menu_layout(struct nk_context *ctx, struct view_state *st)
     }
 
     dir = (m->ax + m->aw + view_menu_width(ctx, st, 0) <= winw - margin) ? 1 : -1;
+    /* The pointer pass needs it too: "towards the submenu" is whichever
+     * way the cascade runs. */
+    m->dir = dir;
 
     for (int c = 0; c < m->cols; c++) {
         float w = view_menu_width(ctx, st, c);
@@ -507,14 +518,26 @@ static void view_menu_descend(struct view_state *st, int col, int i)
 }
 
 /* Pointer pass: hover moves the highlight and opens the next column, a
- * click on a leaf selects, the wheel scrolls the column under the pointer.
- * Returns the rendering to select, or -1. */
+ * click selects a rendering or opens a submenu at once, the wheel scrolls
+ * the column under the pointer. Returns the rendering to select, or -1.
+ *
+ * Hover is deliberately not immediate. Sweeping the pointer diagonally
+ * from an entry to something in the submenu it opened crosses that entry's
+ * siblings, and a menu that switched on every crossing would collapse the
+ * column being aimed at - which is what made this feel finicky. So an
+ * entry has to be rested on before its submenu opens, and for a moment
+ * after one opens the siblings are ignored while the pointer is still
+ * travelling towards it. */
 static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
                              bool *over)
 {
     struct view_lut_menu *m = &st->menu;
     struct nk_input *in = &ctx->input;
     struct nk_vec2 p = in->mouse.pos;
+    int64_t now = av_gettime_relative();
+    float dx = p.x - m->prev_x;
+    int hit_col = -1, hit_entry = -1;
+    bool clicked = false;
     int pick = -1;
 
     *over = false;
@@ -522,7 +545,6 @@ static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
     for (int c = 0; c < m->cols; c++) {
         struct nk_rect r = nk_rect(m->x[c], m->y[c], m->w[c], m->h[c]);
         int n = view_menu_count(st, c);
-        bool leaf = view_menu_leaf(st, c);
 
         if (!NK_INBOX(p.x, p.y, r.x, r.y, r.w, r.h))
             continue;
@@ -549,13 +571,56 @@ static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
             if (e.y < r.y || e.y + e.h > r.y + r.h)
                 break;
 
-            m->kb = -1;             /* the pointer has taken over */
-            view_menu_descend(st, c, i);
-            if (leaf && nk_input_is_mouse_click_in_rect(in, NK_BUTTON_LEFT, e))
-                pick = view_menu_lut(st, c, i);
+            hit_col = c;
+            hit_entry = i;
+            clicked = nk_input_is_mouse_click_in_rect(in, NK_BUTTON_LEFT, e) != 0;
             break;
         }
     }
+
+    /* How long the pointer has been where it is. */
+    if (hit_col != m->hover_col || hit_entry != m->hover_entry) {
+        m->hover_col = hit_col;
+        m->hover_entry = hit_entry;
+        m->hover_since = now;
+    }
+
+    if (hit_col >= 0) {
+        bool leaf = view_menu_leaf(st, hit_col);
+
+        if (clicked) {
+            /* A click is unambiguous: act on it at once, whatever the
+             * hover timers were about to do. */
+            m->kb = -1;
+            if (leaf) {
+                pick = view_menu_lut(st, hit_col, hit_entry);
+            } else {
+                view_menu_descend(st, hit_col, hit_entry);
+                m->guard_col = hit_col;
+                m->guard_until = now + VIEW_MENU_GUARD_US;
+            }
+        } else if (m->sel[hit_col] != hit_entry) {
+            /* Still travelling towards the submenu this column opened:
+             * the siblings on the way do not get to close it. */
+            bool guarded = hit_col == m->guard_col && now < m->guard_until &&
+                           dx * (float)m->dir > 0.0f;
+
+            if (leaf) {
+                /* Nothing to protect and nothing to open, so a leaf's
+                 * highlight simply follows the pointer. */
+                m->kb = -1;
+                view_menu_descend(st, hit_col, hit_entry);
+            } else if (!guarded && now - m->hover_since >= VIEW_MENU_OPEN_US) {
+                m->kb = -1;
+                view_menu_descend(st, hit_col, hit_entry);
+                m->guard_col = hit_col;
+                m->guard_until = now + VIEW_MENU_GUARD_US;
+            }
+        }
+    }
+
+    m->prev_x = p.x;
+    m->prev_y = p.y;
 
     return pick;
 }
@@ -595,12 +660,17 @@ static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
                 continue;           /* scrolled out of the column */
 
             view_menu_label(st, c, i, buf, sizeof(buf));
+            /* The rendering actually in use gets a mark of its own, so it
+             * stays findable while the highlight is off wandering. */
+            if (view_menu_lut(st, c, i) == st->look.film_sim &&
+                st->look.film_sim >= 0)
+                nk_fill_rect(out, e, 2.0f, nk_rgba(40, 62, 52, 255));
             if (on)
                 nk_fill_rect(out, e, 2.0f,
                              m->kb == c ? nk_rgba(64, 92, 140, 255)
                                         : nk_rgba(52, 66, 96, 255));
 
-            t = nk_rect(e.x + VIEW_MENU_PAD, e.y, e.w - 2 * VIEW_MENU_PAD, e.h);
+            t = nk_rect(e.x + VIEW_MENU_XPAD, e.y, e.w - 2 * VIEW_MENU_XPAD, e.h);
             nk_draw_text(out, t, buf, (int)strlen(buf), font,
                          nk_rgba(0, 0, 0, 0), nk_rgba(226, 226, 232, 255));
 
@@ -651,6 +721,14 @@ void view_ui_menu_open(struct view_state *st)
         m->sel[c] = -1;
         m->scroll[c] = 0.0f;
     }
+
+    /* No stale hover timers from the last time it was open, and no guard
+     * protecting a column that no longer exists. */
+    m->hover_col = -1;
+    m->hover_entry = -1;
+    m->hover_since = av_gettime_relative();
+    m->guard_col = -1;
+    m->guard_until = 0;
 
     /* Open on what is already selected, so Enter then the arrows walks on
      * from the current look rather than from the top of the list. */
@@ -813,8 +891,8 @@ static void view_menu_step(struct view_state *st, int adj)
     view_lut_select_film(st, CRAW_CLAMP(cur + adj, lo, hi));
 }
 
-/* The panel row. Hovering or clicking it opens the menu; the menu itself
- * is built after the panel so that it draws on top. */
+/* The panel row. Clicking it toggles the menu; the menu itself is built
+ * after the panel so that it draws on top. */
 static void view_panel_film_sim(struct nk_context *ctx, struct view_state *st)
 {
     struct view_lut_menu *m = &st->menu;
@@ -838,16 +916,14 @@ static void view_panel_film_sim(struct nk_context *ctx, struct view_state *st)
     m->ah = b.h;
     m->anchored = true;
 
+    /* Click to toggle, never hover: a menu that dropped open whenever the
+     * pointer crossed the row on its way somewhere else was the single
+     * most irritating thing about it. */
     if (nk_button_label(ctx, view_lut_film_name(st))) {
         if (m->open)
             view_ui_menu_close(st);
         else
             view_ui_menu_open(st);
-        m->kb = -1;
-    } else if (!m->open &&
-               nk_input_is_mouse_hovering_rect(&ctx->input,
-                                               nk_rect(m->ax, m->ay, m->aw, m->ah))) {
-        view_ui_menu_open(st);
         m->kb = -1;
     }
 }
@@ -871,12 +947,14 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
         return;
     }
 
-    /* The pointer leaving the menu and the row closes it, but only while
-     * the pointer is the thing driving: a menu opened with Enter stays up
-     * wherever the pointer happens to be sitting. */
-    if (m->kb < 0 && !over &&
-        !nk_input_is_mouse_hovering_rect(&ctx->input,
-                                         nk_rect(m->ax, m->ay, m->aw, m->ah))) {
+    /* Merely moving the pointer off the columns does not close anything:
+     * the menu is opened by a click and it stays until something says
+     * otherwise. A click outside it is one of those things, and so is the
+     * row itself, which toggles and is therefore left alone here. */
+    if (!over && ctx->input.mouse.buttons[NK_BUTTON_LEFT].clicked &&
+        !NK_INBOX(ctx->input.mouse.buttons[NK_BUTTON_LEFT].clicked_pos.x,
+                  ctx->input.mouse.buttons[NK_BUTTON_LEFT].clicked_pos.y,
+                  m->ax, m->ay, m->aw, m->ah)) {
         view_ui_menu_close(st);
         return;
     }
@@ -1051,6 +1129,34 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
               view_total_gain(st) * exp2f(lk->exposure), view_peak_ceiling(st));
 }
 
+/* The crop row: the mode a left drag draws in, what it has drawn, and a
+ * way to take it back. The rectangle is in source pixels, so the readout
+ * says which region of the frame the export will write whatever the window
+ * is doing with it. */
+static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
+{
+    int x, y, w, h;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    {
+        bool f = view_row(st, ctx);
+
+        if (view_step(st, f))
+            st->crop.on_flag = !st->crop.on_flag;
+    }
+    nk_checkbox_label(ctx, "crop mode (c)", &st->crop.on_flag);
+    st->crop.on = st->crop.on_flag != 0;
+
+    if (nk_button_label(ctx, "clear"))
+        view_crop_clear(st);
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    if (view_crop_rect(st, &x, &y, &w, &h))
+        nk_labelf(ctx, NK_TEXT_LEFT, "crop: %dx%d at %d,%d", w, h, x, y);
+    else
+        nk_label(ctx, "crop: none, drag one over the picture", NK_TEXT_LEFT);
+}
+
 static void view_panel(struct nk_context *ctx, struct view_state *st)
 {
     struct view_look *lk = &st->look;
@@ -1193,37 +1299,50 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         nk_tree_pop(ctx);
     }
 
-    if (nk_tree_push(ctx, NK_TREE_TAB, "Export", NK_MINIMIZED)) {
-        static int first = 0, last = 0;
-        static char dir[VIEW_MAX_PATH];
+    view_panel_grain(ctx, st);
 
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        nk_property_int(ctx, "#first", 0,  &first,
-                        (int)CRAW_MAX(st->dec.nb_frames - 1, 0), 1, 1);
-        nk_property_int(ctx, "#last", 0, &last,
-                        (int)CRAW_MAX(st->dec.nb_frames - 1, 0), 1, 1);
+    view_panel_crop(ctx, st);
+
+    if (nk_tree_push(ctx, NK_TREE_TAB, "Export", NK_MINIMIZED)) {
+        /* The field follows the frame on screen until it is typed into:
+         * once it differs from the default that was last put there, it is
+         * the user's and is left alone. */
+        static char path[VIEW_MAX_PATH], def[VIEW_MAX_PATH];
+        static char codec[64];
+        char want[VIEW_MAX_PATH];
+
+        view_export_default_path(st, st->index, want, sizeof(want));
+        if (!path[0] || !strcmp(path, def)) {
+            snprintf(path, sizeof(path), "%s", want);
+            snprintf(def, sizeof(def), "%s", want);
+        }
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        nk_label(ctx, "directory (empty: next to the clip)", NK_TEXT_LEFT);
-        if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, dir, sizeof(dir),
+        nk_label(ctx, "file (the extension picks the format)", NK_TEXT_LEFT);
+        if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, path, sizeof(path),
                                            nk_filter_default) & NK_EDIT_ACTIVE)
             st->ui_edit_active = true;
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        if (nk_button_label(ctx, st->exp.active ? "Stop" : "Export")) {
-            if (st->exp.active) {
-                st->exp.active = false;
-            } else {
-                st->playing = false;
-                view_export_begin(st, first, last, dir[0] ? dir : view_clip_dir(st));
-            }
+        nk_label(ctx, "codec (empty: by name)", NK_TEXT_LEFT);
+        if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, codec, sizeof(codec),
+                                           nk_filter_default) & NK_EDIT_ACTIVE)
+            st->ui_edit_active = true;
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        if (nk_button_label(ctx, "Export") && !st->exp.active) {
+            /* The current frame, and nothing but it: a range of stills is
+             * a video encode, which this is not. */
+            st->playing = false;
+            view_export_begin(st, st->index, path, codec);
         }
-        if (st->exp.active && st->exp.last >= st->exp.first) {
-            nk_size p = (nk_size)(st->exp.done * 100 /
-                                  (st->exp.last - st->exp.first + 1));
-            nk_progress(ctx, &p, 100, nk_false);
-        } else {
-            nk_label(ctx, "", NK_TEXT_LEFT);
+        {
+            int x, y, w, h;
+
+            if (view_crop_rect(st, &x, &y, &w, &h))
+                nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d cropped", w, h);
+            else
+                nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d full", w, h);
         }
 
         if (st->exp.status[0]) {
@@ -1232,6 +1351,71 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         }
         nk_tree_pop(ctx);
     }
+}
+
+/* ------------------------------------------------------- the crop shade */
+
+static void view_crop_band(struct nk_command_buffer *out, float x0, float y0,
+                           float x1, float y1, struct nk_color c)
+{
+    if (x1 > x0 && y1 > y0)
+        nk_fill_rect(out, nk_rect(x0, y0, x1 - x0, y1 - y0), 0.0f, c);
+}
+
+/* Everything outside the crop, darkened, with a thin light border on the
+ * rectangle itself. It is drawn on the nuklear canvas rather than anywhere
+ * in the render path, so the picture is not touched and no shader changes;
+ * the geometry comes from the same view transform that gives libplacebo
+ * its crop rects, which is what keeps the shade on the same source pixels
+ * at every zoom, pan and window size.
+ *
+ * The window is the picture exactly as it lands on screen, so nuklear's
+ * own clipping cuts the bands and the border at its edges, and it is built
+ * before the panel so that the panel and the menu draw on top of it. */
+static void view_crop_draw(struct nk_context *ctx, struct view_state *st)
+{
+    struct nk_command_buffer *out;
+    /* 60 % black. The overlay is composited by the renderer in linear
+     * light, so what is left outside the rectangle is 40 % of the
+     * picture's light, which comes out at about 0.64 encoded: dark enough
+     * to read as excluded without hiding what is in it. */
+    struct nk_color shade = nk_rgba(0, 0, 0, 153);
+    pl_rect2df src, dst, crop;
+
+    if (!st->crop.have || !view_crop_screen(st, &crop))
+        return;
+
+    view_zoom_rects(st, &src, &dst);
+    if (pl_rect_w(dst) < 4.0f || pl_rect_h(dst) < 4.0f)
+        return;
+
+    nk_style_push_vec2(ctx, &ctx->style.window.padding, nk_vec2(0.0f, 0.0f));
+    nk_style_push_style_item(ctx, &ctx->style.window.fixed_background,
+                             nk_style_item_color(nk_rgba(0, 0, 0, 0)));
+
+    if (nk_begin(ctx, "craw-view-crop",
+                 nk_rect(dst.x0, dst.y0, pl_rect_w(dst), pl_rect_h(dst)),
+                 NK_WINDOW_NO_SCROLLBAR | NK_WINDOW_NO_INPUT |
+                 NK_WINDOW_BACKGROUND)) {
+        out = nk_window_get_canvas(ctx);
+
+        /* Four bands that tile the picture minus the rectangle. Any of them
+         * can come out empty, and any can hang over an edge when the crop
+         * is partly scrolled off; the helper drops the first case and the
+         * window's clip takes care of the second. */
+        view_crop_band(out, dst.x0, dst.y0,  dst.x1,  crop.y0, shade);
+        view_crop_band(out, dst.x0, crop.y1, dst.x1,  dst.y1,  shade);
+        view_crop_band(out, dst.x0, crop.y0, crop.x0, crop.y1, shade);
+        view_crop_band(out, crop.x1, crop.y0, dst.x1, crop.y1, shade);
+
+        nk_stroke_rect(out, nk_rect(crop.x0, crop.y0,
+                                    pl_rect_w(crop), pl_rect_h(crop)),
+                       0.0f, 1.0f, nk_rgba(235, 235, 240, 220));
+    }
+    nk_end(ctx);
+
+    nk_style_pop_style_item(ctx);
+    nk_style_pop_vec2(ctx);
 }
 
 void view_ui_build(struct view_state *st)
@@ -1245,6 +1429,9 @@ void view_ui_build(struct view_state *st)
     st->menu.anchored = false;
     if (st->ui_rows > 0)
         st->focus = (st->focus % st->ui_rows + st->ui_rows) % st->ui_rows;
+
+    /* Before the panel, which is what puts the panel on top of it. */
+    view_crop_draw(view_nk, st);
 
     if (nk_begin(view_nk, "craw-view",
                  nk_rect((float)st->gpu.ui_w - VIEW_UI_WIDTH - VIEW_UI_MARGIN,

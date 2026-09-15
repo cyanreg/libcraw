@@ -35,9 +35,12 @@ placebo = dependency('libplacebo', version: '>=7.349', required: false)
 # Audio is optional: without libswresample craw-view plays silent and paces
 # the picture off wall time instead of the audio clock.
 swresample = dependency('libswresample', required: false)
+# The still exporter converts the rendered RGBA16 into whatever the encoder
+# the file name picks will take, which for a JPEG or an AVIF is YUV.
+swscale = dependency('libswscale', required: false)
 
 craw_tools_ffmpeg = libavformat_dep.found() and libavcodec_dep.found() and libavutil_dep.found()
-craw_tools_gui = craw_tools_ffmpeg and sdl3.found() and placebo.found()
+craw_tools_gui = craw_tools_ffmpeg and sdl3.found() and placebo.found() and swscale.found()
 
 if craw_tools_ffmpeg
     tools_args = []
@@ -104,18 +107,23 @@ if craw_tools_ffmpeg
             'gui/ui.c',
             'gui/audio.c',
             'gui/export.c',
+            'gui/still.c',
+            'gui/grain.c',
+            'gui/grain_ui.c',
             'profiles.c',
             c_args: gui_args,
             include_directories: [ craw_inc ],
             dependencies: [
                 craw_dep, vulkan_dep, sdl3, placebo,
-                libavformat_dep, libavcodec_dep, libavutil_dep,
+                libavformat_dep, libavcodec_dep, libavutil_dep, swscale,
                 cc.find_library('m', required: false),
             ] + gui_deps,
             install: true,
         )
 
+        # The film grain model's headless proof. Not installed and not a
         # test(): it needs a GPU and it writes pictures a person looks at.
+        subdir('grain')
     endif
 endif
 

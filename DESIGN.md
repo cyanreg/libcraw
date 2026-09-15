@@ -670,6 +670,47 @@ support: with coefficients small enough to stay stable it still produces an
 autocorrelation about one pixel wide (measured: all 24 coefficients at 20
 with shift 9 gives 1.1 px). libaom's photon noise tables use lag 0.
 
+**Blob size beyond a few pixels -> a reduced resolution.** AV1's luma
+template is one 82x73 array of which libplacebo uploads a 64x64 window, and
+every 32x32 block of the picture is a window into it at an offset of 0 to 30
+in each axis. At a one pixel blob that window holds thousands of independent
+blobs and no two blocks look alike. At ten it holds about thirty-six, every
+block shows nearly the same handful, and the picture visibly tiles - a
+repeated stamp rather than grain.
+
+Measured on a flat field through the shader, as the autocorrelation of the
+applied grain at lags past the 32 pixel block grid, which should be zero:
+
+| blob | rho(32) before | rho(64) before | rho(32) after | rho(64) after |
+|---|---|---|---|---|
+| 1.0 px | 0.001 | 0.000 | 0.001 | 0.000 |
+| 4.4 px | 0.042 | 0.027 | -0.025 | 0.021 |
+| 13.2 px | 0.176 | 0.111 | 0.066 | -0.012 |
+
+Note the shape of the "before" column: a flat pedestal out to a lag of 128,
+not a spike at the block period. That rules out the other candidate - block
+offsets that are not varying - and identifies the cause as every block
+sharing the template's own low frequencies. The one pixel row is the control:
+if the offsets were constant it would tile too, and it does not.
+
+So above about 2.5 px the grain is synthesised on a copy of the picture
+reduced by an integer factor - 2 or 4, chosen so the blob is at most 2.5 px
+there - and the field is upsampled bilinearly. The template then covers four
+or sixteen times the film area and the filter no longer has to strain: at
+13.2 px the model reaches 13.1, where at full resolution it saturated at
+10.7.
+
+The grain shader does not produce a grain field on its own - it samples a
+picture, works out the amplitude from what it read, and adds - so the hook
+runs three passes: reduce the picture, grain the reduced copy, then add the
+difference between the two reduced textures to the full resolution picture,
+sampled bilinearly. The amplitude the reduced pass is asked for is raised by
+a measured factor (1.20 at 1/2, 1.145 at 1/4) because upsampling low-passes
+the field; after that compensation the delivered standard deviation is within
+0.1% of the intended one at both factors. The panel's readout says which
+factor is in use, because it changes how the grain is made and not only how
+it looks.
+
 **Amplitude -> scaling function.** With `scaling_shift` 8 and
 `grain_scale_shift` 0 at 8 bits the template is the Gaussian sequence
 (sigma 512) shifted right by 4, so sigma is 32 in 8-bit units and a scaling
@@ -807,6 +848,12 @@ Amount 0 leaves a standard deviation of 0.00002, i.e. nothing.
   On the source path, where the signal is scene-linear, a steep response can
   land a sixth of a step out at the reference level. Placing the boundaries
   perceptually - which H.274 allows, they are arbitrary - would fix it.
+- **The residual correlation at a 13 px blob.** rho(32) is 0.066 after the
+  fix rather than zero. Part of that is the blob itself - a 13 px blob has
+  real correlation out to 16 px - and part is the reduced-resolution
+  template's own pedestal, which lands at four times the lag. A factor of
+  eight would push it further out at the cost of another halving of the
+  template's resolution; it has not been tried.
 - **The AV1 template's white noise floor.** The AR recursion always adds one
   unfiltered copy of the white noise on top of the smoothed part, so coarse
   grain carries a fine texture at roughly `1/gain` relative amplitude. It is

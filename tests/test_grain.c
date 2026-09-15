@@ -157,22 +157,41 @@ static void craw_test_size(void)
           "a 3x size must actually build a bigger blob: %.2f against %.2f",
           large.blob_clamped, small.blob_clamped);
 
-    /* Past the ceiling the blob stops growing but the amplitude must not
-     * run away with it. */
-    p.size = 16.0f;
+    /* The subsample factor buys reach: the model's own ceiling is about
+     * 7.7 px and the factor is capped at four, so the blob stops growing
+     * somewhere around thirty. Past that the amplitude must not run away
+     * with it. */
+    p.size = 64.0f;
     struct craw_grain_out huge, huger;
-    CHECK(craw_grain_build(&p, &huge) == 0, "size 16");
-    p.size = 32.0f;
-    CHECK(craw_grain_build(&p, &huger) == 0, "size 32");
-    /* The reported figure is the CPU field simulation's, which runs high
-     * past about six pixels; grain_preview measures 7.7 px on the GPU where
-     * this says 10.7. What matters is that it stops. */
-    CHECK(huge.blob_clamped < 12.0f,
-          "the AV1 model must have a ceiling, got %.2f", huge.blob_clamped);
-    CHECK_NEAR(huger.blob_clamped, huge.blob_clamped, 0.01,
-               "past the ceiling, asking for more must change nothing");
-    CHECK_NEAR(huge.sigma_built, huge.sigma_signal,
-               0.06 * huge.sigma_signal, "amplitude past the size ceiling");
+    CHECK(craw_grain_build(&p, &huge) == 0, "size 64");
+    p.size = 128.0f;
+    CHECK(craw_grain_build(&p, &huger) == 0, "size 128");
+    CHECK(huge.subsample == 4 && huger.subsample == 4,
+          "a blob that big has to be made at a quarter resolution: %d, %d",
+          huge.subsample, huger.subsample);
+    CHECK(huge.blob_clamped < 50.0f,
+          "the model must have a ceiling, got %.2f", huge.blob_clamped);
+    CHECK_NEAR(huger.blob_clamped, huge.blob_clamped, 2.0,
+               "past the ceiling, asking for twice as much changes little");
+    /* The amplitude is checked at the top of the range a real gauge can
+     * ask for - Regular 8 at one to one on a 5760 wide source wants about
+     * 16 px - rather than at the absurd sizes above, where the filter is at
+     * its strongest and the seed-to-seed spread of a 64x64 template holding
+     * a handful of blobs is widest. */
+    p.size = 16.0f;
+    struct craw_grain_out coarse;
+    CHECK(craw_grain_build(&p, &coarse) == 0, "size 16");
+    CHECK_NEAR(coarse.sigma_built, coarse.sigma_signal,
+               0.06 * coarse.sigma_signal, "amplitude at a 16 px blob");
+
+    /* And the factor has to be chosen, not constant. */
+    p.size = 1.0f;
+    struct craw_grain_out fine;
+    CHECK(craw_grain_build(&p, &fine) == 0, "size 1");
+    CHECK(fine.subsample == 1,
+          "a one pixel blob needs no subsampling, got 1/%d", fine.subsample);
+    CHECK(fine.upsample_gain == 1.0f,
+          "and so no upsample compensation, got %.3f", fine.upsample_gain);
 }
 
 /* A smaller gauge is magnified more, so its grain must come out bigger at

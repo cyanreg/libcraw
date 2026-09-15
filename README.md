@@ -87,6 +87,41 @@ Fujifilm simulations) and Looks (warm, cool, vintage, cinematic and so on).
 compact pack that ends up in the executable is built by
 `tools/luts_build.py` at build time.
 
+The panel's "Film grain" section emulates film grain through libplacebo's
+AV1 grain synthesis, applied after scaling and colour management so that
+what is graded is what is on screen, at the size it is on screen. It is
+driven by gauge and stock rather than by codec parameters: a gauge sets how
+much the frame is magnified and so how coarse the grain looks, a stock sets
+how much of it there is, and a response says how it varies with exposure.
+`--grain GAUGE[,STOCK][:AMOUNT]` sets it from the command line, as in
+`--grain super8,500t:0.8`. It is off until it is turned on, and it has
+nothing to do with the film simulation LUTs: the two are independent, and
+neither ever changes the other. The grain's seed comes from the frame
+number, so a frame exported twice with the same settings is the same file
+twice. DESIGN.md section 13 has the derivation, the published granularity
+figures behind the stocks, and which of them are estimates.
+
+The picture can be cropped for the export. `c` turns crop mode on, a left
+drag over the picture then draws the rectangle instead of panning, and
+everything outside it is shaded with a thin border around what is kept; the
+panel's crop row reports the region and clears it. The rectangle is held in
+source pixels with even edges, so zoom, pan and a resized window leave it
+where it is, and the export writes exactly that region at source
+resolution. `--crop WxH+X+Y` sets the same rectangle from the command line.
+
+`--export FRAME OUT` writes one frame to one file and exits without opening
+a window; the Export panel does the same for the frame on screen. The file
+name picks the format through libavformat, which knows both the muxer and
+the codec an extension implies: `.png` and `.tif` take the sixteen bit RGB
+the frame is rendered as, `.jpg`, `.webp` and `.avif` whatever their encoder
+supports, deepest first, through libswscale where that is not RGB;
+`--codec` overrides the encoder and `--enc KEY=VALUE,...` passes it options
+(`cpu-used=8,threads=2` for an AVIF). PNG is written at zlib level 1 (a
+fifth of the time of the default level for a per cent of the size) and
+TIFF uncompressed. The stream is tagged as what the export really is: full
+range, BT.709 primaries, sRGB transfer, display referred. A sequence of
+stills is deliberately not offered — that is a video encode.
+
 ## Layout
 
     include/craw/   public headers

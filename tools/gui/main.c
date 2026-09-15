@@ -2,7 +2,7 @@
 
 /* craw-view: open a camera raw clip, decode it on the GPU, run every frame
  * through libcraw on the same device and show the result through
- * libplacebo, with a nuklear panel for the grade and a PNG exporter.
+ * libplacebo, with a nuklear panel for the grade and a still exporter.
  *
  * craw-process is the batch tool and the reference for the profile,
  * exposure and white balance semantics; this is the interactive one. The
@@ -10,6 +10,7 @@
 
 #include <getopt.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -22,6 +23,7 @@
 #include <libavutil/time.h>
 
 #include "view.h"
+#include "grain_ui.h"
 #include "../profiles.h"
 
 /* The embedded film simulation collection is optional; without it --lut
@@ -637,6 +639,143 @@ void view_pan_pixels(struct view_state *st, int dx, int dy)
     st->view.cy = src.y0 + pl_rect_h(src) * 0.5f - (float)dy / z;
 }
 
+/* ------------------------------------------------------------- the crop */
+
+/* Window pixels to source pixels, through the same two rectangles the
+ * renderer is handed, so that the rubber band lands on the pixels it is
+ * drawn over at any zoom and pan. */
+static void view_source_pos(const struct view_state *st, int px, int py,
+                            float *sx, float *sy)
+{
+    pl_rect2df src, dst;
+    float dw, dh;
+
+    view_zoom_rects(st, &src, &dst);
+    dw = pl_rect_w(dst);
+    dh = pl_rect_h(dst);
+
+    *sx = src.x0 + ((float)px - dst.x0) * (dw > 0.0f ? pl_rect_w(src) / dw : 0.0f);
+    *sy = src.y0 + ((float)py - dst.y0) * (dh > 0.0f ? pl_rect_h(src) / dh : 0.0f);
+}
+
+/* A source coordinate snapped to an even pixel inside the frame: half a
+ * Bayer quad is not a thing to crop to, and every encoder that subsamples
+ * chroma wants an even offset and an even size. */
+static int view_crop_snap(float v, int max)
+{
+    int i = (int)lrintf(v * 0.5f) * 2;
+
+    return CRAW_CLAMP(i, 0, max & ~1);
+}
+
+void view_crop_begin(struct view_state *st, int px, int py)
+{
+    st->crop.dragging = true;
+    view_source_pos(st, px, py, &st->crop.ax, &st->crop.ay);
+}
+
+void view_crop_drag(struct view_state *st, int px, int py)
+{
+    struct view_crop *c = &st->crop;
+    float bx, by;
+    int x0, y0, x1, y1;
+
+    if (!c->dragging || !st->gpu.width || !st->gpu.height)
+        return;
+
+    view_source_pos(st, px, py, &bx, &by);
+
+    x0 = view_crop_snap(CRAW_MIN(c->ax, bx), (int)st->gpu.width);
+    y0 = view_crop_snap(CRAW_MIN(c->ay, by), (int)st->gpu.height);
+    x1 = view_crop_snap(CRAW_MAX(c->ax, bx), (int)st->gpu.width);
+    y1 = view_crop_snap(CRAW_MAX(c->ay, by), (int)st->gpu.height);
+
+    /* The rectangle is replaced only once the pointer has really moved, so
+     * that a stray click keeps the one that is already there. */
+    if (x1 == x0 && y1 == y0)
+        return;
+
+    c->x0 = x0;
+    c->y0 = y0;
+    c->x1 = x1;
+    c->y1 = y1;
+    c->have = true;
+}
+
+void view_crop_end(struct view_state *st)
+{
+    struct view_crop *c = &st->crop;
+
+    c->dragging = false;
+    /* A rectangle too small to hold a pixel pair is a mis-click, not a
+     * crop. */
+    if (c->have && (c->x1 - c->x0 < 2 || c->y1 - c->y0 < 2))
+        c->have = false;
+}
+
+void view_crop_clear(struct view_state *st)
+{
+    st->crop.have = false;
+    st->crop.dragging = false;
+}
+
+bool view_crop_rect(const struct view_state *st, int *x, int *y, int *w, int *h)
+{
+    const struct view_crop *c = &st->crop;
+    int sw = (int)st->gpu.width, sh = (int)st->gpu.height;
+    bool have = c->have;
+    int x0 = 0, y0 = 0, x1 = sw, y1 = sh;
+
+    if (have) {
+        /* The command line sets a rectangle before the clip's size is
+         * known, so this is where it meets it. */
+        x0 = CRAW_CLAMP(c->x0, 0, sw);
+        y0 = CRAW_CLAMP(c->y0, 0, sh);
+        x1 = CRAW_CLAMP(c->x1, x0, sw);
+        y1 = CRAW_CLAMP(c->y1, y0, sh);
+
+        if (x1 - x0 < 2 || y1 - y0 < 2) {
+            x0 = y0 = 0;
+            x1 = sw;
+            y1 = sh;
+            have = false;
+        }
+    }
+
+    *x = x0;
+    *y = y0;
+    *w = x1 - x0;
+    *h = y1 - y0;
+
+    return have;
+}
+
+bool view_crop_screen(const struct view_state *st, pl_rect2df *out)
+{
+    pl_rect2df src, dst;
+    float zx, zy;
+    int x, y, w, h;
+
+    if (!st->crop.have || !view_crop_rect(st, &x, &y, &w, &h))
+        return false;
+
+    view_zoom_rects(st, &src, &dst);
+    if (!(pl_rect_w(src) > 0.0f) || !(pl_rect_h(src) > 0.0f))
+        return false;
+
+    zx = pl_rect_w(dst) / pl_rect_w(src);
+    zy = pl_rect_h(dst) / pl_rect_h(src);
+
+    *out = (pl_rect2df) {
+        dst.x0 + ((float)x - src.x0) * zx,
+        dst.y0 + ((float)y - src.y0) * zy,
+        dst.x0 + ((float)(x + w) - src.x0) * zx,
+        dst.y0 + ((float)(y + h) - src.y0) * zy,
+    };
+
+    return true;
+}
+
 /* ------------------------------------------------------------- one frame */
 
 static int view_awb_step(struct view_state *st)
@@ -936,6 +1075,29 @@ static int view_parse_wb(struct view_look *lk, const char *arg)
     return 0;
 }
 
+/* WxH+X+Y, the way every tool that takes a geometry spells it. The size
+ * against the clip is checked later, when the clip's own size is known. */
+static int view_parse_crop(struct view_crop *c, const char *arg)
+{
+    int w, h, x, y, n = 0;
+
+    if (sscanf(arg, "%dx%d+%d+%d%n", &w, &h, &x, &y, &n) != 4 || arg[n] ||
+        w <= 0 || h <= 0 || x < 0 || y < 0) {
+        fprintf(stderr, "--crop: expected WxH+X+Y, got `%s`\n", arg);
+        return CRAW_ERROR(EINVAL);
+    }
+
+    /* The same even edges the pointer draws, so that a rectangle read off
+     * the panel and handed back on the command line is the same one. */
+    c->x0 = view_crop_snap((float)x, INT_MAX);
+    c->y0 = view_crop_snap((float)y, INT_MAX);
+    c->x1 = view_crop_snap((float)(x + w), INT_MAX);
+    c->y1 = view_crop_snap((float)(y + h), INT_MAX);
+    c->have = true;
+
+    return 0;
+}
+
 static void view_usage(FILE *f)
 {
     fprintf(f,
@@ -978,15 +1140,30 @@ static void view_usage(FILE *f)
 "                      BT.709 display.\n"
 "  --no-peak-detect    tone map against the profile's sensor clip instead of\n"
 "                      the peak libplacebo measures per frame\n"
+"  --grain GAUGE[,STOCK][:AMOUNT]\n"
+"                      film grain, e.g. super8, 16mm,500t or super35,50d:0.6.\n"
+"                      Gauges: regular8, super8, 16mm, super16, 2perf, 3perf,\n"
+"                      academy, super35, 65mm, imax. Stocks: fine, medium,\n"
+"                      coarse, 50d, 200t, 250d, 500t, doublex, trix,\n"
+"                      ektachrome, portra400. The panel has the rest\n"
 "  --zoom SCALE        start at fit, or at SCALE screen pixels per source\n"
 "                      pixel (1 is one to one)\n"
 "  --profile NAME      use a built-in per-CCT table set (%s)\n"
 "  --tables FILE       load the per-CCT tables from a text file\n"
 "\n"
-"  --export START END DIR\n"
-"                      write craw-view-%%05d.png for frames START to END\n"
-"                      into DIR and exit, without opening a window. The\n"
-"                      PNGs hold the displayed look, sRGB encoded.\n"
+"  --export FRAME OUT  write frame FRAME to the file OUT and exit, without\n"
+"                      opening a window. The name picks the format through\n"
+"                      libavformat: .png and .tif hold sixteen bits, .jpg,\n"
+"                      .webp and .avif whatever their encoder takes. The\n"
+"                      file holds the displayed look, sRGB encoded.\n"
+"  --codec NAME        encode the still with this encoder rather than the\n"
+"                      one the file name implies\n"
+"  --enc KEY=VALUE[,...]\n"
+"                      options for that encoder, e.g. cpu-used=8,threads=2\n"
+"                      for an AVIF or qmin=1 for a JPEG\n"
+"  --crop WxH+X+Y      export only that region of the source, in source\n"
+"                      pixels, with the edges snapped to even ones. The\n"
+"                      viewer shades everything outside it.\n"
 "\n"
 "Audio is the master clock. The clip's PCM track plays through SDL3 with\n"
 "5 ms fades at every boundary; a silent clip falls back to wall time.\n"
@@ -996,8 +1173,9 @@ static void view_usage(FILE *f)
 "and out; shift with page up/down goes to the first and last frame; control\n"
 "with the arrows pans; tab or 0 fits the picture again, 1 is one to one;\n"
 "enter opens the film simulation menu on its row and escape closes it;\n"
-"the wheel zooms about the pointer and dragging pans; m mutes; q, or escape\n"
-"with no menu open, quits.\n",
+"the wheel zooms about the pointer and dragging pans; c turns crop mode on\n"
+"and off, where a left drag draws the rectangle the export is cut to;\n"
+"m mutes; q, or escape with no menu open, quits.\n",
     craw_tool_profile_builtin_list());
 }
 
@@ -1017,6 +1195,9 @@ enum {
     VIEW_OPT_PROFILE,
     VIEW_OPT_TABLES,
     VIEW_OPT_EXPORT,
+    VIEW_OPT_CODEC,
+    VIEW_OPT_ENC,
+    VIEW_OPT_CROP,
     VIEW_OPT_LOOPS,
     VIEW_OPT_NO_LOOP,
     VIEW_OPT_AUDIO_DUMP,
@@ -1024,6 +1205,7 @@ enum {
     VIEW_OPT_NO_PEAK,
     VIEW_OPT_ZOOM,
     VIEW_OPT_LIST_LUTS,
+    VIEW_OPT_GRAIN,
 };
 
 static int view_parse_args(struct view_state *st, int argc, char **argv,
@@ -1046,12 +1228,16 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "profile",  required_argument, NULL, VIEW_OPT_PROFILE   },
         { "tables",   required_argument, NULL, VIEW_OPT_TABLES    },
         { "export",   required_argument, NULL, VIEW_OPT_EXPORT    },
+        { "codec",    required_argument, NULL, VIEW_OPT_CODEC     },
+        { "enc",      required_argument, NULL, VIEW_OPT_ENC       },
+        { "crop",     required_argument, NULL, VIEW_OPT_CROP      },
         { "loops",    required_argument, NULL, VIEW_OPT_LOOPS     },
         { "no-loop",  no_argument,       NULL, VIEW_OPT_NO_LOOP   },
         { "audio-dump", required_argument, NULL, VIEW_OPT_AUDIO_DUMP },
         { "audio-map", required_argument,  NULL, VIEW_OPT_AUDIO_MAP },
         { "no-peak-detect", no_argument,   NULL, VIEW_OPT_NO_PEAK   },
         { "zoom",     required_argument, NULL, VIEW_OPT_ZOOM      },
+        { "grain",    required_argument, NULL, VIEW_OPT_GRAIN     },
         { "help",     no_argument,       NULL, 'h'                },
         { NULL,       0,                 NULL, 0                  },
     };
@@ -1109,6 +1295,10 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         case VIEW_OPT_NO_PEAK:
             st->look.peak_detect = false;
             st->look.peak_detect_flag = 0;
+            break;
+        case VIEW_OPT_GRAIN:
+            if ((ret = view_grain_parse(&st->grain, optarg)) < 0)
+                return ret;
             break;
         case VIEW_OPT_WB:
             if ((ret = view_parse_wb(&st->look, optarg)) < 0)
@@ -1171,27 +1361,31 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             break;
 
         case VIEW_OPT_EXPORT:
-            /* Three arguments, which getopt cannot express: the first is the
-             * option's own, the other two are taken from the tail. */
-            if (optind + 1 >= argc) {
-                fprintf(stderr, "--export takes START END DIR\n");
+            /* Two arguments, which getopt cannot express: the first is the
+             * option's own, the file name is taken from the tail. */
+            if (optind >= argc) {
+                fprintf(stderr, "--export takes FRAME OUT\n");
                 return CRAW_ERROR(EINVAL);
             }
-            st->cfg.export_start = strtoll(optarg, &end, 10);
-            if (end == optarg || *end || st->cfg.export_start < 0) {
+            st->cfg.export_frame = strtoll(optarg, &end, 10);
+            if (end == optarg || *end || st->cfg.export_frame < 0) {
                 fprintf(stderr, "--export: `%s` is not a frame number\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
-            st->cfg.export_end = strtoll(argv[optind], &end, 10);
-            if (end == argv[optind] || *end || st->cfg.export_end < st->cfg.export_start) {
-                fprintf(stderr, "--export: `%s` is not a frame number at or after "
-                                "%" PRId64 "\n", argv[optind], st->cfg.export_start);
-                return CRAW_ERROR(EINVAL);
-            }
-            snprintf(st->cfg.export_dir, sizeof(st->cfg.export_dir), "%s",
-                     argv[optind + 1]);
-            optind += 2;
+            snprintf(st->cfg.export_path, sizeof(st->cfg.export_path), "%s",
+                     argv[optind]);
+            optind += 1;
             st->cfg.headless = true;
+            break;
+        case VIEW_OPT_CODEC:
+            st->cfg.export_codec = optarg;
+            break;
+        case VIEW_OPT_ENC:
+            st->cfg.export_enc = optarg;
+            break;
+        case VIEW_OPT_CROP:
+            if ((ret = view_parse_crop(&st->crop, optarg)) < 0)
+                return ret;
             break;
 
         default:
@@ -1320,8 +1514,8 @@ static void view_seek_by(struct view_state *st, int64_t frames)
  * they land on; Shift with Left or Right seeks a second; Page Up and Page
  * Down zoom and Shift with them goes to the ends of the clip; Control with
  * the arrows pans, which only does anything while the picture is larger
- * than its area. A key that toggles or seeks acts once per press, the ones
- * that step act on every repeat. */
+ * than its area; c turns crop mode on and off. A key that toggles or seeks
+ * acts once per press, the ones that step act on every repeat. */
 static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *running)
 {
     bool shift = (e->key.mod & SDL_KMOD_SHIFT) != 0;
@@ -1427,6 +1621,15 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
     case SDLK_1:
         if (!repeat)
             view_zoom_reset(st, true);
+        break;
+
+    case SDLK_C:
+        /* Crop mode: a left drag draws the rectangle instead of panning.
+         * The rectangle itself outlives the mode. */
+        if (!repeat) {
+            st->crop.on = !st->crop.on;
+            st->crop.on_flag = st->crop.on;
+        }
         break;
 
     case SDLK_M:
@@ -1562,22 +1765,50 @@ static int view_run_window(struct view_state *st)
                 break;
 
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                /* A click anywhere outside the open film simulation menu
+                 * dismisses it and goes no further: that first click is
+                 * the dismissal, not a pan, a crop or a panel widget. The
+                 * columns themselves, and the row that toggles them, are
+                 * left to nuklear. */
+                if (e.button.button == SDL_BUTTON_LEFT && st->menu.open &&
+                    !view_ui_menu_covers(st, e.button.x, e.button.y)) {
+                    view_ui_menu_close(st);
+                    to_nuklear = false;
+                    break;
+                }
                 if (e.button.button == SDL_BUTTON_LEFT &&
                     view_over_picture(st, e.button.x, e.button.y)) {
-                    st->view.dragging = true;
-                    st->view.drag_x = e.button.x;
-                    st->view.drag_y = e.button.y;
+                    /* In crop mode the drag draws a rectangle; otherwise it
+                     * pans, which is what it has always done. */
+                    if (st->crop.on) {
+                        int px, py;
+
+                        view_mouse_pos(st, e.button.x, e.button.y, &px, &py);
+                        view_crop_begin(st, px, py);
+                    } else {
+                        st->view.dragging = true;
+                        st->view.drag_x = e.button.x;
+                        st->view.drag_y = e.button.y;
+                    }
                     to_nuklear = false;
                 }
                 break;
             case SDL_EVENT_MOUSE_BUTTON_UP:
-                if (e.button.button == SDL_BUTTON_LEFT && st->view.dragging) {
+                if (e.button.button == SDL_BUTTON_LEFT &&
+                    (st->view.dragging || st->crop.dragging)) {
                     st->view.dragging = false;
+                    view_crop_end(st);
                     to_nuklear = false;
                 }
                 break;
             case SDL_EVENT_MOUSE_MOTION:
-                if (st->view.dragging) {
+                if (st->crop.dragging) {
+                    int px, py;
+
+                    view_mouse_pos(st, e.motion.x, e.motion.y, &px, &py);
+                    view_crop_drag(st, px, py);
+                    to_nuklear = false;
+                } else if (st->view.dragging) {
                     int ax, ay, bx, by;
 
                     view_mouse_pos(st, st->view.drag_x, st->view.drag_y, &ax, &ay);
@@ -1824,6 +2055,8 @@ static void view_close(struct view_state *st)
     view_ui_close(st);
     view_audio_close(&st->audio);
     view_decoder_close(&st->dec);
+    /* The grain hooks hold shader objects, so they go before the pl_gpu. */
+    view_grain_close(&st->grain);
     view_gpu_close(&st->gpu);
 
     if (st->win)
@@ -1832,17 +2065,31 @@ static void view_close(struct view_state *st)
         SDL_Quit();
 }
 
+/* Where a headless export's wall time goes, for -v: the device and the
+ * decoder are paid for once whatever is exported, the rest is the frame. */
+static int64_t view_phase(const struct view_state *st, int64_t t0, const char *what)
+{
+    int64_t now = av_gettime_relative();
+
+    view_log(st, "%s: %.0f ms\n", what, (double)(now - t0) / 1000.0);
+
+    return now;
+}
+
 static int view_run_headless(struct view_state *st)
 {
+    int64_t t0 = av_gettime_relative();
     int ret;
 
     ret = view_gpu_open(&st->gpu, &st->cfg, NULL);
     if (ret < 0)
         return ret;
+    t0 = view_phase(st, t0, "device and pipeline");
 
     ret = view_decoder_open(&st->dec, st->cfg.input, &st->gpu, st->cfg.verbose);
     if (ret < 0)
         return ret;
+    t0 = view_phase(st, t0, "decoder");
 
     ret = view_profile_setup(st, st->cfg.profile, st->cfg.tables);
     if (ret < 0)
@@ -1853,9 +2100,10 @@ static int view_run_headless(struct view_state *st)
         fprintf(stderr, "--lut %s: %s\n", st->look.lut_path, st->lut_error);
         return ret;
     }
+    t0 = view_phase(st, t0, "profile and LUT");
 
-    view_export_begin(st, st->cfg.export_start, st->cfg.export_end,
-                      st->cfg.export_dir);
+    view_export_begin(st, st->cfg.export_frame, st->cfg.export_path,
+                      st->cfg.export_codec);
 
     while (st->exp.active) {
         ret = view_export_step(st);
@@ -1863,6 +2111,7 @@ static int view_run_headless(struct view_state *st)
             return ret;
     }
 
+    view_phase(st, t0, "seek, decode, render and encode");
     fprintf(stderr, "%s\n", st->exp.status);
 
     return 0;
@@ -1894,6 +2143,9 @@ int main(int argc, char **argv)
     st.cfg.loop = true;
     st.view.fit = true;
     st.volume = 1.0f;
+    /* Before the arguments, so that --grain overrides the defaults. */
+    view_grain_defaults(&st.grain);
+
 #if CRAW_VIEW_HAVE_LUTS
     /* Reads the pack's tables, which is all pointer arithmetic over the
      * embedded array; nothing is decompressed until a rendering is picked.

@@ -922,6 +922,88 @@ static void debug_av1(struct ctx *c, int width, int height, float level)
     pl_shader_obj_destroy(&raw_state);
 }
 
+
+/* Autocorrelation of the rendered grain along both axes, out past the 32
+ * pixel block grid and the 64 pixel template period. A peak at 32 or 64
+ * means the block offsets are not doing their job, or that the template is
+ * too small for the blob being asked for and every block is showing the
+ * same few blobs. */
+static void acf_report(struct ctx *c, int width, int height, const uint16_t *plain)
+{
+    static const struct { const char *name; int gauge; float size; } cases[] = {
+        { "Super 35, size 1 (blob 1.0 px)", CRAW_GRAIN_GAUGE_SUPER35, 1.0f },
+        { "Super 8,  size 1 (blob 4.4 px)", CRAW_GRAIN_GAUGE_SUPER8,  1.0f },
+        { "Super 8,  size 3 (blob 13 px)",  CRAW_GRAIN_GAUGE_SUPER8,  3.0f },
+    };
+
+    printf("\n=== autocorrelation of the applied grain ===\n");
+    for (size_t k = 0; k < sizeof(cases) / sizeof(*cases); k++) {
+        struct craw_grain_params p = craw_grain_default_params();
+        struct craw_grain_out o;
+        int x0, y0, x1, y1;
+
+        p.gauge = cases[k].gauge;
+        p.stock = CRAW_GRAIN_STOCK_V3_500T;
+        p.response = CRAW_GRAIN_RESPONSE_FLAT;
+        p.size = cases[k].size;
+        p.width = width;
+        p.height = height;
+        p.seed = 0x1234;
+        if (render(c, &p, &o, false) < 0)
+            return;
+        patch_rect(1, width, height, &x0, &y0, &x1, &y1);
+
+        /* Work on the grain alone, not the picture plus grain. */
+        const int w = x1 - x0, h = y1 - y0;
+        double *g = malloc((size_t)w * h * sizeof(double));
+        double m = 0, v = 0;
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                size_t i = ((size_t)(y0 + y) * width + x0 + x) * 4 + 1;
+                g[(size_t)y * w + x] = (c->out[i] - (double)plain[i]) / 65535.0;
+            }
+        for (size_t i = 0; i < (size_t)w * h; i++)
+            m += g[i];
+        m /= (double)w * h;
+        for (size_t i = 0; i < (size_t)w * h; i++)
+            v += (g[i] - m) * (g[i] - m);
+        v /= (double)w * h;
+
+        float want = craw_grain_sigma_at(&o, 0.5f);
+        printf("%-32s asked %.1f px, built %.1f px at 1/%d, sd %.5f "
+               "(want %.5f, ratio %.3f)\n",
+               cases[k].name, o.blob_px, o.blob_clamped,
+               o.subsample, sqrt(v), want, sqrt(v) / want);
+        printf("   lag:");
+        static const int lags[] = { 1, 2, 4, 8, 16, 24, 30, 31, 32, 33, 34,
+                                    40, 48, 62, 63, 64, 65, 66, 96, 128 };
+        for (size_t l = 0; l < sizeof(lags) / sizeof(*lags); l++)
+            printf("%7d", lags[l]);
+        printf("\n   rho x:");
+        for (size_t l = 0; l < sizeof(lags) / sizeof(*lags); l++) {
+            int d = lags[l];
+            double a = 0; long n = 0;
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x + d < w; x++) {
+                    a += (g[(size_t)y*w+x] - m) * (g[(size_t)y*w+x+d] - m); n++;
+                }
+            printf("%7.3f", n ? a / n / v : 0.0);
+        }
+        printf("\n   rho y:");
+        for (size_t l = 0; l < sizeof(lags) / sizeof(*lags); l++) {
+            int d = lags[l];
+            double a = 0; long n = 0;
+            for (int y = 0; y + d < h; y++)
+                for (int x = 0; x < w; x++) {
+                    a += (g[(size_t)y*w+x] - m) * (g[(size_t)(y+d)*w+x] - m); n++;
+                }
+            printf("%7.3f", n ? a / n / v : 0.0);
+        }
+        printf("\n");
+        free(g);
+    }
+}
+
 /* ---------------------------------------------------------------- main */
 
 static const char *outdir = ".";
@@ -1096,6 +1178,9 @@ int main(int argc, char **argv)
 
     if (debug)
         debug_av1(&c, width, height, (float)ref[1].mean[1]);
+
+    if (want(only, "acf"))
+        acf_report(&c, width, height, plain);
 
     const int cell = 256;
 

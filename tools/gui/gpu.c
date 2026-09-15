@@ -32,6 +32,7 @@
 #include <libplacebo/utils/libav.h>
 
 #include "view.h"
+#include "grain_ui.h"
 
 /* BT.2408 diffuse white; a pipeline value of 1.0 is diffuse white, so the
  * sensor clip lands at this times the profile gain. */
@@ -1183,7 +1184,7 @@ static void view_render_params(struct view_state *st,
                                struct pl_color_map_params *cmp,
                                struct pl_peak_detect_params *pdp,
                                struct pl_color_adjustment *adj,
-                               const struct pl_hook **hook)
+                               const struct pl_hook **hook, bool export_path)
 {
     *cmp = pl_color_map_default_params;
     cmp->tone_mapping_function = view_tone_map(st->look.tone_map);
@@ -1221,13 +1222,31 @@ static void view_render_params(struct view_state *st,
     /* Only the non-raw path needs a shader for exposure; on the raw path
      * libcraw has already applied it, and the scRGB scale below would be
      * the wrong place for it anyway. */
-    *hook = NULL;
+    hook[0] = hook[1] = NULL;
+    int nb_hooks = 0;
     if (!st->dec.raw) {
-        *hook = view_exposure_hook(&st->gpu, view_video_exposure(st));
-        if (*hook) {
-            rp->hooks = hook;
-            rp->num_hooks = 1;
-        }
+        const struct pl_hook *h = view_exposure_hook(&st->gpu,
+                                                     view_video_exposure(st));
+        if (h)
+            hook[nb_hooks++] = h;
+    }
+
+    /* Film grain runs at PL_HOOK_PRE_OUTPUT, so it lands on the picture
+     * after scaling and colour management: what the grain is applied to is
+     * what is on screen, at the size it is on screen. That is also why the
+     * two hooks can share one array without caring about the order - they
+     * hook different stages. The export path gets its own shader state and
+     * its own frame-index seed, so exporting a range twice gives the same
+     * files. */
+    {
+        const struct pl_hook *h = view_grain_hook(st, export_path);
+        if (h)
+            hook[nb_hooks++] = h;
+    }
+
+    if (nb_hooks) {
+        rp->hooks = hook;
+        rp->num_hooks = nb_hooks;
     }
 }
 
@@ -1250,7 +1269,7 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
     struct pl_peak_detect_params pdp;
     struct pl_color_adjustment adj;
     struct pl_hdr_metadata measured;
-    const struct pl_hook *hook;
+    const struct pl_hook *hook[2];
     struct pl_frame image, target;
     struct pl_overlay overlay;
     struct pl_overlay_part part;
@@ -1259,7 +1278,7 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
         return CRAW_ERROR(EAGAIN);
 
     pl_frame_from_swapchain(&target, &sw_frame);
-    view_render_params(st, &rp, &cmp, &pdp, &adj, &hook);
+    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, false);
 
     /* The film simulation is applied to the encoded output, which for an
      * SDR window is the sRGB these CLUTs were built for. */
@@ -1344,11 +1363,16 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
     struct pl_color_map_params cmp;
     struct pl_peak_detect_params pdp;
     struct pl_color_adjustment adj;
-    const struct pl_hook *hook;
+    const struct pl_hook *hook[2];
     struct pl_frame image, target;
     pl_fmt fmt;
+    int cx, cy, cw, ch;
 
-    if (!g->export_tex || g->export_w != (int)g->width || g->export_h != (int)g->height) {
+    /* The target is the crop, or the whole frame when there is none: the
+     * export writes source pixels, never a rescale of them. */
+    view_crop_rect(st, &cx, &cy, &cw, &ch);
+
+    if (!g->export_tex || g->export_w != cw || g->export_h != ch) {
         pl_tex_destroy(g->gpu, &g->export_tex);
 
         fmt = pl_find_named_fmt(g->gpu, "rgba16");
@@ -1359,8 +1383,8 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
         }
 
         g->export_tex = pl_tex_create(g->gpu, pl_tex_params(
-            .w             = (int)g->width,
-            .h             = (int)g->height,
+            .w             = cw,
+            .h             = ch,
             .format        = fmt,
             .renderable    = true,
             .storable      = !!(fmt->caps & PL_FMT_CAP_STORABLE),
@@ -1368,21 +1392,27 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
             .host_readable = true,
         ));
         if (!g->export_tex) {
-            fprintf(stderr, "cannot create the %ux%u export texture\n", g->width, g->height);
+            fprintf(stderr, "cannot create the %dx%d export texture\n", cw, ch);
             return CRAW_ERROR(ENOMEM);
         }
-        g->export_w = (int)g->width;
-        g->export_h = (int)g->height;
+        g->export_w = cw;
+        g->export_h = ch;
     }
 
     if (st->dec.raw)
         view_gpu_image(g, &image, view_peak_ceiling(st));
     else
         image = g->mapped;
-    view_render_params(st, &rp, &cmp, &pdp, &adj, &hook);
+    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, true);
 
-    /* Display referred on purpose: what the PNG holds is the look on screen,
-     * sRGB encoded, not the scene-linear numbers. */
+    /* The crop is nothing but this rectangle, the same way zoom and pan are
+     * nothing but the pair of them on the display path. */
+    image.crop = (pl_rect2df) {
+        (float)cx, (float)cy, (float)(cx + cw), (float)(cy + ch),
+    };
+
+    /* Display referred on purpose: what the file holds is the look on
+     * screen, sRGB encoded, not the scene-linear numbers. */
     target = (struct pl_frame) {
         .num_planes = 1,
         .planes[0] = {
@@ -1397,7 +1427,7 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
             .bits   = { .sample_depth = 16, .color_depth = 16 },
         },
         .color = pl_color_space_srgb,
-        .crop  = { 0, 0, (float)g->width, (float)g->height },
+        .crop  = { 0, 0, (float)cw, (float)ch },
     };
 
     /* Same place as on screen: the film simulation goes on the sRGB
@@ -1408,8 +1438,8 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
     }
 
     /* The export has its own renderer so that the peak detection track it
-     * walks through depends only on the exported frames: the same range
-     * exported twice then gives the same files. */
+     * walks through depends only on the exported frames: the same frame
+     * exported twice then gives the same file. */
     if (!pl_render_image(g->rr_export, &image, &target, &rp)) {
         fprintf(stderr, "pl_render_image failed while exporting\n");
         return CRAW_ERROR(EIO);

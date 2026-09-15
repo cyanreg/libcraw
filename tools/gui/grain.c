@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <libplacebo/dispatch.h>
+#include <libplacebo/shaders/sampling.h>
 
 #include "grain.h"
 
@@ -1198,8 +1199,12 @@ static int build_h274(const struct craw_grain_params *p,
                       struct craw_grain_out *out, float sigma, float blob)
 {
     struct pl_h274_grain_data *d = &out->data.params.h274;
-    static uint8_t lower[3][H274_INTERVALS], upper[3][H274_INTERVALS];
-    static int16_t values[3][H274_INTERVALS][6];
+    /* In `out`, not function statics: the caller may hold several results
+     * at once - the viewer keeps one per renderer - and statics would make
+     * every one of them point at the last build's numbers. */
+    uint8_t (*lower)[H274_INTERVALS] = out->h274_lo;
+    uint8_t (*upper)[H274_INTERVALS] = out->h274_hi;
+    int16_t (*values)[H274_INTERVALS][6] = out->h274_val;
 
     const int idx = h274_index_for(blob);
     out->blob_clamped = h274_cal[idx].fwhm;
@@ -1327,6 +1332,25 @@ static int build_h274(const struct craw_grain_params *p,
     return 0;
 }
 
+/* How much of a grain field's standard deviation survives being generated
+ * at 1/f resolution and bilinearly upsampled, inverted so it can be applied
+ * as a gain. Bilinear interpolation is a triangle filter: the interpolated
+ * samples between two texels are averages, so the field comes out quieter
+ * than it went in, by more the larger the factor.
+ *
+ * These are measurements, taken with `grain_preview --only subsample`
+ * against libplacebo's own sampler, not the textbook figure - the grain at
+ * the reduced resolution is correlated rather than white, which is exactly
+ * the regime where the textbook figure does not apply. */
+static float grain_upsample_gain(int f)
+{
+    switch (f) {
+    case 2:  return 1.20f;
+    case 4:  return 1.145f;
+    default: return 1.0f;
+    }
+}
+
 int craw_grain_build(const struct craw_grain_params *p,
                      struct craw_grain_out *out)
 {
@@ -1355,6 +1379,9 @@ int craw_grain_build(const struct craw_grain_params *p,
     out->sigma_density = (s->rms / 1000.0f) * 48.0f / aperture;
     out->sigma_rel = logf(10.0f) * out->sigma_density * p->amount;
     out->sigma_signal = signal_amp(out->sigma_rel, 1.0f, GRAIN_MID, p->path);
+    /* What the builders are asked for: the physical amplitude, raised by
+     * whatever the upsample below will take back out. */
+    float sigma_for_model = out->sigma_rel;
 
     if (p->amount <= 0.0f || out->sigma_rel <= 0.0f) {
         out->enabled = false;
@@ -1365,6 +1392,23 @@ int craw_grain_build(const struct craw_grain_params *p,
     /* A blob finer than a pixel is just white noise; the amplitude already
      * accounts for the extra averaging through Selwyn's law. */
     float blob = out->blob_px < 1.0f ? 1.0f : out->blob_px;
+
+    /* Above a few pixels the template runs out of independent blobs and the
+     * picture tiles, so synthesise at a reduced resolution and upsample -
+     * see `subsample` in grain.h. Only the output path can do this: the
+     * source path hands its data to pl_renderer, which applies the grain
+     * itself and has no idea any of this is going on. The factor is a power
+     * of two so the upsample lands on exact texel centres, and 2.5 px is
+     * where the measured pedestal is still under 0.02. */
+    out->subsample = 1;
+    out->upsample_gain = 1.0f;
+    if (p->path == CRAW_GRAIN_PATH_OUTPUT) {
+        while (out->subsample < 4 && blob / out->subsample > 2.5f)
+            out->subsample *= 2;
+        blob /= out->subsample;
+        out->upsample_gain = grain_upsample_gain(out->subsample);
+        sigma_for_model *= out->upsample_gain;
+    }
 
     enum craw_grain_model model = p->model;
     if (model == CRAW_GRAIN_MODEL_AUTO) {
@@ -1384,10 +1428,17 @@ int craw_grain_build(const struct craw_grain_params *p,
     }
 
     int ret = model == CRAW_GRAIN_MODEL_H274
-        ? build_h274(p, out, out->sigma_rel, blob)
-        : build_av1(p, out, out->sigma_rel, blob);
+        ? build_h274(p, out, sigma_for_model, blob)
+        : build_av1(p, out, sigma_for_model, blob);
     if (ret < 0)
         return ret;
+
+    /* The builders work in the reduced resolution's units. Everything the
+     * caller sees is in the output's: the blob as it will land on screen,
+     * and the amplitude after the upsample has taken the compensation back
+     * out again. */
+    out->blob_clamped *= (float)out->subsample;
+    out->sigma_built /= out->upsample_gain;
 
     out->enabled = true;
     if (craw_grain_validate(&out->data)) {
@@ -1498,6 +1549,10 @@ float craw_grain_sigma_at(const struct craw_grain_out *out, float level)
 {
     if (!out || !out->enabled)
         return 0.0f;
+    /* The scaling points hold the amplitude the reduced-resolution pass is
+     * asked for; what reaches the screen is that divided by the gain the
+     * upsample gives back. */
+    const float g = out->upsample_gain > 0.0f ? out->upsample_gain : 1.0f;
     const float idx = level * 255.0f;
     /* Interval bounds are whole levels, so a query landing between two of
      * them has to round rather than fall through the crack. */
@@ -1510,17 +1565,17 @@ float craw_grain_sigma_at(const struct craw_grain_out *out, float level)
         /* The scaling LUT is flat before the first point and after the
          * last, and linear in between: AV1 7.18.3.4. */
         if (idx <= d->points_y[0][0])
-            return d->points_y[0][1] * out->unit_sd;
+            return d->points_y[0][1] * out->unit_sd / g;
         for (int i = 0; i + 1 < d->num_points_y; i++) {
             float x0 = d->points_y[i][0], x1 = d->points_y[i + 1][0];
             if (idx <= x1) {
                 float t = (idx - x0) / (x1 - x0);
                 return (d->points_y[i][1] +
                         t * (d->points_y[i + 1][1] - d->points_y[i][1])) *
-                       out->unit_sd;
+                       out->unit_sd / g;
             }
         }
-        return d->points_y[d->num_points_y - 1][1] * out->unit_sd;
+        return d->points_y[d->num_points_y - 1][1] * out->unit_sd / g;
     }
 
     if (out->data.type == PL_FILM_GRAIN_H274) {
@@ -1531,7 +1586,7 @@ float craw_grain_sigma_at(const struct craw_grain_out *out, float level)
         for (int i = 0; i < d->num_intensity_intervals[c]; i++) {
             if (idxi >= d->intensity_interval_lower_bound[c][i] &&
                 idxi <= d->intensity_interval_upper_bound[c][i])
-                return d->comp_model_value[c][i][0] * out->unit_sd;
+                return d->comp_model_value[c][i][0] * out->unit_sd / g;
         }
         /* Outside every interval the shader picks a scale of zero, which is
          * how H.274 leaves values above its top bound with no grain at all
@@ -1575,10 +1630,20 @@ static struct pl_hook_res grain_hook_fn(void *priv,
 
     /* The image at PL_HOOK_PRE_OUTPUT has already been colour managed and
      * encoded for the target, so it is RGB in [0,1] whatever the source
-     * was. That is why the grain shaders' clamps cost nothing here. */
+     * was. That is why the grain shaders' clamps cost nothing here.
+     *
+     * The bit depth is cleared rather than carried over from the target.
+     * libplacebo's bit_depth() reads it to decide the grain's quantisation
+     * and the shift the template is generated with, and craw_grain_build()
+     * solves the whole model at eight bits; a ten bit or twelve bit
+     * swapchain would otherwise hand the shader a different shift from the
+     * one the amplitude was calibrated against. With the field cleared the
+     * two always agree, and since the texture here holds values already
+     * normalised to [0,1], pl_color_repr_normalize() correctly returns 1. */
     struct pl_color_repr repr = hp->repr;
     repr.sys = PL_COLOR_SYSTEM_RGB;
     repr.levels = PL_COLOR_LEVELS_FULL;
+    repr.bits = (struct pl_bit_encoding) {0};
 
     struct pl_film_grain_params fg = {
         .data = h->out.data,
@@ -1591,15 +1656,135 @@ static struct pl_hook_res grain_hook_fn(void *priv,
     if (!pl_needs_film_grain(&fg))
         return res;
 
-    pl_shader sh = pl_dispatch_begin(hp->dispatch);
-    if (!pl_shader_film_grain(sh, &h->state, &fg)) {
-        pl_dispatch_abort(hp->dispatch, &sh);
+    /* Dispatched into a texture of its own rather than handed back as a
+     * shader to be appended to the output pass.
+     *
+     * pl_renderer runs its own film grain on a shader it begins with
+     * pl_dispatch_begin_ex(dp, true) - the `unique` flag, which gives the
+     * shader its own identifier namespace. That entry point is internal, so
+     * a hook outside libplacebo cannot ask for it, and a shader begun with
+     * the public pl_dispatch_begin() gets identifier id 0 and is then
+     * merged into whatever the renderer appends next. The grain shader
+     * declares more objects than anything else libplacebo generates - two
+     * grain LUTs, three scaling LUTs, a block offset LUT, several variables
+     * - so it is the worst possible candidate for sharing a namespace.
+     * Finishing it into its own target sidesteps the question entirely and
+     * makes this pass structurally the same as the one pl_renderer runs.
+     * It costs one more render target at output resolution. */
+    const int w = hp->tex->params.w, h_ = hp->tex->params.h;
+    const int f = h->out.subsample > 0 ? h->out.subsample : 1;
+
+    pl_tex out = hp->get_tex(hp->priv, w, h_);
+    if (!out)
         return res;
+
+    pl_shader sh;
+
+    if (f == 1) {
+        sh = pl_dispatch_begin(hp->dispatch);
+        if (!pl_shader_film_grain(sh, &h->state, &fg)) {
+            pl_dispatch_abort(hp->dispatch, &sh);
+            return res;
+        }
+        if (!pl_dispatch_finish(hp->dispatch, pl_dispatch_params(
+                .shader = &sh, .target = out)))
+            return res;
+    } else {
+        /* Coarse grain, synthesised small and upsampled.
+         *
+         * The grain shader does not produce a grain field on its own - it
+         * samples a picture, works out the amplitude from what it read
+         * there, and adds. So the reduced-resolution pass is run on a
+         * reduced copy of the picture and what gets upsampled is the
+         * difference between that copy and its grained self. The amplitude
+         * then still follows the picture, which is the point of the scaling
+         * function, and it is read off a copy whose detail is smooth at the
+         * scale the grain is being generated at anyway. */
+        const int sw = (w + f - 1) / f, sh2 = (h_ + f - 1) / f;
+        pl_tex small = hp->get_tex(hp->priv, sw, sh2);
+        pl_tex grained = hp->get_tex(hp->priv, sw, sh2);
+
+        if (!small || !grained)
+            return res;
+
+        sh = pl_dispatch_begin(hp->dispatch);
+        if (!pl_shader_sample_bilinear(sh, pl_sample_src(
+                .tex = hp->tex,
+                .new_w = sw,
+                .new_h = sh2,
+                .components = 4,
+            ))) {
+            pl_dispatch_abort(hp->dispatch, &sh);
+            return res;
+        }
+        if (!pl_dispatch_finish(hp->dispatch, pl_dispatch_params(
+                .shader = &sh, .target = small)))
+            return res;
+
+        fg.tex = small;
+        sh = pl_dispatch_begin(hp->dispatch);
+        if (!pl_shader_film_grain(sh, &h->state, &fg)) {
+            pl_dispatch_abort(hp->dispatch, &sh);
+            return res;
+        }
+        if (!pl_dispatch_finish(hp->dispatch, pl_dispatch_params(
+                .shader = &sh, .target = grained)))
+            return res;
+
+        /* Full resolution again: the picture untouched, plus the grain the
+         * two small textures differ by, sampled bilinearly. pl_shader_custom
+         * emits a #define per descriptor and per variable, so the body can
+         * name them. */
+        const struct pl_shader_desc descs[3] = {
+            { .desc = { .name = "craw_full", .type = PL_DESC_SAMPLED_TEX },
+              .binding = { .object = hp->tex,
+                           .sample_mode = PL_TEX_SAMPLE_NEAREST,
+                           .address_mode = PL_TEX_ADDRESS_CLAMP } },
+            { .desc = { .name = "craw_grained", .type = PL_DESC_SAMPLED_TEX },
+              .binding = { .object = grained,
+                           .sample_mode = PL_TEX_SAMPLE_LINEAR,
+                           .address_mode = PL_TEX_ADDRESS_CLAMP } },
+            { .desc = { .name = "craw_small", .type = PL_DESC_SAMPLED_TEX },
+              .binding = { .object = small,
+                           .sample_mode = PL_TEX_SAMPLE_LINEAR,
+                           .address_mode = PL_TEX_ADDRESS_CLAMP } },
+        };
+        /* The reduced textures cover the same picture, so the coordinate is
+         * the full resolution pixel centre scaled into their own [0,1]. */
+        const float inv[2] = { 1.0f / (float)(sw * f), 1.0f / (float)(sh2 * f) };
+        const struct pl_shader_var vars[1] = {
+            { .var = pl_var_vec2("craw_inv"), .data = (void *) inv },
+        };
+
+        sh = pl_dispatch_begin(hp->dispatch);
+        if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
+                .description = "craw film grain upsample",
+                .input = PL_SHADER_SIG_NONE,
+                .output = PL_SHADER_SIG_COLOR,
+                .output_w = w,
+                .output_h = h_,
+                .descriptors = descs,
+                .num_descriptors = 3,
+                .variables = vars,
+                .num_variables = 1,
+                .body =
+                    "vec2 craw_p = gl_FragCoord.xy;                        \n"
+                    "color = texelFetch(craw_full, ivec2(craw_p), 0);      \n"
+                    "vec2 craw_uv = craw_p * craw_inv;                     \n"
+                    "color.rgb += texture(craw_grained, craw_uv).rgb       \n"
+                    "           - texture(craw_small, craw_uv).rgb;        \n",
+            })) {
+            pl_dispatch_abort(hp->dispatch, &sh);
+            return res;
+        }
+        if (!pl_dispatch_finish(hp->dispatch, pl_dispatch_params(
+                .shader = &sh, .target = out)))
+            return res;
     }
 
     return (struct pl_hook_res) {
-        .output = PL_HOOK_SIG_COLOR,
-        .sh = sh,
+        .output = PL_HOOK_SIG_TEX,
+        .tex = out,
         .repr = repr,
         .color = hp->color,
         .components = hp->components,

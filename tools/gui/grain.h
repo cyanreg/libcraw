@@ -329,6 +329,42 @@ struct craw_grain_out {
      * produces: point_y_scaling for AV1, comp_model_value[0] for H.274.
      * craw_grain_sigma_at() is the way to use it. */
     float unit_sd;
+
+    /* Integer factor the grain is synthesised at below the output, 1 when
+     * it is synthesised at the output itself.
+     *
+     * AV1's luma template is one 82x73 array of which libplacebo uploads a
+     * 64x64 window, and every 32x32 block of the picture is a window into
+     * that at an offset of 0 to 30. Ask for a one pixel blob and the
+     * template holds about four thousand independent blobs and no two
+     * blocks look alike; ask for ten and it holds thirty-six, every block
+     * shows nearly the same handful, and the picture visibly tiles.
+     * Measured on a flat field through the shader, the autocorrelation at
+     * lags past the block grid - which should be zero - is 0.00 at a one
+     * pixel blob, 0.03 at 4.3 px and 0.11 at 10.7 px, a flat pedestal out
+     * to 128 px rather than a spike at the block period, which is the
+     * signature of every block sharing the template's own low frequencies.
+     *
+     * So above about 2.5 px the grain is synthesised on a picture reduced
+     * by this factor and the field bilinearly upsampled, which multiplies
+     * the film area one template covers by its square and lets the filter
+     * work in the range where it is well behaved. */
+    int subsample;
+    /* Upsampling a noise field low-passes it, so the amplitude asked of
+     * the reduced-resolution pass is raised by this to land on target.
+     * Measured, not derived; see grain_upsample_gain(). */
+    float upsample_gain;
+
+    /* H.274 hands libplacebo pointers rather than values, so the arrays
+     * those point at have to outlive the build and belong to this result
+     * rather than to the function that filled them. AV1 leaves them
+     * untouched. Treat as private. Note that `data` points at the arrays of
+     * the craw_grain_out it was *built* into, so a copy of one of these
+     * structs is only good for as long as the original lives - which is the
+     * case for craw_grain_hook_update()'s `out`, whose original is the
+     * hook. What this buys is that two hooks no longer share one set. */
+    uint8_t h274_lo[3][17], h274_hi[3][17];
+    int16_t h274_val[3][17][6];
 };
 
 /* The standard deviation the built data will produce at picture level

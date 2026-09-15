@@ -149,6 +149,18 @@ struct view_lut_menu {
     float ax, ay, aw, ah;
     bool anchored;
     int row;
+
+    /* Hover hysteresis, so the cascade behaves like a real menu rather
+     * than snapping to whatever the pointer crossed last. An entry has to
+     * be rested on before its submenu opens, and once one is open the
+     * entries the pointer sweeps past on its way there are ignored for a
+     * moment: the "safe triangle" every cascading menu needs. */
+    int hover_col, hover_entry;     /* what the pointer is on, -1 for none */
+    int64_t hover_since;            /* when it landed there, microseconds */
+    int guard_col;                  /* the column whose submenu is protected */
+    int64_t guard_until;            /* until when, microseconds */
+    float prev_x, prev_y;           /* the pointer last frame, for direction */
+    int dir;                        /* +1 cascading right, -1 left */
 };
 
 /* The standard third-stop ISO list Apple's plug-in restricts the working
@@ -364,8 +376,10 @@ struct view_cfg {
 
     /* Headless export: run the loop without a window. */
     bool headless;
-    int64_t export_start, export_end;
-    char export_dir[VIEW_MAX_PATH];
+    int64_t export_frame;
+    char export_path[VIEW_MAX_PATH];
+    const char *export_codec;   /* --codec, NULL: the muxer's own */
+    const char *export_enc;     /* --enc KEY=VALUE,... for the encoder */
 };
 
 struct view_awb {
@@ -376,14 +390,18 @@ struct view_awb {
     bool have_illum;
 };
 
+/* One frame to one file. The work is spread over the loop's iterations
+ * only because the decoder may have to walk to the frame first; the write
+ * itself happens in one go. */
 struct view_export {
     bool active;
-    int64_t first, last, next;
-    char dir[VIEW_MAX_PATH];
-    int64_t done;
+    int64_t frame;
+    char path[VIEW_MAX_PATH];
+    char codec[64];             /* empty: the muxer's own */
+    char enc[256];              /* encoder options, from --enc */
     char status[128];
 
-    /* One full resolution RGBA16 frame, grown once and kept. */
+    /* One RGBA16 frame, grown once and kept. */
     uint16_t *rgba;
     size_t rgba_values;
 };
@@ -417,6 +435,22 @@ struct view_zoom {
     float drag_x, drag_y;
 };
 
+/* The crop rectangle, in source pixels, so that it survives zoom, pan and
+ * a resized window: it is a region of the frame, not of the screen. The
+ * edges are even, which is what a subsampled encoder and a Bayer quad both
+ * want. `on` is the mode a left drag draws in - outside it a drag pans as
+ * it always has - and the rectangle outlives the mode being turned off.
+ * Only the export reads it; the picture on screen is untouched, and the
+ * shading over it is drawn on the nuklear overlay. */
+struct view_crop {
+    bool on;
+    int on_flag;                /* nuklear's checkbox wants an int */
+    bool have;
+    int x0, y0, x1, y1;
+    bool dragging;
+    float ax, ay;               /* the drag's anchor, in source pixels */
+};
+
 /* How well the picture is keeping up with the master clock. */
 struct view_sync {
     double diff;                /* clock minus frame pts at present time */
@@ -425,6 +459,33 @@ struct view_sync {
     int64_t presented;
     int64_t dropped;
     int64_t run_frames;         /* since the last start or seek */
+};
+
+/* Film grain, as the panel holds it. grain.c turns this into the parameters
+ * libplacebo's grain shaders take and grain_ui.c does the turning; nothing
+ * here reaches the raw pipeline, because the grain is applied at
+ * PL_HOOK_PRE_OUTPUT, after scaling and colour management. `chroma` below
+ * zero means "whatever the stock says". */
+typedef struct craw_grain_hook craw_grain_hook;
+
+struct view_grain {
+    bool on;
+    int gauge, stock, response;
+    float amount, size, chroma;
+    bool boil;
+    int boil_flag;              /* nuklear's checkbox wants an int */
+
+    /* What the last build worked out, for the panel's readout. */
+    float blob_px;              /* what the gauge asked for */
+    float blob_built;           /* what the model could build */
+    float sigma;                /* amplitude it will deliver at mid grey */
+    int model_used;
+    int subsample;              /* 1, or the factor the grain is made at */
+
+    /* One per renderer, the way the display and the export each own a
+     * pl_renderer: the grain shaders keep state between frames and the two
+     * must not share it. Owned by grain_ui.c. */
+    craw_grain_hook *hook, *hook_export;
 };
 
 struct view_state {
@@ -438,6 +499,8 @@ struct view_state {
     struct view_sync sync;
     struct view_timing timing;
     struct view_zoom view;
+    struct view_crop crop;
+    struct view_grain grain;
 
     /* Keyboard focus through the panel's adjustable rows. `row` counts them
      * as the panel is laid out; `adjust` is the pending Left/Right step,
@@ -580,12 +643,16 @@ int  view_profile_from_frame(CRAWProfile *p, const AVFrame *frame);
 
 /* ----------------------------------------------------------- export.c */
 
-/* Packs interleaved RGBA16 host pixels into a 16 bit RGB PNG. */
-int  view_export_png(const char *path, const uint16_t *rgba,
-                     uint32_t w, uint32_t h);
+/* Starts writing one frame to one file. An empty `path` means the default
+ * one below; an empty `codec` means the one the file name implies. */
+void view_export_begin(struct view_state *st, int64_t frame, const char *path,
+                       const char *codec);
+/* Renders and writes once the decoder has reached the frame. */
 int  view_export_step(struct view_state *st);
-void view_export_begin(struct view_state *st, int64_t first, int64_t last,
-                       const char *dir);
+
+/* Next to the clip, named after the clip and the frame, .png. */
+void view_export_default_path(const struct view_state *st, int64_t frame,
+                              char *out, size_t size);
 
 /* ----------------------------------------------------------- ui.c */
 
@@ -697,5 +764,22 @@ void view_zoom_reset(struct view_state *st, bool one_to_one);
 /* Pan by a fraction of the visible area, or by a screen-pixel delta. */
 void view_pan_fraction(struct view_state *st, float fx, float fy);
 void view_pan_pixels(struct view_state *st, int dx, int dy);
+
+/* The crop, drawn by a left drag in crop mode. The positions are in window
+ * pixels, the way view_zoom_rects() gives them. */
+void view_crop_begin(struct view_state *st, int px, int py);
+void view_crop_drag(struct view_state *st, int px, int py);
+void view_crop_end(struct view_state *st);
+void view_crop_clear(struct view_state *st);
+
+/* The region to export, in source pixels: the rectangle when there is one,
+ * the whole frame when there is not, which is what the return value says.
+ * Clamped to the frame, which is where a rectangle from the command line
+ * meets the clip's real size for the first time. */
+bool view_crop_rect(const struct view_state *st, int *x, int *y, int *w, int *h);
+
+/* Where that rectangle lands on screen, in window pixels, through the same
+ * transform the renderer is handed. False when there is nothing to draw. */
+bool view_crop_screen(const struct view_state *st, pl_rect2df *out);
 
 #endif /* CRAW_VIEW_H */
