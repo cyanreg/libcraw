@@ -620,7 +620,7 @@ static int view_reader_start(struct view_decoder *d)
             return CRAW_ERROR(ENOMEM);
     }
 
-    r->thread = SDL_CreateThread(view_reader_thread, "craw-view reader", d);
+    r->thread = SDL_CreateThread(view_reader_thread, "cineview reader", d);
     if (!r->thread)
         return CRAW_ERROR(EAGAIN);
 
@@ -857,7 +857,7 @@ int view_profile_from_frame(CRAWProfile *p, const AVFrame *frame)
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_RAW_COLOR_PARAMS);
     if (!sd) {
         fprintf(stderr, "the decoder produced no AV_FRAME_DATA_RAW_COLOR_PARAMS "
-                        "side data; craw-view only handles raw camera clips\n");
+                        "side data; cineview only handles raw camera clips\n");
         return CRAW_ERROR(EINVAL);
     }
 

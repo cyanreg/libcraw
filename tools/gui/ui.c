@@ -60,11 +60,11 @@
 
 /* The embedded film simulation collection is optional: without it the row
  * and its menu compile out and the panel says so. */
-#ifndef CRAW_VIEW_HAVE_LUTS
-#define CRAW_VIEW_HAVE_LUTS 0
+#ifndef CINEVIEW_HAVE_LUTS
+#define CINEVIEW_HAVE_LUTS 0
 #endif
 
-#if CRAW_VIEW_HAVE_LUTS
+#if CINEVIEW_HAVE_LUTS
 #include "luts.h"
 #endif
 
@@ -260,7 +260,7 @@ static void view_adjust_cycle(struct view_state *st, bool focused, int *v, int n
 
 /* ------------------------------------------- the film simulation menu */
 
-#if CRAW_VIEW_HAVE_LUTS
+#if CINEVIEW_HAVE_LUTS
 
 /* nuklear has popups and groups but nothing cascading, and its windows
  * hand input to whichever one the pointer last activated, which is not how
@@ -641,7 +641,7 @@ static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
         bool leaf = view_menu_leaf(st, c);
         char name[32];
 
-        snprintf(name, sizeof(name), "craw-view-lutmenu-%d", c);
+        snprintf(name, sizeof(name), "cineview-lutmenu-%d", c);
         if (!nk_begin(ctx, name, r,
                       NK_WINDOW_BORDER | NK_WINDOW_NO_SCROLLBAR |
                       NK_WINDOW_NO_INPUT)) {
@@ -963,7 +963,7 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
     view_menu_draw(ctx, st);
 }
 
-#else /* !CRAW_VIEW_HAVE_LUTS */
+#else /* !CINEVIEW_HAVE_LUTS */
 
 void view_ui_menu_open(struct view_state *st) { (void)st; }
 void view_ui_menu_close(struct view_state *st) { (void)st; }
@@ -988,7 +988,7 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
     (void)ctx; (void)st;
 }
 
-#endif /* CRAW_VIEW_HAVE_LUTS */
+#endif /* CINEVIEW_HAVE_LUTS */
 
 static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
 {
@@ -1534,7 +1534,7 @@ static void view_crop_draw(struct nk_context *ctx, struct view_state *st)
     nk_style_push_style_item(ctx, &ctx->style.window.fixed_background,
                              nk_style_item_color(nk_rgba(0, 0, 0, 0)));
 
-    if (nk_begin(ctx, "craw-view-crop",
+    if (nk_begin(ctx, "cineview-crop",
                  nk_rect(dst.x0, dst.y0, pl_rect_w(dst), pl_rect_h(dst)),
                  NK_WINDOW_NO_SCROLLBAR | NK_WINDOW_NO_INPUT |
                  NK_WINDOW_BACKGROUND)) {
@@ -1574,7 +1574,7 @@ void view_ui_build(struct view_state *st)
     /* Before the panel, which is what puts the panel on top of it. */
     view_crop_draw(view_nk, st);
 
-    if (nk_begin(view_nk, "craw-view",
+    if (nk_begin(view_nk, "cineview",
                  nk_rect((float)st->gpu.ui_w - VIEW_UI_WIDTH - VIEW_UI_MARGIN,
                          VIEW_UI_MARGIN, VIEW_UI_WIDTH, h),
                  NK_WINDOW_BORDER | NK_WINDOW_TITLE | NK_WINDOW_SCROLL_AUTO_HIDE))

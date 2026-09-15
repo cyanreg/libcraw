@@ -1,7 +1,7 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-#ifndef CRAW_VIEW_ADJUST_H
-#define CRAW_VIEW_ADJUST_H
+#ifndef CINEVIEW_ADJUST_H
+#define CINEVIEW_ADJUST_H
 
 #include <stdbool.h>
 
@@ -209,4 +209,4 @@ const struct pl_hook *craw_adjust_vibrance(craw_adjust *a,
                                            const struct craw_vibrance_params *p);
 const struct pl_hook *craw_adjust_softlight(craw_adjust *a, float strength);
 
-#endif /* CRAW_VIEW_ADJUST_H */
+#endif /* CINEVIEW_ADJUST_H */

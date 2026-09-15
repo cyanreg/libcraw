@@ -25,7 +25,7 @@
 # grain_preview: the headless proof for the film grain model.
 #
 # It makes a libplacebo Vulkan context with no surface, renders a test chart
-# and a developed frame through exactly the pl_render_image path craw-view
+# and a developed frame through exactly the pl_render_image path cineview
 # uses, applies grain by each path and each preset, measures what came out
 # and writes uncompressed frames and contact sheets. Every number in
 # DESIGN.md's "Film grain

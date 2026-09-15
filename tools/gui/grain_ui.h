@@ -1,7 +1,7 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-#ifndef CRAW_VIEW_GRAIN_UI_H
-#define CRAW_VIEW_GRAIN_UI_H
+#ifndef CINEVIEW_GRAIN_UI_H
+#define CINEVIEW_GRAIN_UI_H
 
 #include <stddef.h>
 
@@ -17,7 +17,7 @@ struct nk_context;
 /* The viewer's side of the film grain model.
  *
  * grain.c holds the model itself and knows nothing about this program;
- * everything here is the part that belongs to craw-view: the panel section,
+ * everything here is the part that belongs to cineview: the panel section,
  * the command line option, and the hook handed to pl_render_params. It is a
  * file of its own so that ui.c, main.c and gpu.c each need one line. */
 
@@ -49,4 +49,4 @@ const char *view_grain_summary(const struct view_grain *g, char *buf, size_t n);
  * focus ring as every other section. */
 void view_panel_grain(struct nk_context *ctx, struct view_state *st);
 
-#endif /* CRAW_VIEW_GRAIN_UI_H */
+#endif /* CINEVIEW_GRAIN_UI_H */

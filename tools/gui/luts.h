@@ -1,11 +1,11 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-#ifndef CRAW_VIEW_LUTS_H
-#define CRAW_VIEW_LUTS_H
+#ifndef CINEVIEW_LUTS_H
+#define CINEVIEW_LUTS_H
 
 /* The embedded film simulation collection.
  *
- * craw-view carries every rendering from filmgrid.org as one compressed
+ * cineview carries every rendering from filmgrid.org as one compressed
  * blob per LUT inside the executable (see tools/luts_build.py for the pack
  * and tools/gui/luts/LICENSE.md for where the data comes from). The user
  * picks one out of a cascading menu, so the two things this module has to
@@ -114,4 +114,4 @@ int view_luts_find(const char *name);
 int view_luts_cube_text(int index, char **text, size_t *len);
 void view_luts_cube_free(char *text);
 
-#endif /* CRAW_VIEW_LUTS_H */
+#endif /* CINEVIEW_LUTS_H */

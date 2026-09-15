@@ -3,7 +3,7 @@
 /* Audio output and the master clock. See audio.h for the model.
  *
  * Without libswresample there is nothing here but stubs and the viewer runs
- * silent; craw-view is a picture tool first. */
+ * silent; cineview is a picture tool first. */
 
 #include <math.h>
 #include <stdlib.h>
@@ -13,13 +13,13 @@
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
 
-#if CRAW_VIEW_HAVE_AUDIO
+#if CINEVIEW_HAVE_AUDIO
 #include <libswresample/swresample.h>
 #endif
 
 #include "audio.h"
 
-#if !CRAW_VIEW_HAVE_AUDIO
+#if !CINEVIEW_HAVE_AUDIO
 
 int view_audio_open(struct view_audio *a, const char *path, const char *map,
                     bool verbose)
@@ -57,7 +57,7 @@ int view_audio_dump_open(struct view_audio *a, const char *path)
     return CRAW_ERROR(ENOTSUP);
 }
 
-#else /* CRAW_VIEW_HAVE_AUDIO */
+#else /* CINEVIEW_HAVE_AUDIO */
 
 #define VIEW_AUDIO_FRAME_BYTES (VIEW_AUDIO_CHANNELS * sizeof(float))
 
@@ -1145,4 +1145,4 @@ void view_audio_set_volume(struct view_audio *a, float volume, bool mute)
     SDL_UnlockMutex(a->lock);
 }
 
-#endif /* CRAW_VIEW_HAVE_AUDIO */
+#endif /* CINEVIEW_HAVE_AUDIO */

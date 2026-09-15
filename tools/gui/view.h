@@ -1,9 +1,9 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-#ifndef CRAW_VIEW_H
-#define CRAW_VIEW_H
+#ifndef CINEVIEW_H
+#define CINEVIEW_H
 
-/* craw-view: interactive viewer and exporter for camera raw clips.
+/* cineview: interactive viewer and exporter for camera raw clips.
  *
  * The whole program runs on a single VkDevice that libplacebo creates: the
  * decoder (FFmpeg's Vulkan hwaccel), the raw pipeline (libcraw) and the
@@ -255,7 +255,7 @@ struct view_decoder {
     AVRational frame_rate;
     int64_t nb_frames;          /* best estimate, 0 if unknown */
 
-    /* Container metadata craw-process also reads. */
+    /* Container metadata cineraw also reads. */
     float meta_as_shot_ei;
     char model[256];
 
@@ -906,4 +906,4 @@ bool view_crop_rect(const struct view_state *st, int *x, int *y, int *w, int *h)
  * transform the renderer is handed. False when there is nothing to draw. */
 bool view_crop_screen(const struct view_state *st, pl_rect2df *out);
 
-#endif /* CRAW_VIEW_H */
+#endif /* CINEVIEW_H */

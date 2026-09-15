@@ -486,7 +486,7 @@ void craw_adjust_destroy(craw_adjust **pa)
 
 /* ------------------------------------------------------ the viewer's side */
 
-/* Everything below belongs to craw-view rather than to the model: the
+/* Everything below belongs to cineview rather than to the model: the
  * defaults the panel starts from, the two command line options and the
  * readout. The hooks themselves are handed to pl_render_params by gpu.c. */
 

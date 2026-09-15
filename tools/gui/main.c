@@ -1,12 +1,12 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-/* craw-view: open a camera raw clip, decode it on the GPU, run every frame
+/* cineview: open a camera raw clip, decode it on the GPU, run every frame
  * through libcraw on the same device and show the result through
  * libplacebo, with a nuklear panel for the grade and a still exporter.
  *
- * craw-process is the batch tool and the reference for the profile,
+ * cineraw is the batch tool and the reference for the profile,
  * exposure and white balance semantics; this is the interactive one. The
- * options it shares with craw-process mean exactly the same thing. */
+ * options it shares with cineraw mean exactly the same thing. */
 
 #include <getopt.h>
 #include <inttypes.h>
@@ -28,11 +28,11 @@
 
 /* The embedded film simulation collection is optional; without it --lut
  * only takes a file and --list-luts says there is nothing to list. */
-#ifndef CRAW_VIEW_HAVE_LUTS
-#define CRAW_VIEW_HAVE_LUTS 0
+#ifndef CINEVIEW_HAVE_LUTS
+#define CINEVIEW_HAVE_LUTS 0
 #endif
 
-#if CRAW_VIEW_HAVE_LUTS
+#if CINEVIEW_HAVE_LUTS
 #include "luts.h"
 #endif
 
@@ -267,7 +267,7 @@ void view_lut_clear(struct view_state *st)
 
 const char *view_lut_film_name(const struct view_state *st)
 {
-#if CRAW_VIEW_HAVE_LUTS
+#if CINEVIEW_HAVE_LUTS
     const ViewLut *l = view_lut_get(st->look.film_sim);
 
     if (l)
@@ -278,7 +278,7 @@ const char *view_lut_film_name(const struct view_state *st)
     return "none";
 }
 
-#if CRAW_VIEW_HAVE_LUTS
+#if CINEVIEW_HAVE_LUTS
 
 int view_lut_select_film(struct view_state *st, int index)
 {
@@ -357,7 +357,7 @@ static void view_list_luts(void)
     }
 }
 
-#else /* !CRAW_VIEW_HAVE_LUTS */
+#else /* !CINEVIEW_HAVE_LUTS */
 
 int view_lut_select_film(struct view_state *st, int index)
 {
@@ -372,7 +372,7 @@ static void view_list_luts(void)
     printf("This build carries no film simulation collection.\n");
 }
 
-#endif /* CRAW_VIEW_HAVE_LUTS */
+#endif /* CINEVIEW_HAVE_LUTS */
 
 /* Resolves what --lut was given. A real file always wins, so a rendering
  * whose name happens to collide with something on disk can never shadow
@@ -391,7 +391,7 @@ static int view_lut_startup(struct view_state *st)
         return view_lut_load(st);
     }
 
-#if CRAW_VIEW_HAVE_LUTS
+#if CINEVIEW_HAVE_LUTS
     {
         int ix = view_luts_find(st->look.lut_path);
 
@@ -944,7 +944,7 @@ static int view_process_frame(struct view_state *st)
     if (ret < 0)
         return ret;
 
-    /* The same exposure model craw-process uses: the frame gain times the
+    /* The same exposure model cineraw uses: the frame gain times the
      * working index over the as-shot ISO, times the bias in stops. */
     if (!(st->prof.as_shot_ei > 0.0f))
         st->prof.as_shot_ei = st->dec.meta_as_shot_ei;
@@ -996,7 +996,7 @@ static int view_process_frame(struct view_state *st)
 
     /* The histogram describes the frame that was just processed; what comes
      * out of the smoother is applied to the next one, exactly as in
-     * craw-process. */
+     * cineraw. */
     if (st->look.wb == VIEW_WB_AUTO && st->prof.nb_wb_knots) {
         ret = view_awb_step(st);
         if (ret < 0)
@@ -1122,7 +1122,7 @@ int view_step_frame(struct view_state *st)
     }
 
     if (st->frame->format != AV_PIX_FMT_VULKAN) {
-        fprintf(stderr, "the decoder produced software frames; craw-view needs the "
+        fprintf(stderr, "the decoder produced software frames; cineview needs the "
                         "Vulkan hwaccel for a raw clip\n");
         return CRAW_ERROR(ENOTSUP);
     }
@@ -1232,7 +1232,7 @@ static int view_parse_crop(struct view_crop *c, const char *arg)
 static void view_usage(FILE *f)
 {
     fprintf(f,
-"usage: craw-view [options] INPUT\n"
+"usage: cineview [options] INPUT\n"
 "\n"
 "Opens a camera raw clip, decodes it with FFmpeg's Vulkan hwaccel, runs\n"
 "every frame through libcraw on the same device and displays the result\n"
@@ -1851,7 +1851,7 @@ static int view_run_window(struct view_state *st)
      * resolution on a scaled output; the picture is then rendered at full
      * density and the panel is laid out in pixels, with pointer positions
      * scaled from window points. */
-    win = SDL_CreateWindow("craw-view", w, h,
+    win = SDL_CreateWindow("cineview", w, h,
                            SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
                            SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!win) {
@@ -2334,7 +2334,7 @@ int main(int argc, char **argv)
     view_grain_defaults(&st.grain);
     view_adjust_defaults(&st.adjustments);
 
-#if CRAW_VIEW_HAVE_LUTS
+#if CINEVIEW_HAVE_LUTS
     /* Reads the pack's tables, which is all pointer arithmetic over the
      * embedded array; nothing is decompressed until a rendering is picked.
      * It has to happen before the arguments, because --list-luts and

@@ -1,7 +1,7 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-#ifndef CRAW_VIEW_STILL_H
-#define CRAW_VIEW_STILL_H
+#ifndef CINEVIEW_STILL_H
+#define CINEVIEW_STILL_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -25,4 +25,4 @@ int view_still_write(const char *path, const char *codec_name,
                      const char *enc_opts, const uint16_t *rgba,
                      uint32_t w, uint32_t h, char *info, size_t info_size);
 
-#endif /* CRAW_VIEW_STILL_H */
+#endif /* CINEVIEW_STILL_H */

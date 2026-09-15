@@ -22,17 +22,17 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# CLI tools. craw-process decodes a camera clip with FFmpeg and runs every
+# CLI tools. cineraw decodes a camera clip with FFmpeg and runs every
 # frame through the library on the GPU, so it needs all three FFmpeg
 # libraries; without them there is nothing here to build.
 libavformat_dep = dependency('libavformat', required: get_option('ffmpeg'))
 libavcodec_dep = dependency('libavcodec', required: get_option('ffmpeg'))
 libavutil_dep = dependency('libavutil', required: get_option('ffmpeg'))
 
-# craw-view additionally needs a window, a renderer and a UI.
+# cineview additionally needs a window, a renderer and a UI.
 sdl3 = dependency('sdl3', required: false)
 placebo = dependency('libplacebo', version: '>=7.349', required: false)
-# Audio is optional: without libswresample craw-view plays silent and paces
+# Audio is optional: without libswresample cineview plays silent and paces
 # the picture off wall time instead of the audio clock.
 swresample = dependency('libswresample', required: false)
 # The still exporter converts the rendered RGBA16 into whatever the encoder
@@ -66,29 +66,29 @@ if craw_tools_ffmpeg
     gui_args = tools_args
     gui_deps = []
     if swresample.found()
-        gui_args += '-DCRAW_VIEW_HAVE_AUDIO=1'
+        gui_args += '-DCINEVIEW_HAVE_AUDIO=1'
         gui_deps += swresample
     else
-        gui_args += '-DCRAW_VIEW_HAVE_AUDIO=0'
+        gui_args += '-DCINEVIEW_HAVE_AUDIO=0'
     endif
 
     # The embedded film simulation collection, built by the top level's
     # subdir('tools/gui/luts') ahead of tests/ so that tests/test_luts can
     # link the same reader. Only the dependency is added here, and only
-    # when the collection is really there: craw_view_luts_dep is a disabler
+    # when the collection is really there: cineview_luts_dep is a disabler
     # otherwise, and a disabler anywhere in an executable's dependency list
-    # disables the whole target, which would make craw-view vanish from a
+    # disables the whole target, which would make cineview vanish from a
     # checkout without the .cube files instead of merely building without
     # the menu.
-    if craw_view_luts_found
-        gui_args += '-DCRAW_VIEW_HAVE_LUTS=1'
-        gui_deps += craw_view_luts_dep
+    if cineview_luts_found
+        gui_args += '-DCINEVIEW_HAVE_LUTS=1'
+        gui_deps += cineview_luts_dep
     else
-        gui_args += '-DCRAW_VIEW_HAVE_LUTS=0'
+        gui_args += '-DCINEVIEW_HAVE_LUTS=0'
     endif
 
-    executable('craw-process',
-        'craw-process.c',
+    executable('cineraw',
+        'cineraw.c',
         'profiles.c',
         # The test device helper doubles as the tool's Vulkan boilerplate.
         '../tests/vkdev.c',
@@ -102,11 +102,11 @@ if craw_tools_ffmpeg
         install: true,
     )
 
-    # craw-view: the interactive viewer and exporter. libplacebo owns the
+    # cineview: the interactive viewer and exporter. libplacebo owns the
     # VkDevice, FFmpeg's Vulkan hwaccel decodes onto it, libcraw processes
     # in place and nuklear draws the panel into an overlay image.
     if craw_tools_gui
-        executable('craw-view',
+        executable('cineview',
             'gui/main.c',
             'gui/gpu.c',
             'gui/decode.c',
@@ -136,7 +136,7 @@ if craw_tools_ffmpeg
 endif
 
 summary({
-    'craw-process': craw_tools_ffmpeg,
-    'craw-view': craw_tools_gui,
-    'craw-view audio': craw_tools_gui and swresample.found(),
+    'cineraw': craw_tools_ffmpeg,
+    'cineview': craw_tools_gui,
+    'cineview audio': craw_tools_gui and swresample.found(),
 }, section: 'tools', bool_yn: true)

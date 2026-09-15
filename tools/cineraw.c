@@ -1,6 +1,6 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-/* craw-process: decode a camera raw clip with FFmpeg, run every frame
+/* cineraw: decode a camera raw clip with FFmpeg, run every frame
  * through libcraw on the GPU, write an image sequence.
  *
  * This is the development driver for the library: it is the only place
@@ -167,7 +167,7 @@ static const char *tool_space_name(enum CRAWColorSpace cs)
 static void tool_usage(FILE *f)
 {
     fprintf(f,
-"usage: craw-process [options] INPUT\n"
+"usage: cineraw [options] INPUT\n"
 "\n"
 "Decodes a camera raw clip with FFmpeg, runs every frame through libcraw on\n"
 "the GPU and writes an image sequence.\n"
@@ -1074,7 +1074,7 @@ static int tool_profile_from_frame(CRAWProfile *p, const AVFrame *frame)
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_RAW_COLOR_PARAMS);
     if (!sd) {
         fprintf(stderr, "the decoder produced no AV_FRAME_DATA_RAW_COLOR_PARAMS "
-                        "side data; craw-process only handles raw camera clips\n");
+                        "side data; cineraw only handles raw camera clips\n");
         return CRAW_ERROR(EINVAL);
     }
 
@@ -1884,7 +1884,7 @@ have_device:
 
         if (frame->format != AV_PIX_FMT_BAYER_RGGB16LE) {
             const char *name = av_get_pix_fmt_name(frame->format);
-            fprintf(stderr, "the decoder produced %s frames; craw-process needs "
+            fprintf(stderr, "the decoder produced %s frames; cineraw needs "
                             "%s (an RGGB Bayer mosaic)\n",
                     name ? name : "frames of an unknown format",
                     av_get_pix_fmt_name(AV_PIX_FMT_BAYER_RGGB16LE));

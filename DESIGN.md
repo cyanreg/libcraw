@@ -32,7 +32,7 @@ Out, deliberately, with a slot reserved: temporal denoising (section 14.7
 says how it attaches), a second chroma-only denoise stage (14.4 says why
 not yet), scaling, learned debayer, highlight reconstruction beyond the
 clip, OCIO-generated transforms, LUTs, other CFA phases, ARRIRAW and BRAW
-profiles, and lens correction. (The GUI, craw-view, exists under tools/gui as a consumer of
+profiles, and lens correction. (The GUI, cineview, exists under tools/gui as a consumer of
 the library: it is not part of the library's scope.) On the last one: Panasonic ProRes RAW frames carry a
 per-frame `com.panasonic.Semi-Pro.optical_correction` record in the
 vendor metadata after the last tile, framed as a `psim` record (be32 size
@@ -537,7 +537,7 @@ Anyone needing a change to a contract file reports it instead of editing.
 `tools/gui/grain.c` and `grain.h` turn a gauge and a stock into parameters
 for libplacebo's film grain shaders. `tools/grain/grain_preview.c` is the
 headless proof: it renders a chart and a developed frame through the same
-`pl_render_image` path craw-view uses, measures what came out and writes it
+`pl_render_image` path cineview uses, measures what came out and writes it
 to disk. Every number below is from that tool unless it is marked as a
 citation, and `--calibrate` re-measures the two tables `grain.c` carries
 against whatever libplacebo is installed.
@@ -1006,7 +1006,7 @@ fifty times the samples is worth more, but not fifty times more, because
 its error is dominated by how smooth that part of the scene is and not by
 counting statistics.
 
-`craw-process --noise-estimate` runs this on every decoded frame, prints
+`cineraw --noise-estimate` runs this on every decoded frame, prints
 the per-frame fit and then the median over the clip, formatted as a
 `noise ISO A B` line ready to paste into a `--tables` file. Two diagnostics
 decide whether to believe it: `fit_rms`, the relative error of the model
@@ -1179,7 +1179,7 @@ fallback was measured and is not needed. A pipeline built with the flag but
 run at strength 0 costs nothing measurable, which is what makes the
 strength a live control rather than a rebuild.
 
-`craw-process --bench`, which decodes on the CPU between frames and so
+`cineraw --bench`, which decodes on the CPU between frames and so
 leaves the GPU idle 97% of the time, reads 5.07 ms without and 7.55 ms
 with, i.e. 2.48 ms: the same pass, measured on a device that is not being
 kept busy. `test_pipeline`'s single real-frame submission, which follows
@@ -1276,7 +1276,7 @@ the sensor noise that was dithering it has been deliberately removed, and
 the correlated quantisation error is the contour. Every quantiser has this
 property and a denoiser is what exposes it.
 
-So the fix belongs at the quantiser, not in the filter: `craw-process`'s
+So the fix belongs at the quantiser, not in the filter: `cineraw`'s
 8-bit writer now adds one step of triangular dither, hashed from the pixel
 position so the output stays reproducible. That takes the error's lag-1
 autocorrelation from +0.062 to +0.000, which is the whole point of TPDF
@@ -1355,7 +1355,7 @@ padding tail, so this is an ABI break and the soname covers it.
 `CRAWFrameParams` and `CRAWPipelineParams` keep their sizes, the new fields
 coming out of their padding tails as intended.
 
-`craw-process` gains `--denoise STRENGTH`, `--noise A,B`, and
+`cineraw` gains `--denoise STRENGTH`, `--noise A,B`, and
 `--noise-estimate`, and its 8-bit writer gains the triangular dither of
 14.3. It also gains `--crop X,Y,W,H`, which writes and takes `--stats` over
 one rectangle of the output while the pipeline still runs on the whole

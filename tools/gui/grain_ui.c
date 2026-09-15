@@ -3,7 +3,7 @@
 /* The viewer's film grain section: the panel rows, the command line option
  * and the hook the renderer runs.
  *
- * The model lives in grain.c and knows nothing about craw-view. What this
+ * The model lives in grain.c and knows nothing about cineview. What this
  * file adds is where the grain is applied from the viewer's point of view.
  * The hook sits at PL_HOOK_PRE_OUTPUT, so the grain lands on the picture
  * after scaling and colour management - which means what is graded is what

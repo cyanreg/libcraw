@@ -811,7 +811,7 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
 
     if (!vkfmt || vkfmt[0] != VK_FORMAT_R16_UNORM) {
         fprintf(stderr, "the decoder's hardware frames are not a single R16_UNORM "
-                        "plane; craw-view needs an RGGB Bayer mosaic\n");
+                        "plane; cineview needs an RGGB Bayer mosaic\n");
         return CRAW_ERROR(ENOTSUP);
     }
 
@@ -1153,7 +1153,7 @@ static const struct pl_hook *view_exposure_hook(struct view_gpu *g, float gain)
     len = snprintf(shader, sizeof(shader),
         "//!HOOK LINEAR\n"
         "//!BIND HOOKED\n"
-        "//!DESC craw-view exposure\n"
+        "//!DESC cineview exposure\n"
         "vec4 hook()\n"
         "{\n"
         "    vec4 color = HOOKED_texOff(0);\n"

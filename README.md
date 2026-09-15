@@ -51,16 +51,16 @@ device; llvmpipe is enough.
 
 ## Tools
 
-`craw-process` decodes a clip with FFmpeg, runs every frame through the
+`cineraw` decodes a clip with FFmpeg, runs every frame through the
 GPU pipeline and writes PNG (16 bit), PFM (linear float) or PPM (8 bit,
 dithered, because a denoised shadow gradient bands without it) sequences.
 The options that matter most:
 
-    craw-process --wb auto -v --frames 30 clip.MOV        estimate the illuminant
-    craw-process --wb 5600:0.02 --ei 400 -o out_%05d.png clip.MOV
-    craw-process --bench --frames 60 clip.MOV             GPU and decode timing
-    craw-process --denoise 1.0 --crop 2750,1450,1000,1000 -o c_%d.png clip.MOV
-    craw-process --noise-estimate --frames 10 flatfield.MOV   fit the noise model
+    cineraw --wb auto -v --frames 30 clip.MOV        estimate the illuminant
+    cineraw --wb 5600:0.02 --ei 400 -o out_%05d.png clip.MOV
+    cineraw --bench --frames 60 clip.MOV             GPU and decode timing
+    cineraw --denoise 1.0 --crop 2750,1450,1000,1000 -o c_%d.png clip.MOV
+    cineraw --noise-estimate --frames 10 flatfield.MOV   fit the noise model
 
 `--denoise` takes a strength in units of the camera's modelled noise
 level, 1.0 meaning "remove exactly that much"; `--noise A,B` overrides the
@@ -76,7 +76,7 @@ which rolls highlights off per channel before the sRGB curve. The
 Panasonic DC-S1M2 per-CCT tables are built in and selected from the
 container's model name; `--tables` loads others from a text file.
 
-`craw-view` is the interactive viewer and exporter built on SDL3, nuklear
+`cineview` is the interactive viewer and exporter built on SDL3, nuklear
 and libplacebo, when those are found. It decodes with FFmpeg's Vulkan
 hwaccel on libplacebo's device, runs libcraw on the same device, reads the
 file on its own thread and loops by default (`--no-loop`). Space plays and
@@ -92,7 +92,7 @@ sets its strength, and reports the noise model it found for the clip's own
 ISO — the stage stays off when the camera has none, which the section says
 rather than leaving you guessing; `--denoise STRENGTH` sets it from the
 command line. With four mono audio tracks the last two are taken
-as the stereo pair (`--audio-map` overrides). `craw-view -h` lists the
+as the stereo pair (`--audio-map` overrides). `cineview -h` lists the
 options.
 
 It also carries 296 film simulation LUTs from
@@ -148,7 +148,7 @@ stills is deliberately not offered — that is a video encode.
     lib/            library sources, shaders under lib/shaders
     lib/ref/        CPU reference implementation
     tests/          tests and the test device helper
-    tools/          build helpers, craw-process, and the craw-view GUI
+    tools/          build helpers, cineraw, and the cineview GUI
 
 ## License
 

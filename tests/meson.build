@@ -59,16 +59,16 @@ endforeach
 #
 # Until then this is simply skipped, so a checkout without the hook, without
 # the .cube files or without zlib still builds and tests everything else.
-if is_variable('craw_view_luts_dep')
+if is_variable('cineview_luts_dep')
     exe = executable('test_luts', 'test_luts.c',
-        dependencies: [ craw_view_luts_dep, cc.find_library('m', required: false) ],
+        dependencies: [ cineview_luts_dep, cc.find_library('m', required: false) ],
         c_args: [ '-DTEST_LUTS_DIR="' +
                   meson.project_source_root() / 'tools' / 'gui' / 'luts' + '"' ])
     test('test_luts', exe, timeout: 300)
 endif
 
 # The film grain parameter model. It lives in tools/gui/ because that is
-# where craw-view uses it from, but it has no SDL and no nuklear in it, so
+# where cineview uses it from, but it has no SDL and no nuklear in it, so
 # the test builds it directly. libplacebo is asked for again here rather
 # than reused from tools/, because meson walks tests/ first.
 grain_placebo = dependency('libplacebo', version: '>=7.349', required: false)

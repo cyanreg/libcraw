@@ -17,7 +17,7 @@ Two halves that run at different times:
           build directory; nothing generated is stored in the tree.
 
 The pack keeps each LUT as its own independently compressed blob, because
-craw-view decompresses exactly one of them — the one the user picked — and
+cineview decompresses exactly one of them — the one the user picked — and
 never the other 295. Each blob is the LUT quantized to 16 bits over its own
 value range (so lossless to one part in 65535 of that range), delta coded
 along the fastest axis (red, the way .cube orders its samples) and deflated.
@@ -43,7 +43,7 @@ import urllib.request
 import zlib
 
 SITE = "https://filmgrid.org"
-UA = ("libcraw-luts_build/1.0 (film simulation pack for libcraw's craw-view; "
+UA = ("libcraw-luts_build/1.0 (film simulation pack for libcraw's cineview; "
       "contact dev@lynne.ee)")
 DELAY = 0.6          # seconds between requests; politeness, not a rate limit
 PACK_MAGIC = b"CRAWLUT1"
@@ -441,7 +441,7 @@ def do_pack(args):
         zs = zstd_compress_all(blobs)
         if zs is not None:
             stotal = sum(len(x) for x in zs)
-            # A second decompressor in craw-view only earns its place on a
+            # A second decompressor in cineview only earns its place on a
             # real win, so hold zstd to 20% better than deflate.
             if stotal <= ztotal * 0.8:
                 comp, comp_flag = zs, 1

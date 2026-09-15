@@ -3,9 +3,9 @@
 /* Headless proof for the film grain model in tools/gui/grain.c.
  *
  * Creates a libplacebo Vulkan context with no surface, pushes a test picture
- * through pl_render_image exactly the way craw-view does, applies grain by
+ * through pl_render_image exactly the way cineview does, applies grain by
  * each of the two paths and each preset, measures what came out and writes
- * contact sheets to look at. Nothing here is part of craw-view; it exists so
+ * contact sheets to look at. Nothing here is part of cineview; it exists so
  * that the numbers in DESIGN.md's film grain section are measurements and
  * not assertions.
  *
@@ -121,7 +121,7 @@ static void patch_rect(int idx, int w, int h, int *x0, int *y0, int *x1, int *y1
     *y1 = h - inset;
 }
 
-/* PFM, as craw-process writes it with `--encode linear -o x.pfm`: linear
+/* PFM, as cineraw writes it with `--encode linear -o x.pfm`: linear
  * float RGB, bottom row first. Box-averaged down to the wanted width, which
  * is also what a real viewer does to a 5760 wide frame. */
 static int image_pfm(struct image *im, const char *path, int want_w)
@@ -432,7 +432,7 @@ static int ctx_upload(struct ctx *c, const struct image *im)
 
     /* pl_tex_upload is a byte copy, not a conversion, so the host data has
      * to already be in the texture's format - fp16, the same as the texture
-     * craw-view hands libplacebo. */
+     * cineview hands libplacebo. */
     uint16_t *rgba = malloc((size_t)im->w * im->h * 4 * sizeof(uint16_t));
     if (!rgba)
         return -ENOMEM;
@@ -478,7 +478,7 @@ static int ctx_target(struct ctx *c, int w, int h)
     return 0;
 }
 
-/* The frame craw-view hands libplacebo: one RGBA16F plane, scene linear
+/* The frame cineview hands libplacebo: one RGBA16F plane, scene linear
  * BT.2020 tagged scRGB, diffuse white at 1.0, the sensor clip as the static
  * HDR ceiling. See tools/gui/gpu.c, view_gpu_image(). */
 static struct pl_frame make_image(const struct ctx *c, float ceiling)
@@ -535,7 +535,7 @@ static int render(struct ctx *c, const struct craw_grain_params *gp,
     const struct pl_hook *hooks[4];
     int nb_hooks = 0;
 
-    /* craw-view's scRGB scale correction, so the tone mapper sees the
+    /* cineview's scRGB scale correction, so the tone mapper sees the
      * pipeline's own numbers. */
     adj.contrast = PL_COLOR_SDR_WHITE / PL_COLOR_SCRGB_WHITE;
     rp.color_adjustment = &adj;
@@ -1064,7 +1064,7 @@ static void usage(void)
     printf(
 "usage: grain_preview [options]\n"
 "  --out DIR      where the PNGs go (default: the working directory)\n"
-"  --frame PFM    a developed frame from `craw-process --encode linear`\n"
+"  --frame PFM    a developed frame from `cineraw --encode linear`\n"
 "  --width N      output width (default 1920)\n"
 "  --src-width N  chart width before scaling (default: the output width)\n"
 "  --device SUB   Vulkan device whose name contains SUB\n"

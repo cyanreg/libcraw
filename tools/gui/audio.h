@@ -1,7 +1,7 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-#ifndef CRAW_VIEW_AUDIO_H
-#define CRAW_VIEW_AUDIO_H
+#ifndef CINEVIEW_AUDIO_H
+#define CINEVIEW_AUDIO_H
 
 /* Audio output and the master clock.
  *
@@ -212,4 +212,4 @@ void view_audio_set_volume(struct view_audio *a, float volume, bool mute);
 /* Writes exactly what the callback hands to the stream. */
 int  view_audio_dump_open(struct view_audio *a, const char *path);
 
-#endif /* CRAW_VIEW_AUDIO_H */
+#endif /* CINEVIEW_AUDIO_H */

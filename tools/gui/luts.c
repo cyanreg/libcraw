@@ -25,11 +25,11 @@
 #include <zlib.h>
 /* The build defines this to 1 when the pack was compressed with zstd;
  * the zlib reader is the default. */
-#ifndef CRAW_VIEW_LUTS_HAVE_ZSTD
-#define CRAW_VIEW_LUTS_HAVE_ZSTD 0
+#ifndef CINEVIEW_LUTS_HAVE_ZSTD
+#define CINEVIEW_LUTS_HAVE_ZSTD 0
 #endif
 
-#if CRAW_VIEW_LUTS_HAVE_ZSTD
+#if CINEVIEW_LUTS_HAVE_ZSTD
 #include <zstd.h>
 #endif
 
@@ -119,8 +119,8 @@ static const uint32_t *pack_list(uint32_t off, uint32_t n, uint32_t lo,
 
 int view_luts_init(void)
 {
-    const uint8_t *p = craw_view_filmgrid_pack_data;
-    size_t len = craw_view_filmgrid_pack_len;
+    const uint8_t *p = cineview_filmgrid_pack_data;
+    size_t len = cineview_filmgrid_pack_len;
     uint32_t dir_off, films_off, fcat_off, lcat_off, lists_off;
     uint32_t strtab_off, strtab_len, total;
 
@@ -161,7 +161,7 @@ int view_luts_init(void)
         return CRAW_ERROR(EINVAL);
 
     if (pack.compression == PACK_ZSTD) {
-#if !CRAW_VIEW_LUTS_HAVE_ZSTD
+#if !CINEVIEW_LUTS_HAVE_ZSTD
         /* Built without zstd but handed a zstd pack: the two halves of the
          * build disagree, which is a build bug, not a runtime one. */
         return CRAW_ERROR(ENOTSUP);
@@ -379,7 +379,7 @@ static int pack_decompress(int index, uint8_t **out, size_t *out_len)
         return CRAW_ERROR(ENOMEM);
 
     if (pack.compression == PACK_ZSTD) {
-#if CRAW_VIEW_LUTS_HAVE_ZSTD
+#if CINEVIEW_LUTS_HAVE_ZSTD
         size_t n = ZSTD_decompress(buf, raw_len, pack.base + blob_off,
                                    comp_len);
         if (ZSTD_isError(n) || n != raw_len) {
