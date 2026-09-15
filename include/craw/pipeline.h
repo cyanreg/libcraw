@@ -45,6 +45,13 @@ enum CRAWDebayer {
  * craw_pipeline_get_awb_histogram(). */
 #define CRAW_PIPELINE_FLAG_AWB_HISTOGRAM (1 << 0)
 
+/* Build the raw-domain denoise pass. It costs an extra full resolution
+ * R16_UNORM image and, at full strength, a few milliseconds a frame, so it
+ * is only created when asked for. Once created it is switched per frame
+ * with CRAWFrameParams.denoise_strength, which costs nothing when zero.
+ * See DESIGN.md 14. */
+#define CRAW_PIPELINE_FLAG_DENOISE (1 << 1)
+
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
 typedef struct CRAWPipelineParams {
@@ -91,16 +98,32 @@ typedef struct CRAWFrameParams {
 
     uint32_t flags;               /* CRAW_FRAME_FLAG_* */
 
+    /* Denoise strength, in units of the modelled noise level: 1.0 removes
+     * noise at exactly the level the model predicts, larger values smooth
+     * across real detail, smaller ones leave noise behind. 0.0 skips the
+     * pass for this frame without rebuilding the pipeline, and is the
+     * default. Ignored unless the pipeline was created with
+     * CRAW_PIPELINE_FLAG_DENOISE. */
+    float denoise_strength;
+
+    /* Sensor noise model for this frame. When `a` is positive it is used
+     * as given; otherwise the profile's table is evaluated at the
+     * profile's as_shot_ei, and a profile without a table makes
+     * craw_pipeline_record() fail with CRAW_ERROR(ENOTSUP) whenever
+     * denoise_strength is positive. */
+    CRAWNoiseModel noise_override;
+
     /* Padding to allow for future options. Must always be set to 0. */
-    uint8_t padding[256 - 4*4 - 8];
+    uint8_t padding[256 - 4*4 - 8 - 12];
 } CRAWFrameParams;
 
 /* Fills `p` with defaults: RGGB, RCD, XYZ D65 output, RGBA16F, no flags.
  * width and height are left at 0 and must be set by the caller. */
 CRAW_API void craw_pipeline_params_init(CRAWPipelineParams *p);
 
-/* Fills `fp` with defaults: as-shot white balance, no exposure change. The
- * profile pointer is left NULL and must be set by the caller. */
+/* Fills `fp` with defaults: as-shot white balance, no exposure change, no
+ * denoising, no noise model override. The profile pointer is left NULL and
+ * must be set by the caller. */
 CRAW_API void craw_frame_params_init(CRAWFrameParams *fp);
 
 /* Allocates the pipeline's intermediate images and histogram buffers for
@@ -114,6 +137,7 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
 /* Records the whole chain into `cmd`:
  *
  *   src (VK_FORMAT_R16_UNORM Bayer mosaic, params width x height)
+ *     -> [denoise, in the raw domain, on the four CFA planes]
  *     -> black/white normalization, as-shot white balance, clip
  *     -> debayer to full resolution camera RGB
  *     -> [auto white balance histogram]

@@ -1,6 +1,7 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ref.h"
@@ -60,10 +61,24 @@ int craw_ref_color(float *rgb, uint32_t width, uint32_t height,
     return 0;
 }
 
+int craw_ref_noise_model(const CRAWFrameParams *fp, CRAWNoiseModel *out)
+{
+    if (!fp || !fp->profile || !out)
+        return CRAW_ERROR(EINVAL);
+
+    if (fp->noise_override.a > 0.0f) {
+        *out = fp->noise_override;
+        return 0;
+    }
+
+    return craw_profile_noise_eval(fp->profile, fp->profile->as_shot_ei, out);
+}
+
 int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
                      size_t stride, const CRAWPipelineParams *params,
                      const CRAWFrameParams *fp, float *out)
 {
+    uint16_t *clean = NULL;
     int ret;
 
     if (!params || !fp || !fp->profile)
@@ -73,18 +88,45 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
     if (params->cfa != fp->profile->cfa)
         return CRAW_ERROR(EINVAL);
 
+    if ((params->flags & CRAW_PIPELINE_FLAG_DENOISE) && fp->denoise_strength > 0.0f) {
+        CRAWNoiseModel nm;
+
+        ret = craw_ref_noise_model(fp, &nm);
+        if (ret < 0)
+            return ret;
+
+        clean = malloc((size_t)width * height * sizeof(*clean));
+        if (!clean)
+            return CRAW_ERROR(ENOMEM);
+
+        ret = craw_ref_denoise(bayer, width, height, stride, fp->profile, &nm,
+                               fp->denoise_strength, clean, width);
+        if (ret < 0) {
+            free(clean);
+            return ret;
+        }
+
+        bayer = clean;
+        stride = width;
+    }
+
     {
         CRAWColorParams par;
 
         ret = craw_profile_eval(fp->profile, fp->wb_mode, &fp->illuminant, &par);
         if (ret < 0)
-            return ret;
+            goto done;
 
         ret = craw_ref_debayer_wb(bayer, width, height, stride, fp->profile, par.wb,
                                   params->debayer, out);
         if (ret < 0)
-            return ret;
+            goto done;
     }
 
-    return craw_ref_color(out, width, height, fp, params->out_space);
+    ret = craw_ref_color(out, width, height, fp, params->out_space);
+
+done:
+    free(clean);
+
+    return ret;
 }

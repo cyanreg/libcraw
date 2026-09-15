@@ -26,6 +26,7 @@
 #include <craw/profile.h>
 #include <craw/pipeline.h>
 #include <craw/awb.h>
+#include <craw/noise.h>
 
 #include "vkdev.h"
 #include "ref/ref.h"
@@ -478,6 +479,257 @@ static int test_check_histogram(const char *method, const uint32_t *gpu_count,
     return 0;
 }
 
+/* ------------------------------------------------------------- denoise */
+
+/* The noise the synthetic mosaic carries: a uniform +-8 count term, which
+ * has a variance of (17^2 - 1) / 12 counts squared, expressed in the
+ * normalized domain of DESIGN.md 14.1. The shot term is the real camera's,
+ * so the model the stage is handed is a plausible one and the filter has
+ * something to do at every level. */
+#define TEST_NOISE_RANGE (TEST_WHITE - TEST_BLACK)
+#define TEST_NOISE_B ((17.0 * 17.0 - 1.0) / 12.0 / \
+                      (65535.0 * TEST_NOISE_RANGE * 65535.0 * TEST_NOISE_RANGE))
+#define TEST_NOISE_A 1.3e-5
+
+/* The denoise pass is a weighted mean of up to 49 stabilised samples,
+ * inverted and re-encoded into 16 bits. What separates the GPU from the
+ * reference is the order those 49 terms are summed in, an ulp or two in
+ * exp(), and samples that land within an ulp of a 16-bit rounding
+ * boundary and quantize the other way; the last of those is the largest
+ * and is one code value of the mosaic, which the debayer and the white
+ * balance turn into about 4e-5 of the intermediate. The bound below is the
+ * intermediate tolerance of DESIGN.md 11 for the non-RCD methods, which
+ * this comfortably clears. */
+#define TEST_DENOISE_TOL 2e-3
+
+/* The real frame goes through the colour stage of a real profile, so it is
+ * held to the relative bound DESIGN.md 11 states for RCD output rather
+ * than to an absolute one: its highlights sit far above 1.0, where fp16
+ * storage alone is worth tens of millis absolute and means nothing. */
+#define TEST_DENOISE_REAL_TOL 1.5e-2
+
+/* The 3x3 [1 -2 1; -2 4 -2; 1 -2 1] / 6 high pass of one CFA plane has
+ * unit gain on white noise variance and none at all on a bilinear signal,
+ * so its median absolute value over a flat patch is 0.6745 noise standard
+ * deviations whatever the patch's level. Used here to check that the stage
+ * removes noise rather than merely producing the same numbers on both
+ * sides. `x0, y0, x1, y1` are mosaic coordinates of a flat region. */
+static int test_cmp_float(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static double test_plane_noise(const uint16_t *m, int x0, int y0, int x1, int y1)
+{
+    static float res[1 << 14];
+    size_t n = 0;
+
+    for (int y = y0 + 2; y <= y1 - 2; y++) {
+        for (int x = x0 + 2; x <= x1 - 2; x++) {
+            double r;
+
+            if (n >= CRAW_ARRAY_ELEMS(res))
+                break;
+
+            /* Steps of two stay inside one CFA plane. */
+            r = (double)m[(y - 2) * TEST_W + x - 2] + m[(y - 2) * TEST_W + x + 2]
+              + m[(y + 2) * TEST_W + x - 2] + m[(y + 2) * TEST_W + x + 2]
+              - 2.0 * ((double)m[(y - 2) * TEST_W + x] + m[(y + 2) * TEST_W + x]
+                     + m[y * TEST_W + x - 2] + m[y * TEST_W + x + 2])
+              + 4.0 * m[y * TEST_W + x];
+            res[n++] = (float)fabs(r / 6.0);
+        }
+    }
+
+    if (!n)
+        return 0.0;
+
+    qsort(res, n, sizeof(*res), test_cmp_float);
+
+    return res[n / 2] / 0.6744897502;
+}
+
+/* GPU against the reference with the denoise pass in front of the debayer,
+ * plus the two ways the pass is switched off and the functional check that
+ * it removes noise instead of merely producing the same numbers on both
+ * sides.
+ *
+ * The first configuration is the plain chain, which fixes the floor every
+ * other number is read against: the debayer's own GPU/CPU disagreement and
+ * the fp16 storage of the intermediate are already there before this stage
+ * adds anything. A denoised frame then has to stay inside the tolerance
+ * against a denoised reference and, at the same time, sit well outside
+ * that floor against an undenoised one, which is what a pass that silently
+ * did not run could not manage. */
+static int test_denoise(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                        const uint16_t *mosaic, CRAWTestImage *src, CRAWTestImage *dst,
+                        float *gpu, float *ref)
+{
+    static const float strengths[] = { 1.0f, 2.0f };
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    uint16_t *clean = NULL;
+    CRAWNoiseModel nm = { .a = (float)TEST_NOISE_A, .b = (float)TEST_NOISE_B };
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    double ms = 0.0, err, base, cross;
+    int ret = -1;
+
+    clean = malloc(npix * sizeof(*clean));
+    if (!clean)
+        return -1;
+
+    /* Strength zero skips the pass, and so does a pipeline built without
+     * the flag; both must reproduce the plain chain. The second of the two
+     * leaves `ref` holding the undenoised reference and `base` the floor. */
+    base = 0.0;
+    for (int off = 0; off < 2; off++) {
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = CRAW_DEBAYER_MHC;
+        pp.out_space = CRAW_CS_XYZ_D65;
+        pp.flags = off ? 0 : CRAW_PIPELINE_FLAG_DENOISE;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.denoise_strength = off ? 1.0f : 0.0f;
+        fp.noise_override = nm;
+
+        if (craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, identity,
+                             CRAW_DEBAYER_MHC, ref) < 0)
+            goto done;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+
+        base = test_max_abs(gpu, ref, npix);
+        printf("  denoise  %-14s: max abs %.3e\n",
+               off ? "flag not set" : "strength 0", base);
+        if (!(base <= TEST_DENOISE_TOL)) {
+            fprintf(stderr, "the denoise pass ran when it should not have (%.3e)\n", base);
+            goto done;
+        }
+    }
+
+    for (size_t si = 0; si < CRAW_ARRAY_ELEMS(strengths); si++) {
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = CRAW_DEBAYER_MHC;
+        pp.out_space = CRAW_CS_XYZ_D65;
+        pp.flags = CRAW_PIPELINE_FLAG_DENOISE;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.denoise_strength = strengths[si];
+        fp.noise_override = nm;
+
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+
+        /* `ref` still holds the undenoised reference from the loop above. */
+        cross = test_max_abs(gpu, ref, npix);
+
+        if (craw_ref_process(mosaic, TEST_W, TEST_H, TEST_W, &pp, &fp, ref) < 0) {
+            fprintf(stderr, "denoise: craw_ref_process failed\n");
+            goto done;
+        }
+        err = test_max_abs(gpu, ref, npix);
+
+        printf("  denoise  strength %.1f  : max abs %.3e (tol %.1e), %.3e against the "
+               "undenoised chain (floor %.3e), %.3f ms\n",
+               (double)strengths[si], err, TEST_DENOISE_TOL, cross, base, ms);
+        if (!(err <= TEST_DENOISE_TOL)) {
+            fprintf(stderr, "denoise at strength %.1f differs by %.3e, tolerance %.1e\n",
+                    (double)strengths[si], err, TEST_DENOISE_TOL);
+            goto done;
+        }
+        if (!(cross > 3.0 * base)) {
+            fprintf(stderr, "a denoised frame is only %.3e from an undenoised one against "
+                    "a floor of %.3e; the pass cannot have run\n", cross, base);
+            goto done;
+        }
+
+        /* The reference's own denoised mosaic, so that the noise numbers
+         * describe the definition rather than one of its implementations. */
+        if (craw_ref_denoise(mosaic, TEST_W, TEST_H, TEST_W, identity, &nm,
+                             strengths[si], clean, TEST_W) < 0) {
+            fprintf(stderr, "craw_ref_denoise failed\n");
+            goto done;
+        }
+
+        {
+            /* The neutral flat patch of test_scene_rgb(), inset so that no
+             * stencil reaches its edge. */
+            double before = test_plane_noise(mosaic, 162, 26, 197, 53);
+            double after = test_plane_noise(clean, 162, 26, 197, 53);
+
+            printf("  denoise  strength %.1f  : flat patch noise %.2f -> %.2f counts "
+                   "(%.0f%%, want <= 60%%)\n",
+                   (double)strengths[si], before, after, 100.0 * after / before);
+            if (!(after <= 0.60 * before)) {
+                fprintf(stderr, "denoise at strength %.1f left %.0f%% of the noise\n",
+                        (double)strengths[si], 100.0 * after / before);
+                goto done;
+            }
+        }
+
+        /* And it must not have flattened the frame: the 2x2 checkerboard
+         * of test_scene_rgb() is real detail at the sampling limit, which
+         * the patch distance is supposed to keep. */
+        {
+            double before = test_plane_noise(mosaic, 212, 100, 243, 131);
+            double after = test_plane_noise(clean, 212, 100, 243, 131);
+
+            printf("  denoise  strength %.1f  : checkerboard high pass %.0f -> %.0f "
+                   "counts (%.0f%%, want >= 70%%)\n",
+                   (double)strengths[si], before, after, 100.0 * after / before);
+            if (!(after >= 0.70 * before)) {
+                fprintf(stderr, "denoise at strength %.1f destroyed the checkerboard "
+                        "(%.0f%% left)\n", (double)strengths[si], 100.0 * after / before);
+                goto done;
+            }
+        }
+    }
+
+    /* Without a model the pass cannot know what to remove. */
+    {
+        CRAWPipeline *pipe = NULL;
+        CRAWProfile bare = *identity;
+        struct test_run run;
+        int rec;
+
+        bare.nb_noise_knots = 0;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.flags = CRAW_PIPELINE_FLAG_DENOISE;
+
+        craw_frame_params_init(&fp);
+        fp.profile = &bare;
+        fp.denoise_strength = 1.0f;
+
+        if (craw_pipeline_create(ctx, &pp, &pipe) < 0)
+            goto done;
+
+        run = (struct test_run) { .pipe = pipe, .src = src, .dst = dst, .fp = &fp };
+        rec = craw_testdev_run(td, test_record, &run);
+        craw_pipeline_free(&pipe);
+        if (rec != CRAW_ERROR(ENOTSUP)) {
+            fprintf(stderr, "denoising without a noise model returned %d, wanted %d\n",
+                    rec, CRAW_ERROR(ENOTSUP));
+            goto done;
+        }
+    }
+
+    ret = 0;
+
+done:
+    free(clean);
+    return ret;
+}
+
 /* ----------------------------------------------------------- rejections */
 
 /* The configurations craw_pipeline_create() must refuse, plus the histogram
@@ -514,6 +766,18 @@ static int test_validation(CRAWContext *ctx)
     pp.out_format = VK_FORMAT_R8G8B8A8_UNORM;
     if (craw_pipeline_create(ctx, &pp, &pipe) != CRAW_ERROR(EINVAL)) {
         fprintf(stderr, "an unsupported output format was not rejected with EINVAL\n");
+        craw_pipeline_free(&pipe);
+        return -1;
+    }
+
+    /* The denoise stage's plane mirror is good for one reflection, so it
+     * has a minimum frame size of its own. */
+    craw_pipeline_params_init(&pp);
+    pp.width = 8;
+    pp.height = 8;
+    pp.flags = CRAW_PIPELINE_FLAG_DENOISE;
+    if (craw_pipeline_create(ctx, &pp, &pipe) != CRAW_ERROR(EINVAL)) {
+        fprintf(stderr, "an 8x8 denoise pipeline was not rejected with EINVAL\n");
         craw_pipeline_free(&pipe);
         return -1;
     }
@@ -629,6 +893,58 @@ static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfi
 
     printf("  rcd on %dx%d: %.2f ms, max abs %.3e, max rel %.3e\n", FRAME_W, FRAME_H, ms,
            test_max_abs(gpu, ref, npix), test_max_rel(gpu, ref, npix));
+
+    /* The same frame through the denoise pass, with the model fitted on
+     * the frame itself so that the stage is handed the noise it really
+     * carries. `cross` is against the undenoised reference still in `ref`,
+     * i.e. how far the pass moved the picture; it has to be far larger
+     * than the agreement between the two implementations of it. */
+    {
+        CRAWNoiseEstimate est;
+        double cross, err_abs, err_rel;
+
+        ret = craw_noise_estimate(mosaic, FRAME_W, FRAME_H, FRAME_W, profile, NULL, &est);
+        if (ret < 0) {
+            fprintf(stderr, "craw_noise_estimate failed: %d\n", ret);
+            goto done;
+        }
+        printf("  noise model: a %.4e b %.4e, %u bins, fit error %.1f%%, "
+               "read noise %.2f code values\n", (double)est.model.a, (double)est.model.b,
+               est.nb_bins, 100.0 * (double)est.fit_rms, (double)est.read_noise_lsb);
+
+        pp.flags = CRAW_PIPELINE_FLAG_DENOISE;
+        fp.denoise_strength = 1.0f;
+        fp.noise_override = est.model;
+
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, gpu, NULL, NULL, &ms);
+        if (ret < 0)
+            goto done;
+
+        cross = test_max_rel(gpu, ref, npix);
+
+        ret = craw_ref_process(mosaic, FRAME_W, FRAME_H, FRAME_W, &pp, &fp, ref);
+        if (ret < 0)
+            goto done;
+
+        err_abs = test_max_abs(gpu, ref, npix);
+        err_rel = test_max_rel(gpu, ref, npix);
+        printf("  rcd + denoise on %dx%d: %.2f ms, max rel %.3e (tol %.1e), max abs %.3e, "
+               "%.3e relative against the undenoised chain\n", FRAME_W, FRAME_H, ms,
+               err_rel, TEST_DENOISE_REAL_TOL, err_abs, cross);
+
+        if (!(err_rel <= TEST_DENOISE_REAL_TOL)) {
+            fprintf(stderr, "denoise on the real frame differs by %.3e relative, "
+                    "tolerance %.1e\n", err_rel, TEST_DENOISE_REAL_TOL);
+            ret = -1;
+            goto done;
+        }
+        if (!(cross > 5.0 * err_rel)) {
+            fprintf(stderr, "the denoised frame is only %.3e relative from the undenoised "
+                    "one; the pass cannot have run\n", cross);
+            ret = -1;
+            goto done;
+        }
+    }
 
 done:
     if (ret < 0)
@@ -817,6 +1133,9 @@ int main(void)
             }
         }
     }
+
+    if (test_denoise(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
 
     if (test_real_frame(&td, ctx, &profile) < 0)
         goto done;

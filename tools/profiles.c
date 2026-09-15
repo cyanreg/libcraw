@@ -35,6 +35,28 @@ static const CRAWMatrixKnot s1m2_matrix_knots[] = {
     { 15000.0f, { { 0.7218f, 0.1263f, 0.1023f }, { 0.3158f, 0.7991f, -0.1149f }, { 0.0023f,  0.1176f, 0.9692f } } },
 };
 
+/* Sensor noise model, DESIGN.md 14.2, fitted with craw_noise_estimate()
+ * on frame 0 of the ProRes RAW clips this camera has produced so far:
+ * seven at ISO 1000 (P1000387, P1093870, P1093961, P1093970, P1093971,
+ * P1094127, P1094644) and one at ISO 1250 (P1030266). Six of the seven
+ * agreed on a to within +-7% and their median is the knot; the seventh is
+ * a scene with fine texture in every bin and was discarded. b is a floor:
+ * none of the clips has a region dark enough to resolve it, and it only
+ * matters below u = b / a, about five code values above black.
+ *
+ * Two knots is not a characterization. The camera writes the same
+ * GainFactor at every ISO, which suggests a fixed analog gain with ISO as
+ * metadata, in which case `a` barely moves; the two knots here are
+ * consistent with that and equally consistent with a weak power law. The
+ * ISO series will decide. Until then craw_noise_model_eval() clamps
+ * outside this range rather than extrapolating, so a high-ISO clip is
+ * under-denoised, never over-denoised, and --denoise or --noise is the way
+ * to correct it. */
+static const CRAWNoiseKnot s1m2_noise_knots[] = {
+    { 1000.0f, 1.30e-5f, 1.0e-9f },
+    { 1250.0f, 1.46e-5f, 1.1e-9f },
+};
+
 struct tool_builtin_profile {
     const char *name;        /* --profile argument */
     const char *model;       /* what the container calls the camera */
@@ -44,6 +66,8 @@ struct tool_builtin_profile {
     uint32_t nb_wb;
     const CRAWMatrixKnot *matrix;
     uint32_t nb_matrix;
+    const CRAWNoiseKnot *noise;
+    uint32_t nb_noise;
 };
 
 static const struct tool_builtin_profile tool_builtin_profiles[] = {
@@ -55,6 +79,8 @@ static const struct tool_builtin_profile tool_builtin_profiles[] = {
         .nb_wb     = CRAW_ARRAY_ELEMS(s1m2_wb_knots),
         .matrix    = s1m2_matrix_knots,
         .nb_matrix = CRAW_ARRAY_ELEMS(s1m2_matrix_knots),
+        .noise     = s1m2_noise_knots,
+        .nb_noise  = CRAW_ARRAY_ELEMS(s1m2_noise_knots),
     },
 };
 
@@ -70,6 +96,8 @@ int craw_tool_profile_apply_builtin(CRAWProfile *p, const char *name)
         p->nb_wb_knots = b->nb_wb;
         memcpy(p->matrix_knots, b->matrix, b->nb_matrix * sizeof(*b->matrix));
         p->nb_matrix_knots = b->nb_matrix;
+        memcpy(p->noise_knots, b->noise, b->nb_noise * sizeof(*b->noise));
+        p->nb_noise_knots = b->nb_noise;
         snprintf(p->name, sizeof(p->name), "%s", b->display);
 
         return 0;
@@ -111,11 +139,18 @@ static int tool_matrix_knot_cmp(const void *a, const void *b)
     return (ka->cct > kb->cct) - (ka->cct < kb->cct);
 }
 
+static int tool_noise_knot_cmp(const void *a, const void *b)
+{
+    const CRAWNoiseKnot *ka = a, *kb = b;
+    return (ka->iso > kb->iso) - (ka->iso < kb->iso);
+}
+
 int craw_tool_profile_load_tables(CRAWProfile *p, const char *path)
 {
     CRAWWbKnot wb[CRAW_PROFILE_MAX_KNOTS];
     CRAWMatrixKnot mat[CRAW_PROFILE_MAX_KNOTS];
-    uint32_t nb_wb = 0, nb_mat = 0;
+    CRAWNoiseKnot noise[CRAW_PROFILE_MAX_NOISE_KNOTS];
+    uint32_t nb_wb = 0, nb_mat = 0, nb_noise = 0;
     char line[512];
     unsigned lineno = 0;
     FILE *f;
@@ -177,6 +212,22 @@ int craw_tool_profile_load_tables(CRAWProfile *p, const char *path)
                 .cct = v[0],
                 .m   = { { v[1], v[2], v[3] }, { v[4], v[5], v[6] }, { v[7], v[8], v[9] } },
             };
+        } else if (!strcmp(kind, "noise")) {
+            n = sscanf(line, "%15s %f %f %f", kind, &v[0], &v[1], &v[2]);
+            if (n != 4) {
+                fprintf(stderr, "%s:%u: expected `noise ISO A B`\n", path, lineno);
+                ret = CRAW_ERROR(EINVAL);
+                goto fail;
+            }
+            if (nb_noise >= CRAW_PROFILE_MAX_NOISE_KNOTS) {
+                fprintf(stderr, "%s:%u: more than %d noise knots\n", path, lineno,
+                        CRAW_PROFILE_MAX_NOISE_KNOTS);
+                ret = CRAW_ERROR(EINVAL);
+                goto fail;
+            }
+            noise[nb_noise++] = (CRAWNoiseKnot) {
+                .iso = v[0], .a = v[1], .b = v[2],
+            };
         } else {
             fprintf(stderr, "%s:%u: unknown keyword `%s`\n", path, lineno, kind);
             ret = CRAW_ERROR(EINVAL);
@@ -194,11 +245,19 @@ int craw_tool_profile_load_tables(CRAWProfile *p, const char *path)
      * allowed to be in any order. */
     qsort(wb, nb_wb, sizeof(*wb), tool_wb_knot_cmp);
     qsort(mat, nb_mat, sizeof(*mat), tool_matrix_knot_cmp);
+    qsort(noise, nb_noise, sizeof(*noise), tool_noise_knot_cmp);
 
     memcpy(p->wb_knots, wb, nb_wb * sizeof(*wb));
     p->nb_wb_knots = nb_wb;
     memcpy(p->matrix_knots, mat, nb_mat * sizeof(*mat));
     p->nb_matrix_knots = nb_mat;
+    /* A file without noise lines leaves whatever table was already there,
+     * so --tables can add per-CCT knots to a built-in profile without
+     * throwing its noise model away. */
+    if (nb_noise) {
+        memcpy(p->noise_knots, noise, nb_noise * sizeof(*noise));
+        p->nb_noise_knots = nb_noise;
+    }
 
 fail:
     fclose(f);

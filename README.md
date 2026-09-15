@@ -13,6 +13,12 @@ ARRIRAW and BRAW are planned.
 - Black/white normalization, white balance, clip handling.
 - Debayering: bilinear, Malvar-He-Cutler, and a ratio-corrected
   directional method (RCD). Full resolution output.
+- Denoising in the raw domain, before the debayer can spread sensor noise
+  into colour: non-local means on the four CFA planes in a variance
+  stabilised domain, so one strength works from the shadows to the clip
+  point. About 1.9 ms on a 5.8K frame on an RX 6900 XT.
+- A sensor noise model, variance = a * signal + b by exposure index, held
+  in the camera profile, with a calibrator that fits it to a clip.
 - Camera profiles with per-CCT white balance and matrix tables, as-shot
   exact and re-balance modes, CCT plus tint illuminant model.
 - Colour: camera matrix, gain, exposure, output to XYZ D65, BT.709,
@@ -52,6 +58,15 @@ matter most:
     craw-process --wb auto -v --frames 30 clip.MOV        estimate the illuminant
     craw-process --wb 5600:0.02 --ei 400 -o out_%05d.png clip.MOV
     craw-process --bench --frames 60 clip.MOV             GPU and decode timing
+    craw-process --denoise 1.0 --crop 2750,1450,1000,1000 -o c_%d.png clip.MOV
+    craw-process --noise-estimate --frames 10 flatfield.MOV   fit the noise model
+
+`--denoise` takes a strength in units of the camera's modelled noise
+level, 1.0 meaning "remove exactly that much"; `--noise A,B` overrides the
+model and `--noise-estimate` measures one, printing a line ready for a
+`--tables` file. `--crop X,Y,W,H` writes one rectangle of the output while
+the pipeline still runs on the whole frame, which is how a 5.8K frame gets
+looked at 1:1 without a 5.8K file.
 
 `--wb` takes `as-shot`, `auto` or `CCT[:TINT]`; `--ei` re-rates the clip
 at a working exposure index, `--exposure` adds a bias in stops; `--encode`

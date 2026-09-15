@@ -40,6 +40,7 @@ lib_headers = [
     'utils.h',
     'vulkan.h',
     'profile.h',
+    'noise.h',
     'pipeline.h',
     'awb.h',
 

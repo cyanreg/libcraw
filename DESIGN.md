@@ -22,13 +22,17 @@ In:
   exposure, conversion to an output colour space. Linear float output.
 - Auto white balance: GPU histogram, CPU estimator on the profile's locus,
   temporal smoother.
-- Camera profile model with per-CCT tables (as-shot exact vs re-balance).
+- Camera profile model with per-CCT tables (as-shot exact vs re-balance),
+  including a sensor noise model by exposure index.
+- Raw domain denoising: non-local means on the four CFA planes in a
+  variance stabilised domain, optional, per-frame strength. Section 14.
 - CPU reference of every stage, tests comparing it against the GPU.
 
-Out, deliberately, with a slot reserved: denoising, scaling, learned
-debayer, highlight reconstruction beyond the clip, OCIO-generated
-transforms, LUTs, other CFA phases, ARRIRAW and BRAW profiles, and lens
-correction. (The GUI, craw-view, exists under tools/gui as a consumer of
+Out, deliberately, with a slot reserved: temporal denoising (section 14.7
+says how it attaches), a second chroma-only denoise stage (14.4 says why
+not yet), scaling, learned debayer, highlight reconstruction beyond the
+clip, OCIO-generated transforms, LUTs, other CFA phases, ARRIRAW and BRAW
+profiles, and lens correction. (The GUI, craw-view, exists under tools/gui as a consumer of
 the library: it is not part of the library's scope.) On the last one: Panasonic ProRes RAW frames carry a
 per-frame `com.panasonic.Semi-Pro.optical_correction` record in the
 vendor metadata after the last tile (version 3: per channel R, G, B a
@@ -76,6 +80,10 @@ Input image: `VK_FORMAT_R16_UNORM`, the mosaic, sample `raw(x, y)` in
 [0, 1]. This is what FFmpeg's Vulkan hwcontext maps `AV_PIX_FMT_BAYER_RGGB16`
 to.
 
+Denoised mosaic (internal, only with `CRAW_PIPELINE_FLAG_DENOISE`):
+`VK_FORMAT_R16_UNORM`, the same raw encoding as the input, written by the
+denoise stage and read by the debayer in its place. Section 14.1.
+
 Intermediate image (internal): `VK_FORMAT_R16G16B16A16_SFLOAT`, camera RGB
 after prep and debayer, alpha unused.
 
@@ -84,8 +92,16 @@ linear light in the requested colour space, alpha 1.0.
 
 Border handling, all stages: mirror without repeating the edge sample and
 preserving CFA phase: `x < 0 -> -x`, `x >= W -> 2W - 2 - x`, same for y.
+The denoise stage applies that same rule to each CFA plane in the plane's
+own coordinates rather than to the mosaic; see 14.1 for why.
 
 ## 4. Stage math
+
+### 4.0 Denoise (optional, before everything)
+
+Filters the mosaic in the raw domain and hands the debayer a denoised
+mosaic in the same encoding. Defined in section 14; nothing else in this
+section changes when it runs.
 
 ### 4.1 Prep (fused into the debayer loads)
 
@@ -449,9 +465,12 @@ for containers without them.
 - Buffers for histograms are storage buffers with device addresses; the
   readback buffer is host visible and cached.
 - The pipeline records, per frame: barrier src to GENERAL/compute read,
-  [fill histogram buffers], debayer passes, [awb histogram], colour pass,
-  [copy histogram to readback], and a final barrier that returns dst to
-  the caller's stated layout.
+  [fill histogram buffers], [denoise pass], debayer passes, [awb
+  histogram], colour pass, [copy histogram to readback], and a final
+  barrier that returns dst to the caller's stated layout. The denoise pass
+  dispatches one workgroup slice per CFA plane over a half resolution grid
+  (`gl_WorkGroupID.z` selects the plane) and the debayer then reads its
+  output image instead of the caller's source.
 - Push constant structs are defined once in `lib/pipeline.c` and mirrored
   in GLSL with `layout(push_constant, scalar)`; keep them in the same
   order and pad explicitly.
@@ -466,11 +485,13 @@ for containers without them.
   three methods reproduce a constant colour exactly; borders never NaN.
 - `test_awb`: estimator and smoother on synthetic histograms/tracks.
 - `test_pipeline`: GPU vs CPU reference on a synthetic 256x160 mosaic and,
-  when `TEST_SOURCE_DIR/../samples` provides one, on a real frame dump.
-  Tolerances: bilinear/MHC 2e-3 absolute per channel on the camera RGB
-  intermediate (fp16), 1e-2 relative on the colour output; RCD 5e-3 /
-  1.5e-2. lavapipe is acceptable for these tests; it exposes everything
-  required.
+  when `TEST_SOURCE_DIR/../samples` or `CRAW_TEST_FRAME` provides one, on a
+  real frame dump. Tolerances: bilinear/MHC 2e-3 absolute per channel on
+  the camera RGB intermediate (fp16), 1e-2 relative on the colour output;
+  RCD 5e-3 / 1.5e-2. The denoise stage is held to the same bounds, plus the
+  checks of section 14.6 that it ran, that it removed noise and that it
+  kept detail. lavapipe is acceptable for these tests; it exposes
+  everything required.
 
 ## 11b. Known API limitations to revisit
 
@@ -496,10 +517,10 @@ Contract files, owned by the integrator: everything under `include/`,
   `lib/vk_image.c`, `lib/vk_shader.c`, `lib/vma/vma.cpp`, `tests/vkdev.c`.
 - Shaders and pipeline: `lib/shaders/*.glsl`, `lib/shaders/meson.build`,
   `lib/pipeline.c`, `tests/test_pipeline.c`.
-- Colour science, reference, CPU tests: `lib/profile.c`,
-  `lib/colorspace.c`, `lib/awb.c`, `lib/awb_smoother.c`,
-  `lib/ref/ref_debayer.c`, `lib/ref/ref_color.c`, `tests/test_profile.c`,
-  `tests/test_ref_debayer.c`, `tests/test_awb.c`.
+- Colour science, noise, reference, CPU tests: `lib/profile.c`,
+  `lib/colorspace.c`, `lib/awb.c`, `lib/awb_smoother.c`, `lib/noise.c`,
+  `lib/ref/ref_debayer.c`, `lib/ref/ref_color.c`, `lib/ref/ref_denoise.c`,
+  `tests/test_profile.c`, `tests/test_ref_debayer.c`, `tests/test_awb.c`.
 
 Anyone needing a change to a contract file reports it instead of editing.
 
@@ -868,3 +889,842 @@ Amount 0 leaves a standard deviation of 0.00002, i.e. nothing.
   mixing, so grain is not blurred between input frames. That follows from
   where `pass_output_target()` sits and has not been measured with
   `pl_render_image_mix`.
+
+## 14. Denoising
+
+### 14.1 Where it sits
+
+Sensor noise is a property of a single sensel: a Poisson count of
+photoelectrons plus a signal independent read term, independent from one
+sensel to the next and from one CFA site to the next. A debayer is a set of
+interpolation kernels, so it mixes neighbouring sensels together and turns
+that independent per-sensel noise into *correlated* noise with a colour:
+MHC's chroma kernels have coefficients of 6/8 and -3/2, RCD's ratios
+divide by low-pass sums, and both hand a single noisy sensel to three
+output channels at once. Once that has happened the noise is no longer
+described by any per-channel model, and a filter downstream has to guess.
+
+So the primary stage runs **before the debayer**, on the mosaic, split into
+its four CFA planes (R, Gr, Gb, B at half resolution each), each filtered
+on its own and reassembled. Three things follow from that choice and all
+three are wanted:
+
+- The noise model is exact there. Nothing has touched the samples, so
+  `var = a * u + b` holds with the sensor's own a and b.
+- The four planes are statistically independent, so filtering them
+  separately loses nothing, and the filter removes the *source* of the
+  output's chroma noise rather than its consequences.
+- Everything downstream is unchanged. The pass writes a denoised mosaic in
+  the same `VK_FORMAT_R16_UNORM` raw encoding the decoder produced, so the
+  prep of section 4.1, all three debayers, the AWB histogram and the colour
+  stage read it without knowing it happened.
+
+It runs before the prep rather than after it because the prep multiplies by
+the white balance gains and clips at 1.0. The gains would scale the model
+per channel (a -> a*g, b -> b*g^2, which is easy but pointless), and the
+clip would truncate the very distribution the model describes. The stage
+therefore works in
+
+    u = (raw - black_level[s]) / (white_level[s] - black_level[s])
+
+which is the prep of 4.1 with the gain and the clip removed, and writes
+`raw' = black_level[s] + u' * (white_level[s] - black_level[s])` back. The
+16-bit re-encoding costs a quantization step of 1/65535 of the sample
+range against a read noise of one to two code values; it is the price of
+leaving five other stages alone.
+
+Green is filtered as two planes, Gr and Gb, rather than as one quincunx
+lattice. They are the same colour filter but not the same pixels, and the
+two-plane form keeps every plane a plain rectangular image with a plain
+rectangular stencil. A shared-lattice green filter has more samples to work
+with and is the obvious thing to try if green ever looks softer than red
+and blue.
+
+Borders are mirrored **in each plane's own coordinates**: `i < 0 -> -i`,
+`i >= W/2 -> W - 2 - i`. That is the rule of section 3 applied to the plane
+as an image in its own right. It differs from mirroring the mosaic and then
+extracting the plane, which for the two phases with an odd offset repeats
+the edge sample instead of reflecting past it; the plane rule is uniform
+across the four phases, which is what a per-plane filter wants.
+
+### 14.2 The noise model
+
+    var(u) = a * u + b
+
+`u` is the signal above black in units of the sensor range, exactly as
+above, so a profile's (a, b) survives a decoder rescaling the sample range.
+`a` is the shot term and `b` the read term. One pair describes all four
+planes because the model sits before the white balance.
+
+The model lives in the profile as a table by exposure index
+(`CRAWNoiseKnot`, up to 16 knots, sorted ascending), evaluated by
+`craw_noise_model_eval()`. Interpolation is linear in log(iso) of log(a)
+and log(b), i.e. a power law between knots, because both terms are power
+laws in the sensor's gain. Outside the table the nearest knot is used
+**unchanged, not extrapolated**: a model that is too small under-denoises,
+which the strength parameter can correct, while one that is too large
+destroys detail that cannot be recovered. The lookup uses the frame's
+as-shot exposure index, not its working one — rating a clip at a different
+index scales the picture afterwards, it does not change how the sensels
+were read.
+
+#### Calibration
+
+`craw_noise_estimate()` fits (a, b) to one frame:
+
+1. Split into the four CFA planes.
+2. High-pass each plane with `[1 -2 1; -2 4 -2; 1 -2 1] / 6`. That kernel
+   annihilates any locally bilinear signal, so a smooth part of the scene
+   contributes nothing but its noise, and its gain on white noise variance
+   is exactly 1, so the residual's standard deviation *is* the sensel's.
+3. Bin every sample by a 9x9 plane mean. The kernel sums to zero over its
+   3x3 support, so any box mean whose window contains that support is
+   exactly uncorrelated with it; 9x9 makes the mean's own noise a ninth of
+   a sample's, which keeps samples from being dragged into the wrong bin.
+   Bins are equally spaced in sqrt(mean), since the standard deviation is
+   what they have to resolve.
+4. Per bin, sigma = median|residual| / 0.6745.
+5. Fit the line robustly: a least trimmed squares seed over every pair of
+   bins, then iteratively reweighted Gauss-Newton on ln(variance) with a
+   Tukey biweight, with a and b carried as logarithms so neither leaves the
+   physical quadrant. The log domain is right because the variances span
+   three decades and what matters is being right by a percentage at every
+   level. The robust loss is what makes this work on an ordinary scene at
+   all: texture only ever *adds* variance, so the bins it contaminates sit
+   above the line and get discarded, never below it.
+
+Bins are weighted by log(1 + samples), not by the sample count: a bin with
+fifty times the samples is worth more, but not fifty times more, because
+its error is dominated by how smooth that part of the scene is and not by
+counting statistics.
+
+`craw-process --noise-estimate` runs this on every decoded frame, prints
+the per-frame fit and then the median over the clip, formatted as a
+`noise ISO A B` line ready to paste into a `--tables` file. Two diagnostics
+decide whether to believe it: `fit_rms`, the relative error of the model
+over the bins it kept, which is 10-15% on a real scene and should be a few
+percent on a flat field; and `read_noise_lsb`, sqrt(b) in 16-bit code
+values, which above roughly 10 means the frame has no region dark enough
+to measure b and what was fitted there is scene texture.
+
+#### Panasonic DC-S1M2, measured
+
+Frame 0 of every ProRes RAW clip this camera has produced so far:
+
+    clip       ISO    a          b          bins  fit   read noise
+    P1093961   1000   1.2225e-5  0          36    10.3%  0.00
+    P1094127   1000   1.2923e-5  2.24e-10   29    12.4%  0.95
+    P1093971   1000   1.3016e-5  0          23     5.0%  0.00
+    P1093870   1000   1.3154e-5  0          37    12.6%  0.00
+    P1000387   1000   1.3322e-5  5.23e-10   17    13.9%  1.45
+    P1094644   1000   1.4028e-5  0          80    15.9%  0.00
+    P1030266   1250   1.4578e-5  1.08e-9    29    13.0%  2.09
+
+    rejected, texture in every bin:
+    P1094643   1000   2.7935e-5  0         107    24.8%  0.00
+    P1093969   1000   3.7812e-5  8.20e-7    50     8.8% 57.50
+    P1093970   1000   6.7972e-5  0          34    11.7%  0.00
+
+Six of the seven ISO 1000 clips agree to within +-7% of their median,
+1.3085e-5, which is the knot. The three rejected ones are scenes with fine
+texture at every level; the first is caught by its fit error and the second
+by an impossible read noise, and the third by neither, which is exactly why
+the shipped table is a median over clips and not one clip's fit. The b
+column is a floor: none of these clips has a region dark enough to resolve
+it, and it only matters below u = b/a, about five code values above black.
+The shipped knots are
+
+    1000 K:  a = 1.30e-5,  b = 1.0e-9     (sqrt(b) = 2.0 code values)
+    1250 K:  a = 1.46e-5,  b = 1.1e-9
+
+Two knots is not a characterization. The camera writes the same GainFactor
+(23.04) at every ISO, which points at a fixed analog gain with ISO carried
+as metadata; the two knots are consistent with that (a moving by 12% for a
+25% ISO change) and equally consistent with a weak power law. The planned
+ISO series — 640, 1000, 3200, 12800 on white paper filling the frame —
+decides it, and `--noise-estimate` on those clips produces the table lines
+directly. Until then the clamp keeps a high-ISO clip under-denoised rather
+than over-denoised, and `--noise A,B` is the override.
+
+One property of this camera's files worth recording: the four residual
+operators tried during calibration (the 3x3 above, a lag-1 difference, a
+lag-2 difference and a 1D second difference) agree to within a few percent
+at every level, so the noise in a *decoded* ProRes RAW frame is white at
+the scale the filter works on. The codec is not visibly reshaping the noise
+spectrum, which is what lets a model fitted on decoded frames be used to
+filter decoded frames.
+
+### 14.3 The raw domain stage
+
+#### The variance stabilised domain
+
+One threshold has to work in the shadows and in the highlights, where the
+noise differs by a factor of thirty. The generalised Anscombe transform
+makes the variance constant so that it can:
+
+    c    = 3 a^2 / 8 + b
+    T(u) = (2 / a) * sqrt(a u + c)          for u >= 0
+
+with `Var(T(u)) ~ 1` wherever `a u >> 3 a^2 / 8`. In this domain one unit
+is one noise standard deviation at every level, so the filter's threshold
+is a plain number.
+
+Below u = 0 the square root has neither a real value nor a bounded
+derivative, and read noise puts a real fraction of the samples of a black
+region there. **The transform is therefore continued below zero by its own
+tangent at zero:**
+
+    sc   = sqrt(c)
+    t0   = 2 sc / a
+    T(u) = t0 + u / sc                      for u < 0
+
+which is C1 at the join, exactly invertible, and correct in its own right:
+for u < 0 the variance is b and constant, so a constant slope is what a
+stabilising transform should have there. The inverse is
+
+    I(t) = a t^2 / 4 - c / a                for t >= t0
+    I(t) = (t - t0) * sc                    for t <  t0
+
+The algebraic inverse is used rather than an asymptotically unbiased one.
+The bias of the algebraic inverse matters below about ten Poisson counts;
+the darkest content in these clips sits at 20 code values above black with
+an `a` of 0.83 code values per code value, which is 25 counts, and a white
+paper field at any of the calibration ISOs is thousands.
+
+Arithmetic is fp32 throughout. The stabilised values are a large offset
+(t0 is 200 to 600 for this camera) with a small useful range around it —
+that is the whole point of the transform — so fp16 would quantize away the
+signal itself. There is no fp16 fast path for this stage.
+
+#### The filter
+
+Non-local means on each plane, in the stabilised domain. For an output at
+p, over a search window of radius S and a patch of radius P:
+
+    d2(q) = (1 / (2P+1)^2) * sum over the patch k of (t(p+k) - t(q+k))^2
+    w(q)  = exp(-max(d2(q) - 2, 0) / h^2)
+    t'(p) = sum over q of w(q) t(q)  /  sum over q of w(q)
+
+The 2 is `2 * sigma^2` with sigma = 1: two stabilised samples of the same
+true value differ by a variance of 2, so that much of every patch distance
+is noise and is subtracted before it can count against a neighbour. It also
+makes `w = 1` for every neighbour that matches within the noise, the centre
+included, so the denominator is never smaller than 1 and no guard is
+needed.
+
+`h` is the strength parameter directly. A neighbourhood that differs from
+the centre by a true step of D noise standard deviations gets
+`w = exp(-D^2 / h^2)`, so at h = 1 detail below one sigma — which is
+indistinguishable from noise anyway — is averaged away, a two sigma step
+keeps 1.8% of its weight, and anything larger is rejected outright. Larger
+h smooths across larger true differences. This is what "strength 1.0
+removes noise at the modelled level" means.
+
+S = 3 and P = 1 (a 7x7 search, a 3x3 patch) on the reference device; see
+the timings below. Both are specialization constants 2 and 3, so changing
+them is a host-side constant and a rebuild of `lib/pipeline.c`, not a
+shader edit. **P = 0 turns the same binary into the bilateral fallback**:
+the patch distance is then the plain difference of two stabilised samples,
+which is a range filter with the same noise-adaptive threshold.
+
+One workgroup per tile of one plane, the plane index in
+`gl_WorkGroupID.z`, so one dispatch covers all four. The workgroup loads
+its tile plus a halo of S + P into shared memory, already stabilised, and
+each invocation keeps its own patch in registers; every search position is
+then one pass over the patch in shared memory. The shared array is a fixed
+28x28 floats, which is a 16x16 workgroup plus a halo of 6, and
+`lib/pipeline.c` static-asserts that the configured radii fit.
+
+#### The highlight guard
+
+Near the sensor's clip point the noise distribution is truncated and the
+model does not hold, and pulling a clipped sample down would un-clip it in
+one channel only — which is the thing the balanced clip of section 4.1
+exists to prevent. The filter is therefore ramped off over u in
+[0.90, 1.00]:
+
+    g = clamp((u0 - 0.90) / 0.10, 0, 1)
+    u_out = mix(I(t'), u0, g)
+
+with u0 the original sample. Values above the white level clamp to 1.0 on
+the way back into 16 bits, exactly as they would have.
+
+#### Measured cost
+
+RX 6900 XT, 5760x3040 RGGB, RCD, XYZ D65 out, back-to-back submissions
+(12 reps, mean; the whole pipeline, and the pass's own share):
+
+    search  patch   pipeline   pass
+    (none)          4.26 ms    --
+    7x7     1x1     4.98 ms    0.71 ms     bilateral fallback
+    5x5     3x3     5.24 ms    0.98 ms
+    7x7     3x3     6.12 ms    1.86 ms     <- shipped
+    9x9     3x3     7.37 ms    3.10 ms
+    7x7     5x5     8.72 ms    4.46 ms
+    9x9     5x5    11.48 ms    7.22 ms
+    flag set, strength 0       4.14 ms    0.00 ms
+
+The budget is 4 ms and 7x7/3x3 spends 1.86 of it, which leaves room for the
+temporal stage of 14.7. 9x9/3x3 also fits and is the first thing to try if
+the search window ever looks too small; 7x7/5x5 does not. The bilateral
+fallback was measured and is not needed. A pipeline built with the flag but
+run at strength 0 costs nothing measurable, which is what makes the
+strength a live control rather than a rebuild.
+
+`craw-process --bench`, which decodes on the CPU between frames and so
+leaves the GPU idle 97% of the time, reads 5.07 ms without and 7.55 ms
+with, i.e. 2.48 ms: the same pass, measured on a device that is not being
+kept busy. `test_pipeline`'s single real-frame submission, which follows
+fifteen seconds of CPU-only reference work, reads about 4.7 ms for the same
+pass. Real playback looks like the first table.
+
+#### Measured quality
+
+Frame 0 of P1000387.MOV, ISO 1000, a dim room with a ceiling spotlight,
+model (a, b) = (1.30e-5, 1.0e-9).
+
+A flat dark patch of 128x128 mosaic samples at (2500, 1000), per CFA plane,
+as the standard deviation of the residual after a least squares quadratic
+surface — which counts the slow blotches an NLM leaves behind and not just
+what a high pass would see:
+
+    plane  mean (lsb)  u        sigma   model   off   1.0    2.0
+    R      380.0       0.00195  10.34   10.31   1.00  2.01   1.54
+    Gr     499.2       0.00383  15.23   14.31   1.06  3.24   2.35
+    Gb     499.0       0.00383  14.87   14.30   1.04  3.10   2.21
+    B      372.8       0.00184  10.35   10.02   1.03  2.27   1.71
+
+The undenoised measurement is within 0 to 6% of what the model predicts on
+all four planes, which is the model validating itself on a frame it was not
+fitted to. Strength 1.0 leaves 20-23% of the noise (4.4x to 5.0x, about
+2.2 stops); strength 2.0 leaves 15-17% (5.9x to 6.7x). The patch mean moves
+by 0.3 code values out of 380, so the stage is not biasing the level.
+
+In the output (linear BT.709), over a 320x200 crop of the same region, the
+same quadratic-residual measure:
+
+               R         G         B         R-G       B-G
+    off        9.465e-3  5.004e-3  5.910e-3  1.001e-2  6.048e-3
+    1.0        2.356e-3  1.185e-3  1.526e-3  2.613e-3  1.805e-3
+    2.0        2.045e-3  9.450e-4  1.243e-3  2.291e-3  1.537e-3
+
+Against a patch mean of 0.096, chroma noise goes from 10.4% to 2.7% at
+strength 1.0.
+
+Detail survives. Over the LED's fresnel rings (a 600x450 crop at
+(2800, 1800), concentric arcs at the sampling limit), the RMS of the same
+3x3 high pass on green is 2.76284e-1 undenoised, 2.76274e-1 at strength 1.0
+and 2.76237e-1 at strength 2.0: 99.996% and 99.98% of the detail energy.
+Over the whole 1000x1000 crop containing the LED, the rim and the wood, the
+99th, 99.9th and 100th percentiles of the green gradient magnitude are
+unchanged to six figures (1.76414e1, 2.29227e1, 3.08944e1) while the median
+gradient, which is the noise floor, drops 4.8x at strength 1.0 and 7.5x at
+strength 2.0. The filter is removing the noise and leaving the edges.
+
+### 14.4 A chroma stage after the debayer: measured, not built
+
+The argument for a second, lighter stage is that chroma noise is what
+people see and that a chroma-only filter on a luma/chroma split at reduced
+resolution is cheap. The measurement above says it is not needed yet, and
+says by how much.
+
+The raw stage reduces the output's chroma noise by 3.8x (R-G) and 3.4x
+(B-G) against 4.2x for luma, so the chroma-to-luma ratio moves from 2.00 to
+2.20 at strength 1.0 and 2.42 at strength 2.0. There is a residual — the
+chroma error the stage leaves is slightly more correlated than the luma
+error, because a 7x7 search on a half resolution plane reaches 14x14 full
+resolution pixels and cannot see a blotch larger than that — but in
+absolute terms chroma noise in a dim shadow is down from 10.4% of the level
+to 2.7%, and the second stage would be chasing the difference between 2.7%
+and perhaps 1.4%.
+
+So: not built this round. What it would be, when it is:
+
+- Between the debayer and the colour stage, on the camera RGB intermediate,
+  not on the output. The intermediate is always RGBA16F whatever the output
+  space, G is a good luma for a Bayer sensor, and R-G and B-G are the
+  colour difference signals the debayer already builds its chroma in.
+- Three dispatches. Downsample (mean of each 4x4 block of R-G, B-G and G
+  into a quarter resolution RGBA16F image); a joint bilateral blur of the
+  two chroma planes at quarter resolution with the range term on the
+  downsampled G, radius 4, which reaches 36x36 full resolution pixels;
+  then a recombine pass that bilinearly upsamples the filtered differences
+  and writes R = G + d_r, B = G + d_b, blended by the chroma strength.
+- Quarter resolution means the blur itself is 1/16 of the work and the only
+  full resolution passes are a read and a read-modify-write, so the whole
+  thing should land near 0.4 ms, well inside what 14.3 leaves.
+- The luma/chroma split guarantees it cannot soften a luma edge; the range
+  term on G is what stops chroma bleeding across one.
+- It needs its own parameter, `denoise_chroma_strength`, and the CLI
+  spelling is already reserved as `--denoise STRENGTH,CHROMA`.
+
+The measurement to repeat before building it is the chroma-to-luma ratio
+above, on an ISO 12800 frame from the planned series rather than on ISO
+1000: the residual grows with the noise, and a stage that is not worth 0.4
+ms at ISO 1000 may well be at ISO 12800.
+
+### 14.5 Parameters and API
+
+`CRAW_PIPELINE_FLAG_DENOISE` builds the pass and its extra full resolution
+R16_UNORM image. Per frame, `CRAWFrameParams` carries:
+
+- `denoise_strength`, the h of 14.3. 0 skips the pass for that frame
+  without rebuilding the pipeline and is the default; the skip is free
+  (measured above), which is what makes this a live control.
+- `noise_override`, a `CRAWNoiseModel`. When its `a` is positive it is used
+  as given; otherwise the profile's table is evaluated at the profile's
+  as-shot exposure index, and a profile with no table makes
+  `craw_pipeline_record()` fail with `CRAW_ERROR(ENOTSUP)` whenever the
+  strength is positive. Failing is right: there is no default noise level,
+  and silently doing nothing would look like a broken pass.
+
+`CRAWProfile` grows `noise_knots` and `nb_noise_knots` at the end of the
+struct, which changes its size; it is plain caller-filled data with no
+padding tail, so this is an ABI break and the soname covers it.
+`CRAWFrameParams` and `CRAWPipelineParams` keep their sizes, the new fields
+coming out of their padding tails as intended.
+
+`craw-process` gains `--denoise STRENGTH`, `--noise A,B`, and
+`--noise-estimate`. It also gains `--crop X,Y,W,H`, which writes and takes
+`--stats` over one rectangle of the output while the pipeline still runs on
+the whole frame: it is how a 5.8K frame gets looked at 1:1 without a 5.8K
+file, and every number in 14.3 was measured through it.
+`craw_tool_profile_load_tables()` accepts a `noise ISO A B` line, and a
+file without one leaves a built-in profile's noise table alone.
+
+### 14.6 Testing
+
+`test_pipeline` covers the stage four ways.
+
+- GPU against `craw_ref_denoise()` on the synthetic mosaic at strengths 1.0
+  and 2.0, tolerance 2e-3 absolute on the camera RGB intermediate, which is
+  the same bound section 11 sets for the non-RCD debayers. What separates
+  the two is the order 49 terms are summed in, an ulp or two in exp(), and
+  samples that land within an ulp of a 16-bit rounding boundary and
+  quantize the other way; the measured difference is 9.8e-4, which is the
+  MHC debayer's own floor and not the denoise pass's.
+- That the comparison is sensitive at all. The largest error of this stage
+  sits on hard edges, which the highlight guard hands through untouched and
+  where a denoised and an undenoised frame agree exactly, so max abs alone
+  would read the same if the pass had never run. The test therefore also
+  measures the denoised GPU frame against the *undenoised* reference and
+  requires that to be more than three times the floor; it measures 6.7e-3
+  against a floor of 9.8e-4.
+- That it denoises and that it preserves detail, both on the reference's
+  own mosaic so that the numbers describe the definition rather than one
+  implementation: the flat neutral patch of the synthetic scene must keep
+  at most 60% of its high-pass noise (it keeps 5%), and the 2x2
+  checkerboard, which is real detail at the sampling limit, must keep at
+  least 70% of its high-pass energy (it keeps 100%).
+- The two ways off is off (strength 0, and the flag not set) reproduce the
+  plain chain, and a profile with no noise table and no override fails with
+  ENOTSUP.
+
+On a real frame, `test_real_frame` fits the model with
+`craw_noise_estimate()` on the frame itself, runs RCD plus denoise at
+strength 1.0 and holds the result to 1.5e-2 *relative* against the
+reference — the bound section 11 states for RCD output, because the frame's
+highlights sit far above 1.0 where fp16 storage alone is worth tens of
+millis absolute. It measures 3.06e-3, against 1.35e-1 relative between the
+denoised frame and the undenoised one.
+
+### 14.7 Temporal denoising, when it comes
+
+A spatial filter has one frame's worth of samples. A temporal one has as
+many as the scene holds still for, and for the shadows of a locked-off shot
+that is the difference between 4.5x and something much larger. It is the
+obvious next stage and it attaches to this one, not to the output.
+
+Where it goes: **inside the raw stage, in the stabilised domain, before the
+spatial filter.** The domain is the whole reason — in stabilised units one
+number is one noise standard deviation at every level and in every frame,
+so the decision "is this sensel the same as last frame's" is a comparison
+against a constant, exactly as the spatial patch distance already is. Doing
+it after the debayer would mean deciding that in a domain where the noise
+has already been mixed and coloured.
+
+The state that persists across frames is one image: the previous frame's
+*filtered* stabilised planes, a full resolution R32_SFLOAT image, 70 MB at
+5.8K. It has to be fp32 for the reason 14.3 gives. The pipeline owns it,
+which means `craw_pipeline_record()` stops being idempotent and the
+"recorded once per submission" rule of section 11b becomes load bearing,
+and a seek or a switch of source has to be able to say so.
+
+The filter is a motion-adaptive recursive average, the cheap end of the
+family:
+
+    d     = |t_prev(p) - t_cur(p)|          in stabilised units
+    alpha = alpha_max * exp(-max(d^2 - 2, 0) / ht^2)
+    t_out = alpha * t_prev(p) + (1 - alpha) * t_cur(p)
+
+which is the spatial weight of 14.3 with a patch of one sample and a search
+of one position, so the threshold and the strength mean the same thing and
+`ht` can be the same number as `h`. `alpha_max` below 1 bounds how long a
+sample can survive, which bounds the smearing a missed motion detection can
+cause; 0.8 gives an effective 5 frames on a static scene and forgets a
+wrong decision in three. A patch distance over 3x3 instead of a single
+sample would make the detection far less trigger-happy at the cost of a
+second tile load, and is the first thing to try if it ghosts.
+
+Motion compensation — searching the previous frame over a window instead of
+reading it at p — is the expensive end and needs a real motion estimate,
+which this library does not have and should probably take from the caller
+rather than compute.
+
+Resetting. The state is wrong whenever the previous frame is not the
+previous frame of the same scene, and there are three cases:
+
+- The caller knows: a seek, a new clip, a jump in the pipeline's own frame
+  counter. A `CRAW_FRAME_FLAG_TEMPORAL_RESET` makes the pass ignore the
+  state for one frame (alpha = 0) and it refills from that frame on.
+  `craw_awb_smoother_push()` already takes a `scene_cut` flag for the same
+  reason and the two should be spelled the same way.
+- A cut the caller does not know about. The pass already computes `d` at
+  every sensel; the fraction of sensels with `d^2 > 2 + k` is a scene
+  change detector for free, and a small reduction buffer next to the AWB
+  histogram would hand it back to the host, one number a frame, to be read
+  the frame *after* — the same one-frame lag the AWB estimator already
+  accepts. On a cut alpha collapses to 0 by itself everywhere at once, so
+  the detector is a diagnostic and a way to reset the *spatial* strength,
+  not a correctness requirement.
+- Any frame the pipeline was not given the previous frame for. The state
+  image starts undefined; a `valid` flag in the pipeline, cleared on
+  creation and on reset, keeps the first frame from reading it.
+
+What it costs: one extra full resolution fp32 image read and written, plus
+about ten instructions per sensel, so well under 0.5 ms — the state image's
+bandwidth is the whole cost. That fits in what 14.3 leaves of the 4 ms.
+
+## 15. Soft light and vibrance
+
+`tools/gui/adjust.c` and `adjust.h` are a clean-room reimplementation of two
+RawTherapee tools the owner reaches for, plus the move of the film
+simulation LUT that had to happen for them to sit in the right order.
+
+RawTherapee is GPL and this is BSD-2, so nothing of its code, comments or
+tables is here. What was taken is the mathematics and the parameter
+semantics, established by reading RawPedia and the two engine files, and
+then written from scratch. Where the behaviour differs it is said so below,
+with the reason.
+
+### 15.1 Where the four hooks sit, and why the LUT moved
+
+RawTherapee applies film simulation in its RGB stage, vibrance in the Lab
+stage after it, and soft light late in that same Lab stage. Order matters:
+vibrance on a LUT'd picture is not the picture a LUT on a vibrant one is.
+The viewer now matches it, with the film grain last because grain is a
+property of the recording medium and everything above it is a property of
+the grade:
+
+    film simulation LUT -> vibrance -> soft light -> film grain
+
+All four are `pl_hook`s at `PL_HOOK_PRE_OUTPUT`, in one array, and
+libplacebo runs the hooks of a stage in array order (`pass_hook()` walks
+`params->hooks` forward), so the array *is* the order.
+
+The LUT had to move to make that possible. It used to ride on
+`pl_frame.lut` of the target frame, and libplacebo applies a target
+`PL_LUT_NATIVE` at the very end of `pass_output_target()` - after every
+`PL_HOOK_PRE_OUTPUT` hook has run. Nothing could ever be put in front of it.
+So the two `target.lut` blocks in `gpu.c` are gone and `craw_adjust_lut()`
+is the first hook instead.
+
+Nothing is lost by the move, and this is checkable rather than merely
+argued. Between the `PL_HOOK_PRE_OUTPUT` hook point and the place the target
+LUT used to be applied, libplacebo runs exactly one thing:
+`pl_shader_encode_color()`. That function's own `skip` test is true for an
+RGB system at full range whose sample and colour depths agree and whose bit
+shift is zero - which is what both the window and the 16-bit export target
+are - so it emits nothing at all. The hook therefore holds the same values
+the target LUT used to be handed, and it calls the same
+`pl_shader_custom_lut()` with a `pl_shader_obj` of its own, so the same
+tetrahedral interpolation runs over the same uploaded texture.
+
+Measured: frame 0 of `P1000387.MOV` exported with `--lut lively-seaside` is
+**byte for byte identical** before and after the move (md5
+`b0ee990691898307bd171c5bb1022ed0` both ways), and so its PSNR against the
+`ffmpeg -vf lut3d=...:interp=trilinear` reference is unchanged at **60.53 dB**
+(per channel 63.15 / 64.13 / 57.48). The export with no LUT at all is also
+unchanged (`4a1630379770e63a6a8b90a18f8ab0c2`).
+
+A user `.cube` from `--lut` is untouched by all this: it still goes on the
+*image* through `pl_render_params.lut`, where it always did, because that
+one is authored against the source and not against the display.
+
+### 15.2 Why `PL_HOOK_SIG_COLOR`
+
+All three new hooks are pure per-pixel functions - no neighbour is read, no
+resolution changes - so they take `PL_HOOK_SIG_COLOR` and append their
+instructions to the shader the renderer is already building.
+`PL_HOOK_SIG_TEX`, which the film grain needs because it does read a
+neighbourhood, would instead force the renderer to finish that shader into
+an intermediate texture and start another: one FBO round trip per hook, plus
+the quantisation of storing a display-encoded value in it. That is also the
+second half of why the LUT is still exactly as correct as it was.
+
+### 15.3 Soft light
+
+RawTherapee uses the **Pegtop** soft light blend, which for a backdrop `a`
+and a blend layer `b` is
+
+    S(a, b) = 2*a*b + a^2 * (1 - 2*b)
+
+This is the continuous approximation to the W3C/SVG `soft-light`
+compositing operator: same endpoints, same behaviour, but without the
+piecewise branch at `b = 0.5` whose derivative is discontinuous. Pegtop
+published it for that reason.
+
+The picture is blended with *itself*, so `b = a` and the whole operator
+collapses to one cubic in one variable:
+
+    S(a, a) = 2*a^2 + a^2*(1 - 2*a) = 3*a^2 - 2*a^3 = a^2 * (3 - 2*a)
+
+which is the smoothstep polynomial. It fixes 0, 0.5 and 1, has zero slope at
+both ends, darkens below mid grey and lightens above it. Applied per channel
+it raises contrast and, because the channels move by different amounts,
+saturation with it.
+
+This is worth pinning down because the variants agree on half the domain:
+for `v <= 0.5` Pegtop, W3C and the Photoshop/illusions.hu formula all give
+`3v^2 - 2v^3`, and they only diverge above it, where W3C and Photoshop
+introduce a square root. The discriminating test point is `v = 0.75`:
+Pegtop gives **0.84375**, the other two about **0.808**. A correct
+implementation has no branch on 0.5 and no `sqrt`.
+
+Strength is a percentage and enters as a plain mix:
+
+    out = a + (strength/100) * (S(a, a) - a)
+
+so 0 is the original and 100 the full blend. Default 0, i.e. off.
+(RawTherapee's slider defaults to 30 but its tool starts disabled, which is
+the same picture by a longer route.)
+
+**Out of range.** RawTherapee does not clamp: a channel outside [0,1] -
+after dividing by its 65535 working scale - **bypasses the effect entirely
+and is passed through untouched**, and the decision is per channel, so a
+pixel can have one channel blended and another not. That is reproduced here,
+branch-free, as
+
+    ok  = step(0, v) * step(v, 1)
+    out = v + ok * (strength/100) * (v^2*(3 - 2*v) - v)
+
+Clamping instead would drag out-of-gamut channels onto the boundary, which
+is exactly where doing so invents a colour. At this hook point the picture
+is display-encoded and mostly inside [0,1] anyway, so the guard costs two
+instructions and matters only at the gamut edge and in clipped highlights.
+
+**Where it differs from RawTherapee.** RawTherapee does the blend in
+gamma-encoded working-space RGB and then mixes the result against the
+*linear* original; here both the blend and the mix happen in the
+display-encoded values the hook stage holds. The blend domain is the same
+kind of signal either way - RawTherapee's gamma is an sRGB-shaped curve with
+slightly shifted breakpoints (slope 12.92310, encode knee 0.003040) over the
+user's working primaries, ours is the target's own transfer function over
+the target's primaries - and at strength 0 and 100 the two are identical by
+construction. Only the intermediate strengths differ, and mixing in the
+encoded domain is what a soft-light layer at N% opacity does in every
+display-referred editor. It is also what the hook stage can do without a
+linearize/delinearize round trip it has no other use for.
+
+Verified against the analytic formula: the 1024x1024 crop exported at
+strength 100 matches `v^2*(3 - 2*v)` to a maximum of **1.25 LSB of 65535**
+(mean 0.31, 103.7 dB), and at strength 50 to 1.12 LSB (103.1 dB). That is
+16-bit quantisation and nothing else.
+
+### 15.4 Vibrance
+
+RawTherapee's vibrance works in CIE L\*a\*b\*, where a line of constant Lab
+hue angle is *not* a line of constant perceived hue - the blue region bends
+badly - so scaling chroma at fixed hue angle visibly rotates the hue, and it
+has to carry a Munsell hue-correction dataset to put it back: on the order
+of 195 one-dimensional tables of up to 140 entries, selected through a
+nested cascade on lightness and hue leaf. That dataset is RawTherapee's, it
+is GPL, and it cannot be reimplemented without equivalent data.
+
+This implementation works in **Oklab** instead. Oklab was fitted to keep
+lines of constant hue straight, which is precisely the property the Munsell
+tables exist to restore, so scaling the `(a, b)` pair by a scalar already
+leaves the hue where it was and no table is needed. That is not a
+substitution of convenience: it is the one change that makes a from-scratch
+version of this tool possible at all.
+
+Chroma and hue are the polar form of Oklab's `(a, b)`:
+
+    C = sqrt(a^2 + b^2),   h = atan2(b, a)
+
+and the whole filter is one number, the factor `C` is multiplied by. `L` and
+`h` are never touched, so the result is lightness- and hue-preserving by
+construction. Measured on the exported crop: max `|dL|` **0.00003** and mean
+`|dh|` **0.006 degrees** (max 0.24, at chroma so low the hue is
+quantisation noise).
+
+The Oklab matrices are kept in their XYZ form and composed at run time with
+the *target's* own RGB<->XYZ matrices, rather than baked against sRGB, so a
+BT.2020 swapchain gets the right hue angles instead of silently wrong ones.
+That costs two 3x3 multiplies once per frame. It is exact for any D65
+primaries; a target on a different white point would want a chromatic
+adaptation that is not there, and no target the viewer can reach today has
+one.
+
+**Parameter mapping.** The two sliders run -100..100 and enter as
+`k = slider/100`, which is RawTherapee's own mapping - not an exponential.
+The chroma factor is `1 + m` where `m` is `k` after the skin factor and the
+limiter:
+
+    m = clamp(k * r, -0.93, +2.00)
+    C' = C * (1 + m)
+
+so +100 doubles chroma, -100 cuts it to 7% of itself, and 0 is exactly 1.
+The `-0.93` floor is RawTherapee's and is worth keeping: it stops a full
+negative slider collapsing a colour onto the neutral axis and losing its hue
+with it. (RawTherapee's positive limit differs between the two regimes, 2.0
+and 1.8. Without its 216-constant hue/lightness weighting table - see below
+- `m` can never exceed 1, so neither limit is reachable and only the floor
+is live.)
+
+**What is deliberately not reproduced.** RawTherapee multiplies the slider
+amount by one of 216 hand-tuned constants chosen by a hard branch on four
+lightness bands and six hue sectors, asking for more gain in hues that
+under-respond and less in hues that clip. Those constants are its data and
+its expression, so they are not here; the hard branches are also its single
+most visible artefact source, since nothing interpolates between adjacent
+bands or sectors. The cost of leaving them out is that the response is
+uniform across hue rather than perceptually weighted. In Oklab a good part
+of what that table compensates for - Lab's uneven chroma scale across hue -
+is already handled by the space.
+
+**The threshold.** RawTherapee's pastel/saturated crossover is driven not by
+chroma but by the RGB saturation `s = 1 - min(R,G,B)/max(R,G,B)` of the
+gamut-mapped linear RGB, and its 9-node piecewise-linear response has its
+crossover at `X = 0.07 + 0.93*T` for a threshold `T`. Here the abscissa is
+Oklab chroma, which is the natural quantity in the space the filter already
+works in and is perceptual where RGB saturation is not.
+
+The default was calibrated rather than guessed. Over 400k random sRGB
+colours, RawTherapee's default crossover of `s = 0.7675` (its threshold 75)
+falls at a **median Oklab chroma of 0.135**, which is 45% of the 0.30 that a
+saturated sRGB primary reaches. So:
+
+    C_ref = 0.30                       (measured: the six sRGB primaries
+                                        and secondaries run 0.15 to 0.32)
+    C_t   = (threshold/100) * C_ref
+    t     = smoothstep(0.75*C_t, C_t + 0.25*(C_ref - C_t), C)
+    m     = mix(k_pastel, k_saturated, t)
+
+and **threshold 45 is the default**, putting the crossover where
+RawTherapee's default 75 puts it. Each regime hands a quarter of its own
+span to the transition, which is the same geometry RawTherapee uses
+(quarter-width sub-intervals either side of the crossover) expressed in
+chroma. The transition is a smoothstep rather than RawTherapee's linear
+ramp: a corner in the response is visible as a contour in any gradient that
+crosses it. At the crossover the smoothstep gives `T^2(3-2T)` of the way
+from the pastel amount to the saturated one where RawTherapee gives `T`;
+at the default that is 0.84 against 0.75.
+
+For reference, the chroma these land on: pastels measure 0.04 (pale sky) to
+0.07 (light skin), mid foliage 0.13, a vivid sky 0.17, the primaries 0.15 to
+0.32. The two regimes fall either side of 0.135.
+
+**Protect skin tones.** RawTherapee classifies skin with a first-match
+cascade of axis-aligned boxes in (L, hue, chroma) across seven lightness
+bands, emitting one of three discrete reduction factors - 0.3 for its core
+region, 0.4 and 0.6 for two wider envelopes. Hard boxes with no feathering
+are the other visible artefact source in that tool.
+
+Here it is a smooth window, and its geometry comes from measuring real skin
+in Oklab rather than from RawTherapee's table. Reference skin swatches -
+light and dark ColorChecker skin, pale, mid and deep complexions - come out
+at hue **28 to 72 degrees** and chroma **0.05 to 0.12**. So the window is a
+plateau over 25..75 degrees with a smoothstep roll-off of 15 degrees at each
+edge, times a chroma ceiling that tapers from full at 0.12 to nothing by
+0.18:
+
+    w = smoothstep(10, 25, h) * (1 - smoothstep(75, 90, h))
+                              * (1 - smoothstep(0.12, 0.18, C))
+    m = m * (1 - 0.7 * w)
+
+The chroma ceiling is what keeps a saturated orange from being mistaken for
+a cheek; RawTherapee bounds its boxes in chroma for the same reason. The
+0.7, i.e. skin keeping 30% of the effect, is RawTherapee's core factor, and
+is worth matching because it is the one number about this control a user
+carries over.
+
+It defaults **on** here, where RawTherapee's defaults it off. Without the
+Munsell table a hue window is all the protection there is, and it costs
+nothing when there is no skin in the frame.
+
+One consequence is worth stating plainly, because it shows up in the test
+export: **warm low-chroma wood, leather and skin are the same colour**. The
+sample frame is a wood ceiling at hue 50-65 degrees and chroma 0.03-0.09,
+squarely inside the window, so with protection on `--vibrance 50,20` raises
+its chroma by 1.15x rather than 1.5x. That is the feature working, not
+failing, and RawTherapee's classifier would say the same thing about the
+same pixels.
+
+**Avoid colour shift.** In RawTherapee this toggle switches on the Munsell
+hue correction, and a gamut-compression loop runs either way. In Oklab hue
+constancy is free, so the toggle here governs only the gamut half, which is
+the half the brief asks for: rather than letting the encoded RGB clip,
+the chroma scale is walked back until the colour fits.
+
+Clipping is the wrong answer because clipping one channel and not the others
+*is* a hue rotation. Walking the scale back keeps `L` and `h` exactly - every
+candidate on the walk has the same hue by construction - and gives up only
+the chroma that could not be shown.
+
+The walk is eight bisections on the scale, between 1 (always safe, since the
+colour came from an in-gamut display value) and the requested factor, with
+the invariant that the low end always fits. The requested factor is tested
+once first and the walk only runs where it did not fit: bisection converges
+on the boundary from inside, so a colour that was always going to fit would
+otherwise come back a 256th of the interval short and the filter would
+quietly under-deliver everywhere rather than only at the edge. The gamut
+test is against the linear RGB in [0,1], which is equivalent to testing the
+encoded RGB because every transfer function involved is monotonic.
+
+Eight steps resolve the interval to a 256th of it, below the quantisation of
+any window this lands in. Measured on the exported crop: the whole shader,
+including the Oklab round trip, the threshold, the skin window, the limiter
+and the walk, matches an independent model of the same algorithm to a
+**mean chroma error of 0.026%** (max 2.1%, at chroma near zero). Pixels the
+walk does not touch land on the asked-for factor exactly - 1.1498 measured
+against 1.150 intended for the protected wood, 1.4997 against 1.500 for the
+unprotected lamp body.
+
+**Not implemented: the user curve.** RawTherapee has a skin-tone curve, a
+hue-to-hue diagonal curve applied inside a fixed band with chroma and hue
+feathering, at a fixed half strength. It is skipped in this round and
+RawTherapee itself short-circuits the identity case, which is the default,
+so nothing is missing at defaults. The hook for it is the place `m` is
+computed in `adjust_vib_head`: a curve would enter as a 1D LUT sampled by
+the normalised chroma position `t`, replacing the `mix()` there, and the
+parameter would join `craw_vibrance_params`.
+
+**Defaults are an absence, not an identity.** `craw_vibrance_is_noop()` is
+true when both amounts are zero, and the caller then leaves the hook off the
+array entirely rather than dispatching a shader that multiplies by one; the
+same is true of soft light at strength 0 and of the LUT when no film
+simulation is picked. So at defaults the render is instruction for
+instruction what it was before this change, which the unchanged export md5
+confirms.
+
+This is also a deliberate improvement on RawTherapee, where the all-zero
+guard is the *only* per-pixel identity path: move a vibrance slider there by
+1 and every pixel in the image additionally goes through a full gamut
+compression and a Munsell correction, so the step from 0 to 1 is far larger
+than 1/100 of the effect. Here the gamut walk belongs to vibrance and scales
+with it.
+
+### 15.5 Cost
+
+Both hooks are a few dozen ALU instructions per pixel appended to a shader
+that was going to run anyway, with no extra pass and no extra render target.
+`-v`'s per-frame `render` cannot resolve them. Over three 22-second
+`--bench` runs each, at 1080p output: **13.90 ms** with the hooks off
+(13.849/13.909/13.934) against **13.40 ms** with `--softlight 50 --vibrance
+50,20` (13.290/13.324/13.582); at 4K output, 14.16 ms off against 13.80 ms
+on. The difference is negative both times, i.e. the loop is decode-bound on
+5.8K ProRes RAW, `render` is measuring GPU queue backpressure rather than
+shader work, and the added instructions fit entirely in the slack. The
+run-to-run spread, with other GPU work on the machine, is larger than
+anything the hooks could cost.

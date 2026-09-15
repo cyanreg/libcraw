@@ -36,6 +36,7 @@
 #include <craw/profile.h>
 #include <craw/pipeline.h>
 #include <craw/awb.h>
+#include <craw/noise.h>
 
 #include "vkdev.h"
 #include "profiles.h"
@@ -92,6 +93,13 @@ struct tool_cfg {
     bool float32;
     bool bench;
     bool stats;
+
+    /* Output crop in pixels, w = 0 for the whole frame. */
+    int64_t crop_x, crop_y, crop_w, crop_h;
+
+    float denoise;            /* 0 = off */
+    CRAWNoiseModel noise;     /* a > 0 overrides the profile's table */
+    bool noise_estimate;
 
     const char *tables;
     const char *profile;
@@ -207,6 +215,25 @@ static void tool_usage(FILE *f)
 "  --exposure STOPS    exposure offset in stops on top of --ei (default: 0)\n"
 "  --clamp-negative    clamp negative output components to zero\n"
 "  --float32           RGBA32F pipeline output instead of RGBA16F\n"
+"  --crop X,Y,W,H      write, and compute --stats over, only this rectangle\n"
+"                      of the output. The pipeline still runs on the whole\n"
+"                      frame, so a crop is what the full frame would have\n"
+"                      looked like there, which is the point: it is how a\n"
+"                      5.8K frame gets looked at 1:1 without a 5.8K file\n"
+"  --denoise STRENGTH  raw domain denoising at this strength: 1.0 removes\n"
+"                      noise at the level the camera's noise model predicts,\n"
+"                      2.0 smooths twice as far, 0 (the default) is off. The\n"
+"                      model comes from the profile's table at the clip's\n"
+"                      as-shot ISO unless --noise overrides it\n"
+"  --noise A,B         override the noise model: variance = A * u + B with u\n"
+"                      the signal above black over the sensor range. Print a\n"
+"                      clip's own pair with --noise-estimate\n"
+"  --noise-estimate    fit A and B on every decoded frame and print them,\n"
+"                      then a summary; no GPU work and no output is written.\n"
+"                      Point it at a flat, evenly lit, unclipped field (a\n"
+"                      sheet of white paper filling the frame) for a\n"
+"                      calibration, and check that the printed fit error is\n"
+"                      small and the read noise plausible before believing it\n"
 "  --bench             per frame GPU and decode time, plus the averages\n"
 "  --stats             per frame min/mean/p50/p99/max of the output's Y\n"
 "                      (XYZ output) or G channel\n"
@@ -691,6 +718,8 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
     pp.out_space = cfg->space;
     pp.out_format = out_format;
     pp.flags = cfg->wb == TOOL_WB_AUTO ? CRAW_PIPELINE_FLAG_AWB_HISTOGRAM : 0;
+    if (cfg->denoise > 0.0f)
+        pp.flags |= CRAW_PIPELINE_FLAG_DENOISE;
 
     ret = craw_pipeline_create(g->ctx, &pp, &g->pipe);
     if (ret < 0) {
@@ -769,16 +798,14 @@ static void tool_buffers_free(struct tool_buffers *b)
     *b = (struct tool_buffers) { 0 };
 }
 
-/* craw_testdev_image_upload() wants tightly packed rows and the decoder
- * pads its own, so the mosaic is repacked on the way in. */
-static int tool_upload_frame(struct tool_gpu *g, struct tool_buffers *b,
-                             const AVFrame *frame)
+/* craw_testdev_image_upload() and craw_noise_estimate() both want tightly
+ * packed rows and the decoder pads its own, so the mosaic is repacked. */
+static int tool_pack_mosaic(struct tool_buffers *b, const AVFrame *frame)
 {
     uint32_t w = (uint32_t)frame->width, h = (uint32_t)frame->height;
-    size_t npix = (size_t)w * h;
-    int ret;
 
-    b->mosaic = tool_grow(b->mosaic, &b->mosaic_samples, npix, sizeof(*b->mosaic));
+    b->mosaic = tool_grow(b->mosaic, &b->mosaic_samples, (size_t)w * h,
+                          sizeof(*b->mosaic));
     if (!b->mosaic)
         return CRAW_ERROR(ENOMEM);
 
@@ -787,12 +814,87 @@ static int tool_upload_frame(struct tool_gpu *g, struct tool_buffers *b,
                frame->data[0] + (ptrdiff_t)y * frame->linesize[0],
                (size_t)w * sizeof(*b->mosaic));
 
+    return 0;
+}
+
+static int tool_upload_frame(struct tool_gpu *g, struct tool_buffers *b,
+                             const AVFrame *frame)
+{
+    size_t npix = (size_t)frame->width * frame->height;
+    int ret;
+
+    ret = tool_pack_mosaic(b, frame);
+    if (ret < 0)
+        return ret;
+
     ret = craw_testdev_image_upload(&g->td, &g->src, b->mosaic,
                                     npix * sizeof(*b->mosaic));
     if (ret < 0)
         fprintf(stderr, "upload failed: %d\n", ret);
 
     return ret;
+}
+
+/* ------------------------------------------------------- noise estimate */
+
+/* Per-frame fits, so that a clip of many frames can be summarized by the
+ * median rather than by whichever frame happened to be last. */
+struct tool_noise_run {
+    float *a, *b;
+    size_t nb, cap;
+};
+
+static int tool_noise_run_push(struct tool_noise_run *r, float a, float b)
+{
+    if (r->nb == r->cap) {
+        size_t cap = r->cap ? r->cap * 2 : 64;
+        float *na = realloc(r->a, cap * sizeof(*na));
+        float *nb = na ? realloc(r->b, cap * sizeof(*nb)) : NULL;
+
+        if (!nb) {
+            free(na);
+            return CRAW_ERROR(ENOMEM);
+        }
+        r->a = na;
+        r->b = nb;
+        r->cap = cap;
+    }
+
+    r->a[r->nb] = a;
+    r->b[r->nb] = b;
+    r->nb++;
+
+    return 0;
+}
+
+static int tool_float_cmp(const void *x, const void *y)
+{
+    float a = *(const float *)x, c = *(const float *)y;
+    return a < c ? -1 : (a > c ? 1 : 0);
+}
+
+static void tool_noise_run_report(struct tool_noise_run *r, const CRAWProfile *prof)
+{
+    float range;
+
+    if (!r->nb)
+        return;
+
+    qsort(r->a, r->nb, sizeof(*r->a), tool_float_cmp);
+    qsort(r->b, r->nb, sizeof(*r->b), tool_float_cmp);
+
+    range = prof->white_level[0] - prof->black_level[0];
+
+    printf("\n%zu frames, median of the per frame fits:\n", r->nb);
+    printf("  noise %.0f %.6g %.6g   # profile table line, iso a b\n",
+           (double)prof->as_shot_ei, (double)r->a[r->nb / 2], (double)r->b[r->nb / 2]);
+    printf("  spread of a: %.4e .. %.4e (%.1f%% of the median)\n",
+           (double)r->a[0], (double)r->a[r->nb - 1],
+           r->a[r->nb / 2] > 0.0f ?
+               100.0 * (r->a[r->nb - 1] - r->a[0]) / r->a[r->nb / 2] : 0.0);
+    printf("  in 16-bit code values: a = %.4f per code value, read noise = %.2f\n",
+           (double)(r->a[r->nb / 2] * range * 65535.0f),
+           sqrt((double)r->b[r->nb / 2]) * (double)range * 65535.0);
 }
 
 /* Brings the output image back as interleaved float RGBA, decoding fp16 on
@@ -1205,6 +1307,82 @@ static int tool_parse_wb(struct tool_cfg *cfg, const char *arg)
     return 0;
 }
 
+/* `X,Y,W,H` in output pixels. */
+static int tool_parse_crop(struct tool_cfg *cfg, const char *arg)
+{
+    double v[4];
+    const char *p = arg;
+    char *end;
+
+    for (int i = 0; i < 4; i++) {
+        v[i] = strtod(p, &end);
+        if (end == p || (i < 3 && *end != ',') || (i == 3 && *end)) {
+            fprintf(stderr, "--crop: expected X,Y,W,H, got `%s`\n", arg);
+            return CRAW_ERROR(EINVAL);
+        }
+        p = end + 1;
+    }
+
+    if (v[0] < 0.0 || v[1] < 0.0 || v[2] < 1.0 || v[3] < 1.0) {
+        fprintf(stderr, "--crop: the offset must not be negative and the size must be "
+                        "at least one pixel\n");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    cfg->crop_x = (int64_t)v[0];
+    cfg->crop_y = (int64_t)v[1];
+    cfg->crop_w = (int64_t)v[2];
+    cfg->crop_h = (int64_t)v[3];
+
+    return 0;
+}
+
+/* Compacts the crop to the front of `rgba` and returns its size, clamped
+ * to the frame. Done on the host after the download: the pipeline has no
+ * notion of a region of interest and every stage's stencil should see the
+ * same neighbours it would in a full frame. */
+static void tool_crop(const struct tool_cfg *cfg, float *rgba, uint32_t *w, uint32_t *h)
+{
+    int64_t x0 = CRAW_MIN(cfg->crop_x, (int64_t)*w - 1);
+    int64_t y0 = CRAW_MIN(cfg->crop_y, (int64_t)*h - 1);
+    int64_t cw = CRAW_MIN(cfg->crop_w, (int64_t)*w - x0);
+    int64_t ch = CRAW_MIN(cfg->crop_h, (int64_t)*h - y0);
+
+    for (int64_t y = 0; y < ch; y++)
+        memmove(rgba + y * cw * 4, rgba + ((y0 + y) * (int64_t)*w + x0) * 4,
+                (size_t)cw * 4 * sizeof(*rgba));
+
+    *w = (uint32_t)cw;
+    *h = (uint32_t)ch;
+}
+
+/* `A,B` or `A B`: the two terms of variance = A * u + B. */
+static int tool_parse_noise(struct tool_cfg *cfg, const char *arg)
+{
+    char *end;
+    double a, b;
+
+    a = strtod(arg, &end);
+    if (end == arg || (*end != ',' && *end != ' ')) {
+        fprintf(stderr, "--noise: expected A,B, got `%s`\n", arg);
+        return CRAW_ERROR(EINVAL);
+    }
+    arg = end + 1;
+    b = strtod(arg, &end);
+    if (end == arg || *end) {
+        fprintf(stderr, "--noise: cannot parse B in `%s`\n", arg);
+        return CRAW_ERROR(EINVAL);
+    }
+    if (!(a > 0.0) || b < 0.0) {
+        fprintf(stderr, "--noise: A must be positive and B must not be negative\n");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    cfg->noise = (CRAWNoiseModel) { .a = (float)a, .b = (float)b };
+
+    return 0;
+}
+
 static int tool_parse_double(const char *opt, const char *arg, double *out)
 {
     char *end;
@@ -1233,6 +1411,10 @@ enum {
     TOOL_OPT_FLOAT32,
     TOOL_OPT_BENCH,
     TOOL_OPT_STATS,
+    TOOL_OPT_CROP,
+    TOOL_OPT_DENOISE,
+    TOOL_OPT_NOISE,
+    TOOL_OPT_NOISE_EST,
     TOOL_OPT_TABLES,
     TOOL_OPT_PROFILE,
 };
@@ -1254,6 +1436,10 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         { "float32",        no_argument,       NULL, TOOL_OPT_FLOAT32   },
         { "bench",          no_argument,       NULL, TOOL_OPT_BENCH     },
         { "stats",          no_argument,       NULL, TOOL_OPT_STATS     },
+        { "crop",           required_argument, NULL, TOOL_OPT_CROP      },
+        { "denoise",        required_argument, NULL, TOOL_OPT_DENOISE   },
+        { "noise",          required_argument, NULL, TOOL_OPT_NOISE     },
+        { "noise-estimate", no_argument,       NULL, TOOL_OPT_NOISE_EST },
         { "tables",         required_argument, NULL, TOOL_OPT_TABLES    },
         { "profile",        required_argument, NULL, TOOL_OPT_PROFILE   },
         { "help",           no_argument,       NULL, 'h'                },
@@ -1354,6 +1540,26 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         case TOOL_OPT_STATS:
             cfg->stats = true;
             break;
+        case TOOL_OPT_CROP:
+            if ((ret = tool_parse_crop(cfg, optarg)) < 0)
+                return ret;
+            break;
+        case TOOL_OPT_DENOISE:
+            if ((ret = tool_parse_double("--denoise", optarg, &d)) < 0)
+                return ret;
+            if (d < 0.0) {
+                fprintf(stderr, "--denoise: %g is not a strength\n", d);
+                return CRAW_ERROR(EINVAL);
+            }
+            cfg->denoise = (float)d;
+            break;
+        case TOOL_OPT_NOISE:
+            if ((ret = tool_parse_noise(cfg, optarg)) < 0)
+                return ret;
+            break;
+        case TOOL_OPT_NOISE_EST:
+            cfg->noise_estimate = true;
+            break;
         case TOOL_OPT_TABLES:
             cfg->tables = optarg;
             break;
@@ -1413,6 +1619,7 @@ int main(int argc, char **argv)
     struct tool_gpu gpu = { 0 };
     struct tool_buffers buf = { 0 };
     struct tool_awb awb = { 0 };
+    struct tool_noise_run noise_run = { 0 };
     CRAWContextOptions ctx_opts = { 0 };
     CRAWProfile base, prof;
     AVFrame *frame = NULL;
@@ -1501,6 +1708,9 @@ int main(int argc, char **argv)
 
     /* ---------------------------------------------------- the device */
 
+    if (cfg.noise_estimate)
+        goto have_device;
+
     ret = craw_testdev_open(&gpu.td, cfg.device, cfg.verbose);
     if (ret < 0) {
         fprintf(stderr, "no usable Vulkan device%s%s: %d\n", cfg.device ? " matching " : "",
@@ -1526,6 +1736,8 @@ int main(int argc, char **argv)
                 tool_space_name(cfg.space),
                 cfg.float32 ? "RGBA32F" : "RGBA16F",
                 tool_encodes[cfg.encode].name);
+
+have_device:
 
     /* ------------------------------------------------- the smoother */
 
@@ -1611,6 +1823,42 @@ int main(int argc, char **argv)
                     prof.white_level[0], prof.as_shot_wb[0], prof.as_shot_wb[2],
                     prof.gain, prof.as_shot_cct, prof.nb_wb_knots, prof.nb_matrix_knots);
 
+        if (cfg.noise_estimate) {
+            CRAWNoiseEstimate est;
+
+            ret = tool_pack_mosaic(&buf, frame);
+            if (ret < 0)
+                goto fail;
+
+            ret = craw_noise_estimate(buf.mosaic, w, h, w, &prof, NULL, &est);
+            if (ret == CRAW_ERROR(ENODATA)) {
+                fprintf(stderr, "frame %5" PRId64 ": too few levels in this frame to fit "
+                        "anything. The fit needs at least three intensity bins holding "
+                        "20000 samples each, which a frame of one flat level or of nothing "
+                        "but texture will not have.\n", processed);
+                goto fail;
+            }
+            if (ret < 0) {
+                fprintf(stderr, "frame %5" PRId64 ": craw_noise_estimate failed: %d\n",
+                        processed, ret);
+                goto fail;
+            }
+
+            printf("frame %5" PRId64 ": a %.4e b %.4e   %u bins, %u fitted, "
+                   "fit error %.1f%%, read noise %.2f code values\n",
+                   processed, (double)est.model.a, (double)est.model.b,
+                   est.nb_bins, est.nb_inliers, 100.0 * (double)est.fit_rms,
+                   (double)est.read_noise_lsb);
+
+            ret = tool_noise_run_push(&noise_run, est.model.a, est.model.b);
+            if (ret < 0)
+                goto fail;
+
+            processed++;
+            av_frame_unref(frame);
+            continue;
+        }
+
         ret = tool_gpu_resize(&gpu, &cfg, w, h);
         if (ret < 0)
             goto fail;
@@ -1623,6 +1871,8 @@ int main(int argc, char **argv)
         fp.profile = &prof;
         fp.exposure_stops = cfg.exposure;
         fp.flags = cfg.clamp_negative ? CRAW_FRAME_FLAG_CLAMP_NEGATIVE : 0;
+        fp.denoise_strength = cfg.denoise;
+        fp.noise_override = cfg.noise;
 
         if (cfg.wb == TOOL_WB_FIXED) {
             fp.wb_mode = CRAW_WB_REBALANCE;
@@ -1667,6 +1917,11 @@ int main(int argc, char **argv)
             ret = tool_download_frame(&gpu, &buf, cfg.float32);
             if (ret < 0)
                 goto fail;
+
+            if (cfg.crop_w) {
+                tool_crop(&cfg, buf.rgba, &w, &h);
+                npix = (size_t)w * h;
+            }
         }
 
         /* ---------------------------------------------------- stats */
@@ -1715,6 +1970,9 @@ int main(int argc, char **argv)
         goto fail;
     }
 
+    if (cfg.noise_estimate)
+        tool_noise_run_report(&noise_run, &prof);
+
     if (cfg.bench) {
         printf("%" PRId64 " frames: gpu %.3f ms/frame average, decode %.1f ms/frame average",
                processed, gpu_ms_total / (double)processed,
@@ -1728,6 +1986,8 @@ int main(int argc, char **argv)
     ret = 0;
 
 fail:
+    free(noise_run.a);
+    free(noise_run.b);
     tool_buffers_free(&buf);
     av_frame_free(&frame);
     craw_awb_smoother_free(&awb.smoother);

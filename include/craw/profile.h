@@ -30,6 +30,7 @@
 #include <stdbool.h>
 
 #include <craw/utils.h>
+#include <craw/noise.h>
 
 /* Bayer colour filter array layout, named by the 2x2 quad read left to
  * right, top to bottom, starting at even (x, y). Only RGGB is implemented
@@ -117,6 +118,13 @@ typedef struct CRAWProfile {
 
     /* Free-form identification, e.g. "Panasonic DC-S1M2". */
     char name[64];
+
+    /* Sensor noise model per exposure index, for the denoise stage. Knots
+     * must be sorted by ascending iso; an empty table means the camera has
+     * not been characterized and the caller has to supply a model itself.
+     * See <craw/noise.h> and DESIGN.md 14.2. */
+    CRAWNoiseKnot noise_knots[CRAW_PROFILE_MAX_NOISE_KNOTS];
+    uint32_t      nb_noise_knots;
 } CRAWProfile;
 
 /* White balance selection for a frame. */
@@ -187,6 +195,15 @@ enum CRAWColorSpace {
     CRAW_CS_ACES_AP1_LINEAR,
     CRAW_CS_NB,
 };
+
+/* Evaluates the profile's noise table at `iso`, which is the sensor's own
+ * exposure index: the as-shot ISO the frame was recorded at, not the
+ * working index a grade rates the clip with. When `iso` is not positive
+ * the profile's as_shot_ei is used. Fails with CRAW_ERROR(ENOTSUP) if the
+ * profile carries no table. See craw_noise_model_eval() for the
+ * interpolation. */
+CRAW_API int craw_profile_noise_eval(const CRAWProfile *p, float iso,
+                                     CRAWNoiseModel *out);
 
 /* Fills `m` with the row-major matrix taking CIE XYZ (D65 relative) to
  * the given space. Identity for CRAW_CS_XYZ_D65. */

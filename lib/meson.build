@@ -39,6 +39,7 @@ craw_sources = files(
     'colorspace.c',
     'awb.c',
     'awb_smoother.c',
+    'noise.c',
 
     # GPU pipeline
     'pipeline.c',
@@ -46,6 +47,7 @@ craw_sources = files(
     # CPU reference (tests and tools only, not exported)
     'ref/ref_debayer.c',
     'ref/ref_color.c',
+    'ref/ref_denoise.c',
 )
 
 # Generate local configure file

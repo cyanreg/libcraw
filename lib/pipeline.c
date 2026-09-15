@@ -21,6 +21,7 @@
 #include "rcd_rb.spv.h"
 #include "color.spv.h"
 #include "awb_hist.spv.h"
+#include "denoise_nlm.spv.h"
 
 /* Every debayer pass shares this block; it mirrors CRAWPrepPushBuf in
  * lib/shaders/common.glsl field for field. Scalar layout gives every member
@@ -42,6 +43,32 @@ static_assert(sizeof(CRAWPrepPush) == 56, "CRAWPrepPush layout");
 static_assert(offsetof(CRAWPrepPush, black) == 8, "CRAWPrepPush layout");
 static_assert(offsetof(CRAWPrepPush, inv_range) == 24, "CRAWPrepPush layout");
 static_assert(offsetof(CRAWPrepPush, wb) == 40, "CRAWPrepPush layout");
+
+/* Mirrors CRAWDenoisePushBuf in lib/shaders/denoise_nlm.comp.glsl. The
+ * transform constants are all derived from the frame's (a, b) on the host,
+ * so the shader never divides by a value it cannot check and the CPU
+ * reference in lib/ref/ref_denoise.c can be handed the same numbers. */
+typedef struct CRAWDenoisePush {
+    int32_t size[2];       /* plane size, i.e. the mosaic halved */
+    float   black[4];      /* black level per quad site, UNORM */
+    float   inv_range[4];  /* 1 / (white - black) per quad site */
+    float   range[4];      /* white - black per quad site */
+    float   gat_a;         /* noise model a */
+    float   gat_c;         /* 3 a^2 / 8 + b */
+    float   gat_sc;        /* sqrt(gat_c) */
+    float   gat_fwd;       /* 2 / a */
+    float   gat_inv;       /* a / 4 */
+    float   gat_off;       /* gat_c / a */
+    float   inv_h2;        /* 1 / strength^2 */
+    float   guard_lo;      /* highlight ramp start, in u */
+    float   guard_inv;     /* 1 / (guard_hi - guard_lo) */
+} CRAWDenoisePush;
+
+static_assert(sizeof(CRAWDenoisePush) == 92, "CRAWDenoisePush layout");
+static_assert(offsetof(CRAWDenoisePush, black) == 8, "CRAWDenoisePush layout");
+static_assert(offsetof(CRAWDenoisePush, range) == 40, "CRAWDenoisePush layout");
+static_assert(offsetof(CRAWDenoisePush, gat_a) == 56, "CRAWDenoisePush layout");
+static_assert(offsetof(CRAWDenoisePush, inv_h2) == 80, "CRAWDenoisePush layout");
 
 /* Mirrors CRAWColorPushBuf in lib/shaders/color.comp.glsl. `matrix` is row
  * major, as everything in libcraw is, and the shader reads it as three
@@ -76,8 +103,36 @@ static_assert(offsetof(CRAWAwbPush, bins) == 20, "CRAWAwbPush layout");
 /* The shader's clamp flag is the public frame flag. */
 static_assert(CRAW_FRAME_FLAG_CLAMP_NEGATIVE == 1, "colour shader flag mirror");
 
+/* Both option structs end in a padding tail written as arithmetic on the
+ * fields in front of it, so a field added without shrinking the tail
+ * changes the size and breaks the ABI silently. These catch that. */
+static_assert(sizeof(CRAWPipelineParams) == 256, "CRAWPipelineParams size");
+static_assert(sizeof(CRAWFrameParams) == 264, "CRAWFrameParams size");
+
 /* One sample per 8x8 block of the intermediate, DESIGN.md 4.4. */
 #define CRAW_AWB_BLOCK 8
+
+/* Denoise geometry, DESIGN.md 14.3. The 7x7 search and 3x3 patch are what
+ * fits the frame budget on the reference device; a patch radius of 0 makes
+ * the same shader the bilateral fallback. */
+#define CRAW_DN_SEARCH_R 3
+#define CRAW_DN_PATCH_R  1
+
+/* The shader's shared tile is a fixed 28x28 floats, which is a 16x16
+ * workgroup plus a halo of search + patch on each side. Both of these are
+ * compile-time here, so the check is too. */
+#define CRAW_DN_TILE_MAX 28
+#define CRAW_DN_WG       16
+
+static_assert(CRAW_DN_WG + 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R) <= CRAW_DN_TILE_MAX,
+              "denoise tile does not fit the shader's shared array");
+static_assert((2 * CRAW_DN_PATCH_R + 1) * (2 * CRAW_DN_PATCH_R + 1) <= 25,
+              "denoise patch does not fit the shader's register array");
+
+/* Where the highlight guard of DESIGN.md 14.3 ramps the filter off, in
+ * units of the sensor range above black. */
+#define CRAW_DN_GUARD_LO 0.90f
+#define CRAW_DN_GUARD_HI 1.00f
 
 #define CRAW_AWB_HIST_ENTRIES (CRAW_AWB_HIST_BINS * CRAW_AWB_HIST_BINS)
 #define CRAW_AWB_HIST_BYTES   (CRAW_AWB_HIST_ENTRIES * (uint32_t)sizeof(uint32_t))
@@ -88,6 +143,7 @@ struct CRAWPipeline {
 
     bool rcd;
     bool awb;
+    bool has_denoise;
 
     /* One of `debayer` or the three RCD passes is created, never both.
      * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
@@ -97,10 +153,12 @@ struct CRAWPipeline {
     CRAWVkShader rcd_rb[2];
     CRAWVkShader color;
     CRAWVkShader awb_hist;
+    CRAWVkShader denoise;
 
     CRAWVkImage inter;   /* camera RGB, RGBA16F */
     CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
     CRAWVkImage green;   /* RCD: pass B green plane, R16F */
+    CRAWVkImage clean;   /* denoise: the filtered mosaic, R16_UNORM */
 
     CRAWVkBuffer hist_count;
     CRAWVkBuffer hist_weight;
@@ -127,10 +185,15 @@ static const CRAWVkBinding craw_bind_awb[4] = {
 };
 
 /* Specialization constants below 253: 0 is the CFA phase (common.glsl), 1
- * the RCD pass C phase (rcd_rb.comp.glsl). */
-static const VkSpecializationMapEntry craw_spec_map[2] = {
-    { .constantID = 0, .offset = 0,                .size = sizeof(uint32_t) },
-    { .constantID = 1, .offset = sizeof(uint32_t), .size = sizeof(uint32_t) },
+ * the RCD pass C phase (rcd_rb.comp.glsl), 2 and 3 the denoise search and
+ * patch radii (denoise_nlm.comp.glsl). A shader that does not declare one
+ * of these ignores its map entry, so every shader is given the prefix of
+ * this array it needs. */
+static const VkSpecializationMapEntry craw_spec_map[4] = {
+    { .constantID = 0, .offset = 0,                    .size = sizeof(uint32_t) },
+    { .constantID = 1, .offset = 1 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 2, .offset = 2 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 3, .offset = 3 * sizeof(uint32_t), .size = sizeof(uint32_t) },
 };
 
 void craw_pipeline_params_init(CRAWPipelineParams *p)
@@ -203,8 +266,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                          CRAWPipeline **pipe)
 {
     CRAWPipeline *p;
-    uint32_t spec[2];
-    uint32_t wg2d, wgrcd;
+    uint32_t spec[4];
+    uint32_t wg2d, wgrcd, wgdn;
     int ret;
 
     if (!ctx || !params || !pipe)
@@ -244,6 +307,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     p->params = *params;
     p->rcd = params->debayer == CRAW_DEBAYER_RCD;
     p->awb = !!(params->flags & CRAW_PIPELINE_FLAG_AWB_HISTOGRAM);
+    p->has_denoise = !!(params->flags & CRAW_PIPELINE_FLAG_DENOISE);
     p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
     p->blocks[1] = (int32_t)(params->height / CRAW_AWB_BLOCK);
 
@@ -251,6 +315,10 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
      * 7x7 patch per invocation, so it gets half the occupancy pressure. */
     wg2d  = craw_wg_dim(ctx, 16);
     wgrcd = craw_wg_dim(ctx, 8);
+    /* The denoise tile is sized for CRAW_DN_WG; a device that cannot run
+     * that many invocations gets a smaller one, which only shrinks the
+     * tile. */
+    wgdn  = craw_wg_dim(ctx, CRAW_DN_WG);
 
     ret = craw_vk_image_create(ctx, &p->inter, params->width, params->height,
                                VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
@@ -259,6 +327,40 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
 
     spec[0] = (uint32_t)params->cfa;
     spec[1] = 0;
+    spec[2] = CRAW_DN_SEARCH_R;
+    spec[3] = CRAW_DN_PATCH_R;
+
+    if (p->has_denoise) {
+        /* The denoise stage mirrors inside each CFA plane, and one
+         * reflection only reaches a stencil radius of plane size - 1, so a
+         * frame smaller than this would read outside the plane. Every real
+         * frame is orders of magnitude bigger; this exists so that the
+         * rule of DESIGN.md 3 is enforced rather than assumed. */
+        const uint32_t dn_min = 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R + 1);
+
+        if (params->width < dn_min || params->height < dn_min) {
+            craw_log(ctx, CRAW_LOG_ERROR,
+                     "Denoising needs a frame of at least %ux%u, got %ux%u\n",
+                     dn_min, dn_min, params->width, params->height);
+            ret = CRAW_ERROR(EINVAL);
+            goto fail;
+        }
+
+        /* A second mosaic rather than a filter in place: no pass in this
+         * library reads an image it also writes, and the caller's source
+         * image is its own. */
+        ret = craw_vk_image_create(ctx, &p->clean, params->width, params->height,
+                                   VK_FORMAT_R16_UNORM, VK_IMAGE_USAGE_STORAGE_BIT);
+        if (ret < 0)
+            goto fail;
+
+        ret = craw_pipeline_shader(p, &p->denoise, "denoise_nlm",
+                                   craw_denoise_nlm_spv_data, craw_denoise_nlm_spv_len,
+                                   craw_bind_images, 2, sizeof(CRAWDenoisePush), wgdn,
+                                   spec, 4);
+        if (ret < 0)
+            goto fail;
+    }
 
     if (!p->rcd) {
         const bool mhc = params->debayer == CRAW_DEBAYER_MHC;
@@ -349,9 +451,10 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
-    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s\n",
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s\n",
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
-             p->awb ? ", awb histogram" : "");
+             p->awb ? ", awb histogram" : "",
+             p->has_denoise ? ", denoise" : "");
 
     *pipe = p;
     return 0;
@@ -385,6 +488,8 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->color);
     if (p->awb_hist.pipeline)
         craw_vk_shader_free(ctx, &p->awb_hist);
+    if (p->denoise.pipeline)
+        craw_vk_shader_free(ctx, &p->denoise);
 
     if (p->inter.image)
         craw_vk_image_free(ctx, &p->inter);
@@ -392,6 +497,8 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_image_free(ctx, &p->aux);
     if (p->green.image)
         craw_vk_image_free(ctx, &p->green);
+    if (p->clean.image)
+        craw_vk_image_free(ctx, &p->clean);
 
     if (p->hist_count.buf)
         craw_vk_buffer_free(ctx, &p->hist_count);
@@ -440,15 +547,77 @@ static int craw_pipeline_prep_push(CRAWPipeline *p, const CRAWProfile *prof,
     return 0;
 }
 
+/* Resolves the frame's noise model and turns it into the shader's
+ * constants, DESIGN.md 14.3. The model is looked up at the sensor's own
+ * exposure index (as_shot_ei) and not at the working one: rating a clip at
+ * a different index scales the picture afterwards, it does not change how
+ * the sensels were read. */
+static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
+                                      const CRAWFrameParams *fp, CRAWDenoisePush *dp)
+{
+    CRAWNoiseModel nm;
+    float a, b, c, sc;
+    int ret;
+
+    if (fp->noise_override.a > 0.0f) {
+        nm = fp->noise_override;
+    } else {
+        ret = craw_profile_noise_eval(prof, prof->as_shot_ei, &nm);
+        if (ret < 0) {
+            craw_log(p->ctx, CRAW_LOG_ERROR,
+                     "Denoising needs a noise model: the profile `%s` has no table and "
+                     "CRAWFrameParams.noise_override was not set\n",
+                     prof->name[0] ? prof->name : "(unnamed)");
+            return ret;
+        }
+    }
+
+    a = nm.a;
+    b = CRAW_MAX(nm.b, 0.0f);
+    if (!(a > 0.0f)) {
+        craw_log(p->ctx, CRAW_LOG_ERROR, "Noise model a = %g is not positive\n", (double)a);
+        return CRAW_ERROR(EINVAL);
+    }
+
+    /* The 3 a^2 / 8 of the Anscombe transform, plus the read term. */
+    c = 3.0f * a * a / 8.0f + b;
+    sc = sqrtf(c);
+
+    *dp = (CRAWDenoisePush) {
+        .size      = { (int32_t)(p->params.width / 2), (int32_t)(p->params.height / 2) },
+        .gat_a     = a,
+        .gat_c     = c,
+        .gat_sc    = sc,
+        .gat_fwd   = 2.0f / a,
+        .gat_inv   = a / 4.0f,
+        .gat_off   = c / a,
+        .inv_h2    = 1.0f / (fp->denoise_strength * fp->denoise_strength),
+        .guard_lo  = CRAW_DN_GUARD_LO,
+        .guard_inv = 1.0f / (CRAW_DN_GUARD_HI - CRAW_DN_GUARD_LO),
+    };
+
+    for (int i = 0; i < 4; i++) {
+        float range = prof->white_level[i] - prof->black_level[i];
+
+        dp->black[i] = prof->black_level[i];
+        dp->inv_range[i] = 1.0f / range;
+        dp->range[i] = range;
+    }
+
+    return 0;
+}
+
+/* `gz` is 1 for every pass but the denoise, which puts the CFA plane index
+ * there and dispatches all four at once. */
 static void craw_pipeline_dispatch(CRAWPipeline *p, VkCommandBuffer cmd, const CRAWVkShader *sh,
                                    CRAWVkDescWrite *writes, uint32_t nb_writes,
                                    const void *push, uint32_t push_size,
-                                   uint32_t gx, uint32_t gy)
+                                   uint32_t gx, uint32_t gy, uint32_t gz)
 {
     craw_vk_shader_bind(p->ctx, cmd, sh);
     craw_vk_shader_push_desc(p->ctx, cmd, sh, writes, nb_writes);
     craw_vk_shader_push_const(p->ctx, cmd, sh, push, push_size);
-    craw_vk_shader_dispatch(p->ctx, cmd, sh, gx, gy, 1);
+    craw_vk_shader_dispatch(p->ctx, cmd, sh, gx, gy, gz);
 }
 
 int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
@@ -457,11 +626,14 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
 {
     CRAWContext *ctx;
     CRAWVkImage src_img, dst_img;
+    CRAWVkImage *mosaic;
     CRAWVkDescWrite writes[4];
     CRAWColorParams frame;
     CRAWPrepPush pp;
     CRAWColorPush cp;
     CRAWAwbPush ap;
+    CRAWDenoisePush dp;
+    bool denoise;
     float m_out[3][3], scale;
     uint32_t w, h;
     int ret;
@@ -506,6 +678,16 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     ret = craw_pipeline_prep_push(p, fp->profile, &frame, &pp);
     if (ret < 0)
         return ret;
+
+    /* A strength of zero is the documented way to turn the pass off for one
+     * frame, so it is not an error on a pipeline that was never built with
+     * it either. */
+    denoise = p->has_denoise && fp->denoise_strength > 0.0f;
+    if (denoise) {
+        ret = craw_pipeline_denoise_push(p, fp->profile, fp, &dp);
+        if (ret < 0)
+            return ret;
+    }
 
     ret = craw_colorspace_from_xyz_d65(p->params.out_space, m_out);
     if (ret < 0)
@@ -555,22 +737,41 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
+    /* The denoise pass writes a second mosaic in the same raw encoding, so
+     * everything downstream, the prep of 4.1 included, is untouched. */
+    mosaic = &src_img;
+    if (denoise) {
+        craw_vk_image_barrier(ctx, cmd, &p->clean, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        craw_vk_desc_image(&writes[0], 0, &src_img);
+        craw_vk_desc_image(&writes[1], 1, &p->clean);
+        /* Half resolution, one workgroup slice per CFA plane. */
+        craw_pipeline_dispatch(p, cmd, &p->denoise, writes, 2, &dp, sizeof(dp),
+                               w / 2, h / 2, 4);
+
+        craw_vk_image_barrier(ctx, cmd, &p->clean, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        mosaic = &p->clean;
+    }
+
     craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
     if (!p->rcd) {
-        craw_vk_desc_image(&writes[0], 0, &src_img);
+        craw_vk_desc_image(&writes[0], 0, mosaic);
         craw_vk_desc_image(&writes[1], 1, &p->inter);
-        craw_pipeline_dispatch(p, cmd, &p->debayer, writes, 2, &pp, sizeof(pp), w, h);
+        craw_pipeline_dispatch(p, cmd, &p->debayer, writes, 2, &pp, sizeof(pp), w, h, 1);
     } else {
         /* Pass A: low-pass and directional weights into the aux image. */
         craw_vk_image_barrier(ctx, cmd, &p->aux, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_vk_desc_image(&writes[0], 0, &src_img);
+        craw_vk_desc_image(&writes[0], 0, mosaic);
         craw_vk_desc_image(&writes[1], 1, &p->aux);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_dir, writes, 2, &pp, sizeof(pp), w, h);
+        craw_pipeline_dispatch(p, cmd, &p->rcd_dir, writes, 2, &pp, sizeof(pp), w, h, 1);
 
         /* Pass B: the green plane. */
         craw_vk_image_barrier(ctx, cmd, &p->aux, VK_IMAGE_LAYOUT_GENERAL,
@@ -580,21 +781,21 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         craw_vk_desc_image(&writes[2], 2, &p->green);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_green, writes, 3, &pp, sizeof(pp), w, h);
+        craw_pipeline_dispatch(p, cmd, &p->rcd_green, writes, 3, &pp, sizeof(pp), w, h, 1);
 
         /* Pass C phase 0: the R and B sites, which phase 1 then reads. */
         craw_vk_image_barrier(ctx, cmd, &p->green, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         craw_vk_desc_image(&writes[3], 3, &p->inter);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[0], writes, 4, &pp, sizeof(pp), w, h);
+        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[0], writes, 4, &pp, sizeof(pp), w, h, 1);
 
         /* Pass C phase 1: the G sites. */
         craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[1], writes, 4, &pp, sizeof(pp), w, h);
+        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[1], writes, 4, &pp, sizeof(pp), w, h, 1);
     }
 
     craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
@@ -617,7 +818,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
         craw_vk_desc_buffer(&writes[3], 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                             &p->hist_bright, 0, CRAW_AWB_HIST_BYTES);
         craw_pipeline_dispatch(p, cmd, &p->awb_hist, writes, 4, &ap, sizeof(ap),
-                               (uint32_t)p->blocks[0], (uint32_t)p->blocks[1]);
+                               (uint32_t)p->blocks[0], (uint32_t)p->blocks[1], 1);
     }
 
     craw_vk_image_barrier(ctx, cmd, &dst_img, VK_IMAGE_LAYOUT_GENERAL,
@@ -625,7 +826,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     craw_vk_desc_image(&writes[0], 0, &p->inter);
     craw_vk_desc_image(&writes[1], 1, &dst_img);
-    craw_pipeline_dispatch(p, cmd, &p->color, writes, 2, &cp, sizeof(cp), w, h);
+    craw_pipeline_dispatch(p, cmd, &p->color, writes, 2, &cp, sizeof(cp), w, h, 1);
 
     if (p->awb) {
         VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = CRAW_AWB_HIST_BYTES };
