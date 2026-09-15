@@ -1221,6 +1221,69 @@ unchanged to six figures (1.76414e1, 2.29227e1, 3.08944e1) while the median
 gradient, which is the noise floor, drops 4.8x at strength 1.0 and 7.5x at
 strength 2.0. The filter is removing the noise and leaving the edges.
 
+#### Integer output: the terracing, and why it is not in the data
+
+The first denoised crops of this frame showed the smooth dark gradient
+across the lamp housing broken into plateaus tens of pixels wide with
+jagged boundaries, where the undenoised crop is smooth under its noise.
+Two mechanisms could produce that and both were measured; neither is what
+happened.
+
+*Re-quantisation of the mosaic.* The stage writes back into R16_UNORM, so
+the worry is that the noise that used to dither those steps is gone and one
+code value becomes a band. In a 200x200 plane patch of that gradient the
+denoised mosaic occupies 125 of the 125 code values it spans with one gap,
+at a mean run length along a row of 1.35 (the input: 165 of 179, run 1.03).
+In the linear output the denoised frame occupies 1722 distinct 16-bit sRGB
+codes at a run length of 1.03. Nothing has collapsed. Note also that this
+camera's black and white levels already fill 96.9% of the 16-bit range, so
+rescaling the encoding could buy at most 3%; the option that would actually
+add precision is a float intermediate, and the numbers say none is needed.
+
+*An NLM staircase.* With `exp(-max(d^2 - 2, 0)/h^2)`, neighbours inside a
+slow gradient all match within the noise and all get weight 1, so the
+filter degenerates to a box mean over the search window; if the weight set
+then changed discretely from pixel to pixel the output would step. It does
+not. The method noise `nlm - in` has an autocorrelation of +1.000 at lag 0
+and within +-0.032 at every lag from 1 to 14, with nothing at lag 7, the
+search window's own period; a staircase cannot hide from that. And the
+filter is not eating the slow signal either: `G20(nlm) - G20(in)` is 0.17
+to 0.21 code values rms against a method noise of 9.8 to 13.7, with a mean
+of -0.2 codes on a level of 380, which is the Anscombe inverse's own bias
+and 0.05% of the signal. Adding the low-pass of the method noise back would
+restore that 0.2 and cost a pass; the measurement says not to.
+
+*What it actually is.* Eight-bit rendering. The same 700x500 region of the
+gradient, quantised to 8 bits:
+
+    field                       mean run   longest run   error acf lag 1
+    undenoised                  1.22       9             +0.001
+    denoised, plain             3.10       66            +0.062
+    denoised, dithered          1.91       25            +0.000
+
+while the linear float field the three come from got *smoother*, its
+laplacian rms falling from 2.83% of the mean to 0.58%. The denoiser did its
+job; 8 bits is simply too coarse a grid for a smooth shadow gradient once
+the sensor noise that was dithering it has been deliberately removed, and
+the correlated quantisation error is the contour. Every quantiser has this
+property and a denoiser is what exposes it.
+
+So the fix belongs at the quantiser, not in the filter: `craw-process`'s
+8-bit writer now adds one step of triangular dither, hashed from the pixel
+position so the output stays reproducible. That takes the error's lag-1
+autocorrelation from +0.062 to +0.000, which is the whole point of TPDF
+dither, and raises the quantisation noise from 1/sqrt(12) to 1/2 of a step,
+which at 8 bits is the trade anyone would take. On an undenoised frame it
+changes nothing measurable (run length 1.22 to 1.21): the sensor noise was
+already dithering. The 16-bit writer is left alone, both because its step
+is 1/256 of an 8-bit code and never visible and because dither has to be
+applied at the *last* quantisation to help: a consumer that takes a 16-bit
+PNG down to 8 bits has to dither there itself.
+
+The same applies to the viewer: anything that puts this library's output on
+an 8- or 10-bit surface needs dither at that step, which libplacebo does by
+default.
+
 ### 14.4 A chroma stage after the debayer: measured, not built
 
 The argument for a second, lighter stage is that chroma noise is what
@@ -1285,9 +1348,10 @@ padding tail, so this is an ABI break and the soname covers it.
 coming out of their padding tails as intended.
 
 `craw-process` gains `--denoise STRENGTH`, `--noise A,B`, and
-`--noise-estimate`. It also gains `--crop X,Y,W,H`, which writes and takes
-`--stats` over one rectangle of the output while the pipeline still runs on
-the whole frame: it is how a 5.8K frame gets looked at 1:1 without a 5.8K
+`--noise-estimate`, and its 8-bit writer gains the triangular dither of
+14.3. It also gains `--crop X,Y,W,H`, which writes and takes `--stats` over
+one rectangle of the output while the pipeline still runs on the whole
+frame: it is how a 5.8K frame gets looked at 1:1 without a 5.8K
 file, and every number in 14.3 was measured through it.
 `craw_tool_profile_load_tables()` accepts a `noise ISO A B` line, and a
 file without one leaves a built-in profile's noise table alone.

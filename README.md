@@ -52,8 +52,9 @@ device; llvmpipe is enough.
 ## Tools
 
 `craw-process` decodes a clip with FFmpeg, runs every frame through the
-GPU pipeline and writes PNG, PFM or PPM sequences. The options that
-matter most:
+GPU pipeline and writes PNG (16 bit), PFM (linear float) or PPM (8 bit,
+dithered, because a denoised shadow gradient bands without it) sequences.
+The options that matter most:
 
     craw-process --wb auto -v --frames 30 clip.MOV        estimate the illuminant
     craw-process --wb 5600:0.02 --ei 400 -o out_%05d.png clip.MOV

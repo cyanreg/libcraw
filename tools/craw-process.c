@@ -174,7 +174,8 @@ static void tool_usage(FILE *f)
 "\n"
 "  -o PATTERN          output path with a printf frame index, e.g.\n"
 "                      out_%%05d.png. The extension picks the writer: .png\n"
-"                      (16 bit), .ppm (8 bit preview), .pfm (linear float).\n"
+"                      (16 bit), .ppm (8 bit preview, dithered), .pfm\n"
+"                      (linear float).\n"
 "                      Without -o nothing is written, which is what --bench\n"
 "                      and `--wb auto -v` want.\n"
 "  --frames N          stop after N frames (default: the whole clip)\n"
@@ -401,6 +402,48 @@ fail:
     return ret;
 }
 
+/* Triangular dither of one quantisation step, for the 8 bit writer only.
+ *
+ * A denoised frame is exactly the case integer output handles worst. The
+ * sensor noise that used to dither the steps has been removed on purpose,
+ * so a smooth shadow gradient lands on one code for tens of pixels and the
+ * boundaries between codes turn into visible contours. Measured on frame 0
+ * of P1000387.MOV, DESIGN.md 14.3: the same dark gradient runs 1.22 pixels
+ * per 8 bit code undenoised and 3.10, with runs up to 66 pixels, after
+ * denoising, while the float field it came from got *smoother* (its
+ * laplacian rms fell from 2.8% of the mean to 0.6%). Nothing is wrong with
+ * the picture; the eight bit grid is too coarse for it once the noise is
+ * gone.
+ *
+ * Two uniform variates summed give a triangular distribution two steps
+ * peak to peak, which is the textbook amount: it decorrelates the
+ * quantisation error from the signal completely, at the cost of raising the
+ * total quantisation noise from 1/sqrt(12) to 1/2 of a step. At 16 bits the
+ * step is 1/256 of an 8 bit code and never visible, so that path is left
+ * alone: dither is added noise and only belongs where it buys something.
+ * Dithering at 16 bits would not help a consumer that goes on to 8 bits
+ * either, since it is the last quantisation that has to carry it.
+ *
+ * The pattern is a hash of the position, not a running PRNG, so the same
+ * frame always produces the same file. */
+static uint32_t tool_hash(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+static float tool_dither(uint32_t x, uint32_t y, int c)
+{
+    uint32_t h = tool_hash(x * 73856093u ^ y * 19349663u ^ (uint32_t)c * 83492791u);
+
+    return (float)(h & 0xFFFFu) * (1.0f / 65536.0f)
+         + (float)(h >> 16)     * (1.0f / 65536.0f) - 1.0f;
+}
+
 /* PNG and PPM both go through libavcodec, so no image writer of our own and
  * no libswscale: the pixel conversion is a clip and a scale. 16 bit PNG is
  * big endian by definition and the encoder takes nothing else. */
@@ -466,10 +509,12 @@ static int tool_write_avcodec(const char *path, enum AVCodecID codec_id,
         for (uint32_t x = 0; x < w; x++) {
             for (int c = 0; c < 3; c++) {
                 float v = tool_encode_value(enc, src[x * 4 + c]);
+                long iq;
                 unsigned q;
 
                 v = CRAW_CLAMP(v, 0.0f, 1.0f);
-                q = (unsigned)lrintf(v * scale);
+                iq = lrintf(v * scale + (depth == 8 ? tool_dither(x, y, c) : 0.0f));
+                q = (unsigned)CRAW_CLAMP(iq, 0, (long)scale);
 
                 /* Written byte by byte so the BE in RGB48BE is honoured
                  * whatever the host is. */
