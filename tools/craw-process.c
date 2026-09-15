@@ -220,7 +220,12 @@ static void tool_usage(FILE *f)
 "                      of the output. The pipeline still runs on the whole\n"
 "                      frame, so a crop is what the full frame would have\n"
 "                      looked like there, which is the point: it is how a\n"
-"                      5.8K frame gets looked at 1:1 without a 5.8K file\n"
+"                      5.8K frame gets looked at 1:1 without a 5.8K file.\n"
+"                      A clip whose frame headers mark a picture inside the\n"
+"                      readout (ProRes RAW carries a crop; the whole readout\n"
+"                      is still decoded and developed) is written cut to that\n"
+"                      picture by default; --crop 0,0,W,H of the coded size\n"
+"                      writes all of it\n"
 "  --denoise STRENGTH  raw domain denoising at this strength: 1.0 removes\n"
 "                      noise at the level the camera's noise model predicts,\n"
 "                      2.0 smooths twice as far, 0 (the default) is off. The\n"
@@ -1240,6 +1245,21 @@ static int tool_decoder_open(struct tool_decoder *d, const char *path, bool verb
      * tool that hands every frame to the GPU anyway. */
     d->dec->thread_count = 1;
 
+    /* ProRes RAW carries a crop in the frame header (the Sony FX6 clips
+     * mark 3840x2160 inside a 3872x2192 readout), and two things are wrong
+     * with letting libavutil apply it. It refuses to, for one:
+     * av_frame_apply_cropping() compares the number of low zero bits of
+     * crop_left with that of the resulting byte offset and returns
+     * AVERROR_BUG when the crop looks less aligned than the offset, which
+     * for two bytes a sample it always does (16 samples is 32 bytes, 4
+     * against 5), so a clip like that would not decode at all. And the
+     * sensels outside the crop are real picture on this camera, which the
+     * pipeline should develop and the user should be able to look at. So
+     * the decoder is told not to crop: the tool sees the whole coded frame
+     * with all four crop fields, develops every sensel, and cuts the
+     * output to the marked picture unless --crop says otherwise. */
+    d->dec->apply_cropping = 0;
+
     ret = avcodec_open2(d->dec, codec, NULL);
     if (ret < 0) {
         fprintf(stderr, "%s: cannot open the %s decoder: %s\n", path, codec->name,
@@ -1382,16 +1402,47 @@ static int tool_parse_crop(struct tool_cfg *cfg, const char *arg)
     return 0;
 }
 
+/* The output crop for a frame: --crop when it was given, otherwise the
+ * picture the frame header marks, if it marks one. The decoder is told not
+ * to apply that crop (tool_decoder_open()), so the pipeline develops the
+ * whole readout and this only decides what is written out; `--crop
+ * 0,0,W,H` of the coded size is how to keep all of it. Returns false when
+ * the whole frame is wanted. */
+static bool tool_frame_crop(const struct tool_cfg *cfg, const AVFrame *frame,
+                            int64_t crop[4])
+{
+    if (cfg->crop_w) {
+        crop[0] = cfg->crop_x;
+        crop[1] = cfg->crop_y;
+        crop[2] = cfg->crop_w;
+        crop[3] = cfg->crop_h;
+        return true;
+    }
+
+    if (!frame->crop_left && !frame->crop_right &&
+        !frame->crop_top && !frame->crop_bottom)
+        return false;
+
+    crop[0] = (int64_t)frame->crop_left;
+    crop[1] = (int64_t)frame->crop_top;
+    crop[2] = (int64_t)frame->width - (int64_t)frame->crop_left -
+              (int64_t)frame->crop_right;
+    crop[3] = (int64_t)frame->height - (int64_t)frame->crop_top -
+              (int64_t)frame->crop_bottom;
+
+    return crop[2] >= 1 && crop[3] >= 1;
+}
+
 /* Compacts the crop to the front of `rgba` and returns its size, clamped
  * to the frame. Done on the host after the download: the pipeline has no
  * notion of a region of interest and every stage's stencil should see the
  * same neighbours it would in a full frame. */
-static void tool_crop(const struct tool_cfg *cfg, float *rgba, uint32_t *w, uint32_t *h)
+static void tool_crop(const int64_t crop[4], float *rgba, uint32_t *w, uint32_t *h)
 {
-    int64_t x0 = CRAW_MIN(cfg->crop_x, (int64_t)*w - 1);
-    int64_t y0 = CRAW_MIN(cfg->crop_y, (int64_t)*h - 1);
-    int64_t cw = CRAW_MIN(cfg->crop_w, (int64_t)*w - x0);
-    int64_t ch = CRAW_MIN(cfg->crop_h, (int64_t)*h - y0);
+    int64_t x0 = CRAW_MIN(crop[0], (int64_t)*w - 1);
+    int64_t y0 = CRAW_MIN(crop[1], (int64_t)*h - 1);
+    int64_t cw = CRAW_MIN(crop[2], (int64_t)*w - x0);
+    int64_t ch = CRAW_MIN(crop[3], (int64_t)*h - y0);
 
     for (int64_t y = 0; y < ch; y++)
         memmove(rgba + y * cw * 4, rgba + ((y0 + y) * (int64_t)*w + x0) * 4,
@@ -1810,6 +1861,8 @@ have_device:
         struct tool_record rec;
         double pts_s, decode_ms, gpu_ms = 0.0;
         int64_t t0;
+        int64_t crop[4];
+        bool have_crop;
         uint32_t w, h;
         size_t npix;
 
@@ -1839,9 +1892,14 @@ have_device:
             goto fail;
         }
 
+        /* The whole coded frame: nothing was cropped away, so the pipeline
+         * sees every sensel the camera read out and the crop below only
+         * picks what is written. */
         w = (uint32_t)frame->width;
         h = (uint32_t)frame->height;
         npix = (size_t)w * h;
+
+        have_crop = tool_frame_crop(&cfg, frame, crop);
 
         prof = base;
         ret = tool_profile_from_frame(&prof, frame);
@@ -1861,12 +1919,35 @@ have_device:
         else if (!(prof.exposure_index > 0.0f))
             prof.exposure_index = prof.as_shot_ei;
 
+        if (cfg.verbose && !processed) {
+            fprintf(stderr, "frame: %ux%u coded, crop %zu left %zu right %zu top "
+                            "%zu bottom, picture %zux%zu\n", w, h,
+                    frame->crop_left, frame->crop_right, frame->crop_top,
+                    frame->crop_bottom,
+                    (size_t)w - frame->crop_left - frame->crop_right,
+                    (size_t)h - frame->crop_top - frame->crop_bottom);
+            if (have_crop)
+                fprintf(stderr, "output crop: %" PRId64 "x%" PRId64 " at %" PRId64
+                                ",%" PRId64 " (%s)\n", crop[2], crop[3], crop[0], crop[1],
+                        cfg.crop_w ? "--crop" : "the frame's own");
+        }
+
         if (cfg.verbose && !processed)
             fprintf(stderr, "profile `%s`: black %.6f white %.6f wb %.5f/%.5f "
                             "gain %.4f cct %.0f K, %u wb knots, %u matrix knots\n",
                     prof.name[0] ? prof.name : "(unnamed)", prof.black_level[0],
                     prof.white_level[0], prof.as_shot_wb[0], prof.as_shot_wb[2],
                     prof.gain, prof.as_shot_cct, prof.nb_wb_knots, prof.nb_matrix_knots);
+
+        /* On a camera without per-CCT tables the frame header's matrix is
+         * the only one there is, so -v shows it rather than only its
+         * existence. */
+        if (cfg.verbose && !processed)
+            fprintf(stderr, "  as-shot camera matrix: [%7.4f %7.4f %7.4f] "
+                            "[%7.4f %7.4f %7.4f] [%7.4f %7.4f %7.4f]\n",
+                    prof.as_shot_matrix[0][0], prof.as_shot_matrix[0][1], prof.as_shot_matrix[0][2],
+                    prof.as_shot_matrix[1][0], prof.as_shot_matrix[1][1], prof.as_shot_matrix[1][2],
+                    prof.as_shot_matrix[2][0], prof.as_shot_matrix[2][1], prof.as_shot_matrix[2][2]);
 
         if (cfg.noise_estimate) {
             CRAWNoiseEstimate est;
@@ -1963,8 +2044,8 @@ have_device:
             if (ret < 0)
                 goto fail;
 
-            if (cfg.crop_w) {
-                tool_crop(&cfg, buf.rgba, &w, &h);
+            if (have_crop) {
+                tool_crop(crop, buf.rgba, &w, &h);
                 npix = (size_t)w * h;
             }
         }

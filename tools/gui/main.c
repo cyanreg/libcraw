@@ -743,6 +743,8 @@ void view_crop_drag(struct view_state *st, int px, int py)
     c->x1 = x1;
     c->y1 = y1;
     c->have = true;
+    /* Drawn by hand, so it is no longer the clip's own rectangle. */
+    c->from_clip = false;
 }
 
 void view_crop_end(struct view_state *st)
@@ -760,6 +762,67 @@ void view_crop_clear(struct view_state *st)
 {
     st->crop.have = false;
     st->crop.dragging = false;
+    st->crop.from_clip = false;
+}
+
+/* The clip's own crop as the default rectangle, read once per clip.
+ *
+ * A ProRes RAW frame header can mark a picture inside the readout, and for
+ * the cameras that do it the sensels around that picture are real, so the
+ * viewer's decoder is told not to crop (decode.c): the frame stays the
+ * whole readout, libcraw develops all of it, and this rectangle only
+ * decides what is looked at. Clearing it brings the rest back.
+ *
+ * The CFA phase does not come into it, which is the point of doing it here
+ * rather than in the pipeline: the frame still starts at its own (0, 0),
+ * which is the sensel the profile's phase describes. The offsets happen to
+ * be even as well, so the picture's own corner carries the same site.
+ *
+ * A rectangle from --crop wins: the command line is a choice, not a
+ * default. */
+static void view_crop_from_clip(struct view_state *st, const AVFrame *f)
+{
+    struct view_crop *c = &st->crop;
+    int x0, y0, x1, y1;
+
+    if (c->clip_read)
+        return;
+    c->clip_read = true;
+
+    if (c->have)
+        return;
+    if (!f->crop_left && !f->crop_top && !f->crop_right && !f->crop_bottom)
+        return;
+
+    /* Snapped to even edges like every other rectangle: half a Bayer quad
+     * is not a thing to crop to, whoever picked the numbers. */
+    x0 = view_crop_snap((float)f->crop_left, (int)st->gpu.width);
+    y0 = view_crop_snap((float)f->crop_top, (int)st->gpu.height);
+    x1 = view_crop_snap((float)(f->width - (int)f->crop_right), (int)st->gpu.width);
+    y1 = view_crop_snap((float)(f->height - (int)f->crop_bottom), (int)st->gpu.height);
+
+    if (x1 - x0 < 2 || y1 - y0 < 2)
+        return;
+
+    c->x0 = x0;
+    c->y0 = y0;
+    c->x1 = x1;
+    c->y1 = y1;
+    c->have = true;
+    c->from_clip = true;
+
+    view_log(st, "clip crop: %dx%d at %d,%d of the %dx%d readout\n",
+             x1 - x0, y1 - y0, x0, y0, f->width, f->height);
+}
+
+/* A clip brings its own crop, so whatever the last one defaulted to goes
+ * with it; a rectangle the user drew or asked for on the command line
+ * stays. */
+static void view_crop_new_clip(struct view_state *st)
+{
+    if (st->crop.from_clip)
+        view_crop_clear(st);
+    st->crop.clip_read = false;
 }
 
 bool view_crop_rect(const struct view_state *st, int *x, int *y, int *w, int *h)
@@ -891,10 +954,16 @@ static int view_process_frame(struct view_state *st)
         st->prof.exposure_index = st->prof.as_shot_ei;
     st->have_prof = true;
 
+    /* The whole decoded frame: the decoder was told not to crop, so this is
+     * the camera's entire readout and every sensel of it is developed. What
+     * the frame header marked as the picture becomes the crop rectangle
+     * below, which is a view of the result and not a change to it. */
     ret = view_gpu_ensure(&st->gpu, (uint32_t)st->frame->width,
                           (uint32_t)st->frame->height, st->look.debayer);
     if (ret < 0)
         return ret;
+
+    view_crop_from_clip(st, st->frame);
 
     view_frame_params(st, &fp);
     /* Taken before the white balance step below moves the track, so that a
@@ -1239,7 +1308,11 @@ static void view_usage(FILE *f)
 "                      for an AVIF or qmin=1 for a JPEG\n"
 "  --crop WxH+X+Y      export only that region of the source, in source\n"
 "                      pixels, with the edges snapped to even ones. The\n"
-"                      viewer shades everything outside it.\n"
+"                      viewer shades everything outside it. A clip whose\n"
+"                      frame headers mark a picture inside the readout\n"
+"                      starts with that rectangle; the whole readout is\n"
+"                      developed either way, and `clear` in the panel shows\n"
+"                      all of it.\n"
 "\n"
 "Audio is the master clock. The clip's PCM track plays through SDL3 with\n"
 "5 ms fades at every boundary; a silent clip falls back to wall time.\n"
@@ -1803,6 +1876,8 @@ static int view_run_window(struct view_state *st)
     if (ret < 0)
         return ret;
 
+    view_crop_new_clip(st);
+
     /* --bench measures the picture pipeline; an audio track would pace the
      * loop at the clip's own rate and the draining at each loop point would
      * dominate a short clip's average. */
@@ -2197,6 +2272,8 @@ static int view_run_headless(struct view_state *st)
     if (ret < 0)
         return ret;
     t0 = view_phase(st, t0, "decoder");
+
+    view_crop_new_clip(st);
 
     ret = view_profile_setup(st, st->cfg.profile, st->cfg.tables);
     if (ret < 0)

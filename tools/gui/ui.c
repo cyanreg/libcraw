@@ -1279,8 +1279,12 @@ static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
         view_crop_clear(st);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    /* "(clip)" while the rectangle is the one the clip's own frame header
+     * marked rather than one that was drawn or asked for: it says why a
+     * picture that was never cropped by hand is shaded all the same. */
     if (view_crop_rect(st, &x, &y, &w, &h))
-        nk_labelf(ctx, NK_TEXT_LEFT, "crop: %dx%d at %d,%d", w, h, x, y);
+        nk_labelf(ctx, NK_TEXT_LEFT, "crop: %dx%d at %d,%d%s", w, h, x, y,
+                  st->crop.from_clip ? " (clip)" : "");
     else
         nk_label(ctx, "crop: none, drag one over the picture", NK_TEXT_LEFT);
 }

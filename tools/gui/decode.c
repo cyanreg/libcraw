@@ -61,6 +61,17 @@ static int view_decoder_codec_open(struct view_decoder *d)
      * threads are the difference between real time and not. */
     d->dec->thread_count = d->raw ? 1 : 0;
 
+    /* A ProRes RAW frame header can carry a crop (the Sony FX6 clips mark
+     * 3840x2160 inside a 3872x2192 readout), and for this camera the
+     * sensels outside it are real picture, not padding. So the decoder is
+     * told not to crop: the frame stays the full coded size with all four
+     * crop fields intact, libcraw develops every sensel of it, and the
+     * crop becomes the viewer's default crop rectangle, which the user can
+     * clear to see the whole readout. A non-raw clip keeps FFmpeg's own
+     * behaviour, where a crop is a container's business and not a look. */
+    if (d->raw)
+        d->dec->apply_cropping = 0;
+
     ret = avcodec_open2(d->dec, codec, NULL);
     if (ret < 0) {
         fprintf(stderr, "cannot open the %s decoder: %s\n", codec->name,

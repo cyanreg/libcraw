@@ -843,6 +843,11 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
         }
     }
 
+    /* The decoder's image whole: it was told not to crop (decode.c), so
+     * this is the camera's entire readout and the pipeline develops all of
+     * it from its own (0, 0), which is the sensel the profile's CFA phase
+     * describes. What the frame header marked as the picture is the
+     * viewer's crop rectangle, and that is a view of the result. */
     src = (CRAWImage) {
         .image  = vkf->img[0],
         .view   = src_view,

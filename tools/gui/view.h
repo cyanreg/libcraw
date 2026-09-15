@@ -478,6 +478,14 @@ struct view_crop {
     int x0, y0, x1, y1;
     bool dragging;
     float ax, ay;               /* the drag's anchor, in source pixels */
+
+    /* A clip whose frames carry a crop starts with that rectangle, so that
+     * what is on screen and what an export writes is the picture the camera
+     * marked, while the sensels around it stay one `clear` away. It is a
+     * default and nothing more: drawing a rectangle or clearing it drops
+     * the flag, and the panel says "(clip)" only while it holds. */
+    bool from_clip;
+    bool clip_read;             /* the clip's own crop has been looked at */
 };
 
 /* How well the picture is keeping up with the master clock. */
