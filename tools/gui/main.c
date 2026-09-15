@@ -658,7 +658,12 @@ static int view_awb_step(struct view_state *st)
     if (st->gpu.submitted < 2)
         return 0;
 
+    /* EINVAL here means the pipeline has not recorded that many frames yet,
+     * which happens right after a rebuild for another debayer method: there
+     * is simply no histogram to read this time round. */
     ret = craw_pipeline_get_awb_histogram_n(st->gpu.pipe, 1, &hist);
+    if (ret == CRAW_ERROR(EINVAL))
+        return 0;
     if (ret < 0)
         return ret;
 

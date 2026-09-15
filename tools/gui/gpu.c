@@ -656,6 +656,10 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
         for (int i = 0; i < VIEW_SLOTS; i++)
             g->slots[i].busy = false;
         craw_pipeline_free(&g->pipe);
+        /* The new pipeline has recorded nothing: the auto white balance
+         * step keys its histogram read off this count, and left alone it
+         * would ask the fresh pipeline for a frame that was never there. */
+        g->submitted = 0;
     }
 
     if (!g->slots[0].tex || g->width != w || g->height != h) {
