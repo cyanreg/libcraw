@@ -207,6 +207,51 @@ static enum AVPixelFormat view_get_format(AVCodecContext *avc,
     return fmts[0];
 }
 
+/* The text of one XML element, with the surrounding whitespace dropped.
+ *
+ * A parser would be the honest answer to a document, but this one is a
+ * fixed two-kilobyte record a camera writes into a metadata dictionary
+ * entry, and the three values wanted from it are leaf elements with no
+ * attributes and no namespace prefix. Matching `<Tag>` and the `</Tag>`
+ * after it is the whole grammar that needs supporting, and it costs no
+ * dependency. Anything unexpected - a missing end tag, a value longer than
+ * the buffer - reads as absent rather than as something made up. */
+static bool view_xml_text(const char *xml, const char *tag, char *out, size_t size)
+{
+    char open[32], close[32];
+    const char *b, *e;
+    size_t n;
+
+    if (!xml)
+        return false;
+
+    snprintf(open, sizeof(open), "<%s>", tag);
+    snprintf(close, sizeof(close), "</%s>", tag);
+
+    b = strstr(xml, open);
+    if (!b)
+        return false;
+    b += strlen(open);
+
+    e = strstr(b, close);
+    if (!e)
+        return false;
+
+    while (b < e && (unsigned char)*b <= ' ')
+        b++;
+    while (e > b && (unsigned char)e[-1] <= ' ')
+        e--;
+
+    n = (size_t)(e - b);
+    if (!n || n >= size)
+        return false;
+
+    memcpy(out, b, n);
+    out[n] = '\0';
+
+    return true;
+}
+
 /* The camera model and the as-shot ISO hide in whichever metadata
  * dictionary the muxer felt like using, so look at both. */
 static void view_read_metadata(struct view_decoder *d)
@@ -226,6 +271,42 @@ static void view_read_metadata(struct view_decoder *d)
         if (e && !d->model[0])
             snprintf(d->model, sizeof(d->model), "%s", e->value);
     }
+
+    /* The Panasonic clip XML, `com.panasonic.Semi-Pro.metadata.xml`. It is
+     * the only record of what the camera was actually recording: an HEVC
+     * V-Log clip carries a BT.709 VUI - primaries, transfer and matrix all
+     * 709 - which is true of the matrix and false of the other two. Every
+     * entry in both dictionaries is scanned rather than the one key, so a
+     * muxer that files the blob somewhere else still works. */
+    for (int i = 0; i < 2; i++) {
+        const AVDictionaryEntry *e = NULL;
+
+        while ((e = av_dict_iterate(dicts[i], e))) {
+            char iso[32];
+
+            if (!d->capture_gamma[0])
+                view_xml_text(e->value, "CaptureGamma", d->capture_gamma,
+                              sizeof(d->capture_gamma));
+            if (!d->capture_gamut[0])
+                view_xml_text(e->value, "CaptureGamut", d->capture_gamut,
+                              sizeof(d->capture_gamut));
+
+            /* The as-shot exposure index, for a clip that has no RDD 18
+             * keys at all - which is every clip this camera writes. What
+             * the exposure section re-rates against. */
+            if (!(d->meta_as_shot_ei > 0.0f) &&
+                view_xml_text(e->value, "ISOSensitivity", iso, sizeof(iso)))
+                d->meta_as_shot_ei = (float)atof(iso);
+        }
+    }
+
+    /* The one clip the tags have to be overridden for. The codec comes
+     * first because the same two elements appear in a ProRes RAW clip's
+     * XML, where they describe what the sensor data would become and not
+     * how it is stored: a raw clip is developed by libcraw and never goes
+     * near this. */
+    d->vlog = !d->raw && !strcmp(d->capture_gamma, "V-Log") &&
+              !strcmp(d->capture_gamut, "V-Gamut");
 
     /* Some muxers only carry the model inside a larger blob - a whole XML
      * document, in this camera's case - so what is kept is the table set it
@@ -318,6 +399,13 @@ int view_decoder_open(struct view_decoder *d, const char *path,
                 d->dec->width, d->dec->height,
                 d->frame_rate.den ? av_q2d(d->frame_rate) : 0.0, d->nb_frames,
                 d->model[0] ? d->model : "(unknown)", d->meta_as_shot_ei);
+
+    if (verbose && (d->capture_gamma[0] || d->capture_gamut[0]))
+        fprintf(stderr, "clip metadata: capture gamma `%s`, gamut `%s`%s\n",
+                d->capture_gamma[0] ? d->capture_gamma : "(none)",
+                d->capture_gamut[0] ? d->capture_gamut : "(none)",
+                d->vlog ? ", overriding the stream's colour tags"
+                        : d->raw ? ", raw: the pipeline develops it" : "");
 
     return 0;
 }

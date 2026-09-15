@@ -258,6 +258,20 @@ struct view_decoder {
     /* Container metadata craw-process also reads. */
     float meta_as_shot_ei;
     char model[256];
+
+    /* What the Panasonic clip XML (`com.panasonic.Semi-Pro.metadata.xml`)
+     * says the camera was recording, verbatim: "V-Log" and "V-Gamut" on
+     * every clip this camera writes in that mode. Empty when the tag is
+     * absent or does not carry the element. */
+    char capture_gamma[32];
+    char capture_gamut[32];
+
+    /* A developed clip whose XML says V-Log in V-Gamut, which is the one
+     * case where the stream's own colour tags have to be overridden: the
+     * camera writes a BT.709 VUI on a V-Log recording. Never true for a raw
+     * clip - see `raw` above - so the same XML in a ProRes RAW file changes
+     * nothing about how that clip is developed. */
+    bool vlog;
 };
 
 /* --------------------------------------------------------------- the gpu */
@@ -651,9 +665,10 @@ int  view_gpu_process(struct view_gpu *g, const AVFrame *frame,
 int  view_gpu_wait_prev(struct view_gpu *g, struct view_timing *tm);
 
 /* The non-raw path: hands the decoded frame to libplacebo. Takes its own
- * reference, so the caller may unref immediately. */
+ * reference, so the caller may unref immediately. `vlog` replaces the two
+ * colour tags the camera writes wrongly; see view_gpu_map(). */
 int  view_gpu_map(struct view_gpu *g, AVFrame *frame, AVStream *stream,
-                  struct view_timing *tm);
+                  bool vlog, struct view_timing *tm);
 void view_gpu_unmap(struct view_gpu *g);
 
 /* Forgets the cached views of the decoder's frame pool, which a rebuilt

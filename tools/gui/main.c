@@ -1025,8 +1025,9 @@ int view_step_frame(struct view_state *st)
 
     if (!st->dec.raw) {
         /* Already developed: straight from the decoder to libplacebo, with
-         * the colour the stream itself declares. */
-        ret = view_gpu_map(&st->gpu, st->frame, vs, &st->timing);
+         * the colour the stream itself declares - unless the clip metadata
+         * says V-Log, which the camera's own VUI does not admit to. */
+        ret = view_gpu_map(&st->gpu, st->frame, vs, st->dec.vlog, &st->timing);
         if (ret < 0)
             return ret;
 
@@ -1201,9 +1202,10 @@ static void view_usage(FILE *f)
 "  --list-luts         print the embedded film simulation trees and exit\n"
 "  --lut-type TYPE     native (gamma light) or normalized (linear light)\n"
 "  --lut-space SPACE   the colour space the LUT was authored for: native\n"
-"                      (the toggle above), bt709, hlg2020 or linear2020.\n"
-"                      Anything but native makes it a conversion LUT to a\n"
-"                      BT.709 display.\n"
+"                      (the toggle above), bt709, hlg2020, linear2020 or\n"
+"                      vlog (V-Log in V-Gamut, what Panasonic's own\n"
+"                      V-Log to V-709 cubes take). Anything but native\n"
+"                      makes it a conversion LUT to a BT.709 display.\n"
 "  --no-peak-detect    tone map against the profile's sensor clip instead of\n"
 "                      the peak libplacebo measures per frame\n"
 "  --softlight PERCENT blend the picture with itself through the soft light\n"

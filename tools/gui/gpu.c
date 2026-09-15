@@ -79,12 +79,17 @@ static const struct pl_color_space view_lut_space_in[] = {
     { .primaries = PL_COLOR_PRIM_BT_709,  .transfer = PL_COLOR_TRC_BT_1886 },
     { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_HLG    },
     { .primaries = PL_COLOR_PRIM_BT_2020, .transfer = PL_COLOR_TRC_LINEAR },
+    /* Panasonic publishes its V-Log to V-709 conversion as a cube taking
+     * full-range V-Log code values in V-Gamut, which is what this names.
+     * The output side is the BT.709 display every entry here converts to,
+     * and V-709 is a BT.709 display encoding, so the two agree. */
+    { .primaries = PL_COLOR_PRIM_V_GAMUT, .transfer = PL_COLOR_TRC_V_LOG   },
 };
 
 /* One word each: the same strings name the choice in the panel and on the
  * command line. */
 const char *const view_lut_space_names[] = {
-    "native", "bt709", "hlg2020", "linear2020",
+    "native", "bt709", "hlg2020", "linear2020", "vlog",
 };
 
 const int view_nb_lut_spaces = (int)CRAW_ARRAY_ELEMS(view_lut_space_in);
@@ -1063,7 +1068,7 @@ void view_gpu_unmap(struct view_gpu *g)
 }
 
 int view_gpu_map(struct view_gpu *g, AVFrame *frame, AVStream *stream,
-                 struct view_timing *tm)
+                 bool vlog, struct view_timing *tm)
 {
     int64_t t0 = av_gettime_relative();
     /* The previous mapping is only dropped here, so that a paused window
@@ -1082,6 +1087,22 @@ int view_gpu_map(struct view_gpu *g, AVFrame *frame, AVStream *stream,
      * anything the container said about colour is picked up here. The tags
      * are taken as they come: nothing is second-guessed. */
     pl_frame_copy_stream_props(&g->mapped, stream);
+
+    /* Except for the one clip whose tags are known to be wrong. A V-Log
+     * recording from this camera is written with a BT.709 VUI throughout,
+     * and only the Y'CbCr matrix of it is true: the camera really does
+     * encode the V-Log signal through the BT.709 matrix at full range, and
+     * decoding it as anything else tilts the colour of the whole picture.
+     * So the two tags that describe the light are replaced and everything
+     * else - the matrix, the range, the chroma siting - is left exactly as
+     * the stream declared it. Downstream nothing changes: libplacebo
+     * linearises V-Log, measures the peak, tone maps to the display, and
+     * the exposure hook, the LUT, the adjustments and the grain all run
+     * where they always did. */
+    if (vlog) {
+        g->mapped.color.primaries = PL_COLOR_PRIM_V_GAMUT;
+        g->mapped.color.transfer  = PL_COLOR_TRC_V_LOG;
+    }
 
     g->have_mapped = true;
     g->width = (uint32_t)frame->width;

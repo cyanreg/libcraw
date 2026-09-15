@@ -1308,6 +1308,12 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
               st->dec.codec_name ? st->dec.codec_name : "?",
               st->dec.raw ? "raw"
                           : st->dec.hwaccel ? "video, gpu" : "video, cpu");
+    /* The clip's own words, when they are what the picture is being read
+     * as: a V-Log clip's stream tags say BT.709 and the panel would
+     * otherwise give no sign that they are being ignored. */
+    if (st->dec.vlog)
+        nk_labelf(ctx, NK_TEXT_LEFT, "%s / %s", st->dec.capture_gamma,
+                  st->dec.capture_gamut);
     nk_labelf(ctx, NK_TEXT_LEFT, "frame %" PRId64 " / %" PRId64 "  %.3f s",
               st->index, st->dec.nb_frames ? st->dec.nb_frames - 1 : 0, st->pts);
     nk_labelf(ctx, NK_TEXT_LEFT, "%.0f/%.0f fps  decode %.1f ms  craw %.2f ms",
