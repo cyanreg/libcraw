@@ -1,0 +1,714 @@
+/* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
+
+/* The GPU pipeline: owns the compute shaders, the intermediate images and
+ * the auto white balance buffers, and records one frame's worth of
+ * dispatches and barriers into a command buffer the caller owns. See
+ * DESIGN.md sections 4, 5 and 10. */
+
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+#include <craw/pipeline.h>
+
+#include "vk_runtime.h"
+
+#include "debayer_bilinear.spv.h"
+#include "debayer_mhc.spv.h"
+#include "rcd_dir.spv.h"
+#include "rcd_green.spv.h"
+#include "rcd_rb.spv.h"
+#include "color.spv.h"
+#include "awb_hist.spv.h"
+
+/* Every debayer pass shares this block; it mirrors CRAWPrepPushBuf in
+ * lib/shaders/common.glsl field for field. Scalar layout gives every member
+ * 4-byte alignment and no padding, which is exactly what C gives these
+ * types, so the static asserts below are the whole ABI check.
+ *
+ * inv_range is 1 / (white - black) rather than the white level itself: the
+ * prep of DESIGN.md 4.1 divides by the range at every one of the up to 49
+ * samples an RCD invocation reads, and a reciprocal computed once on the
+ * host costs at most an ulp against the tolerances of section 11. */
+typedef struct CRAWPrepPush {
+    int32_t size[2];
+    float   black[4];
+    float   inv_range[4];
+    float   wb[4];        /* as-shot gains in [0..2], [3] unused */
+} CRAWPrepPush;
+
+static_assert(sizeof(CRAWPrepPush) == 56, "CRAWPrepPush layout");
+static_assert(offsetof(CRAWPrepPush, black) == 8, "CRAWPrepPush layout");
+static_assert(offsetof(CRAWPrepPush, inv_range) == 24, "CRAWPrepPush layout");
+static_assert(offsetof(CRAWPrepPush, wb) == 40, "CRAWPrepPush layout");
+
+/* Mirrors CRAWColorPushBuf in lib/shaders/color.comp.glsl. `matrix` is row
+ * major, as everything in libcraw is, and the shader reads it as three
+ * vec3 rows and does the three dot products by hand: a GLSL mat3 would be
+ * three *columns*, so this avoids a transpose that would have to be undone
+ * somewhere. Scalar layout makes the GLSL array stride 12, matching
+ * float[3][3]. */
+typedef struct CRAWColorPush {
+    int32_t  size[2];
+    float    matrix[3][3];   /* M_out * cam_to_xyz * gain * 2^exposure_stops */
+    float    wb_ratio[3];    /* frame wb / as-shot wb */
+    uint32_t flags;
+} CRAWColorPush;
+
+static_assert(sizeof(CRAWColorPush) == 60, "CRAWColorPush layout");
+static_assert(offsetof(CRAWColorPush, matrix) == 8, "CRAWColorPush layout");
+static_assert(offsetof(CRAWColorPush, wb_ratio) == 44, "CRAWColorPush layout");
+static_assert(offsetof(CRAWColorPush, flags) == 56, "CRAWColorPush layout");
+
+/* Mirrors CRAWAwbPushBuf in lib/shaders/awb_hist.comp.glsl. */
+typedef struct CRAWAwbPush {
+    int32_t blocks[2];
+    float   wb[3];           /* as-shot gains, divided back out */
+    int32_t bins;
+    float   log_min, log_max;
+} CRAWAwbPush;
+
+static_assert(sizeof(CRAWAwbPush) == 32, "CRAWAwbPush layout");
+static_assert(offsetof(CRAWAwbPush, wb) == 8, "CRAWAwbPush layout");
+static_assert(offsetof(CRAWAwbPush, bins) == 20, "CRAWAwbPush layout");
+
+/* The shader's clamp flag is the public frame flag. */
+static_assert(CRAW_FRAME_FLAG_CLAMP_NEGATIVE == 1, "colour shader flag mirror");
+
+/* One sample per 8x8 block of the intermediate, DESIGN.md 4.4. */
+#define CRAW_AWB_BLOCK 8
+
+#define CRAW_AWB_HIST_ENTRIES (CRAW_AWB_HIST_BINS * CRAW_AWB_HIST_BINS)
+#define CRAW_AWB_HIST_BYTES   (CRAW_AWB_HIST_ENTRIES * (uint32_t)sizeof(uint32_t))
+
+struct CRAWPipeline {
+    CRAWContext *ctx;
+    CRAWPipelineParams params;
+
+    bool rcd;
+    bool awb;
+
+    /* One of `debayer` or the three RCD passes is created, never both.
+     * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
+    CRAWVkShader debayer;
+    CRAWVkShader rcd_dir;
+    CRAWVkShader rcd_green;
+    CRAWVkShader rcd_rb[2];
+    CRAWVkShader color;
+    CRAWVkShader awb_hist;
+
+    CRAWVkImage inter;   /* camera RGB, RGBA16F */
+    CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
+    CRAWVkImage green;   /* RCD: pass B green plane, R16F */
+
+    CRAWVkBuffer hist_count;
+    CRAWVkBuffer hist_weight;
+    CRAWVkBuffer hist_bright;
+    CRAWVkBuffer hist_readback[4];
+    uint32_t     nb_slots;
+    uint64_t     nb_recorded;
+
+    int32_t blocks[2];   /* whole AWB blocks */
+};
+
+static const CRAWVkBinding craw_bind_images[4] = {
+    { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+};
+
+static const CRAWVkBinding craw_bind_awb[4] = {
+    { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+    { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+    { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+};
+
+/* Specialization constants below 253: 0 is the CFA phase (common.glsl), 1
+ * the RCD pass C phase (rcd_rb.comp.glsl). */
+static const VkSpecializationMapEntry craw_spec_map[2] = {
+    { .constantID = 0, .offset = 0,                .size = sizeof(uint32_t) },
+    { .constantID = 1, .offset = sizeof(uint32_t), .size = sizeof(uint32_t) },
+};
+
+void craw_pipeline_params_init(CRAWPipelineParams *p)
+{
+    if (!p)
+        return;
+
+    *p = (CRAWPipelineParams) {
+        .cfa        = CRAW_CFA_RGGB,
+        .debayer    = CRAW_DEBAYER_RCD,
+        .out_space  = CRAW_CS_XYZ_D65,
+        .out_format = VK_FORMAT_R16G16B16A16_SFLOAT,
+    };
+    p->nb_awb_slots = 1;
+}
+
+void craw_frame_params_init(CRAWFrameParams *fp)
+{
+    if (!fp)
+        return;
+
+    *fp = (CRAWFrameParams) {
+        .wb_mode = CRAW_WB_AS_SHOT,
+    };
+}
+
+/* Largest square workgroup the device allows, capped at `want`. Vulkan
+ * guarantees 128 invocations and 128 in x and y, so a device reporting less
+ * than that never had its properties filled in and only the guarantee is
+ * trusted. */
+static uint32_t craw_wg_dim(const CRAWContext *ctx, uint32_t want)
+{
+    const VkPhysicalDeviceLimits *l = &ctx->props.properties.limits;
+
+    if (l->maxComputeWorkGroupInvocations < 128)
+        return CRAW_MIN(want, 8);
+
+    while (want > 1 && (want * want > l->maxComputeWorkGroupInvocations ||
+                        want > l->maxComputeWorkGroupSize[0] ||
+                        want > l->maxComputeWorkGroupSize[1]))
+        want /= 2;
+
+    return want;
+}
+
+static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
+                                const uint8_t *spirv, size_t spirv_len,
+                                const CRAWVkBinding *bindings, uint32_t nb_bindings,
+                                uint32_t push_size, uint32_t wg,
+                                const uint32_t *spec, uint32_t nb_spec)
+{
+    CRAWVkShaderDesc desc = {
+        .name           = name,
+        .spirv          = spirv,
+        .spirv_len      = spirv_len,
+        .bindings       = bindings,
+        .nb_bindings    = nb_bindings,
+        .push_size      = push_size,
+        .wg             = { wg, wg, 1 },
+        .spec_entries   = nb_spec ? craw_spec_map : NULL,
+        .nb_spec_entries = nb_spec,
+        .spec_data      = nb_spec ? spec : NULL,
+        .spec_size      = nb_spec * sizeof(uint32_t),
+    };
+
+    return craw_vk_shader_create(p->ctx, sh, &desc);
+}
+
+int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
+                         CRAWPipeline **pipe)
+{
+    CRAWPipeline *p;
+    uint32_t spec[2];
+    uint32_t wg2d, wgrcd;
+    int ret;
+
+    if (!ctx || !params || !pipe)
+        return CRAW_ERROR(EINVAL);
+
+    if (params->cfa != CRAW_CFA_RGGB) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Only the RGGB CFA phase is implemented\n");
+        return CRAW_ERROR(ENOTSUP);
+    }
+
+    /* Odd sizes would break the quad geometry every stage assumes, and the
+     * mirrored borders of DESIGN.md 3 only support one reflection, i.e. a
+     * frame at least as wide as the largest stencil radius (3, in RCD). */
+    if (!params->width || !params->height ||
+        (params->width & 1) || (params->height & 1) ||
+        params->width < 8 || params->height < 8) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Invalid frame size %ux%u: both must be even and at least 8\n",
+                 params->width, params->height);
+        return CRAW_ERROR(EINVAL);
+    }
+
+    if (params->out_format != VK_FORMAT_R16G16B16A16_SFLOAT &&
+        params->out_format != VK_FORMAT_R32G32B32A32_SFLOAT) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Output format must be RGBA16F or RGBA32F\n");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    if (params->debayer < 0 || params->debayer >= CRAW_DEBAYER_NB ||
+        params->out_space < 0 || params->out_space >= CRAW_CS_NB)
+        return CRAW_ERROR(EINVAL);
+
+    p = calloc(1, sizeof(*p));
+    if (!p)
+        return CRAW_ERROR(ENOMEM);
+
+    p->ctx = ctx;
+    p->params = *params;
+    p->rcd = params->debayer == CRAW_DEBAYER_RCD;
+    p->awb = !!(params->flags & CRAW_PIPELINE_FLAG_AWB_HISTOGRAM);
+    p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
+    p->blocks[1] = (int32_t)(params->height / CRAW_AWB_BLOCK);
+
+    /* 16x16 for the pointwise and small-stencil stages; RCD pass A reads a
+     * 7x7 patch per invocation, so it gets half the occupancy pressure. */
+    wg2d  = craw_wg_dim(ctx, 16);
+    wgrcd = craw_wg_dim(ctx, 8);
+
+    ret = craw_vk_image_create(ctx, &p->inter, params->width, params->height,
+                               VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+    if (ret < 0)
+        goto fail;
+
+    spec[0] = (uint32_t)params->cfa;
+    spec[1] = 0;
+
+    if (!p->rcd) {
+        const bool mhc = params->debayer == CRAW_DEBAYER_MHC;
+        ret = craw_pipeline_shader(p, &p->debayer, mhc ? "debayer_mhc" : "debayer_bilinear",
+                                   mhc ? craw_debayer_mhc_spv_data : craw_debayer_bilinear_spv_data,
+                                   mhc ? craw_debayer_mhc_spv_len : craw_debayer_bilinear_spv_len,
+                                   craw_bind_images, 2, sizeof(CRAWPrepPush), wg2d, spec, 1);
+        if (ret < 0)
+            goto fail;
+    } else {
+        ret = craw_vk_image_create(ctx, &p->aux, params->width, params->height,
+                                   VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+        if (ret < 0)
+            goto fail;
+
+        ret = craw_vk_image_create(ctx, &p->green, params->width, params->height,
+                                   VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+        if (ret < 0)
+            goto fail;
+
+        ret = craw_pipeline_shader(p, &p->rcd_dir, "rcd_dir",
+                                   craw_rcd_dir_spv_data, craw_rcd_dir_spv_len,
+                                   craw_bind_images, 2, sizeof(CRAWPrepPush), wgrcd, spec, 1);
+        if (ret < 0)
+            goto fail;
+
+        ret = craw_pipeline_shader(p, &p->rcd_green, "rcd_green",
+                                   craw_rcd_green_spv_data, craw_rcd_green_spv_len,
+                                   craw_bind_images, 3, sizeof(CRAWPrepPush), wg2d, spec, 1);
+        if (ret < 0)
+            goto fail;
+
+        for (uint32_t i = 0; i < 2; i++) {
+            spec[1] = i;
+            ret = craw_pipeline_shader(p, &p->rcd_rb[i], i ? "rcd_rb_g" : "rcd_rb_rb",
+                                       craw_rcd_rb_spv_data, craw_rcd_rb_spv_len,
+                                       craw_bind_images, 4, sizeof(CRAWPrepPush), wg2d, spec, 2);
+            if (ret < 0)
+                goto fail;
+        }
+    }
+
+    ret = craw_pipeline_shader(p, &p->color, "color", craw_color_spv_data, craw_color_spv_len,
+                               craw_bind_images, 2, sizeof(CRAWColorPush), wg2d, NULL, 0);
+    if (ret < 0)
+        goto fail;
+
+    if (p->awb) {
+        ret = craw_pipeline_shader(p, &p->awb_hist, "awb_hist",
+                                   craw_awb_hist_spv_data, craw_awb_hist_spv_len,
+                                   craw_bind_awb, 4, sizeof(CRAWAwbPush), wg2d, NULL, 0);
+        if (ret < 0)
+            goto fail;
+
+        ret = craw_vk_buffer_create(ctx, &p->hist_count, CRAW_AWB_HIST_BYTES,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT, CRAW_MEM_DEVICE);
+        if (ret < 0)
+            goto fail;
+
+        ret = craw_vk_buffer_create(ctx, &p->hist_weight, CRAW_AWB_HIST_BYTES,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT, CRAW_MEM_DEVICE);
+        if (ret < 0)
+            goto fail;
+
+        ret = craw_vk_buffer_create(ctx, &p->hist_bright, CRAW_AWB_HIST_BYTES,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT, CRAW_MEM_DEVICE);
+        if (ret < 0)
+            goto fail;
+
+        p->nb_slots = params->nb_awb_slots ? params->nb_awb_slots : 1;
+        if (p->nb_slots > CRAW_ARRAY_ELEMS(p->hist_readback)) {
+            craw_log(ctx, CRAW_LOG_ERROR, "At most %zu awb histogram slots are supported\n",
+                     CRAW_ARRAY_ELEMS(p->hist_readback));
+            ret = CRAW_ERROR(EINVAL);
+            goto fail;
+        }
+        for (uint32_t i = 0; i < p->nb_slots; i++) {
+            ret = craw_vk_buffer_create(ctx, &p->hist_readback[i], 3 * CRAW_AWB_HIST_BYTES,
+                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT, CRAW_MEM_HOST_READBACK);
+            if (ret < 0)
+                goto fail;
+        }
+    }
+
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s\n",
+             params->width, params->height, (int)params->debayer, wg2d, wg2d,
+             p->awb ? ", awb histogram" : "");
+
+    *pipe = p;
+    return 0;
+
+fail:
+    craw_pipeline_free(&p);
+    return ret;
+}
+
+void craw_pipeline_free(CRAWPipeline **pipe)
+{
+    CRAWPipeline *p;
+    CRAWContext *ctx;
+
+    if (!pipe || !*pipe)
+        return;
+
+    p = *pipe;
+    ctx = p->ctx;
+
+    if (p->debayer.pipeline)
+        craw_vk_shader_free(ctx, &p->debayer);
+    if (p->rcd_dir.pipeline)
+        craw_vk_shader_free(ctx, &p->rcd_dir);
+    if (p->rcd_green.pipeline)
+        craw_vk_shader_free(ctx, &p->rcd_green);
+    for (int i = 0; i < 2; i++)
+        if (p->rcd_rb[i].pipeline)
+            craw_vk_shader_free(ctx, &p->rcd_rb[i]);
+    if (p->color.pipeline)
+        craw_vk_shader_free(ctx, &p->color);
+    if (p->awb_hist.pipeline)
+        craw_vk_shader_free(ctx, &p->awb_hist);
+
+    if (p->inter.image)
+        craw_vk_image_free(ctx, &p->inter);
+    if (p->aux.image)
+        craw_vk_image_free(ctx, &p->aux);
+    if (p->green.image)
+        craw_vk_image_free(ctx, &p->green);
+
+    if (p->hist_count.buf)
+        craw_vk_buffer_free(ctx, &p->hist_count);
+    if (p->hist_weight.buf)
+        craw_vk_buffer_free(ctx, &p->hist_weight);
+    if (p->hist_bright.buf)
+        craw_vk_buffer_free(ctx, &p->hist_bright);
+    for (uint32_t i = 0; i < CRAW_ARRAY_ELEMS(p->hist_readback); i++) {
+        if (p->hist_readback[i].buf)
+            craw_vk_buffer_free(ctx, &p->hist_readback[i]);
+    }
+
+    free(p);
+    *pipe = NULL;
+}
+
+/* out = a * b, both row major. */
+static void craw_mat3_mul(float out[3][3], const float a[3][3], const float b[3][3])
+{
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+}
+
+static int craw_pipeline_prep_push(CRAWPipeline *p, const CRAWProfile *prof,
+                                   const CRAWColorParams *par, CRAWPrepPush *pp)
+{
+    *pp = (CRAWPrepPush) {
+        .size = { (int32_t)p->params.width, (int32_t)p->params.height },
+    };
+
+    for (int i = 0; i < 4; i++) {
+        float range = prof->white_level[i] - prof->black_level[i];
+        if (!(range > 0.0f)) {
+            craw_log(p->ctx, CRAW_LOG_ERROR, "Profile site %d has white level %f <= black level %f\n",
+                     i, prof->white_level[i], prof->black_level[i]);
+            return CRAW_ERROR(EINVAL);
+        }
+        pp->black[i] = prof->black_level[i];
+        pp->inv_range[i] = 1.0f / range;
+    }
+
+    for (int i = 0; i < 3; i++)
+        pp->wb[i] = par->wb[i];
+
+    return 0;
+}
+
+static void craw_pipeline_dispatch(CRAWPipeline *p, VkCommandBuffer cmd, const CRAWVkShader *sh,
+                                   CRAWVkDescWrite *writes, uint32_t nb_writes,
+                                   const void *push, uint32_t push_size,
+                                   uint32_t gx, uint32_t gy)
+{
+    craw_vk_shader_bind(p->ctx, cmd, sh);
+    craw_vk_shader_push_desc(p->ctx, cmd, sh, writes, nb_writes);
+    craw_vk_shader_push_const(p->ctx, cmd, sh, push, push_size);
+    craw_vk_shader_dispatch(p->ctx, cmd, sh, gx, gy, 1);
+}
+
+int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
+                         const CRAWImage *src, const CRAWImage *dst,
+                         const CRAWFrameParams *fp)
+{
+    CRAWContext *ctx;
+    CRAWVkImage src_img, dst_img;
+    CRAWVkDescWrite writes[4];
+    CRAWColorParams frame;
+    CRAWPrepPush pp;
+    CRAWColorPush cp;
+    CRAWAwbPush ap;
+    float m_out[3][3], scale;
+    uint32_t w, h;
+    int ret;
+
+    if (!p || !cmd || !src || !dst || !fp || !fp->profile)
+        return CRAW_ERROR(EINVAL);
+
+    ctx = p->ctx;
+    w = p->params.width;
+    h = p->params.height;
+
+    if (src->format != VK_FORMAT_R16_UNORM) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Source must be VK_FORMAT_R16_UNORM (got %d)\n",
+                 (int)src->format);
+        return CRAW_ERROR(EINVAL);
+    }
+    if (dst->format != p->params.out_format) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Destination format %d does not match the pipeline's %d\n",
+                 (int)dst->format, (int)p->params.out_format);
+        return CRAW_ERROR(EINVAL);
+    }
+    if (src->width != w || src->height != h || dst->width != w || dst->height != h) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Frame size mismatch: src %ux%u dst %ux%u, pipeline %ux%u\n",
+                 src->width, src->height, dst->width, dst->height, w, h);
+        return CRAW_ERROR(EINVAL);
+    }
+    if (!src->image || !src->view || !dst->image || !dst->view)
+        return CRAW_ERROR(EINVAL);
+    if (src->image == dst->image) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Source and destination must not alias\n");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    /* The prep of DESIGN.md 4.1 applies the frame's own gains, so that the
+     * clamp at the balanced clip point keeps blown highlights neutral under
+     * whatever illuminant was chosen; re-balancing after the clamp would
+     * turn every clipped lamp the colour of the gain ratio. */
+    ret = craw_profile_eval(fp->profile, fp->wb_mode, &fp->illuminant, &frame);
+    if (ret < 0)
+        return ret;
+
+    ret = craw_pipeline_prep_push(p, fp->profile, &frame, &pp);
+    if (ret < 0)
+        return ret;
+
+    ret = craw_colorspace_from_xyz_d65(p->params.out_space, m_out);
+    if (ret < 0)
+        return ret;
+
+    cp = (CRAWColorPush) {
+        .size  = { (int32_t)w, (int32_t)h },
+        .flags = fp->flags & CRAW_FRAME_FLAG_CLAMP_NEGATIVE,
+    };
+    craw_mat3_mul(cp.matrix, m_out, frame.cam_to_xyz);
+    scale = frame.gain * exp2f(fp->exposure_stops);
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++)
+            cp.matrix[i][j] *= scale;
+        /* The gains are already in the intermediate; kept as a field so
+         * the shader layout stays put. */
+        cp.wb_ratio[i] = 1.0f;
+    }
+
+    craw_vk_image_wrap(&src_img, src);
+    craw_vk_image_wrap(&dst_img, dst);
+
+    craw_vk_image_barrier(ctx, cmd, &src_img, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+    if (p->awb) {
+        ctx->fn.CmdFillBuffer(cmd, p->hist_count.buf, 0, VK_WHOLE_SIZE, 0);
+        ctx->fn.CmdFillBuffer(cmd, p->hist_weight.buf, 0, VK_WHOLE_SIZE, 0);
+        ctx->fn.CmdFillBuffer(cmd, p->hist_bright.buf, 0, VK_WHOLE_SIZE, 0);
+        /* vkCmdFillBuffer is a clear, not a copy: with synchronization2 it
+         * executes in CLEAR, which COPY does not cover. */
+        craw_vk_buffer_barrier(ctx, cmd, &p->hist_count,
+                               VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        craw_vk_buffer_barrier(ctx, cmd, &p->hist_weight,
+                               VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        craw_vk_buffer_barrier(ctx, cmd, &p->hist_bright,
+                               VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+
+    craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    if (!p->rcd) {
+        craw_vk_desc_image(&writes[0], 0, &src_img);
+        craw_vk_desc_image(&writes[1], 1, &p->inter);
+        craw_pipeline_dispatch(p, cmd, &p->debayer, writes, 2, &pp, sizeof(pp), w, h);
+    } else {
+        /* Pass A: low-pass and directional weights into the aux image. */
+        craw_vk_image_barrier(ctx, cmd, &p->aux, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        craw_vk_desc_image(&writes[0], 0, &src_img);
+        craw_vk_desc_image(&writes[1], 1, &p->aux);
+        craw_pipeline_dispatch(p, cmd, &p->rcd_dir, writes, 2, &pp, sizeof(pp), w, h);
+
+        /* Pass B: the green plane. */
+        craw_vk_image_barrier(ctx, cmd, &p->aux, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        craw_vk_image_barrier(ctx, cmd, &p->green, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        craw_vk_desc_image(&writes[2], 2, &p->green);
+        craw_pipeline_dispatch(p, cmd, &p->rcd_green, writes, 3, &pp, sizeof(pp), w, h);
+
+        /* Pass C phase 0: the R and B sites, which phase 1 then reads. */
+        craw_vk_image_barrier(ctx, cmd, &p->green, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        craw_vk_desc_image(&writes[3], 3, &p->inter);
+        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[0], writes, 4, &pp, sizeof(pp), w, h);
+
+        /* Pass C phase 1: the G sites. */
+        craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[1], writes, 4, &pp, sizeof(pp), w, h);
+    }
+
+    craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+
+    if (p->awb) {
+        ap = (CRAWAwbPush) {
+            .blocks  = { p->blocks[0], p->blocks[1] },
+            .wb      = { frame.wb[0], frame.wb[1], frame.wb[2] },
+            .bins    = CRAW_AWB_HIST_BINS,
+            .log_min = CRAW_AWB_HIST_LOG_MIN,
+            .log_max = CRAW_AWB_HIST_LOG_MAX,
+        };
+        craw_vk_desc_image(&writes[0], 0, &p->inter);
+        craw_vk_desc_buffer(&writes[1], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            &p->hist_count, 0, CRAW_AWB_HIST_BYTES);
+        craw_vk_desc_buffer(&writes[2], 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            &p->hist_weight, 0, CRAW_AWB_HIST_BYTES);
+        craw_vk_desc_buffer(&writes[3], 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            &p->hist_bright, 0, CRAW_AWB_HIST_BYTES);
+        craw_pipeline_dispatch(p, cmd, &p->awb_hist, writes, 4, &ap, sizeof(ap),
+                               (uint32_t)p->blocks[0], (uint32_t)p->blocks[1]);
+    }
+
+    craw_vk_image_barrier(ctx, cmd, &dst_img, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    craw_vk_desc_image(&writes[0], 0, &p->inter);
+    craw_vk_desc_image(&writes[1], 1, &dst_img);
+    craw_pipeline_dispatch(p, cmd, &p->color, writes, 2, &cp, sizeof(cp), w, h);
+
+    if (p->awb) {
+        VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = CRAW_AWB_HIST_BYTES };
+
+        craw_vk_buffer_barrier(ctx, cmd, &p->hist_count,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        craw_vk_buffer_barrier(ctx, cmd, &p->hist_weight,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        craw_vk_buffer_barrier(ctx, cmd, &p->hist_bright,
+                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+        CRAWVkBuffer *rb = &p->hist_readback[p->nb_recorded % p->nb_slots];
+
+        ctx->fn.CmdCopyBuffer(cmd, p->hist_count.buf, rb->buf, 1, &region);
+        region.dstOffset = CRAW_AWB_HIST_BYTES;
+        ctx->fn.CmdCopyBuffer(cmd, p->hist_weight.buf, rb->buf, 1, &region);
+        region.dstOffset = 2 * CRAW_AWB_HIST_BYTES;
+        ctx->fn.CmdCopyBuffer(cmd, p->hist_bright.buf, rb->buf, 1, &region);
+
+        craw_vk_buffer_barrier(ctx, cmd, rb,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
+        p->nb_recorded++;
+    }
+
+    /* Hand both of the caller's images back in the layout it stated. */
+    craw_vk_image_barrier(ctx, cmd, &dst_img, dst->layout,
+                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    craw_vk_image_barrier(ctx, cmd, &src_img, src->layout,
+                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+    return 0;
+}
+
+int craw_pipeline_get_awb_histogram_n(CRAWPipeline *p, uint32_t frames_back,
+                                      CRAWAwbHistogram *out)
+{
+    CRAWVkBuffer *rb;
+    void *base;
+    int ret;
+
+    if (!p || !out)
+        return CRAW_ERROR(EINVAL);
+
+    if (!p->awb) {
+        craw_log(p->ctx, CRAW_LOG_ERROR,
+                 "Pipeline was created without CRAW_PIPELINE_FLAG_AWB_HISTOGRAM\n");
+        return CRAW_ERROR(EINVAL);
+    }
+    if (frames_back >= p->nb_slots || frames_back >= p->nb_recorded)
+        return CRAW_ERROR(EINVAL);
+
+    rb = &p->hist_readback[(p->nb_recorded - 1 - frames_back) % p->nb_slots];
+
+    ret = craw_vk_buffer_invalidate(p->ctx, rb);
+    if (ret < 0)
+        return ret;
+
+    base = rb->mapped;
+    if (!base)
+        return CRAW_ERROR(EINVAL);
+
+    *out = (CRAWAwbHistogram) {
+        .bins    = CRAW_AWB_HIST_BINS,
+        .log_min = CRAW_AWB_HIST_LOG_MIN,
+        .log_max = CRAW_AWB_HIST_LOG_MAX,
+        .count   = base,
+        .weight  = (const uint32_t *)((const unsigned char *)base + CRAW_AWB_HIST_BYTES),
+        .weight_bright = (const uint32_t *)((const unsigned char *)base + 2 * CRAW_AWB_HIST_BYTES),
+    };
+
+    return 0;
+}
+
+int craw_pipeline_get_awb_histogram(CRAWPipeline *p, CRAWAwbHistogram *out)
+{
+    return craw_pipeline_get_awb_histogram_n(p, 0, out);
+}

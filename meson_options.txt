@@ -1,0 +1,25 @@
+option('assert',
+    type: 'integer',
+    min : -1,
+    max : 2,
+    value : -1,
+    description: 'Assert level with which to build the library (-1: depending on the build type)'
+)
+
+option('tools',
+    type: 'feature',
+    value: 'auto',
+    description: 'Build libcraw CLI tools'
+)
+
+option('tests',
+    type: 'feature',
+    value: 'auto',
+    description: 'Build tests'
+)
+
+option('ffmpeg',
+    type: 'feature',
+    value: 'auto',
+    description: 'Enable decoding of camera files via FFmpeg (in CLI tools only)'
+)
