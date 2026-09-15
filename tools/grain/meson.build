@@ -27,7 +27,8 @@
 # It makes a libplacebo Vulkan context with no surface, renders a test chart
 # and a developed frame through exactly the pl_render_image path craw-view
 # uses, applies grain by each path and each preset, measures what came out
-# and writes raw frames and contact sheets. Every number in DESIGN.md's "Film grain
+# and writes uncompressed frames and contact sheets. Every number in
+# DESIGN.md's "Film grain
 # emulation" section came out of this, including the calibration tables
 # grain.c carries: `grain_preview --calibrate` re-measures them against
 # whatever libplacebo is installed.
@@ -46,7 +47,7 @@ executable('grain_preview',
     include_directories: [ include_directories('../gui') ],
     dependencies: [
         placebo,
-        libavformat_dep, libavcodec_dep, libavutil_dep,
+        libavcodec_dep, libavutil_dep,
         cc.find_library('m', required: false),
     ],
     build_by_default: false,

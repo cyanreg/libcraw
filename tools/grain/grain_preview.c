@@ -9,13 +9,13 @@
  * that the numbers in DESIGN.md's film grain section are measurements and
  * not assertions.
  *
- * Anything frame sized goes out as raw RGB48LE in a NUT container, because
- * deflating a megapixel of noise costs more than rendering it and the
+ * Anything frame sized goes out as uncompressed 16 bit RGB TIFF, because
+ * deflating a megapixel of noise costs far more than storing it and the
  * measurements are taken from the pixels in memory anyway. Only the contact
  * sheets - crops assembled to be looked at, each well under a megapixel -
  * are written as PNG. To see a frame, crop it first:
  *
- *   ffmpeg -i frame_super8.nut -vf crop=640:480:560:300 -frames:v 1 crop.png
+ *   ffmpeg -i frame_super8.tif -vf crop=640:480:560:300 -frames:v 1 crop.png
  */
 
 #include <errno.h>
@@ -28,7 +28,7 @@
 #include <string.h>
 
 #include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
+#include <libavutil/dict.h>
 #include <libavutil/frame.h>
 
 #include <libplacebo/renderer.h>
@@ -188,107 +188,39 @@ static int image_pfm(struct image *im, const char *path, int want_w)
     return 0;
 }
 
-/* ---------------------------------------------------------- raw output */
+/* ------------------------------------------------------------- images */
 
-/* One frame of raw RGB48LE in a NUT container. No encoder, no compression:
- * the point is to get the pixels onto disk without paying for deflate on
- * what is by construction incompressible noise. */
-static int write_nut(const char *path, const uint16_t *rgba, int w, int h)
+/* One still through one of libavcodec's image encoders. Both the TIFF and
+ * the PNG encoder emit a complete file in a single packet, so there is no
+ * muxer here, just the packet written out.
+ *
+ * `opts` carries the encoder's private options - for TIFF that is
+ * compression_algo=raw, which is the whole point: the frames this tool
+ * writes are pictures of noise, and asking deflate to think about a
+ * megapixel of it costs about thirty times what storing it does. */
+static int write_still(const char *path, const uint16_t *rgba, int w, int h,
+                       enum AVCodecID id, enum AVPixelFormat pix_fmt,
+                       bool big_endian, AVDictionary **opts)
 {
-    AVFormatContext *fc = NULL;
-    AVPacket *pkt = NULL;
-    AVStream *st;
-    int ret;
-
-    ret = avformat_alloc_output_context2(&fc, NULL, "nut", path);
-    if (ret < 0 || !fc) {
-        fprintf(stderr, "%s: no NUT muxer\n", path);
-        return -ENOSYS;
-    }
-    st = avformat_new_stream(fc, NULL);
-    if (!st) {
-        avformat_free_context(fc);
-        return -ENOMEM;
-    }
-    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
-    /* NUT identifies a raw stream by its fourcc, not by codecpar->format,
-     * and a zero tag makes the muxer guess - it guessed rgb555le. */
-    st->codecpar->codec_tag = avcodec_pix_fmt_to_codec_tag(AV_PIX_FMT_RGB48LE);
-    st->codecpar->format = AV_PIX_FMT_RGB48LE;
-    st->codecpar->width = w;
-    st->codecpar->height = h;
-    st->time_base = (AVRational) { 1, 1 };
-
-    ret = avio_open(&fc->pb, path, AVIO_FLAG_WRITE);
-    if (ret < 0) {
-        fprintf(stderr, "%s: %s\n", path, av_err2str(ret));
-        avformat_free_context(fc);
-        return -EIO;
-    }
-    ret = avformat_write_header(fc, NULL);
-    if (ret < 0)
-        goto done;
-
-    pkt = av_packet_alloc();
-    if (!pkt) {
-        ret = -ENOMEM;
-        goto done;
-    }
-    ret = av_new_packet(pkt, w * h * 6);
-    if (ret < 0)
-        goto done;
-
-    /* The renderer hands back RGBA; the alpha is always opaque here. */
-    for (size_t i = 0, n = (size_t)w * h; i < n; i++) {
-        uint16_t *dst = (uint16_t *)(pkt->data + i * 6);
-        dst[0] = rgba[i * 4 + 0];
-        dst[1] = rgba[i * 4 + 1];
-        dst[2] = rgba[i * 4 + 2];
-    }
-    pkt->stream_index = 0;
-    pkt->pts = pkt->dts = 0;
-    pkt->duration = 1;
-    pkt->flags |= AV_PKT_FLAG_KEY;
-
-    ret = av_write_frame(fc, pkt);
-    if (ret >= 0)
-        ret = av_write_trailer(fc);
-done:
-    if (ret < 0)
-        fprintf(stderr, "%s: %s\n", path, av_err2str(ret));
-    av_packet_free(&pkt);
-    if (fc->pb)
-        avio_closep(&fc->pb);
-    avformat_free_context(fc);
-    return ret < 0 ? -EIO : 0;
-}
-
-/* --------------------------------------------------------------- PNG */
-
-/* Only for the contact sheets. A full frame goes through write_nut(). */
-static int write_png(const char *path, const uint16_t *rgba, int w, int h)
-{
-    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_PNG);
+    const AVCodec *codec = avcodec_find_encoder(id);
     AVCodecContext *avc = NULL;
     AVFrame *frame = NULL;
     AVPacket *pkt = NULL;
     FILE *f = NULL;
     int ret = -EINVAL;
 
-    if (!codec)
+    if (!codec) {
+        fprintf(stderr, "%s: libavcodec has no encoder for this format\n", path);
         return -ENOSYS;
-    if ((long)w * h > 1200000L)
-        fprintf(stderr, "%s: %dx%d is over a megapixel for a PNG; frame "
-                "sized output belongs in a NUT\n", path, w, h);
+    }
     avc = avcodec_alloc_context3(codec);
     if (!avc)
         return -ENOMEM;
     avc->width = w;
     avc->height = h;
-    avc->pix_fmt = AV_PIX_FMT_RGB48BE;
+    avc->pix_fmt = pix_fmt;
     avc->time_base = (AVRational) { 1, 1 };
-    if (avcodec_open2(avc, codec, NULL) < 0)
+    if (avcodec_open2(avc, codec, opts) < 0)
         goto done;
 
     frame = av_frame_alloc();
@@ -301,14 +233,17 @@ static int write_png(const char *path, const uint16_t *rgba, int w, int h)
     if (av_frame_get_buffer(frame, 0) < 0)
         goto done;
 
+    /* The renderer hands back RGBA; the alpha is always opaque here. The
+     * samples are written byte by byte so the host's own order never comes
+     * into it. */
     for (int y = 0; y < h; y++) {
         const uint16_t *src = rgba + (size_t)y * w * 4;
         uint8_t *dst = frame->data[0] + (ptrdiff_t)y * frame->linesize[0];
         for (int x = 0; x < w; x++)
             for (int c = 0; c < 3; c++) {
                 unsigned v = src[x * 4 + c];
-                dst[(x * 3 + c) * 2 + 0] = (uint8_t)(v >> 8);
-                dst[(x * 3 + c) * 2 + 1] = (uint8_t)(v & 0xFF);
+                dst[(x * 3 + c) * 2 + (big_endian ? 0 : 1)] = (uint8_t)(v >> 8);
+                dst[(x * 3 + c) * 2 + (big_endian ? 1 : 0)] = (uint8_t)(v & 0xFF);
             }
     }
 
@@ -330,6 +265,28 @@ done:
     av_frame_free(&frame);
     avcodec_free_context(&avc);
     return ret;
+}
+
+/* Frame-sized output: uncompressed 16 bit RGB TIFF, one file per frame. */
+static int write_tiff(const char *path, const uint16_t *rgba, int w, int h)
+{
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "compression_algo", "raw", 0);
+    int ret = write_still(path, rgba, w, h, AV_CODEC_ID_TIFF,
+                          AV_PIX_FMT_RGB48LE, false, &opts);
+    av_dict_free(&opts);
+    return ret;
+}
+
+/* Only for the contact sheets, which are crops assembled to be looked at.
+ * A frame goes through write_tiff(). */
+static int write_png(const char *path, const uint16_t *rgba, int w, int h)
+{
+    if ((long)w * h > 1200000L)
+        fprintf(stderr, "%s: %dx%d is over a megapixel for a PNG; frame "
+                "sized output belongs in a TIFF\n", path, w, h);
+    return write_still(path, rgba, w, h, AV_CODEC_ID_PNG,
+                       AV_PIX_FMT_RGB48BE, true, NULL);
 }
 
 /* -------------------------------------------------------------- state */
@@ -1123,9 +1080,9 @@ int main(int argc, char **argv)
     if (!plain)
         return 1;
     memcpy(plain, c.out, (size_t)width * height * 4 * sizeof(uint16_t));
-    path_for(path, sizeof(path), "chart_none.nut");
-    write_nut(path, c.out, width, height);
-    printf("  wrote %s (%dx%d raw rgb48le)\n", path, width, height);
+    path_for(path, sizeof(path), "chart_none.tif");
+    write_tiff(path, c.out, width, height);
+    printf("  wrote %s (%dx%d uncompressed rgb48le)\n", path, width, height);
 
     struct meas ref[4];
     printf("\n=== reference patch levels, no grain ===\n");
@@ -1473,10 +1430,10 @@ int main(int argc, char **argv)
             return 1;
         static const struct { const char *name; int gauge; float amount; }
         cases[] = {
-            { "frame_none.nut",     CRAW_GRAIN_GAUGE_SUPER35, 0.0f },
-            { "frame_super35.nut",  CRAW_GRAIN_GAUGE_SUPER35, 1.0f },
-            { "frame_16mm.nut",     CRAW_GRAIN_GAUGE_16MM,    1.0f },
-            { "frame_super8.nut",   CRAW_GRAIN_GAUGE_SUPER8,  1.0f },
+            { "frame_none.tif",     CRAW_GRAIN_GAUGE_SUPER35, 0.0f },
+            { "frame_super35.tif",  CRAW_GRAIN_GAUGE_SUPER35, 1.0f },
+            { "frame_16mm.tif",     CRAW_GRAIN_GAUGE_16MM,    1.0f },
+            { "frame_super8.tif",   CRAW_GRAIN_GAUGE_SUPER8,  1.0f },
         };
         for (size_t k = 0; k < sizeof(cases) / sizeof(*cases); k++) {
             struct craw_grain_params p = craw_grain_default_params();
@@ -1490,10 +1447,11 @@ int main(int argc, char **argv)
             if (render(&c, cases[k].amount > 0 ? &p : NULL, &o, false) < 0)
                 return 1;
             path_for(path, sizeof(path), cases[k].name);
-            write_nut(path, c.out, real.w, real.h);
-            printf("  wrote %s (%dx%d raw rgb48le)\n", path, real.w, real.h);
+            write_tiff(path, c.out, real.w, real.h);
+            printf("  wrote %s (%dx%d uncompressed rgb48le)\n",
+                   path, real.w, real.h);
         }
-        printf("  to look at one: ffmpeg -i <name>.nut"
+        printf("  to look at one: ffmpeg -i <name>.tif"
                " -vf crop=640:480:560:300 -frames:v 1 crop.png\n");
         image_free(&real);
     }
