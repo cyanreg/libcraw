@@ -212,7 +212,9 @@ static int write_nut(const char *path, const uint16_t *rgba, int w, int h)
     }
     st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     st->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
-    st->codecpar->codec_tag = 0;
+    /* NUT identifies a raw stream by its fourcc, not by codecpar->format,
+     * and a zero tag makes the muxer guess - it guessed rgb555le. */
+    st->codecpar->codec_tag = avcodec_pix_fmt_to_codec_tag(AV_PIX_FMT_RGB48LE);
     st->codecpar->format = AV_PIX_FMT_RGB48LE;
     st->codecpar->width = w;
     st->codecpar->height = h;

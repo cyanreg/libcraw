@@ -508,10 +508,17 @@ Anyone needing a change to a contract file reports it instead of editing.
 `tools/gui/grain.c` and `grain.h` turn a gauge and a stock into parameters
 for libplacebo's film grain shaders. `tools/grain/grain_preview.c` is the
 headless proof: it renders a chart and a developed frame through the same
-`pl_render_image` path craw-view uses, measures what came out and writes
-contact sheets. Every number below is from that tool unless it is marked as
-a citation, and `--calibrate` re-measures the two tables `grain.c` carries
+`pl_render_image` path craw-view uses, measures what came out and writes it
+to disk. Every number below is from that tool unless it is marked as a
+citation, and `--calibrate` re-measures the two tables `grain.c` carries
 against whatever libplacebo is installed.
+
+Frame-sized output is raw RGB48LE in a NUT container: the measurements come
+from the pixels in memory, and deflating a megapixel of noise into a PNG
+costs more than rendering it did. Only the contact sheets - crops assembled
+to be looked at, each under a megapixel - are PNGs. To look at a frame, crop
+it first: `ffmpeg -i frame_super8.nut -vf crop=640:480:560:300 -frames:v 1
+crop.png`.
 
 ### 13.1 What libplacebo does, and where
 
