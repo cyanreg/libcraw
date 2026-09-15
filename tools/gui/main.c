@@ -155,12 +155,53 @@ float view_peak_ceiling(const struct view_state *st)
          * view_matrix_headroom(&cp);
 }
 
+/* The noise model the denoise stage would use for the frame on screen, and
+ * the exposure index it was looked up at.
+ *
+ * That index is the sensor's own, `as_shot_ei`, not the working one the
+ * Exposure section sets: rating a clip at a different index scales the
+ * picture afterwards, it does not change how the sensels were read
+ * (DESIGN.md 14.2). Returns false when the camera has no model, which is
+ * the one case the stage has to stay off in - without one it cannot know
+ * what to remove, and craw_pipeline_record() refuses rather than guess. */
+bool view_denoise_model(const struct view_state *st, CRAWNoiseModel *nm, float *iso)
+{
+    CRAWNoiseModel local;
+
+    if (!st->dec.raw || !st->have_prof)
+        return false;
+
+    if (iso)
+        *iso = st->prof.as_shot_ei;
+
+    return craw_profile_noise_eval(&st->prof, st->prof.as_shot_ei,
+                                   nm ? nm : &local) >= 0;
+}
+
+/* The strength the pass will actually run at: zero whenever the switch is
+ * off, the strength is zero, or the camera has no model. Everything that
+ * has to agree on whether the stage ran - the frame parameters, the look
+ * the picture was processed with, the panel - asks this. */
+float view_denoise_strength(const struct view_state *st)
+{
+    if (!st->denoise.on || !(st->denoise.strength > 0.0f))
+        return 0.0f;
+    if (!view_denoise_model(st, NULL, NULL))
+        return 0.0f;
+
+    return st->denoise.strength;
+}
+
 void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
 {
     craw_frame_params_init(fp);
 
     fp->profile = &st->prof;
     fp->exposure_stops = st->look.exposure;
+    /* The model itself is left to the profile: noise_override stays zero,
+     * so craw_pipeline_record() evaluates the table at the frame's own
+     * as-shot index. */
+    fp->denoise_strength = view_denoise_strength(st);
 
     if (st->look.wb == VIEW_WB_MANUAL && st->prof.nb_wb_knots) {
         fp->wb_mode = CRAW_WB_REBALANCE;
@@ -182,6 +223,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .exposure   = st->look.exposure,
         .ambience   = st->awb.params.ambience,
         .debayer    = st->look.debayer,
+        .denoise    = view_denoise_strength(st),
     };
 }
 
@@ -195,7 +237,8 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->have_illum == b->have_illum &&
            a->illum.cct == b->illum.cct && a->illum.tint == b->illum.tint &&
            a->ei == b->ei && a->exposure == b->exposure &&
-           a->ambience == b->ambience && a->debayer == b->debayer;
+           a->ambience == b->ambience && a->debayer == b->debayer &&
+           a->denoise == b->denoise;
 }
 
 const char *view_clip_dir(const struct view_state *st)
@@ -864,6 +907,24 @@ static int view_process_frame(struct view_state *st)
 
     st->have_frame = true;
 
+    /* What the panel reports, resolved once per frame rather than once per
+     * panel redraw. */
+    st->denoise.have_model = view_denoise_model(st, &st->denoise.model,
+                                                &st->denoise.iso);
+
+    /* libcraw's timestamps come back from a slot VIEW_SLOTS submissions
+     * later, so the pass flag recorded with that slot says which of the two
+     * averages this measurement belongs to. Held apart rather than
+     * subtracted per frame, because the difference of two noisy numbers is
+     * noise and the difference of two smoothed ones is not. */
+    if (st->gpu.last_gpu_ms > 0.0) {
+        double *acc = st->gpu.last_gpu_denoise ? &st->denoise.ms_on
+                                               : &st->denoise.ms_off;
+
+        *acc = *acc > 0.0 ? *acc * 0.9 + st->gpu.last_gpu_ms * 0.1
+                          : st->gpu.last_gpu_ms;
+    }
+
     /* The histogram describes the frame that was just processed; what comes
      * out of the smoother is applied to the next one, exactly as in
      * craw-process. */
@@ -1127,6 +1188,11 @@ static void view_usage(FILE *f)
 "                      INDEX / as-shot ISO\n"
 "  --exposure STOPS    exposure bias on top of --ei (default: 0)\n"
 "  --debayer METHOD    bilinear, mhc or rcd (default: rcd)\n"
+"  --denoise STRENGTH  raw domain denoising, in units of the camera's\n"
+"                      modelled noise level: 1.0 removes exactly that much,\n"
+"                      0.25 to 3.0, 0 (the default) leaves it off. Needs a\n"
+"                      noise model for the clip's ISO; the Denoise section\n"
+"                      says which one it found\n"
 "  --tone-map NAME     bt.2390, spline, reinhard or clip (default: bt.2390)\n"
 "  --gamut-map NAME    perceptual, softclip, relative, clip or desaturate\n"
 "  --lut NAME          a .cube LUT applied by the renderer: a file, or the\n"
@@ -1214,6 +1280,7 @@ enum {
     VIEW_OPT_ZOOM,
     VIEW_OPT_LIST_LUTS,
     VIEW_OPT_GRAIN,
+    VIEW_OPT_DENOISE,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
 };
@@ -1248,6 +1315,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "no-peak-detect", no_argument,   NULL, VIEW_OPT_NO_PEAK   },
         { "zoom",     required_argument, NULL, VIEW_OPT_ZOOM      },
         { "grain",    required_argument, NULL, VIEW_OPT_GRAIN     },
+        { "denoise",  required_argument, NULL, VIEW_OPT_DENOISE   },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
         { "help",     no_argument,       NULL, 'h'                },
@@ -1312,6 +1380,22 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             if ((ret = view_grain_parse(&st->grain, optarg)) < 0)
                 return ret;
             break;
+        case VIEW_OPT_DENOISE: {
+            float v2 = strtof(optarg, &end);
+
+            if (end == optarg || *end || v2 < 0.0f || v2 > 3.0f) {
+                fprintf(stderr, "--denoise: expected a strength from 0 to 3, "
+                                "got `%s`\n", optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            /* Zero keeps it off and leaves the panel's own strength where
+             * it was, so the section still opens on a sensible number. */
+            st->denoise.on = v2 > 0.0f;
+            st->denoise.on_flag = st->denoise.on ? 1 : 0;
+            if (v2 > 0.0f)
+                st->denoise.strength = v2;
+            break;
+        }
         case VIEW_OPT_SOFTLIGHT:
             if ((ret = view_adjust_parse_softlight(&st->adjustments, optarg)) < 0)
                 return ret;
@@ -2164,7 +2248,10 @@ int main(int argc, char **argv)
     st.cfg.loop = true;
     st.view.fit = true;
     st.volume = 1.0f;
-    /* Before the arguments, so that --grain overrides the defaults. */
+    /* Before the arguments, so that --grain and --denoise override the
+     * defaults. The strength is set even though the stage is off, so that
+     * the panel's switch turns it on at something sensible. */
+    st.denoise.strength = 1.0f;
     view_grain_defaults(&st.grain);
     view_adjust_defaults(&st.adjustments);
 

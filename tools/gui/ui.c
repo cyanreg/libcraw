@@ -1129,6 +1129,65 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
               view_total_gain(st) * exp2f(lk->exposure), view_peak_ceiling(st));
 }
 
+/* The "Denoise" section: the raw domain stage of DESIGN.md 14, which runs
+ * on the CFA planes before the debayer. The pipeline is always built with
+ * the pass (gpu.c), so everything here is live: the strength reaches the
+ * next frame and a change while paused puts the picture through again.
+ *
+ * The model is the camera's, not the panel's. All this shows is which one
+ * was found for the frame's own ISO, because a clip the camera has not been
+ * characterized at cannot be denoised at all and the reason has to be
+ * visible rather than inferred from nothing happening. */
+static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_denoise *d = &st->denoise;
+    int on;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    on = d->on_flag;
+    view_adjust_cycle(st, view_row(st, ctx), &on, 2);
+    d->on_flag = on;
+    nk_checkbox_label(ctx, "denoise", &d->on_flag);
+    d->on = d->on_flag != 0;
+    nk_labelf(ctx, NK_TEXT_LEFT, "%s",
+              !d->have_model ? "no model: off"
+                             : d->on ? "on, before the debayer" : "off");
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    view_adjust_float(st, view_row(st, ctx), &d->strength, 0.25f, 0.25f, 3.0f);
+    nk_property_float(ctx, "#strength", 0.25f, &d->strength, 3.0f, 0.25f, 0.01f);
+
+    /* 1.0 is "remove noise at exactly the modelled level", so the numbers
+     * either side of it are worth naming. */
+    nk_labelf(ctx, NK_TEXT_LEFT, "%.2f: %s", (double)d->strength,
+              d->strength < 0.95f  ? "under the modelled level"
+            : d->strength < 1.05f  ? "the modelled level"
+            : d->strength < 2.05f  ? "smooths across real detail"
+                                   : "heavy");
+
+    if (!d->have_model)
+        nk_labelf(ctx, NK_TEXT_LEFT, "no noise model for ISO %.0f: off", (double)d->iso);
+    else
+        nk_labelf(ctx, NK_TEXT_LEFT, "noise a %.3g, b %.2g at ISO %.0f",
+                  (double)d->model.a, (double)d->model.b, (double)d->iso);
+
+    /* Two smoothed averages of libcraw's own pass time, one for the frames
+     * that ran the stage and one for the frames that did not, so the cost
+     * shown is a measurement and not an estimate. It only appears once the
+     * clip has been played both ways. */
+    if (st->cfg.verbose) {
+        if (d->ms_on > 0.0 && d->ms_off > 0.0) {
+            nk_labelf(ctx, NK_TEXT_LEFT, "libcraw %.2f ms on, %.2f off",
+                      d->ms_on, d->ms_off);
+            nk_labelf(ctx, NK_TEXT_LEFT, "the pass costs %.2f ms",
+                      d->ms_on - d->ms_off);
+        } else {
+            nk_labelf(ctx, NK_TEXT_LEFT, "libcraw %.2f ms; toggle to measure",
+                      st->gpu.last_gpu_ms);
+        }
+    }
+}
+
 /* The crop row: the mode a left drag draws in, what it has drawn, and a
  * way to take it back. The rectangle is in source pixels, so the readout
  * says which region of the frame the export will write whatever the window
@@ -1300,6 +1359,11 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         for (int i = 0; i < CRAW_DEBAYER_NB; i++)
             if (nk_option_label(ctx, view_debayer_names[i], lk->debayer == i))
                 lk->debayer = (enum CRAWDebayer)i;
+        nk_tree_pop(ctx);
+    }
+
+    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "Denoise", NK_MINIMIZED)) {
+        view_panel_denoise(ctx, st);
         nk_tree_pop(ctx);
     }
 

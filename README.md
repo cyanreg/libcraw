@@ -87,7 +87,11 @@ Control with the arrows pans; Tab or `0` fits the picture again and `1` is
 one to one; Enter opens the film simulation menu on its row and Escape
 closes it; the wheel zooms about the pointer and a left drag pans; `m`
 mutes; `q`, or Escape with no menu open, quits. Zoom and pan only touch the
-view, never the export. With four mono audio tracks the last two are taken
+view, never the export. Its "Denoise" section switches the raw stage on and
+sets its strength, and reports the noise model it found for the clip's own
+ISO — the stage stays off when the camera has none, which the section says
+rather than leaving you guessing; `--denoise STRENGTH` sets it from the
+command line. With four mono audio tracks the last two are taken
 as the stereo pair (`--audio-map` overrides). `craw-view -h` lists the
 options.
 

@@ -724,9 +724,11 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
     pp.debayer    = debayer;
     pp.out_space  = CRAW_CS_BT2020_LINEAR;
     pp.out_format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    /* Always built: the panel can switch to auto white balance at any time
-     * and a pipeline rebuild mid-clip would drop a frame. */
-    pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM;
+    /* Both always built: the panel can switch to auto white balance or to
+     * denoising at any time and a pipeline rebuild mid-clip would drop a
+     * frame. A denoise pass that is built but left at strength 0 costs
+     * nothing measurable, which is what makes it a live control. */
+    pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE;
     /* Enough copies that the previous frame's histogram is still readable
      * while the current one is in flight, which is what lets the auto white
      * balance run without a per-frame stall. */
@@ -827,8 +829,13 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
 
         if (vkGetQueryPoolResults(g->vk->device, g->queries, (uint32_t)(2 * g->slot),
                                   2, sizeof(ts), ts, sizeof(ts[0]),
-                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
             g->last_gpu_ms = (double)(ts[1] - ts[0]) * g->timestamp_period / 1.0e6;
+            /* This slot's flag still describes the submission the
+             * timestamps came from; it is overwritten below for the one
+             * about to be recorded. */
+            g->last_gpu_denoise = g->slot_denoise[g->slot];
+        }
     }
 
     src = (CRAWImage) {
@@ -863,6 +870,10 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
     g->out_value = hold;
 
     vkResetQueryPool(g->vk->device, g->queries, (uint32_t)(2 * g->slot), 2);
+
+    /* Charged to this slot's timestamps, which are read back the next time
+     * the slot comes round. */
+    g->slot_denoise[g->slot] = fp->denoise_strength > 0.0f;
 
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,

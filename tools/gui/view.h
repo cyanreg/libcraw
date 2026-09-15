@@ -115,6 +115,9 @@ struct view_pipeline_look {
     bool have_illum;
     float ei, exposure, ambience;
     enum CRAWDebayer debayer;
+    /* The strength the pass actually ran at, 0 when it did not: a toggle
+     * while paused has to put the frame through again. */
+    float denoise;
 };
 
 struct view_name_map {
@@ -312,6 +315,12 @@ struct view_gpu {
     uint32_t width, height;
     enum CRAWDebayer pipe_debayer;
 
+    /* Whether the denoise stage ran in each slot's submission, so that the
+     * timestamp read back from a slot VIEW_SLOTS frames later is charged to
+     * the right one of the panel's two averages. */
+    bool slot_denoise[VIEW_SLOTS];
+    bool last_gpu_denoise;
+
     /* The pipeline's output: one libplacebo texture per slot, held for the
      * duration of libcraw's submission into it. */
     struct view_slot slots[VIEW_SLOTS];
@@ -494,6 +503,30 @@ struct view_adjust {
     craw_adjust *state, *state_export;
 };
 
+/* Raw domain denoising, as the panel holds it. The model itself is the
+ * camera's, read from the profile at the frame's as-shot exposure index, so
+ * the panel holds only the switch, the strength and whatever the last frame
+ * resolved, for the readout. See DESIGN.md 14.
+ *
+ * `strength` is kept across an off, so turning the section back on returns
+ * to the number that was set rather than to the default. */
+struct view_denoise {
+    bool on;
+    int on_flag;                /* nuklear's checkbox wants an int */
+    float strength;
+
+    /* What the frame on screen resolved, for the readout. */
+    CRAWNoiseModel model;
+    float iso;
+    bool have_model;
+
+    /* libcraw's own pass time, smoothed separately for the frames that ran
+     * the stage and the frames that did not, so that the panel can show
+     * what it costs. Both only exist once the clip has been played both
+     * ways, which is why the readout has to check. */
+    double ms_on, ms_off;
+};
+
 /* Film grain, as the panel holds it. grain.c turns this into the parameters
  * libplacebo's grain shaders take and grain_ui.c does the turning; nothing
  * here reaches the raw pipeline, because the grain is applied at
@@ -534,6 +567,7 @@ struct view_state {
     struct view_zoom view;
     struct view_crop crop;
     struct view_grain grain;
+    struct view_denoise denoise;
     struct view_adjust adjustments;
 
     /* Keyboard focus through the panel's adjustable rows. `row` counts them
@@ -760,6 +794,15 @@ float view_video_exposure(const struct view_state *st);
 
 /* Fills the per-frame parameters from the look and the current profile. */
 void view_frame_params(const struct view_state *st, CRAWFrameParams *fp);
+
+/* The camera's noise model for the frame on screen, looked up at its
+ * as-shot exposure index, and false when there is none. Either pointer may
+ * be NULL. */
+bool view_denoise_model(const struct view_state *st, CRAWNoiseModel *nm, float *iso);
+
+/* The strength the denoise stage will actually run at: zero unless the
+ * switch is on, the strength is positive and a model exists. */
+float view_denoise_strength(const struct view_state *st);
 
 /* The pipeline-relevant part of the current look, and whether two of them
  * would give the same picture. */
