@@ -2538,11 +2538,19 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
 /* ------------------------------------------------------- the crop shade */
 
-static void view_crop_band(struct nk_command_buffer *out, float x0, float y0,
-                           float x1, float y1, struct nk_color c)
+/* A band from whole pixel edges. They have to be whole: nk_fill_rect takes
+ * a float rectangle but stores it as a short origin and an unsigned short
+ * size, each truncated on its own, so a band that starts at 693.09 and ends
+ * at 846.18 is drawn from 693 with a height of 153 and stops at 845 - the
+ * fraction is dropped twice and the far edge falls a pixel short. Two bands
+ * that meet on such an edge leave the pixel between them unshaded, which is
+ * a bright one pixel line all the way across the picture. */
+static void view_crop_band(struct nk_command_buffer *out, int x0, int y0,
+                           int x1, int y1, struct nk_color c)
 {
     if (x1 > x0 && y1 > y0)
-        nk_fill_rect(out, nk_rect(x0, y0, x1 - x0, y1 - y0), 0.0f, c);
+        nk_fill_rect(out, nk_rect((float)x0, (float)y0, (float)(x1 - x0),
+                                  (float)(y1 - y0)), 0.0f, c);
 }
 
 /* Everything outside the crop, darkened, with a thin light border on the
@@ -2558,12 +2566,17 @@ static void view_crop_band(struct nk_command_buffer *out, float x0, float y0,
 static void view_crop_draw(struct nk_context *ctx, struct view_state *st)
 {
     struct nk_command_buffer *out;
-    /* 60 % black. The overlay is composited by the renderer in linear
-     * light, so what is left outside the rectangle is 40 % of the
-     * picture's light, which comes out at about 0.64 encoded: dark enough
-     * to read as excluded without hiding what is in it. */
+    /* Black at 153 of 255, which is not the 60 % it looks like: the
+     * backend blends into a cleared, fully transparent target with
+     * src_alpha for the colour and for the alpha both, so what lands in
+     * the overlay is 0.36 coverage, and the renderer composites that on
+     * the swapchain in the swapchain's own encoding. What is left outside
+     * the rectangle is 0.64 of the encoded picture - 82 where the picture
+     * is 128, and 41 where it is 64, both measured: dark enough to read as
+     * excluded without hiding what is in it. */
     struct nk_color shade = nk_rgba(0, 0, 0, 153);
     pl_rect2df src, dst, crop;
+    int dx0, dy0, dx1, dy1, cx0, cy0, cx1, cy1, rx0, ry0, rx1, ry1;
 
     if (!st->crop.have || !view_crop_screen(st, &crop))
         return;
@@ -2572,27 +2585,58 @@ static void view_crop_draw(struct nk_context *ctx, struct view_state *st)
     if (pl_rect_w(dst) < 4.0f || pl_rect_h(dst) < 4.0f)
         return;
 
+    /* The edges every band is built from, as whole pixels, worked out once
+     * here rather than per band: two bands that share an edge have to be
+     * handed the very same number, or the pixel on it is shaded twice or
+     * not at all. The crop's own edges are also held to the picture, so
+     * that a crop scrolled off an edge collapses the bands on that side
+     * instead of asking for a rectangle whose size no longer fits in the
+     * unsigned short nuklear keeps it in. */
+    dx0 = (int)lroundf(dst.x0);
+    dy0 = (int)lroundf(dst.y0);
+    dx1 = (int)lroundf(dst.x1);
+    dy1 = (int)lroundf(dst.y1);
+    rx0 = (int)lroundf(crop.x0);
+    ry0 = (int)lroundf(crop.y0);
+    rx1 = (int)lroundf(crop.x1);
+    ry1 = (int)lroundf(crop.y1);
+    cx0 = CRAW_CLAMP(rx0, dx0, dx1);
+    cy0 = CRAW_CLAMP(ry0, dy0, dy1);
+    cx1 = CRAW_CLAMP(rx1, cx0, dx1);
+    cy1 = CRAW_CLAMP(ry1, cy0, dy1);
+
     nk_style_push_vec2(ctx, &ctx->style.window.padding, nk_vec2(0.0f, 0.0f));
     nk_style_push_style_item(ctx, &ctx->style.window.fixed_background,
                              nk_style_item_color(nk_rgba(0, 0, 0, 0)));
 
+    /* The window is the picture on the same whole pixels the bands are cut
+     * from. It has to be whole for the same reason they do: nuklear turns
+     * the window's rectangle into the clip it hands the backend by
+     * truncating the origin and the size on their own, so a picture that
+     * starts at 233.82 and is 612.36 tall is clipped to rows 233 to 844 and
+     * the last row of the bottom band is cut off. */
     if (nk_begin(ctx, "cineview-crop",
-                 nk_rect(dst.x0, dst.y0, pl_rect_w(dst), pl_rect_h(dst)),
+                 nk_rect((float)dx0, (float)dy0,
+                         (float)(dx1 - dx0), (float)(dy1 - dy0)),
                  NK_WINDOW_NO_SCROLLBAR | NK_WINDOW_NO_INPUT |
                  NK_WINDOW_BACKGROUND)) {
         out = nk_window_get_canvas(ctx);
 
         /* Four bands that tile the picture minus the rectangle. Any of them
-         * can come out empty, and any can hang over an edge when the crop
-         * is partly scrolled off; the helper drops the first case and the
-         * window's clip takes care of the second. */
-        view_crop_band(out, dst.x0, dst.y0,  dst.x1,  crop.y0, shade);
-        view_crop_band(out, dst.x0, crop.y1, dst.x1,  dst.y1,  shade);
-        view_crop_band(out, dst.x0, crop.y0, crop.x0, crop.y1, shade);
-        view_crop_band(out, crop.x1, crop.y0, dst.x1, crop.y1, shade);
+         * can come out empty - the crop scrolled off an edge collapses the
+         * two bands on that side - and the helper drops those. */
+        view_crop_band(out, dx0, dy0, dx1, cy0, shade);
+        view_crop_band(out, dx0, cy1, dx1, dy1, shade);
+        view_crop_band(out, dx0, cy0, cx0, cy1, shade);
+        view_crop_band(out, cx1, cy0, dx1, cy1, shade);
 
-        nk_stroke_rect(out, nk_rect(crop.x0, crop.y0,
-                                    pl_rect_w(crop), pl_rect_h(crop)),
+        /* The border on the same whole pixels, so that the line straddles
+         * the edge of the shade instead of landing a pixel inside it, and
+         * on the crop's own edges rather than the clamped ones: a side
+         * that has scrolled off the picture has to stay off it rather than
+         * come to rest on the edge of the view. */
+        nk_stroke_rect(out, nk_rect((float)rx0, (float)ry0,
+                                    (float)(rx1 - rx0), (float)(ry1 - ry0)),
                        0.0f, 1.0f, nk_rgba(235, 235, 240, 220));
     }
     nk_end(ctx);

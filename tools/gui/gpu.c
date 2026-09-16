@@ -595,6 +595,21 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
             .surface      = g->surface,
             .present_mode = cfg->bench ? VK_PRESENT_MODE_IMMEDIATE_KHR
                                        : VK_PRESENT_MODE_FIFO_KHR,
+            /* Eight bits per channel for an SDR window, even where the
+             * surface offers ten. What the renderer dithers to is the
+             * depth of this image, and a Wayland compositor does not put
+             * this image on the screen: it composites it into a
+             * framebuffer of its own, eight bits deep unless it was told
+             * otherwise (sway's render_bit_depth, which defaults to 8),
+             * rounding to it without dithering. A ten-bit window is then
+             * dithered against a grid two bits finer than the one it
+             * lands on, which leaves exactly the eight-bit contours the
+             * dither is there to break: faint lines that follow the
+             * gradients of a smooth picture. This asks for the depth that
+             * is actually presented, so the dither meets it. Only the SDR
+             * formats are given up - an HDR surface still gets ten bits,
+             * and a compositor that accepts one presents them. */
+            .disable_10bit_sdr = true,
         ));
         if (!g->sw) {
             fprintf(stderr, "cannot create the swapchain\n");
