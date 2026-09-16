@@ -1182,19 +1182,19 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
 
     nk_labelf(ctx, NK_TEXT_LEFT, "%s",
               !st->dec.raw       ? "not a raw clip"
-            : !have              ? "no lens record in this clip"
-            : ln->on             ? "on, after the colour stage"
+            : !have              ? "no record"
+            : ln->on             ? "on"
                                  : "off");
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
 
     if (have) {
-        nk_labelf(ctx, NK_TEXT_LEFT, "%s record: corner %+.0f px R, %+.0f px G, "
-                                     "%+.0f px B", view_lens_kind(ln),
-                  (double)ln->corner[0], (double)ln->corner[1],
-                  (double)ln->corner[2]);
-        nk_labelf(ctx, NK_TEXT_LEFT, "lateral CA R-B %+.2f px at the corner, "
-                                     "centre (%.3f, %.3f)",
+        /* Short enough for the panel's width: the corner shift per channel
+         * and the chromatic difference are what a glance wants. */
+        nk_labelf(ctx, NK_TEXT_LEFT, "%s: corner %+.0f/%+.0f/%+.0f px RGB",
+                  view_lens_kind(ln), (double)ln->corner[0],
+                  (double)ln->corner[1], (double)ln->corner[2]);
+        nk_labelf(ctx, NK_TEXT_LEFT, "CA R-B %+.2f px, centre %.3f, %.3f",
                   (double)(ln->corner[0] - ln->corner[2]),
                   (double)ln->record.centre[0], (double)ln->record.centre[1]);
     } else {
