@@ -109,6 +109,12 @@ struct view_preset_family {
      * device rather than from this build: the answer needs the encoder to
      * be opened once, which view_presets_probe_step() does. */
     bool probe;
+
+    /* The pixel formats the encoder takes, fixed in presets.c: a Vulkan
+     * encoder cannot be asked short of opening it with each candidate,
+     * which is far too dear to do at run time. */
+    const enum AVPixelFormat *fmts;
+    int nb_fmts;
 };
 
 /* The eight families, in the order the menu's first column shows them. */
@@ -290,23 +296,13 @@ const char *view_presets_container(const struct view_preset_sel *s);
 
 /* ------------------------------------------------- the pixel format */
 
-/* The cap on one family's accepted-format list. This device answers 77
- * software formats for a Vulkan frames context and prores_ks_vulkan opens
- * with every one of them, so a family really can fill this; it is a bound
- * on the probe's cache and not a statement about any codec. */
-#define VIEW_MAX_PIX_FMTS 96
-
 /* "4:2:0 8-bit (nv12)", "RGB 16-bit (gbrp16le)": the chroma layout, the
  * depth and FFmpeg's own name, all three read off the AVPixFmtDescriptor
  * rather than written down anywhere. Returns `buf`. */
 const char *view_presets_fmt_label(enum AVPixelFormat fmt, char *buf, size_t n);
 
-/* What the family's encoder was found to accept, and whether the walk that
- * found it has finished. The list fills in as view_presets_probe_step()
- * works through the candidates, so a caller may see a short one; it is
- * never wrong, only incomplete. */
+/* The formats the family's encoder takes: the family's own fixed list. */
 int  view_presets_fmts(int family, const enum AVPixelFormat **out);
-bool view_presets_fmts_ready(int family);
 
 /* The format a selection writes: the row's explicit choice while it still
  * belongs to this family, and the preset's own pin otherwise. */
@@ -344,25 +340,15 @@ const char *view_presets_preset_why_not(int family, int preset);
 /* And with a colour space in hand, since three of them need 16 bit RGB. */
 const char *view_presets_colour_why_not(int family, int preset, int colour);
 
-/* Asks the device one question about one family, so that neither the menu
- * nor the pixel format row has to guess: whether the family's encoder has
- * an engine here at all, and which software formats it opens with.
- *
- * `want` is the family whose format list is wanted now - the selected one -
- * and -1 for none; it is walked first and the rest are left alone, because
- * an encoder open is not a cheap thing (136 ms for ffv1_vulkan on this
- * machine, 470 for prores_ks_vulkan, 540 for apv_vulkan, all of it
- * pipeline creation and none of it dependent on the size or the options).
- * One call is at most one open and then stands back for twice as long as
- * that open took, so a panel drawing this every frame keeps two frames in
- * three for itself and a family's list fills in over a second or two while
- * the section is being read. Returns true while there is work left.
+/* Asks the device one question about one family that declares `probe`:
+ * whether its encoder has an engine here at all, so that a GPU with none
+ * greys the row rather than failing at export time. One open per call, the
+ * family `want` (the selected one, or -1) first; the video-queue encoders
+ * answer in microseconds. Returns true while a family is still unasked.
+ * The pixel formats are not asked for: each family carries its list.
  *
  * `hw_device` is the viewer's AVHWDeviceContext, or NULL. */
 bool view_presets_probe_step(struct AVBufferRef *hw_device, int want,
                              bool verbose);
-
-/* The same walk, run to the end with no rate limit, for --list-presets. */
-void view_presets_probe_all(struct AVBufferRef *hw_device, bool verbose);
 
 #endif /* CINEVIEW_PRESETS_H */

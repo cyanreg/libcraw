@@ -249,27 +249,17 @@ line, by FFmpeg's own names. The row starts on the format the chosen preset
 implies and remembers an explicit choice until the family changes, since the
 next family's encoder need not take the same formats at all.
 
-The list is not written down anywhere. A software encoder is asked what it
-accepts through `avcodec_get_supported_config()`. A Vulkan encoder answers
-that question with `vulkan` and nothing else — it has no way in this FFmpeg
-to be asked which *software* formats a frames context may have — so cineview
-opens it once with a frames context of each candidate, shaped exactly the way
-the exporter shapes one, and keeps what opened. The candidates are what
-libavcodec says pictures of that codec can be, which is every software
-encoder for the same codec ID, narrowed to the formats the device can hold;
-where the codec has no software encoder at all, as APV has not, the device's
-own list is walked instead. That narrowing is not tidiness: `prores_ks_vulkan`
-validates nothing and opens with all 77 formats this device offers, bayer and
-gray included, writing every one of them as 4:4:4.
-
-The probe costs one encoder open per candidate — 136 ms for `ffv1_vulkan` on
-an RX 6900 XT, 470 for `prores_ks_vulkan`, 540 for `apv_vulkan`, all of it
-pipeline creation and none of it dependent on the size or the options — so
-the panel does at most one per frame, the selected family first, and stands
-back for twice as long as the last one took before the next. A family's list
-fills in over a second or two while the section is being read and is kept for
-the rest of the session. `--list-presets` opens a device of its own and prints
-the whole answer per family, which takes about ten seconds.
+The list is fixed per family, in `presets.c`. A software encoder declares
+what it takes, but a Vulkan encoder declares only `vulkan`, and the only way
+to ask it is to open it with a frames context of each candidate — 136 ms an
+open for `ffv1_vulkan` on an RX 6900 XT, about half a second for the ProRes
+and APV ones, over a hundred opens for the table — which is not a thing to
+do at run time. The lists are what those opens found on that GPU, trimmed to
+the layouts a graded picture is written in: 4:2:0, 4:2:2, 4:4:4 and RGB at
+the depths each encoder has, no gray, no alpha. `--list-presets` prints
+them. A format an encoder refuses for a particular frame, as `ffv1_vulkan`
+does for 4:2:0 because its slice grid must divide the chroma planes, is
+reported in the encoder's own words at export time.
 
 A format the encoder does not accept is never offered. One it accepts that
 the preset's profile forbids is offered greyed, with the reason, because the

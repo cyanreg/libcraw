@@ -20,7 +20,6 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
-#include <libavutil/hwcontext.h>
 #include <libavutil/time.h>
 
 #include "view.h"
@@ -1965,23 +1964,12 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                                               optarg)) < 0)
                 return ret;
             break;
-        case VIEW_OPT_LIST_PRESETS: {
-            AVBufferRef *dev = NULL;
-
-            /* Which formats an encoder takes is a property of this GPU and
-             * not of the build - a Vulkan encoder declares nothing but
-             * "vulkan" and has to be opened with each one in turn - so the
-             * list opens a device of its own rather than printing half an
-             * answer. That costs a few seconds and is why the probe is
-             * spread over frames in the panel instead. */
-            if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VULKAN, NULL,
-                                       NULL, 0) < 0)
-                dev = NULL;
-            view_presets_probe_all(dev, st->cfg.verbose);
+        case VIEW_OPT_LIST_PRESETS:
+            /* The lists are fixed per family, so this needs no device; the
+             * one thing it cannot say is which Vulkan family has no engine
+             * on this GPU, which the panel finds out with one open each. */
             view_presets_list();
-            av_buffer_unref(&dev);
             return 1;
-        }
         case VIEW_OPT_CROP:
             if ((ret = view_parse_crop(&st->crop, optarg)) < 0)
                 return ret;
