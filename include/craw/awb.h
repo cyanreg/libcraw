@@ -153,9 +153,10 @@ CRAW_API void craw_awb_smoother_reset(CRAWAwbSmoother *sm);
 /* Feeds one frame's estimate at presentation time `pts_s` and returns the
  * smoothed illuminant to apply to that frame. `scene_cut` resets the track
  * to the new estimate immediately. Estimates flagged invalid or below
- * min_confidence hold the current track. Before any track exists an
- * invalid estimate cannot be adopted: the call returns CRAW_ERROR(EAGAIN)
- * and leaves `out` untouched. */
+ * min_confidence hold the current track, and cannot start one or restart
+ * it at a cut either: before any track exists such an estimate makes the
+ * call return CRAW_ERROR(EAGAIN) and leave `out` untouched, so the caller
+ * stays on what it had until a confident estimate arrives. */
 CRAW_API int craw_awb_smoother_push(CRAWAwbSmoother *sm, double pts_s,
                                     const CRAWAwbEstimate *est, bool scene_cut,
                                     CRAWIlluminant *out);

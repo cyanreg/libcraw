@@ -618,13 +618,35 @@ static void craw_test_smoother(void)
     CHECK_NEAR(out.cct, 8000.0, 1e-2, "a scene cut adopts the estimate");
     CHECK_NEAR(out.tint, -0.03, 1e-6, "a scene cut adopts the tint");
 
-    /* And so is the first push after a reset. */
+    /* After a reset an estimate below the confidence gate cannot start the
+     * track: the call reports EAGAIN and leaves the output alone, so a
+     * caller keeps what it had. A night scene's low-confidence readings
+     * swing by thousands of kelvin between frames, and whichever came
+     * first used to become the new track at every seek. */
     craw_awb_smoother_reset(sm);
+    t += frame;
+    out.cct = 1234.0f;
+    est = craw_test_est(3850.0, 0.0, 0.1);
+    ret = craw_awb_smoother_push(sm, t, &est, false, &out);
+    CHECK(ret == CRAW_ERROR(EAGAIN), "a low-confidence estimate must not start a track: %d", ret);
+    CHECK_NEAR(out.cct, 1234.0, 1e-6, "EAGAIN leaves the output untouched");
+    est = craw_test_est(3850.0, 0.0, 0.1);
+    ret = craw_awb_smoother_push(sm, t, &est, true, &out);
+    CHECK(ret == CRAW_ERROR(EAGAIN), "nor start one at a scene cut: %d", ret);
+
+    /* The first confident push after a reset is adopted as is. */
     t += frame;
     est = craw_test_est(2900.0, 0.0, 1.0);
     ret = craw_awb_smoother_push(sm, t, &est, false, &out);
     CHECK(ret == 0, "push failed: %d", ret);
-    CHECK_NEAR(out.cct, 2900.0, 1e-2, "the first push after a reset adopts");
+    CHECK_NEAR(out.cct, 2900.0, 1e-2, "the first confident push after a reset adopts");
+
+    /* With a track, a low-confidence scene cut holds rather than jumps. */
+    t += frame;
+    est = craw_test_est(8000.0, 0.0, 0.1);
+    ret = craw_awb_smoother_push(sm, t, &est, true, &out);
+    CHECK(ret == 0, "push failed: %d", ret);
+    CHECK_NEAR(out.cct, 2900.0, 1e-2, "a low-confidence scene cut holds the track");
 
     /* A long gap must not turn into an unbounded jump: dt is clamped to a
      * second, so at most one second worth of slew happens. */

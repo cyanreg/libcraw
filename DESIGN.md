@@ -362,10 +362,14 @@ estimate, i.e. warm light is only partially corrected. The estimate is
 then clamped to `[cct_min, cct_max]`.
 
 Smoother: state is a mired value and a tint. On push: if `scene_cut` or no
-state, adopt the estimate; when there is no state and the estimate is
-invalid there is nothing to adopt and the call fails with EAGAIN, leaving
-the output untouched. Else if `est.valid && est.confidence >=
-min_confidence`: target = estimate; ignore the change if
+state, adopt the estimate, but only when it is valid and its confidence
+reaches `min_confidence`; when there is no state and the estimate does not
+qualify there is nothing to adopt and the call fails with EAGAIN, leaving
+the output untouched (a night scene's low-confidence readings swing by
+thousands of kelvin from frame to frame, and adopting whichever came first
+after a reset restarted the track somewhere new at every seek). Else if
+`est.valid && est.confidence >= min_confidence`: target = estimate; ignore
+the change if
 `|target - state| < hysteresis_mired`; otherwise move the state towards the
 target by `1 - exp(-dt / time_constant)` of the difference, limited to
 `max_slew_mired_per_s * dt`. Tint follows the same rule with the same

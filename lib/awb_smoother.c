@@ -116,7 +116,14 @@ int craw_awb_smoother_push(CRAWAwbSmoother *sm, double pts_s,
     if (dt > 1.0)
         dt = 1.0;
 
-    if (usable && (scene_cut || !sm->have_state)) {
+    /* A track starts, or restarts at a cut, only from an estimate that
+     * passes the confidence gate. On a night scene the readings that fail
+     * it swing by thousands of kelvin from one frame to the next, and
+     * adopting whichever of them came first after a reset restarted the
+     * track somewhere new at every seek; below the gate there is nothing
+     * to report until a confident one arrives. */
+    if (usable && est->confidence >= sm->params.min_confidence &&
+        (scene_cut || !sm->have_state)) {
         sm->mired = target_mired;
         sm->tint = target_tint;
         sm->have_state = true;

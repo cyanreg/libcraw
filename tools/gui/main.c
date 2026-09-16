@@ -1004,6 +1004,13 @@ static int view_awb_step(struct view_state *st)
     if (st->gpu.submitted < 2)
         return 0;
 
+    /* The histogram this step would read belongs to the frame a seek left
+     * behind; the next one is the first of the new position. */
+    if (st->awb.skip > 0) {
+        st->awb.skip--;
+        return 0;
+    }
+
     /* EINVAL here means the pipeline has not recorded that many frames yet,
      * which happens right after a rebuild for another debayer method: there
      * is simply no histogram to read this time round. */
@@ -1017,7 +1024,11 @@ static int view_awb_step(struct view_state *st)
     if (ret < 0)
         return ret;
 
-    ret = craw_awb_smoother_push(st->awb.smoother, st->pts, &st->awb.last, false, &out);
+    /* One frame period per estimate rather than the clip's pts: the filter
+     * smooths what the eye sees, and a seek's jump in pts is not elapsed
+     * time (see struct view_awb). */
+    st->awb.clock += view_frame_duration(st);
+    ret = craw_awb_smoother_push(st->awb.smoother, st->awb.clock, &st->awb.last, false, &out);
     if (ret < 0 && ret != CRAW_ERROR(EAGAIN))
         return ret;
 
@@ -1027,6 +1038,16 @@ static int view_awb_step(struct view_state *st)
         st->awb.illum = out;
         st->awb.have_illum = true;
     }
+
+    if (st->cfg.verbose)
+        view_log(st, "awb: frame %" PRId64 " est %s cct %5.0f tint %+.4f conf %.2f"
+                     " -> track %s cct %5.0f tint %+.4f\n",
+                 st->index, st->awb.last.valid ? "ok" : "invalid",
+                 st->awb.last.illuminant.cct, st->awb.last.illuminant.tint,
+                 st->awb.last.confidence,
+                 ret >= 0 ? "moved" : "held",
+                 st->awb.have_illum ? st->awb.illum.cct : 0.0f,
+                 st->awb.have_illum ? st->awb.illum.tint : 0.0f);
 
     return 0;
 }
@@ -1175,10 +1196,13 @@ int view_step_frame(struct view_state *st)
         }
         st->seek_tries = 0;
 
-        if (jump) {
-            craw_awb_smoother_reset(st->awb.smoother);
-            st->awb.have_illum = false;
-        }
+        /* The auto track survives a seek: the clip is one scene, and the
+         * smoother's own clamp on the time step already limits how far one
+         * frame can pull it. Only the stale estimate is dropped, the one
+         * whose histogram was read a frame behind and belongs to the
+         * picture the seek left. */
+        if (jump)
+            st->awb.skip = 1;
     }
 
     t0 = av_gettime_relative();

@@ -536,6 +536,17 @@ struct view_awb {
     CRAWAwbEstimate last;
     CRAWIlluminant illum;
     bool have_illum;
+    /* Estimates still to throw away after a seek: the histogram read is
+     * one frame behind, so the first one after a jump belongs to the
+     * picture the seek left. The track itself is kept across seeks within
+     * a clip; a camera original is one scene, and a track that restarted
+     * from whatever frame came first jumped at every seek. */
+    int skip;
+    /* What the smoother is given as time: one frame period per estimate,
+     * not the clip's pts. The filter smooths over what the eye sees, and a
+     * seek's jump in pts is not elapsed time; fed the pts, the smoother
+     * clamped the gap to a second and let one frame slew a second's worth. */
+    double clock;
 };
 
 /* One frame to one file. The work is spread over the loop's iterations
