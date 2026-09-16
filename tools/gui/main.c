@@ -124,15 +124,44 @@ static float view_matrix_headroom(const CRAWColorParams *cp)
     return headroom;
 }
 
+/* The Exposure section's switch, applied. Bypassed means a bias of zero at
+ * the index the camera shot at - which is what rates a camera original at
+ * 1.0 - while the panel keeps both numbers, so switching the section back
+ * on returns to the exposure that was set rather than to a default. */
+float view_exposure_bias(const struct view_state *st)
+{
+    return st->sections.exposure ? st->look.exposure : 0.0f;
+}
+
+float view_exposure_ei(const struct view_state *st)
+{
+    return st->sections.exposure ? st->look.ei : 0.0f;
+}
+
+/* The Look and Adjustments switches, with the one thing that overrides
+ * them: a scene-referred export carries no display-referred operator at
+ * all, so while one is selected all three sections are off whatever their
+ * switches say (and the panel greys them out to explain it). */
+bool view_look_active(const struct view_state *st)
+{
+    return st->sections.look && !view_export_is_scene(st);
+}
+
+bool view_adjust_active(const struct view_state *st)
+{
+    return st->sections.adjust && !view_export_is_scene(st);
+}
+
 /* The exposure model the raw path hands to libcraw, as a plain linear gain
  * for the non-raw path's shader: the bias in stops times the working index
  * over the as-shot one. */
 float view_video_exposure(const struct view_state *st)
 {
-    float gain = exp2f(st->look.exposure);
+    float ei = view_exposure_ei(st);
+    float gain = exp2f(view_exposure_bias(st));
 
-    if (st->look.ei > 0.0f && st->dec.meta_as_shot_ei > 0.0f)
-        gain *= st->look.ei / st->dec.meta_as_shot_ei;
+    if (ei > 0.0f && st->dec.meta_as_shot_ei > 0.0f)
+        gain *= ei / st->dec.meta_as_shot_ei;
 
     return gain;
 }
@@ -155,7 +184,7 @@ float view_peak_ceiling(const struct view_state *st)
     if (craw_profile_eval(&st->prof, fp.wb_mode, &fp.illuminant, &cp) < 0)
         return VIEW_REF_WHITE_NITS;
 
-    return VIEW_REF_WHITE_NITS * cp.gain * exp2f(st->look.exposure)
+    return VIEW_REF_WHITE_NITS * cp.gain * exp2f(view_exposure_bias(st))
          * view_matrix_headroom(&cp);
 }
 
@@ -234,7 +263,7 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
     craw_frame_params_init(fp);
 
     fp->profile = &st->prof;
-    fp->exposure_stops = st->look.exposure;
+    fp->exposure_stops = view_exposure_bias(st);
     /* The model itself is left to the profile: noise_override stays zero,
      * so craw_pipeline_record() evaluates the table at the frame's own
      * as-shot index. */
@@ -263,8 +292,8 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .manual     = st->look.manual,
         .illum      = st->awb.have_illum ? st->awb.illum : (CRAWIlluminant) { 0 },
         .have_illum = st->awb.have_illum,
-        .ei         = st->look.ei,
-        .exposure   = st->look.exposure,
+        .ei         = view_exposure_ei(st),
+        .exposure   = view_exposure_bias(st),
         .ambience   = st->awb.params.ambience,
         .debayer    = st->look.debayer,
         .denoise    = view_denoise_strength(st),
@@ -1014,8 +1043,8 @@ static int view_process_frame(struct view_state *st)
      * working index over the as-shot ISO, times the bias in stops. */
     if (!(st->prof.as_shot_ei > 0.0f))
         st->prof.as_shot_ei = st->dec.meta_as_shot_ei;
-    if (st->look.ei > 0.0f)
-        st->prof.exposure_index = st->look.ei;
+    if (view_exposure_ei(st) > 0.0f)
+        st->prof.exposure_index = view_exposure_ei(st);
     else if (!(st->prof.exposure_index > 0.0f))
         st->prof.exposure_index = st->prof.as_shot_ei;
     st->have_prof = true;
@@ -1329,6 +1358,37 @@ static int view_parse_crop(struct view_crop *c, const char *arg)
     return 0;
 }
 
+/* `--bypass exposure,look,adjustments`: the panel's section switches, off.
+ *
+ * It exists for the three sections whose switch is a bypass and nothing
+ * else, so that no other option can reach it: Denoise, Lens and Film grain
+ * are switched by --denoise 0, --lens off and the absence of --grain, and
+ * the crop mode is not a picture setting at all. A headless export can then
+ * be handed exactly the state the panel is in. */
+static int view_parse_bypass(struct view_sections *s, const char *arg)
+{
+    char buf[128];
+    char *tok, *save = NULL;
+
+    snprintf(buf, sizeof(buf), "%s", arg);
+
+    for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (!strcmp(tok, "exposure"))
+            s->exposure = false;
+        else if (!strcmp(tok, "look"))
+            s->look = false;
+        else if (!strcmp(tok, "adjustments") || !strcmp(tok, "adjust"))
+            s->adjust = false;
+        else {
+            fprintf(stderr, "--bypass: `%s` is not a section, expected "
+                            "exposure, look or adjustments\n", tok);
+            return CRAW_ERROR(EINVAL);
+        }
+    }
+
+    return 0;
+}
+
 static void view_usage(FILE *f)
 {
     fprintf(f,
@@ -1402,6 +1462,13 @@ static void view_usage(FILE *f)
 "                      one number sets both; THRESHOLD, 0 to 100, is the\n"
 "                      chroma they meet at (default: 45). The panel also\n"
 "                      has the skin protection and gamut toggles\n"
+"  --bypass SECTION[,...]\n"
+"                      start with these panel sections switched off, their\n"
+"                      settings kept: exposure (the bias and the working\n"
+"                      index), look (the film simulation or --lut cube) and\n"
+"                      adjustments (soft light and vibrance). The other\n"
+"                      sections' switches are --denoise 0, --lens off and\n"
+"                      the absence of --grain\n"
 "  --grain GAUGE[,STOCK][:AMOUNT]\n"
 "                      film grain, e.g. super8, 16mm,500t or super35,50d:0.6.\n"
 "                      Gauges: regular8, super8, 16mm, super16, 2perf, 3perf,\n"
@@ -1535,6 +1602,7 @@ enum {
     VIEW_OPT_LENS_FIT,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
+    VIEW_OPT_BYPASS,
 };
 
 static int view_parse_args(struct view_state *st, int argc, char **argv,
@@ -1580,6 +1648,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "lens-fit", required_argument, NULL, VIEW_OPT_LENS_FIT  },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
+        { "bypass",   required_argument, NULL, VIEW_OPT_BYPASS    },
         { "help",     no_argument,       NULL, 'h'                },
         { NULL,       0,                 NULL, 0                  },
     };
@@ -1650,7 +1719,6 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 fprintf(stderr, "--lens: expected on or off, got `%s`\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
-            st->lens.on_flag = st->lens.on ? 1 : 0;
             break;
 
         case VIEW_OPT_LENS_FIT:
@@ -1677,7 +1745,6 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             /* Zero keeps it off and leaves the panel's own strength where
              * it was, so the section still opens on a sensible number. */
             st->denoise.on = v2 > 0.0f;
-            st->denoise.on_flag = st->denoise.on ? 1 : 0;
             if (v2 > 0.0f)
                 st->denoise.strength = v2;
             break;
@@ -1688,6 +1755,10 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             break;
         case VIEW_OPT_VIBRANCE:
             if ((ret = view_adjust_parse_vibrance(&st->adjustments, optarg)) < 0)
+                return ret;
+            break;
+        case VIEW_OPT_BYPASS:
+            if ((ret = view_parse_bypass(&st->sections, optarg)) < 0)
                 return ret;
             break;
         case VIEW_OPT_WB:
@@ -1997,7 +2068,14 @@ static void view_log_look(const struct view_state *st)
     else
         fprintf(stderr, ", ei as shot");
 
-    fprintf(stderr, ", exposure %+.2f, debayer %s", lk->exposure,
+    fprintf(stderr, ", exposure %+.2f", lk->exposure);
+    /* The section switches say "kept but not applied", which is why the
+     * numbers are printed either way: a bypassed section still carries the
+     * settings it will come back with. */
+    if (!st->sections.exposure)
+        fprintf(stderr, " (bypassed)");
+
+    fprintf(stderr, ", debayer %s",
             (unsigned)lk->debayer < CRAW_DEBAYER_NB
                 ? view_debayer_names[lk->debayer] : "?");
 
@@ -2018,8 +2096,12 @@ static void view_log_look(const struct view_state *st)
             lk->video_preset.peak ? "on" : "off");
     fprintf(stderr, ", lut %s", lk->lut_path[0] ? lk->lut_path
                                                 : view_lut_film_name(st));
+    if (!st->sections.look)
+        fprintf(stderr, " (bypassed)");
     fprintf(stderr, ", adjustments %s",
             view_adjust_summary(&st->adjustments, adj, sizeof(adj)));
+    if (!st->sections.adjust)
+        fprintf(stderr, " (bypassed)");
     /* The gauge and the stock as the panel holds them, not the readout of
      * the last build: what carries across a clip is the setting. */
     fprintf(stderr, ", grain %s", view_grain_setting(&st->grain, gr, sizeof(gr)));
@@ -2360,8 +2442,9 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
 
     case SDLK_RETURN:
     case SDLK_KP_ENTER:
-        /* Enter only means anything on a row that owns a menu. */
-        if (!repeat)
+        /* A section header expands or collapses; any other row means
+         * nothing unless it owns a cascade, which no header does. */
+        if (!repeat && !view_ui_section_toggle(st, st->focus))
             view_ui_menu_open_row(st, st->focus);
         break;
 
@@ -2378,10 +2461,8 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
     case SDLK_C:
         /* Crop mode: a left drag draws the rectangle instead of panning.
          * The rectangle itself outlives the mode. */
-        if (!repeat) {
+        if (!repeat)
             st->crop.on = !st->crop.on;
-            st->crop.on_flag = st->crop.on;
-        }
         break;
 
     case SDLK_M:
@@ -2940,12 +3021,19 @@ int main(int argc, char **argv)
      * expects to be corrected, and one that does not is untouched either
      * way. --lens off turns it off. */
     st.lens.on = true;
-    st.lens.on_flag = 1;
     /* And filling the frame by default, because that is the framing the
      * camera chose and the one every other decoder shows. --lens-fit keep,
      * or the panel's row, keeps the corners instead. */
     st.lens.keep = false;
     st.lens.keep_sel = 0;
+    /* The three section switches that are nothing but a bypass: on, so that
+     * a viewer that is handed no options develops the clip exactly as it
+     * always did. The parameters behind them are already neutral, which is
+     * why they need no option of their own to turn on - only --bypass to
+     * turn off. */
+    st.sections.exposure = true;
+    st.sections.look = true;
+    st.sections.adjust = true;
     view_grain_defaults(&st.grain);
     view_adjust_defaults(&st.adjustments);
 

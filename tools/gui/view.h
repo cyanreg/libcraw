@@ -591,7 +591,6 @@ struct view_zoom {
  * shading over it is drawn on the nuklear overlay. */
 struct view_crop {
     bool on;
-    int on_flag;                /* nuklear's checkbox wants an int */
     bool have;
     int x0, y0, x1, y1;
     bool dragging;
@@ -659,7 +658,6 @@ struct view_adjust {
  * to the number that was set rather than to the default. */
 struct view_denoise {
     bool on;
-    int on_flag;                /* nuklear's checkbox wants an int */
     float strength;
 
     /* What the frame on screen resolved, for the readout. */
@@ -683,7 +681,6 @@ struct view_denoise {
  * has a record, which view_lens_active() is the single answer to. */
 struct view_lens {
     bool on;
-    int on_flag;                /* nuklear's checkbox wants an int */
 
     /* The record of the picture on screen, copied out of the packet it came
      * from. Invalid when that frame carried none. */
@@ -735,6 +732,54 @@ struct view_grain {
     craw_grain_hook *hook, *hook_export;
 };
 
+/* ------------------------------------------------------ the panel's sections */
+
+/* The collapsible sections of the panel, in the order they are laid out.
+ * Each one is a header - a power switch, then an expander - and a body that
+ * only exists while the header is open. */
+enum view_section {
+    VIEW_SEC_WB = 0,
+    VIEW_SEC_EXPOSURE,
+    VIEW_SEC_DEBAYER,
+    VIEW_SEC_DENOISE,
+    VIEW_SEC_LENS,
+    VIEW_SEC_LOOK,
+    VIEW_SEC_ADJUST,
+    VIEW_SEC_GRAIN,
+    VIEW_SEC_CROP,
+    VIEW_SEC_EXPORT,
+    VIEW_NB_SECTIONS,
+};
+
+/* What each header carries, RawTherapee's arrangement: a switch at the left
+ * of the title that bypasses the whole section while every one of its
+ * parameters is kept, so switching it back on returns the picture it had.
+ *
+ * The open and closed state is here rather than in nuklear's own per-title
+ * table because these headers are not nk_tree_push()es any more: a nuklear
+ * tree header owns its whole row and cannot hold a switch beside its title.
+ *
+ * Four of the switches are the sections' own existing flags - denoise.on,
+ * lens.on, grain.on and crop.on - which the header now shows instead of a
+ * row inside the body. The three below are the new ones, and like every
+ * other setting they carry from clip to clip. */
+struct view_sections {
+    bool open[VIEW_NB_SECTIONS];
+    /* Where each header sits on the focus ring, filled as the panel is laid
+     * out; -1 for a section this clip does not show at all, so that Enter
+     * on some other row never finds it. */
+    int row[VIEW_NB_SECTIONS];
+
+    /* Off: the bias is zero and the working index is the as-shot one, with
+     * the slider and the combo left where they were set. */
+    bool exposure;
+    /* Off: neither the film simulation nor a --lut cube is applied, and the
+     * selection stays selected. */
+    bool look;
+    /* Off: no soft light and no vibrance, at whatever amounts they hold. */
+    bool adjust;
+};
+
 struct view_state {
     struct view_cfg cfg;
     struct view_look look;
@@ -766,6 +811,7 @@ struct view_state {
     bool ui_greyed;
     bool ui_edit_active;        /* a text field is being typed into */
     struct view_lut_menu menu;
+    struct view_sections sections;
 
     CRAWProfile base;           /* tables, no per-frame data */
     CRAWProfile prof;           /* base plus the current frame's side data */
@@ -999,6 +1045,11 @@ void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind);
 /* Opens whichever cascade the focus ring's row `row` owns, if any: what
  * Enter on a menu row does. */
 void view_ui_menu_open_row(struct view_state *st, int row);
+
+/* Expands or collapses the section whose header is the focus ring's row
+ * `row`, and says whether there was one: the other half of what Enter does,
+ * tried first because a header and a cascade can never be the same row. */
+bool view_ui_section_toggle(struct view_state *st, int row);
 void view_ui_menu_close(struct view_state *st);
 /* Handles one key while the menu is open; true when it consumed it. */
 bool view_ui_menu_key(struct view_state *st, int key);
@@ -1048,6 +1099,21 @@ bool view_export_is_scene(const struct view_state *st);
  * selected export space. CRAW_CS_XYZ_D65 for anything that is not scene
  * referred, which nothing asks for. */
 enum CRAWColorSpace view_export_craw_space(const struct view_state *st);
+
+/* The exposure the picture is actually developed at: the panel's own two
+ * numbers while the Exposure section is switched on, and a bias of zero at
+ * the as-shot index while it is bypassed. Everything that has to agree on
+ * what the frame was exposed with - the frame parameters, the ceiling, the
+ * look the picture was processed with, the panel's readout - asks these. */
+float view_exposure_bias(const struct view_state *st);
+/* 0 means "as shot", the same as an unset --ei. */
+float view_exposure_ei(const struct view_state *st);
+
+/* Whether the film simulation or the .cube is applied, and whether soft
+ * light and vibrance are: the Look and Adjustments switches, and with them
+ * the scene-referred export that takes all three away. */
+bool view_look_active(const struct view_state *st);
+bool view_adjust_active(const struct view_state *st);
 
 /* Linear gain the non-raw path's exposure hook applies: the bias in stops
  * times the working exposure index over the as-shot one, which is the same

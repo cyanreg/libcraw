@@ -84,17 +84,35 @@ pauses; Up and Down walk the panel's rows and Left and Right adjust the
 focused one; Shift with Left and Right seeks one second; Page Up and Page
 Down zoom in and out, and Shift with them goes to the first and last frame;
 Control with the arrows pans; Tab or `0` fits the picture again and `1` is
-one to one; Enter opens the film simulation menu on its row and Escape
-closes it; the wheel zooms about the pointer and a left drag pans; `r` and
-`t` go to the previous and the next file; `m` mutes; `q`, or Escape with no
-menu open, quits. Zoom and pan only touch the
-view, never the export. Its "Denoise" section switches the raw stage on and
-sets its strength, and reports the noise model it found for the clip's own
-ISO — the stage stays off when the camera has none, which the section says
-rather than leaving you guessing; `--denoise STRENGTH` sets it from the
-command line. With four mono audio tracks the last two are taken
-as the stereo pair (`--audio-map` overrides). `cineview -h` lists the
-options.
+one to one; Enter expands or collapses the section header it is on and
+opens the film simulation menu on that row, and Escape closes the menu; the
+wheel zooms about the pointer and a left drag pans; `r` and `t` go to the
+previous and the next file; `m` mutes; `q`, or Escape with no menu open,
+quits. Zoom and pan only touch the view, never the export.
+
+The panel is a column of sections — White balance, Exposure, Debayer,
+Denoise, Lens, Look, Adjustments, Film grain, Crop, Export — each behind a
+header with a power switch at the left of its title, the way RawTherapee
+puts an enable button on every tool. Off bypasses that section while every
+setting in it is kept, so switching it back on returns the picture it had:
+Exposure off is a bias of zero at the as-shot index with the slider still
+where it was, Look off drops the film simulation or the `--lut` cube
+without unselecting it, Adjustments off drops soft light and vibrance, Film
+grain, Denoise and Lens off turn their stages off, and Crop is the same
+switch `c` is. White balance and Debayer have nothing to bypass and carry
+an empty slot so the titles stay in line. The headers are on the keyboard's
+focus ring too: Left and Right work the switch, Enter opens and closes the
+section. `--denoise 0`, `--lens off` and the absence of `--grain` start
+those three off, and `--bypass exposure,look,adjustments` starts the other
+three off, which is how a headless export is handed the state the panel is
+in.
+
+The "Denoise" section sets the strength and reports the noise model it
+found for the clip's own ISO — the stage stays off when the camera has
+none, which the section says rather than leaving you guessing; `--denoise
+STRENGTH` sets both the switch and the strength from the command line.
+With four mono audio tracks the last two are taken as the stereo pair
+(`--audio-map` overrides). `cineview -h` lists the options.
 
 It takes any number of files, which makes a playlist: `r` and `t` step to
 the previous and the next clip and wrap at both ends, and the panel's clip
@@ -104,7 +122,8 @@ no audio at all — and a switch keeps every setting exactly as it was: the
 white balance mode and a manual CCT, the exposure index and bias, debayer,
 denoise, lens correction and its fit, the export's colour space, size, tone
 and gamut mapping, the film
-simulation, the adjustments, the grain and the zoom. A setting a clip's kind
+simulation, the adjustments, the grain, every section's switch and the
+zoom. A setting a clip's kind
 cannot use is kept rather than dropped, so the white balance a raw clip was
 graded with is still there after a developed one. Only what is read from the
 clip is read again: its tables and as-shot values, its crop, its lens
@@ -141,7 +160,8 @@ figures behind the stocks, and which of them are estimates.
 The picture can be cropped for the export. `c` turns crop mode on, a left
 drag over the picture then draws the rectangle instead of panning, and
 everything outside it is shaded with a thin border around what is kept; the
-panel's crop row reports the region and clears it. The rectangle is held in
+Crop section's switch is that same mode, and its body reports the region
+and clears it. The rectangle is held in
 source pixels with even edges, so zoom, pan and a resized window leave it
 where it is, and the export writes exactly that region at source
 resolution. `--crop WxH+X+Y` sets the same rectangle from the command line.

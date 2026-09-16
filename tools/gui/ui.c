@@ -308,6 +308,166 @@ static void view_grey_end(struct view_state *st, struct nk_context *ctx, bool on
     st->ui_greyed = false;
 }
 
+/* ------------------------------------------------- the section headers */
+
+/* A section header is a power switch and an expander side by side, the way
+ * RawTherapee puts an enable button at the left of every tool's title: off
+ * bypasses the whole section while every parameter in it is kept, so
+ * switching it back on returns the picture it had.
+ *
+ * nuklear's tree header cannot host it. A tree header is one widget from
+ * the triangle to the far edge of the row, and it owns every click that
+ * lands on it, so there is nowhere to put a switch that is not also the
+ * expander. The row is therefore built here out of a template - a square
+ * cell for the switch, then a button over the rest of the row - and that
+ * button is drawn as the NK_TREE_TAB it replaces: the same height, the same
+ * background and border, the triangle at the left of a left-aligned title,
+ * and the body indented under it the way nuklear indents a tree's.
+ *
+ * Which sections are open lives in view state rather than in nuklear's own
+ * per-title table, because nothing but a tree widget writes that table. */
+
+/* Lit when on, an outline when off: down a column of ten of these the
+ * state has to be readable without reading anything. */
+#define VIEW_SWITCH_ON  nk_rgb(122, 182, 255)
+#define VIEW_SWITCH_OFF nk_rgb(104, 104, 112)
+
+/* The body's indent, which is the one thing a tree does to the panel that
+ * has no call of its own: `sign` +1 on the way in and -1 on the way out, so
+ * the two are exact inverses the way nk_tree_push() and nk_tree_pop() are. */
+static void view_section_indent(struct nk_context *ctx, float sign)
+{
+    struct nk_panel *p = nk_window_get_panel(ctx);
+    float indent = ctx->style.tab.indent;
+
+    p->at_x += sign * indent;
+    p->bounds.w -= sign * (indent + ctx->style.window.padding.x);
+}
+
+/* `on` is the section's switch, or NULL for a section with nothing to
+ * bypass; the cell is spent either way, so every title in the column lines
+ * up. `disabled` greys the switch without changing it, which is what a
+ * scene-referred export does to the three display-referred sections.
+ *
+ * Returns true when the body is to be laid out, and then view_section_end()
+ * closes it. */
+static bool view_section_header(struct nk_context *ctx, struct view_state *st,
+                                enum view_section id, const char *title,
+                                bool *on, bool disabled)
+{
+    const struct nk_style *style = &ctx->style;
+    float h = style->font->height + 2.0f * style->tab.padding.y;
+    struct nk_style_button bs;
+    struct nk_rect b;
+    bool focused;
+    int adj;
+
+    /* A square switch cell as tall as the header, then the expander. */
+    nk_layout_row_template_begin(ctx, h);
+    nk_layout_row_template_push_static(ctx, h);
+    nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_end(ctx);
+
+    focused = view_row(st, ctx);
+    st->sections.row[id] = st->ui_greyed ? -1 : st->ui_row - 1;
+
+    /* The step is consumed whether or not there is a switch to spend it on,
+     * or Left on a header with none would fall through to the row under
+     * it. */
+    adj = view_step(st, focused);
+    if (adj && on && !disabled)
+        *on = !*on;
+
+    if (on) {
+        bs = style->tab.tab_minimize_button;
+        bs.border = 1.0f;
+        bs.border_color = style->tab.border_color;
+        bs.padding = style->tab.padding;
+        bs.text_normal = bs.text_hover = bs.text_active =
+            *on ? VIEW_SWITCH_ON : VIEW_SWITCH_OFF;
+        /* This style is a copy, so the dimming nk_widget_disable_begin()
+         * does to ctx->style never reaches it: a greyed switch has to be
+         * given the factor here to look greyed as well as refuse the
+         * click. */
+        if (disabled)
+            bs.color_factor_text = bs.color_factor_background =
+                bs.disabled_factor;
+
+        if (disabled)
+            nk_widget_disable_begin(ctx);
+        /* A disabled widget takes no input at all, so the click below
+         * cannot happen while the section is greyed. */
+        if (nk_button_symbol_styled(ctx, &bs, *on ? NK_SYMBOL_CIRCLE_SOLID
+                                                  : NK_SYMBOL_CIRCLE_OUTLINE))
+            *on = !*on;
+        if (disabled)
+            nk_widget_disable_end(ctx);
+    } else {
+        nk_spacing(ctx, 1);
+    }
+
+    bs = style->tab.tab_minimize_button;
+    /* The expander fills its whole cell, so the focus ring view_row() drew
+     * behind the row would be covered by it: a focused header is drawn in
+     * the ring's own colour instead, which is the same thing said the same
+     * way. */
+    bs.normal = bs.hover = bs.active = focused
+        ? nk_style_item_color(nk_rgba(46, 64, 96, 255)) : style->tab.background;
+    bs.border = style->tab.border;
+    bs.border_color = style->tab.border_color;
+    bs.rounding = style->tab.rounding;
+    bs.text_normal = bs.text_hover = bs.text_active = style->tab.text;
+    bs.text_alignment = NK_TEXT_LEFT;
+    /* Padding that leaves the triangle its square, where the tree draws
+     * its own. */
+    bs.padding = nk_vec2(style->tab.padding.x + style->font->height +
+                         style->window.spacing.x, style->tab.padding.y);
+
+    b = nk_widget_bounds(ctx);
+    if (nk_button_label_styled(ctx, &bs, title))
+        st->sections.open[id] = !st->sections.open[id];
+
+    /* The triangle, drawn after the button so that it lands on the
+     * background the button has just filled, in the place and the shape
+     * nuklear's own tree gives it: a square of the font's height inset by
+     * the tab padding, pointing right while the section is shut and down
+     * while it is open. */
+    {
+        struct nk_command_buffer *out = nk_window_get_canvas(ctx);
+        struct nk_color c = style->tab.text;
+        float x = b.x + style->tab.padding.x, y = b.y + style->tab.padding.y;
+        float s = style->font->height;
+
+        if (st->sections.open[id])
+            nk_fill_triangle(out, x, y, x + s, y, x + s * 0.5f, y + s, c);
+        else
+            nk_fill_triangle(out, x, y, x + s, y + s * 0.5f, x, y + s, c);
+    }
+
+    if (!st->sections.open[id])
+        return false;
+
+    view_section_indent(ctx, 1.0f);
+
+    return true;
+}
+
+static void view_section_end(struct nk_context *ctx)
+{
+    view_section_indent(ctx, -1.0f);
+}
+
+bool view_ui_section_toggle(struct view_state *st, int row)
+{
+    for (int i = 0; i < VIEW_NB_SECTIONS; i++)
+        if (st->sections.row[i] == row) {
+            st->sections.open[i] = !st->sections.open[i];
+            return true;
+        }
+
+    return false;
+}
+
 /* ------------------------------------------------- the cascading menus */
 
 /* Three rows use this: the film simulation, the video export's codec
@@ -1484,8 +1644,12 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
                       1.0f / 6.0f, -3.0f, 3.0f);
     nk_property_float(ctx, "#bias (stops)", -3.0f, &lk->exposure, 3.0f, 0.1f, 0.01f);
     nk_slider_float(ctx, -3.0f, &lk->exposure, 3.0f, 0.05f);
+    /* The gain the picture really has, which a bypassed section takes back
+     * to the as-shot rating while the two controls above keep their
+     * numbers. */
     nk_labelf(ctx, NK_TEXT_LEFT, "gain %.2f, ceiling %.0f nits",
-              view_total_gain(st) * exp2f(lk->exposure), view_peak_ceiling(st));
+              view_total_gain(st) * exp2f(view_exposure_bias(st)),
+              view_peak_ceiling(st));
 }
 
 /* What the record says the lens is doing, in one word: the sign of the
@@ -1509,36 +1673,16 @@ static const char *view_lens_kind(const struct view_lens *ln)
  * record cannot be corrected at all and the reason has to be visible rather
  * than inferred from nothing happening. On a clip that zooms while
  * recording the readout moves frame by frame, which is the record doing
- * exactly what it is for. */
+ * exactly what it is for. The warp's own switch is the header's, greyed
+ * there on a clip that carries no record; what is left here is the mode
+ * and the readout. */
 static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
 {
     struct view_lens *ln = &st->lens;
     bool have = ln->record.valid;
-    int on;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-
-    /* The row keeps its place on the focus ring either way, so the ring
-     * does not change shape when a clip without a record is opened; it just
-     * cannot be switched on. */
-    on = ln->on_flag;
-    if (have) {
-        view_adjust_cycle(st, view_row(st, ctx), &on, 2);
-    } else {
-        view_row(st, ctx);
-        view_step(st, false);
-    }
-    ln->on_flag = on;
-
-    if (have) {
-        nk_checkbox_label(ctx, "lens correction", &ln->on_flag);
-    } else {
-        /* Greyed: nuklear has no disabled widget, so the checkbox is drawn
-         * as a label that cannot be clicked. */
-        nk_label(ctx, "lens correction", NK_TEXT_LEFT);
-    }
-    ln->on = ln->on_flag != 0;
-
+    nk_label(ctx, "lens correction", NK_TEXT_LEFT);
     nk_labelf(ctx, NK_TEXT_LEFT, "%s",
               !st->dec.raw       ? "not a raw clip"
             : !have              ? "no record"
@@ -1549,7 +1693,8 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
      * the source's corners, which is the trade the camera's own crop makes,
      * or shrink the corrected picture until all of the source fits and
      * paint the rest black. The row keeps its place on the ring on a clip
-     * with no record too, for the same reason the switch above does. */
+     * with no record too, so the ring does not change shape when such a
+     * clip is opened; it just cannot be moved. */
     {
         int sel = ln->keep_sel;
 
@@ -1626,23 +1771,18 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
  * The model is the camera's, not the panel's. All this shows is which one
  * was found for the frame's own ISO, because a clip the camera has not been
  * characterized at cannot be denoised at all and the reason has to be
- * visible rather than inferred from nothing happening. */
+ * visible rather than inferred from nothing happening. The stage's own
+ * switch is the header's; what is left here is the strength and what the
+ * frame on screen resolved. */
 static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
 {
     struct view_denoise *d = &st->denoise;
-    int on;
 
-    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    on = d->on_flag;
-    view_adjust_cycle(st, view_row(st, ctx), &on, 2);
-    d->on_flag = on;
-    nk_checkbox_label(ctx, "denoise", &d->on_flag);
-    d->on = d->on_flag != 0;
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "%s",
               !d->have_model ? "no model: off"
                              : d->on ? "on, before the debayer" : "off");
 
-    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     view_adjust_float(st, view_row(st, ctx), &d->strength, 0.25f, 0.25f, 3.0f);
     nk_property_float(ctx, "#strength", 0.25f, &d->strength, 3.0f, 0.25f, 0.01f);
 
@@ -1677,27 +1817,17 @@ static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
     }
 }
 
-/* The crop row: the mode a left drag draws in, what it has drawn, and a
- * way to take it back. The rectangle is in source pixels, so the readout
- * says which region of the frame the export will write whatever the window
- * is doing with it. */
 /* The "Adjustments" section: soft light and vibrance, the two RawTherapee
  * tools adjust.c reimplements. It sits between Look and Film grain because
  * that is where the hooks sit in the render: after the film simulation the
- * Look section chooses, before the grain. */
+ * Look section chooses, before the grain. The header above it is the
+ * section's switch: off leaves both hooks unattached at the amounts they
+ * hold. */
 static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
 {
     struct view_adjust *a = &st->adjustments;
     char buf[128];
     bool grey;
-
-    /* Open when something is already on, which after --softlight or
-     * --vibrance it is. nuklear remembers the state per title from the
-     * first frame on, so this only decides where the section starts. */
-    if (!nk_tree_push(ctx, NK_TREE_TAB, "Adjustments",
-                      (a->softlight > 0.0f || a->pastels != 0.0f ||
-                       a->saturated != 0.0f) ? NK_MAXIMIZED : NK_MINIMIZED))
-        return;
 
     grey = view_grey_begin(st, ctx,
         "not applied: the export is scene referred, and these two are "
@@ -1753,7 +1883,6 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
              NK_TEXT_LEFT);
 
     view_grey_end(st, ctx, grey);
-    nk_tree_pop(ctx);
 }
 
 /* The video exporter's corner of the Export section: two cascades - the
@@ -2001,19 +2130,18 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     }
 }
 
+/* The "Crop" section: what a left drag has drawn and a way to take it back.
+ * The mode the drag draws in is the header's switch, which `c` is the other
+ * hand on; the rectangle is in source pixels, so the readout says which
+ * region of the frame the export will write whatever the window is doing
+ * with it. */
 static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
 {
     int x, y, w, h;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    {
-        bool f = view_row(st, ctx);
-
-        if (view_step(st, f))
-            st->crop.on_flag = !st->crop.on_flag;
-    }
-    nk_checkbox_label(ctx, "crop mode (c)", &st->crop.on_flag);
-    st->crop.on = st->crop.on_flag != 0;
+    nk_label(ctx, st->crop.on ? "drag to draw one" : "crop mode is off (c)",
+             NK_TEXT_LEFT);
 
     if (nk_button_label(ctx, "clear"))
         view_crop_clear(st);
@@ -2102,19 +2230,29 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
                   st->sync.diff * 1000.0, st->sync.dropped, st->audio.underruns);
     }
 
-    /* An already developed clip has no mosaic: there is nothing to balance
-     * and nothing to debayer, so those sections are not offered at all. */
-    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "White balance", NK_MINIMIZED)) {
+    /* Every section from here down is a header - a switch and an expander -
+     * and a body under it.
+     *
+     * An already developed clip has no mosaic: there is nothing to balance
+     * and nothing to debayer, so those two sections are not offered at all.
+     * Neither has anything to bypass either - for a raw clip the balance is
+     * always applied and the mosaic always has to come off - so their
+     * headers carry the empty switch slot that keeps the column lined up
+     * and nothing else. */
+    if (st->dec.raw &&
+        view_section_header(ctx, st, VIEW_SEC_WB, "White balance", NULL, false)) {
         view_panel_wb(ctx, st);
-        nk_tree_pop(ctx);
+        view_section_end(ctx);
     }
 
-    if (nk_tree_push(ctx, NK_TREE_TAB, "Exposure", NK_MINIMIZED)) {
+    if (view_section_header(ctx, st, VIEW_SEC_EXPOSURE, "Exposure",
+                            &st->sections.exposure, false)) {
         view_panel_exposure(ctx, st);
-        nk_tree_pop(ctx);
+        view_section_end(ctx);
     }
 
-    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "Debayer", NK_MINIMIZED)) {
+    if (st->dec.raw &&
+        view_section_header(ctx, st, VIEW_SEC_DEBAYER, "Debayer", NULL, false)) {
         int dbg = (int)lk->debayer;
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 3);
@@ -2123,20 +2261,28 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         for (int i = 0; i < CRAW_DEBAYER_NB; i++)
             if (nk_option_label(ctx, view_debayer_names[i], lk->debayer == i))
                 lk->debayer = (enum CRAWDebayer)i;
-        nk_tree_pop(ctx);
+        view_section_end(ctx);
     }
 
-    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "Denoise", NK_MINIMIZED)) {
+    if (st->dec.raw &&
+        view_section_header(ctx, st, VIEW_SEC_DENOISE, "Denoise",
+                            &st->denoise.on, false)) {
         view_panel_denoise(ctx, st);
-        nk_tree_pop(ctx);
+        view_section_end(ctx);
     }
 
-    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "Lens", NK_MINIMIZED)) {
+    /* The lens switch is the one that can be refused: a clip whose frames
+     * carry no correction record cannot be corrected, so the switch greys
+     * out rather than lying about what it would do. */
+    if (st->dec.raw &&
+        view_section_header(ctx, st, VIEW_SEC_LENS, "Lens", &st->lens.on,
+                            !st->lens.record.valid)) {
         view_panel_lens(ctx, st);
-        nk_tree_pop(ctx);
+        view_section_end(ctx);
     }
 
-    if (nk_tree_push(ctx, NK_TREE_TAB, "Look", NK_MINIMIZED)) {
+    if (view_section_header(ctx, st, VIEW_SEC_LOOK, "Look", &st->sections.look,
+                            view_export_is_scene(st))) {
         /* Tone mapping, peak detection and gamut mapping used to be here.
          * They are not a look: the window is mapped with libplacebo's own
          * defaults for whatever the compositor negotiated, and choosing is
@@ -2191,16 +2337,30 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         }
 
         view_grey_end(st, ctx, grey);
-        nk_tree_pop(ctx);
+        view_section_end(ctx);
     }
 
-    view_panel_adjust(ctx, st);
+    if (view_section_header(ctx, st, VIEW_SEC_ADJUST, "Adjustments",
+                            &st->sections.adjust, view_export_is_scene(st))) {
+        view_panel_adjust(ctx, st);
+        view_section_end(ctx);
+    }
 
-    view_panel_grain(ctx, st);
+    if (view_section_header(ctx, st, VIEW_SEC_GRAIN, "Film grain",
+                            &st->grain.on, view_export_is_scene(st))) {
+        view_panel_grain(ctx, st);
+        view_section_end(ctx);
+    }
 
-    view_panel_crop(ctx, st);
+    /* The crop mode is a switch like any other, and `c` is the same
+     * switch: the rectangle it draws outlives both. */
+    if (view_section_header(ctx, st, VIEW_SEC_CROP, "Crop", &st->crop.on,
+                            false)) {
+        view_panel_crop(ctx, st);
+        view_section_end(ctx);
+    }
 
-    if (nk_tree_push(ctx, NK_TREE_TAB, "Export", NK_MINIMIZED)) {
+    if (view_section_header(ctx, st, VIEW_SEC_EXPORT, "Export", NULL, false)) {
         /* The field follows the frame on screen until it is typed into:
          * once it differs from the default that was last put there, it is
          * the user's and is left alone. */
@@ -2249,7 +2409,7 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
         view_panel_export_video(ctx, st);
 
-        nk_tree_pop(ctx);
+        view_section_end(ctx);
     }
 }
 
@@ -2332,6 +2492,11 @@ void view_ui_build(struct view_state *st)
      * whatever row happens to have its old index would open one. */
     for (int i = 0; i < VIEW_MENU_KINDS; i++)
         st->menu.rows[i] = -1;
+    /* And the same for the section headers, which a developed clip has
+     * fewer of than a raw one: Enter must never find a header that is not
+     * on screen. */
+    for (int i = 0; i < VIEW_NB_SECTIONS; i++)
+        st->sections.row[i] = -1;
     if (st->ui_rows > 0)
         st->focus = (st->focus % st->ui_rows + st->ui_rows) % st->ui_rows;
 

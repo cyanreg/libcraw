@@ -1500,8 +1500,11 @@ static void view_render_params(struct view_state *st,
      * front of it. It is now the first of the adjustment hooks below, on
      * the same values and through the same pl_shader_custom_lut, so that
      * vibrance and soft light can follow it the way they follow film
-     * simulation in RawTherapee. */
-    rp->lut = st->look.film_sim >= 0 || scene ? NULL : st->lut;
+     * simulation in RawTherapee.
+     *
+     * The Look section's switch takes both away at once and leaves the
+     * selection selected, which is what view_look_active() answers. */
+    rp->lut = st->look.film_sim >= 0 || !view_look_active(st) ? NULL : st->lut;
     rp->lut_type = st->look.lut_space > 0 ? PL_LUT_CONVERSION : st->look.lut_type;
 
     /* Only the non-raw path needs a shader for exposure; on the raw path
@@ -1535,11 +1538,14 @@ static void view_render_params(struct view_state *st,
         craw_adjust *aj = view_adjust_state(st, export_path);
         const struct pl_hook *h;
 
-        if (aj) {
-            if (st->look.film_sim >= 0 && st->lut &&
-                (h = craw_adjust_lut(aj, st->lut)))
-                hook[nb_hooks++] = h;
+        if (aj && view_look_active(st) && st->look.film_sim >= 0 && st->lut &&
+            (h = craw_adjust_lut(aj, st->lut)))
+            hook[nb_hooks++] = h;
 
+        /* Soft light and vibrance are one switch of their own: the
+         * Adjustments section, off, leaves both hooks unattached at
+         * whatever amounts they are set to. */
+        if (aj && view_adjust_active(st)) {
             const struct craw_vibrance_params vp = {
                 .pastels      = st->adjustments.pastels,
                 .saturated    = st->adjustments.saturated,

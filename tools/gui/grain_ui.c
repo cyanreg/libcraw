@@ -253,6 +253,13 @@ const struct pl_hook *view_grain_hook(struct view_state *st, bool export_path)
     if (!g->on || g->amount <= 0.0f || !st->gpu.gpu)
         return NULL;
 
+    /* The model is sized from the frame, and the window is rendered before
+     * the first frame of a developed clip has been mapped, when the size is
+     * still zero. With no frame there is nothing to grain, so there is no
+     * hook rather than a division by zero below. */
+    if (!st->gpu.width || !st->gpu.height)
+        return NULL;
+
     if (!*slot) {
         *slot = craw_grain_hook_create(st->gpu.gpu);
         if (!*slot)
@@ -338,7 +345,6 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
     static bool names_done;
     char buf[128];
     bool grey = false;
-    int on;
 
     if (!names_done) {
         for (int i = 0; i < CRAW_GRAIN_GAUGE_NB; i++)
@@ -347,14 +353,6 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
             stocks[i] = craw_grain_stock_name(i);
         names_done = true;
     }
-
-    /* Open when grain is already on, which after --grain it is: somebody
-     * who asked for grain on the command line wants to see the controls.
-     * nuklear remembers the state per title from the first frame on, so
-     * this only decides where the section starts. */
-    if (!nk_tree_push(ctx, NK_TREE_TAB, "Film grain",
-                      g->on ? NK_MAXIMIZED : NK_MINIMIZED))
-        return;
 
     /* Grain is applied after colour management, on display-encoded values,
      * so a scene-referred export carries none of it and neither does the
@@ -371,15 +369,9 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
         grey = true;
     }
 
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    on = g->on ? 1 : 0;
-    grain_adjust_cycle(st, grain_row(st, ctx), &on, 2);
-    g->on = on != 0;
-    {
-        int flag = g->on ? 1 : 0;
-        nk_checkbox_label(ctx, "grain", &flag);
-        g->on = flag != 0;
-    }
+    /* Whether there is any grain at all is the header's switch; this is
+     * what the model made of the settings under it. */
+    nk_layout_row_dynamic(ctx, GRAIN_ROW, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "%s",
               view_grain_summary(g, buf, sizeof(buf)));
 
@@ -450,6 +442,4 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
         nk_widget_disable_end(ctx);
         st->ui_greyed = false;
     }
-
-    nk_tree_pop(ctx);
 }
