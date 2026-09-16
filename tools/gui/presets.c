@@ -63,6 +63,10 @@
 
 #include <libavutil/buffer.h>
 #include <libavutil/hwcontext.h>
+/* For the frames context the format probe builds, which has to carry the
+ * same image usage the exporter's does or it would answer a different
+ * question from the one that matters. Pulls in <vulkan/vulkan.h> itself. */
+#include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/opt.h>
 #include <libavutil/time.h>
 #include <libavutil/pixdesc.h>
@@ -72,17 +76,33 @@
 
 /* ------------------------------------------------------------- ProRes */
 
+/* Kept to three wrapped lines: the panel gives a refusal three rows of
+ * height and a wrapped label clips at the bottom of the rectangle it is
+ * given. */
+#define VIEW_PRORES_422_WHY \
+    "proxy, LT, standard and HQ are the 4:2:2 ProRes profiles, and " \
+    "prores_ks reads the layout off the frame, not off the profile"
+#define VIEW_PRORES_444_WHY \
+    "4444 and 4444 XQ are the 4:4:4 ProRes profiles, and prores_ks reads " \
+    "the layout off the frame, not off the profile"
+
 /* auto is left unpinned on purpose: with no format of its own it gets the
  * engine's first choice for a ProRes-shaped codec, which is 4:2:2 ten bit,
  * and the encoder then autoselects HQ from it. */
 static const struct view_preset view_presets_prores[] = {
     { "auto",     "profile=auto",     AV_PIX_FMT_NONE },
-    { "proxy",    "profile=proxy",    AV_PIX_FMT_YUV422P10 },
-    { "lt",       "profile=lt",       AV_PIX_FMT_YUV422P10 },
-    { "standard", "profile=standard", AV_PIX_FMT_YUV422P10 },
-    { "hq",       "profile=hq",       AV_PIX_FMT_YUV422P10 },
-    { "4444",     "profile=4444",     AV_PIX_FMT_YUV444P10 },
-    { "4444xq",   "profile=4444xq",   AV_PIX_FMT_YUV444P10 },
+    { "proxy",    "profile=proxy",    AV_PIX_FMT_YUV422P10,
+      .fmt_why = VIEW_PRORES_422_WHY },
+    { "lt",       "profile=lt",       AV_PIX_FMT_YUV422P10,
+      .fmt_why = VIEW_PRORES_422_WHY },
+    { "standard", "profile=standard", AV_PIX_FMT_YUV422P10,
+      .fmt_why = VIEW_PRORES_422_WHY },
+    { "hq",       "profile=hq",       AV_PIX_FMT_YUV422P10,
+      .fmt_why = VIEW_PRORES_422_WHY },
+    { "4444",     "profile=4444",     AV_PIX_FMT_YUV444P10,
+      .fmt_why = VIEW_PRORES_444_WHY },
+    { "4444xq",   "profile=4444xq",   AV_PIX_FMT_YUV444P10,
+      .fmt_why = VIEW_PRORES_444_WHY },
 };
 #define VIEW_PRORES_DEF 5       /* 4444 */
 
@@ -130,25 +150,38 @@ static const struct view_preset view_presets_apv[] = {
 
 /* ------------------------------------------------------------- the AV1s */
 
+#define VIEW_AV1_MAIN_WHY \
+    "AV1 Main profile is 4:2:0: 4:2:2 is not an AV1 chroma format at all, " \
+    "and 4:4:4 is High"
+#define VIEW_AV1_HIGH_WHY "AV1 High profile is 4:4:4"
+
 /* AV1 High profile is 4:4:4, which libsvtav1 has no pixel format for: it
  * lists yuv420p and yuv420p10le and nothing else, and SVT itself answers
  * "Profile 1 requires 4:4:4 color format". Both were run. */
 static const struct view_preset view_presets_svtav1[] = {
-    { "Main", "profile=main", AV_PIX_FMT_YUV420P10 },
+    { "Main", "profile=main", AV_PIX_FMT_YUV420P10,
+      .fmt_why = VIEW_AV1_MAIN_WHY },
     { "High", "profile=high", AV_PIX_FMT_YUV444P10, .why_not =
       "libsvtav1 takes only 4:2:0 in this build, and AV1 High profile is "
-      "4:4:4" },
+      "4:4:4", .fmt_why = VIEW_AV1_HIGH_WHY },
 };
 
 static const struct view_preset view_presets_av1_vk[] = {
-    { "Main", "profile=main", AV_PIX_FMT_YUV420P10 },
-    { "High", "profile=high", AV_PIX_FMT_YUV444P10 },
+    { "Main", "profile=main", AV_PIX_FMT_YUV420P10,
+      .fmt_why = VIEW_AV1_MAIN_WHY },
+    { "High", "profile=high", AV_PIX_FMT_YUV444P10,
+      .fmt_why = VIEW_AV1_HIGH_WHY },
 };
 
 /* ---------------------------------------------------------------- x264 */
 
 /* x264's own preset names, which are what the family's presets are. The
- * pixel format and the profile go together: ten bit 4:2:0 is High 10. */
+ * pinned format is ten bit 4:2:0, which x264 writes as High 10; the
+ * profile is not set alongside it, because x264 picks the lowest profile
+ * that can carry the format it is given and the pixel format row would
+ * otherwise be a row that refuses everything it offers. Checked: with no
+ * `profile` at all, yuv420p10 still comes out High 10 and yuv444p10 comes
+ * out High 4:4:4 Predictive. */
 static const struct view_preset view_presets_x264[] = {
     { "veryfast", "preset=veryfast", AV_PIX_FMT_YUV420P10 },
     { "fast",     "preset=fast",     AV_PIX_FMT_YUV420P10 },
@@ -247,7 +280,6 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_x264),
         .def = VIEW_X264_DEF,
         .ctrl = VIEW_CTRL_RC, .container = "mp4",
-        .always = "profile=high10",
         .scene_fmt = AV_PIX_FMT_NONE,
         .rc = {
             { "CRF", false, 0, 51, 18 },
@@ -393,6 +425,10 @@ void view_presets_default(struct view_preset_sel *s)
     s->preset = view_preset_families[1].def;
     s->colour = VIEW_COLOUR_709;
     s->hdr_peak = 1000;
+    /* Spelled out: AV_PIX_FMT_NONE is -1 and the memset above made this
+     * field AV_PIX_FMT_YUV420P. */
+    s->pix_fmt = AV_PIX_FMT_NONE;
+    s->pix_fmt_family = -1;
     s->tone_map = VIEW_TONE_MAP_DEF;
     s->gamut_map = VIEW_GAMUT_MAP_DEF;
     s->peak = 1;
@@ -660,13 +696,131 @@ int view_presets_dict(const struct view_preset_sel *s, const char *extra,
     return 0;
 }
 
+/* --------------------------------------------------------- pixel formats */
+
+const char *view_presets_fmt_label(enum AVPixelFormat fmt, char *buf, size_t n)
+{
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(fmt);
+    const char *name = av_get_pix_fmt_name(fmt);
+    char layout[16];
+
+    if (!d || !name) {
+        snprintf(buf, n, "none");
+        return buf;
+    }
+
+    /* The layout is read off the descriptor rather than looked up: the
+     * chroma planes' subsampling *is* the layout, one in x being 4:2:2,
+     * one in both 4:2:0, two in x 4:1:1, and a format with no chroma
+     * planes at all has no layout to say. */
+    if (d->flags & AV_PIX_FMT_FLAG_RGB)
+        snprintf(layout, sizeof(layout), "RGB");
+    else if (d->nb_components < 3)
+        snprintf(layout, sizeof(layout), "gray");
+    else
+        snprintf(layout, sizeof(layout), "4:%d:%d", 4 >> d->log2_chroma_w,
+                 d->log2_chroma_h ? 0 : 4 >> d->log2_chroma_w);
+
+    snprintf(buf, n, "%s%s %d-bit%s (%s)", layout,
+             d->flags & AV_PIX_FMT_FLAG_ALPHA ? "+A" : "",
+             d->comp[0].depth,
+             d->flags & AV_PIX_FMT_FLAG_FLOAT ? " float" : "", name);
+
+    return buf;
+}
+
+enum AVPixelFormat view_presets_sel_fmt(const struct view_preset_sel *s)
+{
+    if (s->pix_fmt != AV_PIX_FMT_NONE && s->pix_fmt_family == s->family)
+        return (enum AVPixelFormat)s->pix_fmt;
+
+    return view_presets_pix_fmt(s);
+}
+
+const char *view_presets_fmt_why_not(int family, int preset,
+                                     enum AVPixelFormat fmt)
+{
+    const struct view_preset *p = view_preset(family, preset);
+    const AVPixFmtDescriptor *want, *got;
+
+    if (!p || !p->fmt_why || p->fmt == AV_PIX_FMT_NONE ||
+        fmt == AV_PIX_FMT_NONE)
+        return NULL;
+
+    want = av_pix_fmt_desc_get(p->fmt);
+    got  = av_pix_fmt_desc_get(fmt);
+    if (!want || !got)
+        return NULL;
+
+    /* The profile fixes the layout and nothing else: a 4:2:2 profile is as
+     * happy at twelve bits as at ten, and as happy with an alpha plane as
+     * without one, but not with 4:4:4. RGB counts as a layout of its own,
+     * and so does having no chroma planes - gray subsamples by nothing,
+     * which would otherwise read as 4:4:4. */
+    if (want->log2_chroma_w == got->log2_chroma_w &&
+        want->log2_chroma_h == got->log2_chroma_h &&
+        !!(want->flags & AV_PIX_FMT_FLAG_RGB) ==
+        !!(got->flags & AV_PIX_FMT_FLAG_RGB) &&
+        (want->nb_components >= 3) == (got->nb_components >= 3))
+        return NULL;
+
+    return p->fmt_why;
+}
+
+int view_presets_parse_fmt(struct view_preset_sel *s, const char *arg)
+{
+    enum AVPixelFormat f;
+
+    if (!arg || !arg[0]) {
+        fprintf(stderr, "--pix-fmt: expected a pixel format, e.g. nv12\n");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    /* av_get_pix_fmt() takes both spellings: "gbrp16le" and the bare
+     * "gbrp16", which it resolves to this machine's endianness. */
+    f = av_get_pix_fmt(arg);
+    if (f == AV_PIX_FMT_NONE) {
+        fprintf(stderr, "--pix-fmt: `%s` is not a pixel format FFmpeg knows. "
+                        "--list-presets prints the ones each family accepts "
+                        "on this machine.\n", arg);
+        return CRAW_ERROR(EINVAL);
+    }
+
+    s->pix_fmt = f;
+    s->pix_fmt_family = s->family;
+    s->set = true;
+
+    return 0;
+}
+
 /* --------------------------------------------------------- availability */
 
 /* One entry per family: what the probe found, or nothing yet. */
 static struct {
     bool done;
     char why[192];
+
+    /* The format walk. `cand` is what is worth trying and `cand_i` how far
+     * through it the walk is; `fmt` is what the encoder really opened
+     * with, which for a software family is the whole of `cand` at once. */
+    bool fmt_started, fmt_done;
+    int cand_n, cand_i;
+    enum AVPixelFormat cand[VIEW_MAX_PIX_FMTS];
+    int nb_fmt;
+    enum AVPixelFormat fmt[VIEW_MAX_PIX_FMTS];
 } view_probe[16];
+
+/* When the next open may start. An encoder open costs between a
+ * millisecond and half a second here and it is all pipeline creation, so a
+ * step that has just paid for one stands back for twice as long before the
+ * next, leaving two frames out of three to whoever is drawing. */
+static int64_t view_probe_next_us;
+
+static int view_nb_probe(void)
+{
+    return CRAW_MIN(view_nb_preset_families,
+                    (int)CRAW_ARRAY_ELEMS(view_probe));
+}
 
 static const char *view_presets_build_why_not(const struct view_preset_family *f)
 {
@@ -738,9 +892,11 @@ const char *view_presets_colour_why_not(int family, int preset, int colour)
     return NULL;
 }
 
-bool view_presets_probe_step(AVBufferRef *hw_device, bool verbose)
+/* Opens one family's encoder once, so that a device with no engine for it
+ * greys the row rather than failing at export time. */
+static void view_probe_family(int idx, AVBufferRef *hw_device, bool verbose)
 {
-    const struct view_preset_family *f = NULL;
+    const struct view_preset_family *f = &view_preset_families[idx];
     const AVCodec *codec;
     AVCodecContext *avc = NULL;
     AVBufferRef *frames = NULL;
@@ -748,31 +904,20 @@ bool view_presets_probe_step(AVBufferRef *hw_device, bool verbose)
     AVDictionary *opts = NULL;
     struct view_preset_sel sel = { 0 };
     char buf[512];
-    int idx = -1, ret;
+    int ret;
     int64_t t0;
-
-    for (int i = 0; i < view_nb_preset_families &&
-                    i < (int)CRAW_ARRAY_ELEMS(view_probe); i++) {
-        if (view_preset_families[i].probe && !view_probe[i].done) {
-            idx = i;
-            f = &view_preset_families[i];
-            break;
-        }
-    }
-    if (!f)
-        return false;
 
     /* No device, no answer; say so rather than claiming the family works. */
     codec = avcodec_find_encoder_by_name(f->encoder);
     if (!codec) {
         view_probe[idx].done = true;        /* the build check says it */
-        return true;
+        return;
     }
     if (!hw_device) {
         snprintf(view_probe[idx].why, sizeof(view_probe[idx].why),
                  "%s needs a Vulkan device and there is none", f->encoder);
         view_probe[idx].done = true;
-        return true;
+        return;
     }
 
     t0 = av_gettime_relative();
@@ -780,7 +925,7 @@ bool view_presets_probe_step(AVBufferRef *hw_device, bool verbose)
     frames = av_hwframe_ctx_alloc(hw_device);
     if (!frames) {
         view_probe[idx].done = true;
-        return true;
+        return;
     }
     fc = (AVHWFramesContext *)frames->data;
     fc->format    = AV_PIX_FMT_VULKAN;
@@ -814,6 +959,7 @@ bool view_presets_probe_step(AVBufferRef *hw_device, bool verbose)
      * question the menu is about to ask. */
     sel.family = idx;
     sel.preset = f->def;
+    sel.pix_fmt = AV_PIX_FMT_NONE;
     view_presets_family_defaults(&sel);
     view_presets_opts(&sel, buf, sizeof(buf));
     if (buf[0])
@@ -837,8 +983,357 @@ out:
     av_dict_free(&opts);
     avcodec_free_context(&avc);
     av_buffer_unref(&frames);
+}
+
+/* ----------------------------------------------------- the format walk */
+
+static bool view_fmt_has(const enum AVPixelFormat *l, int n,
+                         enum AVPixelFormat f)
+{
+    for (int i = 0; i < n; i++)
+        if (l[i] == f)
+            return true;
+
+    return false;
+}
+
+/* Appends what libavcodec says an encoder takes. A Vulkan encoder answers
+ * AV_PIX_FMT_VULKAN and nothing else, which is not an answer to the
+ * question this row asks, so it contributes nothing. */
+static int view_fmt_declared(const AVCodec *c, enum AVPixelFormat *out, int n,
+                             int max)
+{
+    const enum AVPixelFormat *list = NULL;
+    int nb = 0;
+
+    if (avcodec_get_supported_config(NULL, c, AV_CODEC_CONFIG_PIX_FORMAT, 0,
+                                     (const void **)&list, &nb) < 0 || !list)
+        return n;
+
+    for (int i = 0; i < nb && n < max; i++) {
+        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(list[i]);
+
+        /* Bayer is a sensor mosaic and not a picture: FFV1 declares it
+         * because FFV1 can store one, but there is no rendering of a
+         * graded frame into a colour filter array, so it is not a format
+         * this export can be asked for. */
+        if (!d || (d->flags & (AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_PAL |
+                               AV_PIX_FMT_FLAG_BITSTREAM |
+                               AV_PIX_FMT_FLAG_BAYER)))
+            continue;
+        /* The yuvj formats are three of the layouts already here with the
+         * range baked into the name, which FFmpeg deprecated in favour of
+         * the color_range tag the export writes anyway. Two rows reading
+         * "4:2:0 8-bit" that differ in something the row does not show is
+         * not a choice anybody can make. */
+        if (!strncmp(d->name, "yuvj", 4))
+            continue;
+        if (!view_fmt_has(out, n, list[i]))
+            out[n++] = list[i];
+    }
+
+    return n;
+}
+
+/* The formats worth handing to a family's encoder, before any has been
+ * tried, and whether each one has to be confirmed by opening it.
+ *
+ * A software encoder declares its own list and that list is the answer:
+ * nothing is opened at all.
+ *
+ * A Vulkan encoder declares AV_PIX_FMT_VULKAN and nothing else, and this
+ * FFmpeg has no other way to be asked - none of them implement the
+ * avcodec_get_supported_config() callback that would let the answer depend
+ * on a context, the AVCodecHWConfigs carry a device type and not a format
+ * list, and hwcontext_vulkan's constraints are the device's formats rather
+ * than any encoder's. So the only way to know is to build a frames context
+ * of each candidate and see which ones the encoder opens with. The
+ * candidates are what libavcodec says pictures of this *codec* can be -
+ * every software encoder for the same AVCodecID - narrowed to what this
+ * device can hold. Where the codec has no software encoder at all, which
+ * here is APV, there is nothing to narrow with and the device's own list is
+ * walked instead.
+ *
+ * The narrowing is not tidiness: prores_ks_vulkan validates nothing, opens
+ * with all 77 formats this device offers - bayer and gray included - and
+ * writes every one of them as 4:4:4, while prores_ks declares the three
+ * formats ProRes actually has. */
+static void view_probe_candidates(int idx, AVBufferRef *hw_device, bool *open)
+{
+    const struct view_preset_family *f = &view_preset_families[idx];
+    const AVCodec *own = avcodec_find_encoder_by_name(f->encoder);
+    AVHWFramesConstraints *con;
+    enum AVPixelFormat ref[VIEW_MAX_PIX_FMTS];
+    int n = 0, nref = 0;
+    void *it = NULL;
+    const AVCodec *c;
+
+    *open = false;
+    view_probe[idx].cand_n = 0;
+    view_probe[idx].cand_i = 0;
+    if (!own)
+        return;
+
+    n = view_fmt_declared(own, view_probe[idx].cand, 0, VIEW_MAX_PIX_FMTS);
+    if (n > 0) {
+        view_probe[idx].cand_n = n;
+        return;                             /* it said so itself */
+    }
+
+    if (!hw_device)
+        return;
+
+    con = av_hwdevice_get_hwframe_constraints(hw_device, NULL);
+    if (!con || !con->valid_sw_formats) {
+        av_hwframe_constraints_free(&con);
+        return;
+    }
+
+    while ((c = av_codec_iterate(&it)))
+        if (av_codec_is_encoder(c) && c->id == own->id &&
+            !(c->capabilities & AV_CODEC_CAP_HARDWARE))
+            nref = view_fmt_declared(c, ref, nref, VIEW_MAX_PIX_FMTS);
+
+    for (const enum AVPixelFormat *p = con->valid_sw_formats;
+         *p != AV_PIX_FMT_NONE && n < VIEW_MAX_PIX_FMTS; p++) {
+        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(*p);
+
+        if (!d || (d->flags & (AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_PAL |
+                               AV_PIX_FMT_FLAG_BITSTREAM |
+                               AV_PIX_FMT_FLAG_BAYER)))
+            continue;
+        if (nref > 0 && !view_fmt_has(ref, nref, *p))
+            continue;
+        if (!strncmp(d->name, "yuvj", 4))
+            continue;
+        view_probe[idx].cand[n++] = *p;
+    }
+
+    av_hwframe_constraints_free(&con);
+    view_probe[idx].cand_n = n;
+    *open = true;
+}
+
+/* One candidate: a frames context shaped exactly the way the exporter
+ * shapes one - the same usage flags, so that a format the device cannot
+ * make a renderable image of is refused here and not at export time - and
+ * the encoder opened on it.
+ *
+ * 1920x1080, which is a shape and not the export's. Most of what an encoder
+ * refuses it refuses whatever the size, but not all: ffv1_vulkan wants its
+ * slice grid to divide the chroma planes, so at 1080 high with 32 slices
+ * every vertically subsampled format is refused and at 1024 high none of
+ * them is. The list is therefore what the encoder takes, not a promise
+ * about a particular frame; an export that runs into such a refusal gets
+ * the encoder's own sentence about it. */
+static bool view_probe_fmt_open(int idx, AVBufferRef *hw_device,
+                                enum AVPixelFormat sw)
+{
+    const struct view_preset_family *f = &view_preset_families[idx];
+    const AVCodec *codec = avcodec_find_encoder_by_name(f->encoder);
+    AVCodecContext *avc = NULL;
+    AVBufferRef *frames = NULL;
+    AVHWFramesContext *fc;
+    AVVulkanFramesContext *vk;
+    AVDictionary *opts = NULL;
+    struct view_preset_sel sel = { 0 };
+    char buf[512];
+    int ret;
+
+    if (!codec || !hw_device)
+        return false;
+
+    frames = av_hwframe_ctx_alloc(hw_device);
+    if (!frames)
+        return false;
+
+    fc = (AVHWFramesContext *)frames->data;
+    vk = fc->hwctx;
+    fc->format    = AV_PIX_FMT_VULKAN;
+    fc->sw_format = sw;
+    fc->width     = 1920;
+    fc->height    = 1080;
+    fc->initial_pool_size = 0;
+    vk->usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    ret = av_hwframe_ctx_init(frames);
+    if (ret < 0)
+        goto out;
+
+    avc = avcodec_alloc_context3(codec);
+    if (!avc) {
+        ret = AVERROR(ENOMEM);
+        goto out;
+    }
+    avc->width      = fc->width;
+    avc->height     = fc->height;
+    avc->pix_fmt    = AV_PIX_FMT_VULKAN;
+    avc->sw_pix_fmt = sw;
+    avc->time_base  = (AVRational) { 1, 25 };
+    avc->framerate  = (AVRational) { 25, 1 };
+    avc->hw_frames_ctx = av_buffer_ref(frames);
+    if (!avc->hw_frames_ctx) {
+        ret = AVERROR(ENOMEM);
+        goto out;
+    }
+
+    /* The family's default preset's options, which is what an export of
+     * this family carries and therefore what has to open. */
+    sel.family = idx;
+    sel.preset = f->def;
+    sel.pix_fmt = AV_PIX_FMT_NONE;
+    view_presets_family_defaults(&sel);
+    view_presets_opts(&sel, buf, sizeof(buf));
+    if (buf[0])
+        av_dict_parse_string(&opts, buf, "=", ",", 0);
+
+    ret = avcodec_open2(avc, codec, &opts);
+
+out:
+    av_dict_free(&opts);
+    avcodec_free_context(&avc);
+    av_buffer_unref(&frames);
+
+    return ret >= 0;
+}
+
+/* The family whose format walk runs next, or -1 when they are all done.
+ * `want` goes first so that the row on screen fills in before the lists
+ * nobody is looking at. */
+static int view_probe_pick_walk(int want)
+{
+    if (want >= 0 && want < view_nb_probe() && !view_probe[want].fmt_done)
+        return want;
+
+    for (int i = 0; i < view_nb_probe(); i++)
+        if (!view_probe[i].fmt_done)
+            return i;
+
+    return -1;
+}
+
+/* One step of one family's walk. Returns false when there was nothing this
+ * call could do, which for a Vulkan family means there is no device yet. */
+static bool view_probe_walk(int idx, AVBufferRef *hw_device, bool verbose)
+{
+    enum AVPixelFormat f;
+    bool open = false, took;
+    int64_t t0;
+    char buf[64];
+
+    if (!view_probe[idx].fmt_started) {
+        view_probe_candidates(idx, hw_device, &open);
+        view_probe[idx].fmt_started = true;
+
+        /* A software encoder's own list is the answer, and taking it is
+         * free; only a Vulkan one has to be asked one format at a time. */
+        if (!open) {
+            if (view_probe[idx].cand_n > 0)
+                memcpy(view_probe[idx].fmt, view_probe[idx].cand,
+                       (size_t)view_probe[idx].cand_n *
+                       sizeof(*view_probe[idx].fmt));
+            view_probe[idx].nb_fmt = view_probe[idx].cand_n;
+            view_probe[idx].fmt_done = true;
+        }
+
+        if (!hw_device && !view_probe[idx].fmt_done) {
+            /* Nothing to ask yet. The walk starts over once a clip has
+             * given the viewer a device. */
+            view_probe[idx].fmt_started = false;
+            return false;
+        }
+
+        return true;
+    }
+
+    if (view_probe[idx].cand_i >= view_probe[idx].cand_n) {
+        view_probe[idx].fmt_done = true;
+        return true;
+    }
+
+    t0 = av_gettime_relative();
+    f = view_probe[idx].cand[view_probe[idx].cand_i++];
+    took = view_probe_fmt_open(idx, hw_device, f);
+    if (took && view_probe[idx].nb_fmt < VIEW_MAX_PIX_FMTS)
+        view_probe[idx].fmt[view_probe[idx].nb_fmt++] = f;
+
+    if (verbose)
+        fprintf(stderr, "%s %s %s in %.0f ms\n",
+                view_preset_families[idx].encoder,
+                took ? "takes" : "refuses",
+                view_presets_fmt_label(f, buf, sizeof(buf)),
+                (double)(av_gettime_relative() - t0) / 1000.0);
+
+    if (view_probe[idx].cand_i >= view_probe[idx].cand_n)
+        view_probe[idx].fmt_done = true;
 
     return true;
+}
+
+int view_presets_fmts(int family, const enum AVPixelFormat **out)
+{
+    if (family < 0 || family >= view_nb_probe()) {
+        *out = NULL;
+        return 0;
+    }
+
+    *out = view_probe[family].fmt;
+
+    return view_probe[family].nb_fmt;
+}
+
+bool view_presets_fmts_ready(int family)
+{
+    return family >= 0 && family < view_nb_probe() &&
+           view_probe[family].fmt_done;
+}
+
+bool view_presets_probe_step(AVBufferRef *hw_device, int want, bool verbose)
+{
+    int64_t now = av_gettime_relative(), t0;
+    int fam = -1;
+
+    /* The family's own open first: it is what greys a whole row of the
+     * menu, and a device with no engine answers it in microseconds. */
+    for (int i = 0; i < view_nb_probe(); i++)
+        if (view_preset_families[i].probe && !view_probe[i].done) {
+            fam = i;
+            break;
+        }
+
+    if (fam < 0 && (fam = view_probe_pick_walk(want)) < 0)
+        return false;
+
+    if (now < view_probe_next_us)
+        return true;
+
+    t0 = av_gettime_relative();
+    if (view_preset_families[fam].probe && !view_probe[fam].done)
+        view_probe_family(fam, hw_device, verbose);
+    else if (!view_probe_walk(fam, hw_device, verbose))
+        return true;
+    view_probe_next_us = av_gettime_relative() +
+                         2 * (av_gettime_relative() - t0);
+
+    return true;
+}
+
+void view_presets_probe_all(AVBufferRef *hw_device, bool verbose)
+{
+    for (int i = 0; i < view_nb_probe(); i++) {
+        if (view_preset_families[i].probe && !view_probe[i].done)
+            view_probe_family(i, hw_device, verbose);
+        while (!view_probe[i].fmt_done)
+            if (!view_probe_walk(i, hw_device, verbose)) {
+                /* No device: a Vulkan family's list cannot be answered at
+                 * all, and an empty one said so is better than a hang. */
+                view_probe[i].fmt_done = true;
+                break;
+            }
+    }
+    view_probe_next_us = 0;
 }
 
 /* ------------------------------------------------------- the names */
@@ -850,13 +1345,15 @@ static bool view_name_eq(const char *a, const char *b)
 
 void view_presets_list(void)
 {
-    char buf[512];
+    char buf[512], fmt[64];
 
     printf("video export presets. --preset \"Family/Preset\"\n\n");
 
     for (int i = 0; i < view_nb_preset_families; i++) {
         const struct view_preset_family *f = &view_preset_families[i];
         const char *why = view_presets_family_why_not(i);
+        const enum AVPixelFormat *fmts = NULL;
+        int nb = view_presets_fmts(i, &fmts);
 
         printf("%s (%s, .%s)%s%s\n", f->name, f->encoder, f->container,
                why ? "  unusable: " : "", why ? why : "");
@@ -870,8 +1367,29 @@ void view_presets_list(void)
                    f->presets[j].name, buf,
                    f->presets[j].why_not ? "   unusable: " : "",
                    f->presets[j].why_not ? f->presets[j].why_not : "");
+            /* What the row starts on for this preset, and what it refuses:
+             * the pinned format is a default everywhere and a requirement
+             * where the profile is a chroma layout. */
+            printf("      pixel format %s%s\n",
+                   f->presets[j].fmt == AV_PIX_FMT_NONE
+                   ? "chosen by the engine"
+                   : view_presets_fmt_label(f->presets[j].fmt, fmt,
+                                            sizeof(fmt)),
+                   f->presets[j].fmt_why ? ", and only that layout" : "");
         }
-        printf("\n");
+
+        /* Everything the encoder was found to take here. For a Vulkan one
+         * this is what it opened with, one format at a time, on this
+         * device; for a software one it is what libavcodec declares. */
+        printf("    accepts:");
+        if (!view_presets_fmts_ready(i))
+            printf(" (not probed: no Vulkan device)");
+        for (int j = 0; j < nb; j++)
+            printf("%s%s", j ? ", " : " ",
+                   view_presets_fmt_label(fmts[j], fmt, sizeof(fmt)));
+        if (view_presets_fmts_ready(i) && !nb)
+            printf(" nothing on this device");
+        printf("\n\n");
     }
 
     printf("colour spaces. --colour NAME\n\n");
@@ -887,6 +1405,10 @@ void view_presets_list(void)
         printf("  %-12s %s\n", view_size_names[i],
                i == VIEW_SIZE_TYPED ? "WxH, given as e.g. --size 2048x1080"
                                     : "of the crop rectangle");
+
+    printf("\npixel formats. --pix-fmt NAME, by FFmpeg's names, out of the "
+           "\"accepts\" line\nof the family. A preset's own format is what "
+           "the row starts on.\n");
 }
 
 int view_presets_parse(struct view_preset_sel *s, const char *arg)
@@ -917,6 +1439,10 @@ int view_presets_parse(struct view_preset_sel *s, const char *arg)
         s->family = i;
         s->preset = f->def;
         view_presets_family_defaults(s);
+        /* A command line is one request rather than a sequence of
+         * gestures, so a --pix-fmt typed before --preset still means this
+         * family's picture; in the panel a family change voids the row. */
+        s->pix_fmt_family = s->family;
         s->set = true;
 
         if (!slash)

@@ -544,12 +544,42 @@ static int view_menu_colour_group(int g, int *count)
 }
 
 /* A leaf column's entries select rather than opening another column. */
+/* The pixel formats the export's format row offers, and how many.
+ *
+ * A scene-referred export has exactly one - the family's float format,
+ * which is the only thing the direct path writes - and it is shown rather
+ * than hidden so that the row still says what the file will hold. Anything
+ * else is what the probe found the family's encoder opens with; a format
+ * it does not open with is never offered at all, and one it opens with
+ * that the preset's profile forbids is offered greyed. */
+static int view_menu_fmts(const struct view_state *st,
+                          const enum AVPixelFormat **out)
+{
+    const struct view_preset_sel *s = &st->look.video_preset;
+    const struct view_preset_family *f;
+
+    if (s->family < 0 || s->family >= view_nb_preset_families) {
+        *out = NULL;
+        return 0;
+    }
+
+    f = &view_preset_families[s->family];
+    if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene) {
+        *out = &f->scene_fmt;
+        return f->scene_fmt == AV_PIX_FMT_NONE ? 0 : 1;
+    }
+
+    return view_presets_fmts(s->family, out);
+}
+
 static bool view_menu_leaf(const struct view_state *st, int col)
 {
     const struct view_lut_menu *m = &st->menu;
     int first, n;
 
     switch (m->kind) {
+    case VIEW_MENU_PIXFMT:
+        return true;
     case VIEW_MENU_PRESET:
         return col == 1;
     case VIEW_MENU_COLOUR:
@@ -573,6 +603,12 @@ static int view_menu_count(const struct view_state *st, int col)
     const ViewLutFilm *f;
 #endif
     int n;
+
+    if (m->kind == VIEW_MENU_PIXFMT) {
+        const enum AVPixelFormat *fmts;
+
+        return col == 0 ? view_menu_fmts(st, &fmts) : 0;
+    }
 
     if (m->kind == VIEW_MENU_PRESET) {
         if (col == 0)
@@ -637,7 +673,7 @@ static int view_menu_lut(const struct view_state *st, int col, int i)
     if (!view_menu_leaf(st, col) || i < 0 || i >= view_menu_count(st, col))
         return -1;
 
-    if (m->kind == VIEW_MENU_PRESET)
+    if (m->kind == VIEW_MENU_PRESET || m->kind == VIEW_MENU_PIXFMT)
         return i;
 
     if (m->kind == VIEW_MENU_COLOUR) {
@@ -666,7 +702,12 @@ static const char *view_menu_why_not(const struct view_state *st, int col, int i
 {
     const struct view_lut_menu *m = &st->menu;
     const struct view_preset_sel *s = &st->look.video_preset;
+    const enum AVPixelFormat *fmts;
     int ix;
+
+    if (m->kind == VIEW_MENU_PIXFMT)
+        return i >= 0 && i < view_menu_fmts(st, &fmts)
+             ? view_presets_fmt_why_not(s->family, s->preset, fmts[i]) : NULL;
 
     if (m->kind == VIEW_MENU_PRESET)
         return col == 0 ? view_presets_family_why_not(i)
@@ -693,9 +734,16 @@ static void view_menu_label(const struct view_state *st, int col, int i,
     const ViewLutFilm *f;
     const ViewLut *l;
 #endif
+    const enum AVPixelFormat *fmts;
     int ix;
 
     buf[0] = '\0';
+
+    if (m->kind == VIEW_MENU_PIXFMT) {
+        if (i >= 0 && i < view_menu_fmts(st, &fmts))
+            view_presets_fmt_label(fmts[i], buf, n);
+        return;
+    }
 
     if (m->kind == VIEW_MENU_PRESET) {
         if (col == 0 && i < view_nb_preset_families)
@@ -778,12 +826,23 @@ static void view_menu_select(struct view_state *st, int col, int i)
 {
     struct view_lut_menu *m = &st->menu;
     struct view_preset_sel *s = &st->look.video_preset;
+    const enum AVPixelFormat *fmts;
     int ix = view_menu_lut(st, col, i);
 
     if (ix < 0 || view_menu_why_not(st, col, i))
         return;
 
     switch (m->kind) {
+    case VIEW_MENU_PIXFMT:
+        if (ix >= view_menu_fmts(st, &fmts))
+            break;
+        s->pix_fmt = fmts[ix];
+        /* Stamped with the family it was chosen under: the row falls back
+         * to the preset's own pin the moment the family moves, since the
+         * next family's encoder need not take this format at all. */
+        s->pix_fmt_family = s->family;
+        s->set = true;
+        break;
     case VIEW_MENU_PRESET:
         s->family = m->sel[0];
         s->preset = ix;
@@ -807,9 +866,16 @@ static int view_menu_current(const struct view_state *st, int col)
 {
     const struct view_lut_menu *m = &st->menu;
     const struct view_preset_sel *s = &st->look.video_preset;
+    const enum AVPixelFormat *fmts;
     int first, n;
 
     switch (m->kind) {
+    case VIEW_MENU_PIXFMT:
+        n = view_menu_fmts(st, &fmts);
+        for (int i = 0; i < n; i++)
+            if (fmts[i] == view_presets_sel_fmt(s))
+                return i;
+        return -1;
     case VIEW_MENU_PRESET:
         return col == 0 ? s->family : (m->sel[0] == s->family ? s->preset : -1);
     case VIEW_MENU_COLOUR:
@@ -1227,6 +1293,11 @@ void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind)
         m->sel[0] = view_menu_current(st, 0);
         m->sel[1] = m->sel[0] >= 0 ? view_menu_current(st, 1) : -1;
         m->kb = m->sel[1] >= 0 ? 1 : 0;
+        return;
+    }
+    if (kind == VIEW_MENU_PIXFMT) {
+        m->sel[0] = view_menu_current(st, 0);
+        m->kb = 0;
         return;
     }
 
@@ -1908,14 +1979,16 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         v->end_ui = v->start_ui + 59;
     }
 
-    /* One family per frame until every one that needs a device answer has
-     * given it, so that a GPU with no AV1 engine greys that row rather
-     * than failing at export time - and so that opening the section never
-     * stalls on four encoder opens at once. */
-    view_presets_probe_step(st->dec.hw_device, st->cfg.verbose);
-
+    /* One question of the device per frame, and never more than one
+     * encoder open: which families have an engine here, so that a GPU with
+     * no AV1 one greys that row rather than failing at export time, and
+     * which pixel formats each encoder opens with. The selected family is
+     * asked first, so the format row below fills in before the lists
+     * nobody is looking at, and opening the section never stalls. */
     if (sel->family < 0 || sel->family >= view_nb_preset_families)
         view_presets_default(sel);
+    view_presets_probe_step(st->dec.hw_device, sel->family, st->cfg.verbose);
+
     fam = &view_preset_families[sel->family];
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
@@ -1931,12 +2004,40 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
 
     scene = view_colours[CRAW_CLAMP(sel->colour, 0, VIEW_NB_COLOURS - 1)].scene;
 
+    /* The pixel format the picture is written in. The list is what the
+     * encoder was found to accept - nothing else is offered - and the entry
+     * in use is the preset's own pin until the row is touched, after which
+     * the choice outlives a preset change and dies with a family one. */
+    {
+        enum AVPixelFormat f = view_presets_sel_fmt(sel);
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        view_row(st, ctx);
+        /* The format is known from the table the moment the preset is,
+         * while the *list* has to be asked of the encoder one format at a
+         * time; so the row says what the file will be written as straight
+         * away and the menu under it fills in behind. A preset that pins
+         * nothing leaves the choice to the engine until the row is used. */
+        if (f != AV_PIX_FMT_NONE)
+            view_presets_fmt_label(f, label, sizeof(label));
+        else
+            snprintf(label, sizeof(label), "chosen by the engine");
+        view_menu_row(ctx, st, VIEW_MENU_PIXFMT, "pixel format", label);
+    }
+
     /* Why the selection cannot be used, said once and in full rather than
      * left for the encoder to discover. */
     why = view_presets_preset_why_not(sel->family, sel->preset);
     if (!why)
         why = view_presets_colour_why_not(sel->family, sel->preset,
                                           sel->colour);
+    /* A format the row still holds from a preset whose profile allowed it,
+     * under one whose profile does not: the menu greys such an entry, but a
+     * preset change can walk the selection into one all the same, and the
+     * profile is the thing that has to win. */
+    if (!why && !scene)
+        why = view_presets_fmt_why_not(sel->family, sel->preset,
+                                       view_presets_sel_fmt(sel));
     /* The size row and a scene-referred space cannot both have their way:
      * the direct path has nothing to resample with, and inventing a scaler
      * for linear light is a decision nobody asked this program to make. */

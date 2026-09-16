@@ -372,6 +372,8 @@ static void view_enc_colours(struct view_encode *e, enum AVPixelFormat fmt)
      * the same numbers as the still of it; a YCbCr one gets the space's own
      * matrix and the studio swing every muxer and player assumes of a
      * movie. */
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(fmt);
+
     if (view_enc_is_rgb(fmt)) {
         e->csp    = AVCOL_SPC_RGB;
         e->range  = AVCOL_RANGE_JPEG;
@@ -379,7 +381,13 @@ static void view_enc_colours(struct view_encode *e, enum AVPixelFormat fmt)
     } else {
         e->csp    = e->col->spc;
         e->range  = AVCOL_RANGE_MPEG;
-        e->chroma = AVCHROMA_LOC_LEFT;
+        /* Left siting is what H.264, HEVC, ProRes and every muxer's
+         * default mean by 4:2:0 and 4:2:2, and libplacebo subsamples where
+         * it is told to; a format with nothing to subsample has no siting
+         * to state, and stating one anyway would put a code point in the
+         * stream that means nothing. */
+        e->chroma = d && (d->log2_chroma_w || d->log2_chroma_h)
+                  ? AVCHROMA_LOC_LEFT : AVCHROMA_LOC_UNSPECIFIED;
     }
 }
 
@@ -1274,7 +1282,28 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     if (e->sel.colour < 0 || e->sel.colour >= VIEW_NB_COLOURS)
         e->sel.colour = VIEW_COLOUR_709;
     e->col = &view_colours[e->sel.colour];
-    e->pin = view_presets_pix_fmt(&e->sel);
+    /* The pixel format row's choice, or the preset's own pin where the row
+     * has not been touched. A format the profile forbids is refused here
+     * rather than handed to an encoder that would take it and write a file
+     * labelled as something it is not: the panel greys such an entry, but
+     * --pix-fmt and --preset can still be combined into one. */
+    e->pin = view_presets_sel_fmt(&e->sel);
+    if (!e->col->scene) {
+        const char *why = view_presets_fmt_why_not(e->sel.family,
+                                                   e->sel.preset, e->pin);
+
+        if (why) {
+            char what[128];
+
+            fprintf(stderr, "%s cannot be written as %s: %s\n",
+                    view_presets_label(&e->sel, what, sizeof(what)),
+                    av_get_pix_fmt_name(e->pin), why);
+            snprintf(v->status, sizeof(v->status), "%.*s",
+                     (int)sizeof(v->status) - 1, why);
+            view_encode_close(st);
+            return CRAW_ERROR(ENOTSUP);
+        }
+    }
 
     /* The scene-referred spaces never touch the renderer: the pipeline runs
      * a second time into the space asked for and those floats go straight
@@ -1485,9 +1514,14 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     } else if (e->pin != AV_PIX_FMT_NONE) {
         ret = view_enc_try(e, st, e->pin, v->enc);
         if (ret < 0) {
+            /* The panel only offers formats the probe opened the encoder
+             * with, but it opened it at 1920x1080: FFV1's slice grid has to
+             * divide the chroma planes, so 4:2:0 is refused at one height
+             * and taken at another. The encoder has just said which it is,
+             * above this line. */
             fprintf(stderr, "%s: cannot open the %s encoder with %s, which is "
-                            "what this preset asks for: %s\n", v->path,
-                    e->codec->name, av_get_pix_fmt_name(e->pin),
+                            "the pixel format this export asks for: %s\n",
+                    v->path, e->codec->name, av_get_pix_fmt_name(e->pin),
                     av_err2str(ret));
             ret = CRAW_ERROR(EINVAL);
             goto fail;

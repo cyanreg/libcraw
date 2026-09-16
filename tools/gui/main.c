@@ -20,6 +20,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
+#include <libavutil/hwcontext.h>
 #include <libavutil/time.h>
 
 #include "view.h"
@@ -1538,8 +1539,20 @@ static void view_usage(FILE *f)
 "                      simulation and no grain at all. Those three need\n"
 "                      float samples, which means FFv1 (Vulkan) with an L4\n"
 "                      preset, and are written at native resolution\n"
+"  --pix-fmt NAME      the pixel format the video is written in, by FFmpeg's\n"
+"                      own names: nv12, p010, yuv422p10, yuv444p12, gbrp16\n"
+"                      and so on. The default is the one the preset's\n"
+"                      profile implies, and only formats the encoder really\n"
+"                      accepts can be asked for - --list-presets prints them\n"
+"                      per family. A format the preset's profile forbids is\n"
+"                      refused with the reason rather than written under the\n"
+"                      wrong label: the ProRes profiles are 4:2:2 or 4:4:4,\n"
+"                      AV1 Main is 4:2:0 and High is 4:4:4\n"
 "  --list-presets      print every family, preset and colour space with the\n"
-"                      options each one means, and exit\n"
+"                      options each one means and the pixel formats each\n"
+"                      encoder accepts on this machine, and exit. Opening\n"
+"                      the Vulkan encoders once each to find that out takes\n"
+"                      a few seconds\n"
 "  --crop WxH+X+Y      export only that region of the source, in source\n"
 "                      pixels, with the edges snapped to even ones. The\n"
 "                      viewer shades everything outside it. A clip whose\n"
@@ -1602,6 +1615,7 @@ enum {
     VIEW_OPT_LENS_FIT,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
+    VIEW_OPT_PIX_FMT,
     VIEW_OPT_BYPASS,
 };
 
@@ -1648,6 +1662,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "lens-fit", required_argument, NULL, VIEW_OPT_LENS_FIT  },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
+        { "pix-fmt",  required_argument, NULL, VIEW_OPT_PIX_FMT   },
         { "bypass",   required_argument, NULL, VIEW_OPT_BYPASS    },
         { "help",     no_argument,       NULL, 'h'                },
         { NULL,       0,                 NULL, 0                  },
@@ -1908,12 +1923,28 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                                                  optarg)) < 0)
                 return ret;
             break;
-        case VIEW_OPT_LIST_PRESETS:
-            /* The probe needs a device, which does not exist this early,
-             * so the list says what this build has and the panel says what
-             * this GPU can do with it. */
+        case VIEW_OPT_PIX_FMT:
+            if ((ret = view_presets_parse_fmt(&st->look.video_preset,
+                                              optarg)) < 0)
+                return ret;
+            break;
+        case VIEW_OPT_LIST_PRESETS: {
+            AVBufferRef *dev = NULL;
+
+            /* Which formats an encoder takes is a property of this GPU and
+             * not of the build - a Vulkan encoder declares nothing but
+             * "vulkan" and has to be opened with each one in turn - so the
+             * list opens a device of its own rather than printing half an
+             * answer. That costs a few seconds and is why the probe is
+             * spread over frames in the panel instead. */
+            if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VULKAN, NULL,
+                                       NULL, 0) < 0)
+                dev = NULL;
+            view_presets_probe_all(dev, st->cfg.verbose);
             view_presets_list();
+            av_buffer_unref(&dev);
             return 1;
+        }
         case VIEW_OPT_CROP:
             if ((ret = view_parse_crop(&st->crop, optarg)) < 0)
                 return ret;

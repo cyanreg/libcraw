@@ -63,6 +63,13 @@ struct view_preset {
     /* Why this preset cannot be used in this build, or NULL. Static
      * strings; the menu greys the row and shows this. */
     const char *why_not;
+    /* Set when `fmt` above is a requirement of the standard rather than a
+     * default: the profile this preset selects *is* a chroma layout, so
+     * the pixel format row refuses every format laid out differently and
+     * shows this string as the reason. The depth stays free - a 4:2:2
+     * profile is as happy at twelve bits as at ten - and a preset that
+     * leaves this NULL takes anything its encoder accepts. */
+    const char *fmt_why;
 };
 
 struct view_preset_family {
@@ -197,6 +204,20 @@ struct view_preset_sel {
     int size;                   /* enum view_size_id */
     int size_w, size_h;         /* VIEW_SIZE_TYPED's own, in pixels */
 
+    /* The pixel format row. AV_PIX_FMT_NONE is an untouched row, which
+     * means the preset's own pinned format; anything else was chosen
+     * explicitly and outranks the pin. Held as an int because that is what
+     * AV_PIX_FMT_NONE being -1 makes a memset of this struct produce, and
+     * view_presets_default() has to spell it out for the same reason.
+     *
+     * `pix_fmt_family` is the family the choice was made under. A format
+     * means a different thing in another family - the encoders do not even
+     * accept the same ones - so the choice is void once the family moves,
+     * and the row falls back to the new preset's pin. Within a family it
+     * survives a preset change, like every other export setting. */
+    int pix_fmt;
+    int pix_fmt_family;
+
     bool set;                   /* false until something chose: use the defaults */
 };
 
@@ -259,11 +280,49 @@ int view_presets_parse_colour(struct view_preset_sel *s, const char *arg);
 /* Every family and preset, one per line, for --list-presets. */
 void view_presets_list(void);
 
-/* The encoder a selection names, and the pixel format its preset pins
- * (AV_PIX_FMT_NONE to let the engine choose). */
+/* The encoder a selection names, and the pixel format its preset pins,
+ * which is what the format row starts on (AV_PIX_FMT_NONE to let the
+ * engine choose). view_presets_sel_fmt() below is what an export uses:
+ * the same thing, with the row's own choice on top. */
 const char *view_presets_encoder(const struct view_preset_sel *s);
 enum AVPixelFormat view_presets_pix_fmt(const struct view_preset_sel *s);
 const char *view_presets_container(const struct view_preset_sel *s);
+
+/* ------------------------------------------------- the pixel format */
+
+/* The cap on one family's accepted-format list. This device answers 77
+ * software formats for a Vulkan frames context and prores_ks_vulkan opens
+ * with every one of them, so a family really can fill this; it is a bound
+ * on the probe's cache and not a statement about any codec. */
+#define VIEW_MAX_PIX_FMTS 96
+
+/* "4:2:0 8-bit (nv12)", "RGB 16-bit (gbrp16le)": the chroma layout, the
+ * depth and FFmpeg's own name, all three read off the AVPixFmtDescriptor
+ * rather than written down anywhere. Returns `buf`. */
+const char *view_presets_fmt_label(enum AVPixelFormat fmt, char *buf, size_t n);
+
+/* What the family's encoder was found to accept, and whether the walk that
+ * found it has finished. The list fills in as view_presets_probe_step()
+ * works through the candidates, so a caller may see a short one; it is
+ * never wrong, only incomplete. */
+int  view_presets_fmts(int family, const enum AVPixelFormat **out);
+bool view_presets_fmts_ready(int family);
+
+/* The format a selection writes: the row's explicit choice while it still
+ * belongs to this family, and the preset's own pin otherwise. */
+enum AVPixelFormat view_presets_sel_fmt(const struct view_preset_sel *s);
+
+/* Why this preset cannot be written in this format, or NULL. The encoder
+ * would take it - a format it does not take is never offered at all - but
+ * the profile the preset selects is a chroma layout in the standard, and
+ * writing one layout under another profile's label makes a file no decoder
+ * reads the way it was written. */
+const char *view_presets_fmt_why_not(int family, int preset,
+                                     enum AVPixelFormat fmt);
+
+/* `--pix-fmt NAME`, by FFmpeg's own names ("nv12", "yuv422p10le", and the
+ * unsuffixed "gbrp16" for the native-endian one). */
+int view_presets_parse_fmt(struct view_preset_sel *s, const char *arg);
 
 /* The whole option string a selection means: the family's always-options,
  * the preset's, and the sliders and the switch the family declares, in
@@ -285,10 +344,25 @@ const char *view_presets_preset_why_not(int family, int preset);
 /* And with a colour space in hand, since three of them need 16 bit RGB. */
 const char *view_presets_colour_why_not(int family, int preset, int colour);
 
-/* Opens at most one unprobed family's encoder, so that a device without an
- * AV1 engine greys that family rather than failing at export time. Cheap
- * to call every frame; returns true while there is still something left to
- * probe. `hw_device` is the viewer's AVHWDeviceContext, or NULL. */
-bool view_presets_probe_step(struct AVBufferRef *hw_device, bool verbose);
+/* Asks the device one question about one family, so that neither the menu
+ * nor the pixel format row has to guess: whether the family's encoder has
+ * an engine here at all, and which software formats it opens with.
+ *
+ * `want` is the family whose format list is wanted now - the selected one -
+ * and -1 for none; it is walked first and the rest are left alone, because
+ * an encoder open is not a cheap thing (136 ms for ffv1_vulkan on this
+ * machine, 470 for prores_ks_vulkan, 540 for apv_vulkan, all of it
+ * pipeline creation and none of it dependent on the size or the options).
+ * One call is at most one open and then stands back for twice as long as
+ * that open took, so a panel drawing this every frame keeps two frames in
+ * three for itself and a family's list fills in over a second or two while
+ * the section is being read. Returns true while there is work left.
+ *
+ * `hw_device` is the viewer's AVHWDeviceContext, or NULL. */
+bool view_presets_probe_step(struct AVBufferRef *hw_device, int want,
+                             bool verbose);
+
+/* The same walk, run to the end with no rate limit, for --list-presets. */
+void view_presets_probe_all(struct AVBufferRef *hw_device, bool verbose);
 
 #endif /* CINEVIEW_PRESETS_H */

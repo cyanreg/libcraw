@@ -235,6 +235,57 @@ typed WxH — applies to a display-referred export. `--size` sets the same
 thing from the command line and still takes a bare `WxH`. It exists because a
 software encoder at 5.8K wants three and a half gigabytes.
 
+### The pixel format
+
+The pixel format row under the colour one says what the picture is written
+as — `4:2:0 8-bit (nv12)`, `4:2:2 10-bit (yuv422p10le)`, `RGB 16-bit
+(gbrp16le)` — and `--pix-fmt NAME` says the same thing from the command
+line, by FFmpeg's own names. The row starts on the format the chosen preset
+implies and remembers an explicit choice until the family changes, since the
+next family's encoder need not take the same formats at all.
+
+The list is not written down anywhere. A software encoder is asked what it
+accepts through `avcodec_get_supported_config()`. A Vulkan encoder answers
+that question with `vulkan` and nothing else — it has no way in this FFmpeg
+to be asked which *software* formats a frames context may have — so cineview
+opens it once with a frames context of each candidate, shaped exactly the way
+the exporter shapes one, and keeps what opened. The candidates are what
+libavcodec says pictures of that codec can be, which is every software
+encoder for the same codec ID, narrowed to the formats the device can hold;
+where the codec has no software encoder at all, as APV has not, the device's
+own list is walked instead. That narrowing is not tidiness: `prores_ks_vulkan`
+validates nothing and opens with all 77 formats this device offers, bayer and
+gray included, writing every one of them as 4:4:4.
+
+The probe costs one encoder open per candidate — 136 ms for `ffv1_vulkan` on
+an RX 6900 XT, 470 for `prores_ks_vulkan`, 540 for `apv_vulkan`, all of it
+pipeline creation and none of it dependent on the size or the options — so
+the panel does at most one per frame, the selected family first, and stands
+back for twice as long as the last one took before the next. A family's list
+fills in over a second or two while the section is being read and is kept for
+the rest of the session. `--list-presets` opens a device of its own and prints
+the whole answer per family, which takes about ten seconds.
+
+A format the encoder does not accept is never offered. One it accepts that
+the preset's profile forbids is offered greyed, with the reason, because the
+profiles that *are* a chroma layout have to win: ProRes proxy, LT, standard
+and HQ are 4:2:2 and 4444 and 4444 XQ are 4:4:4, and `prores_ks` reads the
+layout off the frame rather than off the profile, so a 4:4:4 frame under
+`-profile hq` comes out subsampled 4:4:4 and labelled HQ. AV1 Main is 4:2:0
+and High is 4:4:4. x264 sets no profile of its own precisely so that this row
+means something: it picks High, High 10, High 4:2:2 or High 4:4:4 Predictive
+from the format it is given. APV takes its profile from the format too, so
+there is nothing there to refuse.
+
+The engine renders straight into whatever was chosen. On the Vulkan path it
+is the frames context's software format, so libplacebo converts to YCbCr and
+subsamples on the way into the encoder's own image; on the software path
+libswscale takes the read-back to it. Either way the stream is tagged as what
+it is: RGB full range, YCbCr studio range with the colour entry's matrix, and
+left chroma siting where there is chroma to site and none stated where there
+is not. A scene-referred export has one format and the row shows it: the
+family's float one, `gbrpf32`.
+
 ## Layout
 
     include/craw/   public headers

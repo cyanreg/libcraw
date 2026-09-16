@@ -164,14 +164,16 @@ struct view_name_map {
  * that this header stays free of nuklear, which only ui.c includes. */
 #define VIEW_MENU_COLS 4
 
-/* Three panel rows hang a cascade off this one struct: the film
- * simulation's, the video export's codec preset and the export's colour
- * space. Only one is ever open, so the geometry, the highlight and the
- * hover timers are shared and `kind` says what the columns mean. */
+/* Four panel rows hang a cascade off this one struct: the film
+ * simulation's, the video export's codec preset, the export's colour space
+ * and the export's pixel format. Only one is ever open, so the geometry,
+ * the highlight and the hover timers are shared and `kind` says what the
+ * columns mean. */
 enum view_menu_kind {
     VIEW_MENU_FILM = 0,
     VIEW_MENU_PRESET,
     VIEW_MENU_COLOUR,
+    VIEW_MENU_PIXFMT,
     VIEW_MENU_KINDS,
 };
 
