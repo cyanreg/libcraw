@@ -392,6 +392,9 @@ int view_lut_select_film(struct view_state *st, int index)
     st->look.lut_path[0] = '\0';
     st->look.film_sim = index;
     view_lut_apply_space(st->lut, st->look.lut_space);
+    /* Picking one is the Look section's parameter being touched. */
+    if (!st->sections.look_forced)
+        st->sections.look = true;
 
     view_log(st, "film simulation: %s (%s, %s) %dx%dx%d\n", l->name,
              view_lut_film(l->film)->name, l->label,
@@ -539,6 +542,8 @@ int view_lut_load(struct view_state *st)
     /* One LUT at a time: loading a file drops any film simulation. */
     st->look.film_sim = -1;
     view_lut_apply_space(st->lut, st->look.lut_space);
+    if (!st->sections.look_forced)
+        st->sections.look = true;
 
     view_log(st, "loaded the LUT %s (%dx%dx%d)\n", st->look.lut_path,
              st->lut->size[0], st->lut->size[1], st->lut->size[2]);
@@ -1375,11 +1380,11 @@ static int view_parse_bypass(struct view_sections *s, const char *arg)
 
     for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         if (!strcmp(tok, "exposure"))
-            s->exposure = false;
+            s->exposure = false, s->exposure_forced = true;
         else if (!strcmp(tok, "look"))
-            s->look = false;
+            s->look = false, s->look_forced = true;
         else if (!strcmp(tok, "adjustments") || !strcmp(tok, "adjust"))
-            s->adjust = false;
+            s->adjust = false, s->adjust_forced = true;
         else {
             fprintf(stderr, "--bypass: `%s` is not a section, expected "
                             "exposure, look or adjustments\n", tok);
@@ -1767,10 +1772,14 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         case VIEW_OPT_SOFTLIGHT:
             if ((ret = view_adjust_parse_softlight(&st->adjustments, optarg)) < 0)
                 return ret;
+            if (!st->sections.adjust_forced)
+                st->sections.adjust = true;
             break;
         case VIEW_OPT_VIBRANCE:
             if ((ret = view_adjust_parse_vibrance(&st->adjustments, optarg)) < 0)
                 return ret;
+            if (!st->sections.adjust_forced)
+                st->sections.adjust = true;
             break;
         case VIEW_OPT_BYPASS:
             if ((ret = view_parse_bypass(&st->sections, optarg)) < 0)
@@ -1786,6 +1795,8 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 fprintf(stderr, "--ei must be a positive exposure index\n");
                 return CRAW_ERROR(EINVAL);
             }
+            if (!st->sections.exposure_forced)
+                st->sections.exposure = true;
             break;
         case VIEW_OPT_EXPOSURE:
             st->look.exposure = strtof(optarg, &end);
@@ -1793,6 +1804,8 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 fprintf(stderr, "--exposure: `%s` is not a number\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
+            if (!st->sections.exposure_forced)
+                st->sections.exposure = true;
             break;
         case VIEW_OPT_DEBAYER:
             if ((ret = view_lookup(view_debayer_names, CRAW_DEBAYER_NB,
@@ -2963,6 +2976,11 @@ static int view_run_headless(struct view_state *st)
         fprintf(stderr, "--lut %s: %s\n", st->look.lut_path, st->lut_error);
         return ret;
     }
+    /* Everything the command line asked for has been applied; from here on
+     * a touched parameter is the user's, and switches its section on even
+     * where --bypass had pinned it off. */
+    st->sections.exposure_forced = st->sections.look_forced =
+        st->sections.adjust_forced = false;
 
     /* The first file and only the first: an export writes one clip to one
      * file, and a playlist is a thing the window has. */
@@ -3057,14 +3075,14 @@ int main(int argc, char **argv)
      * or the panel's row, keeps the corners instead. */
     st.lens.keep = false;
     st.lens.keep_sel = 0;
-    /* The three section switches that are nothing but a bypass: on, so that
-     * a viewer that is handed no options develops the clip exactly as it
-     * always did. The parameters behind them are already neutral, which is
-     * why they need no option of their own to turn on - only --bypass to
-     * turn off. */
-    st.sections.exposure = true;
-    st.sections.look = true;
-    st.sections.adjust = true;
+    /* The three section switches that are nothing but a bypass start off,
+     * as RawTherapee's tools do: their parameters are neutral, so off and
+     * on develop the clip the same way, and a lit switch then only ever
+     * means the section is doing something. Touching a parameter - from an
+     * option, the panel or the keyboard - switches the section on. */
+    st.sections.exposure = false;
+    st.sections.look = false;
+    st.sections.adjust = false;
     view_grain_defaults(&st.grain);
     view_adjust_defaults(&st.adjustments);
 

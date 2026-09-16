@@ -102,10 +102,15 @@ grain, Denoise and Lens off turn their stages off, and Crop is the same
 switch `c` is. White balance and Debayer have nothing to bypass and carry
 an empty slot so the titles stay in line. The headers are on the keyboard's
 focus ring too: Left and Right work the switch, Enter opens and closes the
-section. `--denoise 0`, `--lens off` and the absence of `--grain` start
-those three off, and `--bypass exposure,look,adjustments` starts the other
-three off, which is how a headless export is handed the state the panel is
-in.
+section. A lit switch always means the section is doing something:
+Exposure, Look and Adjustments start off and switch themselves on the
+moment one of their parameters is touched — a slider moved, a film
+simulation picked, `--exposure`, `--ei`, `--lut`, `--softlight` or
+`--vibrance` given — the way RawTherapee's tools do. `--denoise 0`, `--lens
+off` and the absence of `--grain` start those three off, and `--bypass
+exposure,look,adjustments` pins the other three off whatever the other
+options set, which is how a headless export is handed the state the panel
+is in.
 
 The "Denoise" section sets the strength and reports the noise model it
 found for the clip's own ISO — the stage stays off when the camera has

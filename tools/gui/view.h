@@ -780,6 +780,14 @@ struct view_sections {
     bool look;
     /* Off: no soft light and no vibrance, at whatever amounts they hold. */
     bool adjust;
+
+    /* The three start off and switch themselves on when one of their
+     * parameters is touched, the way RawTherapee's tools do, so that a lit
+     * switch always means the section is doing something. --bypass pins
+     * one off for the rest of the command line, whatever the other options
+     * set; these remember that so their order does not matter. The panel
+     * is not bound by it: touching a parameter later switches on. */
+    bool exposure_forced, look_forced, adjust_forced;
 };
 
 struct view_state {

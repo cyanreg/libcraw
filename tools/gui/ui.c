@@ -1705,16 +1705,26 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
         nk_label(ctx, "exposure index", NK_TEXT_LEFT);
         {
             int chosen = nk_combo(ctx, items, nb_items, pick, 20, nk_vec2(140, 260));
-            if (chosen != sel)
+            if (chosen != sel) {
                 lk->ei = view_iso_list[chosen];
+                st->sections.exposure = true;
+            }
         }
     }
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-    view_adjust_float(st, view_row(st, ctx), &lk->exposure,
-                      1.0f / 6.0f, -3.0f, 3.0f);
-    nk_property_float(ctx, "#bias (stops)", -3.0f, &lk->exposure, 3.0f, 0.1f, 0.01f);
-    nk_slider_float(ctx, -3.0f, &lk->exposure, 3.0f, 0.05f);
+    {
+        /* A touched control switches the section on, RawTherapee's way:
+         * the switch starts off and a lit one means the bias is in use. */
+        float before = lk->exposure;
+
+        view_adjust_float(st, view_row(st, ctx), &lk->exposure,
+                          1.0f / 6.0f, -3.0f, 3.0f);
+        nk_property_float(ctx, "#bias (stops)", -3.0f, &lk->exposure, 3.0f, 0.1f, 0.01f);
+        nk_slider_float(ctx, -3.0f, &lk->exposure, 3.0f, 0.05f);
+        if (lk->exposure != before)
+            st->sections.exposure = true;
+    }
     /* The gain the picture really has, which a bypassed section takes back
      * to the as-shot rating while the two controls above keep their
      * numbers. */
@@ -1908,6 +1918,10 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     nk_labelf(ctx, NK_TEXT_LEFT, "%s",
               view_adjust_summary(a, buf, sizeof(buf)));
 
+    /* A touched control switches the section on, RawTherapee's way: the
+     * switch starts off and a lit one means an adjustment is in use. */
+    const struct view_adjust before = *a;
+
     /* Soft light first, even though it runs last: it is the one control
      * most people came for, and the panel is not the pipeline. */
     view_adjust_float(st, view_row(st, ctx), &a->softlight, 5.0f, 0.0f, 100.0f);
@@ -1952,6 +1966,12 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     a->avoid_shift = a->avoid_shift_flag != 0;
     nk_label(ctx, a->avoid_shift ? "chroma kept in gamut" : "chroma clipped",
              NK_TEXT_LEFT);
+
+    if (a->softlight != before.softlight || a->pastels != before.pastels ||
+        a->saturated != before.saturated || a->threshold != before.threshold ||
+        a->protect_skin != before.protect_skin ||
+        a->avoid_shift != before.avoid_shift)
+        st->sections.adjust = true;
 
     view_grey_end(st, ctx, grey);
 }
