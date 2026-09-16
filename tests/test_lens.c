@@ -314,6 +314,279 @@ static void test_malformed(const uint8_t *frame, size_t size, size_t tbl,
     }
 }
 
+
+/* ---------------------------------------- the keep-everything scale (16.8) */
+
+/* Everything below re-derives the scale a second way and checks the
+ * library against it. The second way inverts r * poly(r) by Newton rather
+ * than by bisection, and reaches the answer through the identity
+ *
+ *     frame_radius(theta) / needed(theta) = poly_c(invert_c(R(theta)))
+ *
+ * which holds because the source rectangle and the output frame are the
+ * same rectangle: the boundary point at angle theta is exactly where the
+ * output frame is hit along that ray. So the ratio depends on the boundary
+ * only through its radius R, and for a polynomial that is monotone over
+ * the range - which every real record is - the smallest ratio is at the
+ * smallest or the largest R, i.e. at an edge midpoint or at a corner. The
+ * test computes both candidates, says which one binds, and only then
+ * compares against the library. */
+
+/* The inverse of r * poly(r) by Newton from r_src itself, which is within
+ * a few percent of the answer for anything lens-shaped. Not the library's
+ * bisection, on purpose. */
+static double test_keep_invert(const float k[4], double r_src)
+{
+    double r = r_src;
+
+    for (int i = 0; i < 100; i++) {
+        double r2 = r * r;
+        double p = (double)k[0] + r2 * ((double)k[1] + r2 * ((double)k[2] + r2 * (double)k[3]));
+        /* d/dr of r * poly(r) */
+        double d = p + r2 * (2.0 * (double)k[1] + r2 * (4.0 * (double)k[2] + r2 * 6.0 * (double)k[3]));
+
+        if (!(fabs(d) > 1e-12))
+            break;
+        r -= (r * p - r_src) / d;
+    }
+
+    return r;
+}
+
+/* The largest output radius the three channels need for a source point at
+ * radius `r_src`, and the ratio that point allows. */
+static double test_keep_ratio(const CRAWLensCorrection *lc, double r_src)
+{
+    double needed = 0.0;
+
+    for (int c = 0; c < 3; c++)
+        needed = fmax(needed, test_keep_invert(lc->k[c], r_src));
+
+    return r_src / needed;
+}
+
+/* The mapping the mode defines, in pixels: where the source point at
+ * (px, py) ends up once the picture has been scaled by `s`. */
+static void test_keep_map(const CRAWLensCorrection *lc, double w, double h,
+                          double s, double px, double py, double out[2])
+{
+    double cx = (double)lc->centre[0] * w;
+    double cy = (double)lc->centre[1] * h;
+    double hx = (double)(lc->centre[0] > 1.0f - lc->centre[0] ? lc->centre[0]
+                                                              : 1.0f - lc->centre[0]) * w;
+    double hy = (double)(lc->centre[1] > 1.0f - lc->centre[1] ? lc->centre[1]
+                                                              : 1.0f - lc->centre[1]) * h;
+    double half_diag = hypot(hx, hy);
+    double dx = px - cx, dy = py - cy;
+    double len = hypot(dx, dy);
+    double needed = 0.0;
+
+    for (int c = 0; c < 3; c++)
+        needed = fmax(needed, test_keep_invert(lc->k[c], len / half_diag));
+
+    out[0] = cx + dx / len * (s * needed * half_diag);
+    out[1] = cy + dy / len * (s * needed * half_diag);
+}
+
+/* One record, one frame size: which of the two candidates binds, whether
+ * the library agrees, and whether the answer actually keeps the source. */
+static void test_keep_scale(const char *what, const CRAWLensCorrection *lc,
+                            uint32_t width, uint32_t height, double want,
+                            const char *want_where)
+{
+    double w = width, h = height;
+    double hx = (double)(lc->centre[0] > 1.0f - lc->centre[0] ? lc->centre[0]
+                                                              : 1.0f - lc->centre[0]) * w;
+    double hy = (double)(lc->centre[1] > 1.0f - lc->centre[1] ? lc->centre[1]
+                                                              : 1.0f - lc->centre[1]) * h;
+    double half_diag = hypot(hx, hy);
+    /* The three places a monotone ratio can bind: the corner, and the
+     * midpoint of each pair of edges. */
+    double r_corner = 1.0;
+    double r_short = (w < h ? w : h) * 0.5 / half_diag;
+    double r_long  = (w < h ? h : w) * 0.5 / half_diag;
+    double cand[3] = { test_keep_ratio(lc, r_corner), test_keep_ratio(lc, r_short),
+                       test_keep_ratio(lc, r_long) };
+    const char *name[3] = { "corner", "short edge midpoint", "long edge midpoint" };
+    int bind = 0;
+    double expect, got = 0.0f, worst_in = 0.0;
+    float s;
+    int ret;
+
+    for (int i = 1; i < 3; i++)
+        if (cand[i] < cand[bind])
+            bind = i;
+    expect = cand[bind] < 1.0 ? cand[bind] : 1.0;
+
+    /* The claim that only those three matter is the claim that the ratio is
+     * monotone in R, so it is checked rather than assumed. */
+    for (int i = 0; i <= 64; i++) {
+        double r = r_short + (1.0 - r_short) * (double)i / 64.0;
+        double v = test_keep_ratio(lc, r);
+
+        TEST_CHECK(v >= cand[bind] - 1e-9,
+                   "%s: the ratio at R %.4f is %.9f, below the %s's %.9f: the "
+                   "polynomial turns over and the two candidates are not the whole "
+                   "story", what, r, v, name[bind], cand[bind]);
+    }
+
+    ret = craw_lens_keep_all_scale(lc, width, height, &s);
+    TEST_CHECK(ret == 0, "%s: craw_lens_keep_all_scale returned %d", what, ret);
+    if (ret < 0)
+        return;
+    got = (double)s;
+
+    printf("%s %ux%u: scale %.6f, binds at the %s (corner %.6f, short %.6f, "
+           "long %.6f)\n", what, width, height, got, name[bind],
+           cand[0], cand[1], cand[2]);
+
+    TEST_CHECK(fabs(got - expect) <= 1e-6 * expect,
+               "%s: the scale is %.9f, the %s says %.9f", what, got, name[bind], expect);
+    if (want > 0.0)
+        TEST_CHECK(fabs(got - want) <= 1e-6 * want,
+                   "%s: the scale is %.9f, the closed form says %.9f", what, got, want);
+    if (want_where)
+        TEST_CHECK(!strcmp(name[bind], want_where),
+                   "%s: the binding point is the %s, expected the %s", what,
+                   name[bind], want_where);
+
+    /* The contract itself: every source pixel has to land inside the output
+     * frame. Sampled at points of the boundary the library does not use -
+     * 331 a side, offset by half a step - so that agreeing with it takes
+     * more than reproducing its sample positions. */
+    for (int side = 0; side < 4; side++) {
+        for (int i = 0; i < 331; i++) {
+            double t = ((double)i + 0.5) / 331.0;
+            double px, py, out[2], over;
+
+            switch (side) {
+            case 0:  px = t * w;         py = 0.0;           break;
+            case 1:  px = w;             py = t * h;         break;
+            case 2:  px = (1.0 - t) * w; py = h;             break;
+            default: px = 0.0;           py = (1.0 - t) * h; break;
+            }
+
+            test_keep_map(lc, w, h, got, px, py, out);
+            over = fmax(fmax(-out[0], out[0] - w), fmax(-out[1], out[1] - h));
+            worst_in = fmax(worst_in, over);
+            TEST_CHECK(over <= 1e-6 * w,
+                       "%s: the source point (%.1f, %.1f) lands at (%.3f, %.3f), "
+                       "%.4f px outside a %.0fx%.0f frame", what, px, py,
+                       out[0], out[1], over, w, h);
+        }
+    }
+
+    /* And that it is the *largest* such scale: a thousandth more has to put
+     * something outside. Only meaningful when the cap at 1 is not what
+     * decided the answer. */
+    if (expect < 1.0) {
+        double s_over = got * 1.001;
+        bool escaped = false;
+
+        for (int side = 0; side < 4 && !escaped; side++) {
+            for (int i = 0; i <= 512; i++) {
+                double t = (double)i / 512.0;
+                double px, py, out[2];
+
+                switch (side) {
+                case 0:  px = t * w;         py = 0.0;           break;
+                case 1:  px = w;             py = t * h;         break;
+                case 2:  px = (1.0 - t) * w; py = h;             break;
+                default: px = 0.0;           py = (1.0 - t) * h; break;
+                }
+
+                test_keep_map(lc, w, h, s_over, px, py, out);
+                if (out[0] < -1e-9 || out[0] > w + 1e-9 ||
+                    out[1] < -1e-9 || out[1] > h + 1e-9) {
+                    escaped = true;
+                    break;
+                }
+            }
+        }
+
+        TEST_CHECK(escaped, "%s: a scale 0.1%% larger still fits, so %.9f is not "
+                   "the largest one", what, got);
+    }
+
+    printf("   worst source point lands %.4f px inside the frame edge\n", -worst_in);
+}
+
+/* r + k1 r^3 = 1 by Newton: the corner's output radius for a pure
+ * quadratic barrel, whose reciprocal is the scale when the corner binds. */
+static double test_keep_cubic_root(double k1)
+{
+    double r = 1.1;
+
+    for (int i = 0; i < 200; i++)
+        r -= (r + k1 * r * r * r - 1.0) / (1.0 + 3.0 * k1 * r * r);
+
+    return r;
+}
+
+static void test_keep_all(const CRAWLensCorrection *real)
+{
+    /* A barrel correction ten times anything real, and a different
+     * coefficient per channel so that the widest one decides. Purely
+     * quadratic, so the corner's output radius is the root of a cubic and
+     * the expected scale is a closed form. */
+    static const CRAWLensCorrection barrel = {
+        .k = { { 1.0f, -0.090f, 0.0f, 0.0f },
+               { 1.0f, -0.100f, 0.0f, 0.0f },
+               { 1.0f, -0.110f, 0.0f, 0.0f } },
+        .centre = { 0.5f, 0.5f },
+        .valid  = true,
+    };
+    /* No distortion at all, only the crop: every boundary point binds
+     * equally and the scale is exactly k0. */
+    static const CRAWLensCorrection pure_crop = {
+        .k = { { 0.8f, 0.0f, 0.0f, 0.0f },
+               { 0.8f, 0.0f, 0.0f, 0.0f },
+               { 0.8f, 0.0f, 0.0f, 0.0f } },
+        .centre = { 0.5f, 0.5f },
+        .valid  = true,
+    };
+    /* Samples outward everywhere: the source already fits, and the mode
+     * must not magnify it to fill the frame. */
+    static const CRAWLensCorrection outward = {
+        .k = { { 1.05f, 0.0f, 0.0f, 0.0f },
+               { 1.05f, 0.0f, 0.0f, 0.0f },
+               { 1.05f, 0.0f, 0.0f, 0.0f } },
+        .centre = { 0.5f, 0.5f },
+        .valid  = true,
+    };
+    CRAWLensCorrection invalid = { 0 };
+    float s;
+
+    /* The camera's own record, on the frame it was written for. A
+     * pincushion correction pushes the corners out, so what is missing is
+     * along the short edges and that is where it binds. */
+    test_keep_scale("the real 60 mm record", real, FRAME_W, FRAME_H, 0.0,
+                    "short edge midpoint");
+
+    /* A barrel correction pulls the corners in, so the corner is the
+     * hungriest point and the closed form is 1 / r_c with
+     * r_c + k1 r_c^3 = 1 for the channel with the widest k1. */
+    test_keep_scale("a 10x barrel", &barrel, FRAME_W, FRAME_H,
+                    1.0 / test_keep_cubic_root(-0.110), "corner");
+    test_keep_scale("a 10x barrel", &barrel, 512, 320,
+                    1.0 / test_keep_cubic_root(-0.110), "corner");
+
+    test_keep_scale("a pure crop", &pure_crop, FRAME_W, FRAME_H, 0.8, NULL);
+
+    TEST_CHECK(craw_lens_keep_all_scale(&outward, FRAME_W, FRAME_H, &s) == 0 &&
+               s == 1.0f, "a correction that samples outward everywhere gave a "
+               "scale of %.6f, expected exactly 1", (double)s);
+
+    TEST_CHECK(craw_lens_keep_all_scale(NULL, FRAME_W, FRAME_H, &s) == CRAW_ERROR(EINVAL),
+               "a NULL correction was accepted");
+    TEST_CHECK(craw_lens_keep_all_scale(real, FRAME_W, FRAME_H, NULL) == CRAW_ERROR(EINVAL),
+               "a NULL output was accepted");
+    TEST_CHECK(craw_lens_keep_all_scale(&invalid, FRAME_W, FRAME_H, &s) == CRAW_ERROR(EINVAL),
+               "an invalid correction was accepted");
+    TEST_CHECK(craw_lens_keep_all_scale(real, 0, FRAME_H, &s) == CRAW_ERROR(EINVAL),
+               "a zero width was accepted");
+}
+
 #if CRAW_TEST_HAVE_LAVF
 /* The same parser on a packet straight out of libavformat, when a clip is
  * pointed at. Nothing is decoded. */
@@ -394,6 +667,8 @@ int main(void)
         return 1;
     }
     test_record(&lc);
+
+    test_keep_all(&lc);
 
     test_malformed(frame, size, tbl, trailer_off);
 

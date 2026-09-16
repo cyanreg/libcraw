@@ -201,6 +201,14 @@ bool view_lens_active(const struct view_state *st)
     return st->dec.raw && st->lens.on && st->lens.record.valid;
 }
 
+/* The same question plus the panel's fill / keep all row. Keeping
+ * everything is a property of the warp, so it cannot be on while the warp
+ * is off, and the row says so by reading "fill" whenever it cannot act. */
+bool view_lens_keep_all(const struct view_state *st)
+{
+    return view_lens_active(st) && st->lens.keep;
+}
+
 void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
 {
     craw_frame_params_init(fp);
@@ -216,6 +224,8 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
      * owns. An invalid one is the documented "leave this frame alone". */
     if (view_lens_active(st))
         fp->lens = st->lens.record;
+    if (view_lens_keep_all(st))
+        fp->flags |= CRAW_FRAME_FLAG_LENS_KEEP_ALL;
 
     if (st->look.wb == VIEW_WB_MANUAL && st->prof.nb_wb_knots) {
         fp->wb_mode = CRAW_WB_REBALANCE;
@@ -239,6 +249,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .debayer    = st->look.debayer,
         .denoise    = view_denoise_strength(st),
         .lens       = view_lens_active(st),
+        .lens_keep  = view_lens_keep_all(st),
     };
 }
 
@@ -253,7 +264,8 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->illum.cct == b->illum.cct && a->illum.tint == b->illum.tint &&
            a->ei == b->ei && a->exposure == b->exposure &&
            a->ambience == b->ambience && a->debayer == b->debayer &&
-           a->denoise == b->denoise && a->lens == b->lens;
+           a->denoise == b->denoise && a->lens == b->lens &&
+           a->lens_keep == b->lens_keep;
 }
 
 const char *view_clip_dir(const struct view_state *st)
@@ -1041,6 +1053,7 @@ int view_replay_frame(struct view_state *st)
 int view_step_frame(struct view_state *st)
 {
     AVStream *vs = st->dec.fmt->streams[st->dec.stream_index];
+    CRAWLensCorrection prev_lens;
     int64_t start, pts, t0;
     int ret;
 
@@ -1107,10 +1120,24 @@ int view_step_frame(struct view_state *st)
     /* The lens record belongs to this picture and is taken exactly once,
      * here: view_process_frame() runs again whenever a paused frame is
      * replayed, and the ring hands each record out only the first time. */
+    prev_lens = st->lens.record;
     view_decoder_lens(&st->dec, st->frame->pts, &st->lens.record);
-    if (st->lens.record.valid)
+    if (st->lens.record.valid) {
         craw_lens_corner_shift(&st->lens.record, (uint32_t)st->frame->width,
                                (uint32_t)st->frame->height, true, st->lens.corner);
+
+        /* The keep-everything scale is a boundary walk of about a
+         * millisecond, so it is worked out here rather than by the panel
+         * sixty times a second, and only when the record has actually
+         * changed - which on a clip that is not zooming is once. It is a
+         * readout only: craw_pipeline_record() works out its own. The
+         * record is the whole key because a clip does not change frame size
+         * while it plays. */
+        if (memcmp(&prev_lens, &st->lens.record, sizeof(prev_lens)) &&
+            craw_lens_keep_all_scale(&st->lens.record, (uint32_t)st->frame->width,
+                                     (uint32_t)st->frame->height, &st->lens.scale) < 0)
+            st->lens.scale = 0.0f;
+    }
 
     start = vs->start_time != AV_NOPTS_VALUE ? vs->start_time : 0;
     pts = st->frame->pts != AV_NOPTS_VALUE ? st->frame->pts : 0;
@@ -1297,6 +1324,11 @@ static void view_usage(FILE *f)
 "                      default for a clip whose frames carry a record, and a\n"
 "                      no-op for one that does not; the Lens section says\n"
 "                      which it is and what the record does at the corner\n"
+"  --lens-fit MODE     fill (the default) fills the frame and loses the\n"
+"                      source's outer corners, which is the trade the camera\n"
+"                      itself makes; keep shrinks the corrected picture until\n"
+"                      every source pixel fits and paints the rest black. The\n"
+"                      Lens section cycles the same row and prints the scale\n"
 "  --tone-map NAME     bt.2390, spline, reinhard or clip (default: bt.2390)\n"
 "  --gamut-map NAME    perceptual, softclip, relative, clip or desaturate\n"
 "  --lut NAME          a .cube LUT applied by the renderer: a file, or the\n"
@@ -1391,6 +1423,7 @@ enum {
     VIEW_OPT_GRAIN,
     VIEW_OPT_DENOISE,
     VIEW_OPT_LENS,
+    VIEW_OPT_LENS_FIT,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
 };
@@ -1427,6 +1460,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "grain",    required_argument, NULL, VIEW_OPT_GRAIN     },
         { "denoise",  required_argument, NULL, VIEW_OPT_DENOISE   },
         { "lens",     required_argument, NULL, VIEW_OPT_LENS      },
+        { "lens-fit", required_argument, NULL, VIEW_OPT_LENS_FIT  },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
         { "help",     no_argument,       NULL, 'h'                },
@@ -1501,6 +1535,19 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return CRAW_ERROR(EINVAL);
             }
             st->lens.on_flag = st->lens.on ? 1 : 0;
+            break;
+
+        case VIEW_OPT_LENS_FIT:
+            if (!strcmp(optarg, "fill")) {
+                st->lens.keep = false;
+            } else if (!strcmp(optarg, "keep")) {
+                st->lens.keep = true;
+            } else {
+                fprintf(stderr, "--lens-fit: expected fill or keep, got `%s`\n",
+                        optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            st->lens.keep_sel = st->lens.keep ? 1 : 0;
             break;
 
         case VIEW_OPT_DENOISE: {
@@ -2384,6 +2431,11 @@ int main(int argc, char **argv)
      * way. --lens off turns it off. */
     st.lens.on = true;
     st.lens.on_flag = 1;
+    /* And filling the frame by default, because that is the framing the
+     * camera chose and the one every other decoder shows. --lens-fit keep,
+     * or the panel's row, keeps the corners instead. */
+    st.lens.keep = false;
+    st.lens.keep_sel = 0;
     view_grain_defaults(&st.grain);
     view_adjust_defaults(&st.adjustments);
 

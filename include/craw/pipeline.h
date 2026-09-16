@@ -95,6 +95,16 @@ typedef struct CRAWPipelineParams {
  * handled by the consumer's gamut mapping. */
 #define CRAW_FRAME_FLAG_CLAMP_NEGATIVE (1 << 0)
 
+/* Lens correction: keep every source pixel instead of filling the frame.
+ * The corrected picture is scaled down uniformly, by one factor for all
+ * three channels, until the whole warped source fits inside the output,
+ * and everything outside it comes out black with alpha still 1.0. Unset,
+ * the warp fills the frame and the source's outer corners are lost, which
+ * is the trade the camera's own k0 makes. Ignored unless the pipeline was
+ * created with CRAW_PIPELINE_FLAG_LENS and the frame carries a valid
+ * correction. See DESIGN.md 16.8 and craw_lens_keep_all_scale(). */
+#define CRAW_FRAME_FLAG_LENS_KEEP_ALL (1 << 1)
+
 /* Per-frame settings. */
 typedef struct CRAWFrameParams {
     const CRAWProfile *profile;

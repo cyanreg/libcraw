@@ -100,12 +100,16 @@ typedef struct CRAWLensPush {
     float   centre[2];      /* optical centre in pixels, pixel centre origin */
     float   inv_half_diag;  /* 1 / the corner distance from `centre` */
     float   k[3][4];        /* k0..k3 per channel, R G B */
+    float   inv_scale;      /* 1 / s of DESIGN.md 16.8, exactly 1.0 to fill */
+    int32_t keep_all;       /* 1: black outside the mapped source */
 } CRAWLensPush;
 
-static_assert(sizeof(CRAWLensPush) == 68, "CRAWLensPush layout");
+static_assert(sizeof(CRAWLensPush) == 76, "CRAWLensPush layout");
 static_assert(offsetof(CRAWLensPush, centre) == 8, "CRAWLensPush layout");
 static_assert(offsetof(CRAWLensPush, inv_half_diag) == 16, "CRAWLensPush layout");
 static_assert(offsetof(CRAWLensPush, k) == 20, "CRAWLensPush layout");
+static_assert(offsetof(CRAWLensPush, inv_scale) == 68, "CRAWLensPush layout");
+static_assert(offsetof(CRAWLensPush, keep_all) == 72, "CRAWLensPush layout");
 
 /* Mirrors CRAWAwbPushBuf in lib/shaders/awb_hist.comp.glsl. */
 typedef struct CRAWAwbPush {
@@ -190,6 +194,16 @@ struct CRAWPipeline {
     uint64_t     nb_recorded;
 
     int32_t blocks[2];   /* whole AWB blocks */
+
+    /* The last keep-everything scale and the record it was worked out for.
+     * craw_lens_keep_all_scale() is a boundary walk of a few hundred
+     * microseconds, and a clip that is not zooming hands over byte for byte
+     * the same record on every frame; the compare is 64 bytes. A miss only
+     * costs the walk, so a caller whose reserved bytes are not zeroed loses
+     * nothing but the cache. */
+    CRAWLensCorrection keep_lc;
+    float keep_scale;
+    bool have_keep_scale;
 };
 
 static const CRAWVkBinding craw_bind_images[4] = {
@@ -660,9 +674,10 @@ static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
  * against the pipeline's own frame size: the pipeline develops the whole
  * coded frame, which is the frame the camera normalized against. */
 static int craw_pipeline_lens_push(CRAWPipeline *p, const CRAWLensCorrection *lc,
-                                   CRAWLensPush *lp)
+                                   bool keep_all, CRAWLensPush *lp)
 {
-    float hx, hy, half_diag;
+    float hx, hy, half_diag, scale;
+    int ret;
 
     if (lc->centre[0] < 0.0f || lc->centre[0] > 1.0f ||
         lc->centre[1] < 0.0f || lc->centre[1] > 1.0f) {
@@ -675,7 +690,33 @@ static int craw_pipeline_lens_push(CRAWPipeline *p, const CRAWLensCorrection *lc
         .size   = { (int32_t)p->params.width, (int32_t)p->params.height },
         .centre = { lc->centre[0] * (float)p->params.width,
                     lc->centre[1] * (float)p->params.height },
+        /* Filling the frame is a scale of exactly one, and the shader's
+         * multiply by it is exact, so the frame it produces is bit for bit
+         * the one it produced before the mode existed. */
+        .inv_scale = 1.0f,
     };
+
+    /* DESIGN.md 16.8: the scale is a property of the record and the frame
+     * size, so it is worked out here, once per recording, rather than by
+     * seventeen million invocations that would each get the same answer.
+     * It changes frame by frame on a clip that is zooming. */
+    if (keep_all) {
+        if (p->have_keep_scale && !memcmp(&p->keep_lc, lc, sizeof(*lc))) {
+            scale = p->keep_scale;
+        } else {
+            ret = craw_lens_keep_all_scale(lc, p->params.width, p->params.height, &scale);
+            if (ret < 0) {
+                craw_log(p->ctx, CRAW_LOG_ERROR, "Lens polynomial cannot be inverted; "
+                         "the keep-everything scale is undefined\n");
+                return ret;
+            }
+            p->keep_lc = *lc;
+            p->keep_scale = scale;
+            p->have_keep_scale = true;
+        }
+        lp->inv_scale = 1.0f / scale;
+        lp->keep_all = 1;
+    }
 
     /* r = 1 is the frame corner as seen from the stated centre, i.e. the
      * farther of the two sides on each axis. */
@@ -780,7 +821,8 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
      * bit for bit the uncorrected one. */
     lens = p->has_lens && fp->lens.valid;
     if (lens) {
-        ret = craw_pipeline_lens_push(p, &fp->lens, &lp);
+        ret = craw_pipeline_lens_push(p, &fp->lens,
+                                      !!(fp->flags & CRAW_FRAME_FLAG_LENS_KEEP_ALL), &lp);
         if (ret < 0)
             return ret;
     }

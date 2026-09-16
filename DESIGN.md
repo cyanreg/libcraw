@@ -2122,3 +2122,157 @@ polynomial per channel, and whether the camera's numbers are the right ones
 for a real lens remains open — as does the channel ordering, which
 `tools/prr_lens.md` section 8 already lists as inferred rather than
 established.
+
+### 16.8 Keeping everything, with black borders
+
+The stage as described so far fills the output frame: every output pixel
+gets a source, and at the wide end, where the correction is a barrel
+correction pulling the periphery outward, the source's own corners are
+pulled past the frame and lost — 233 px past the corner on the 24 mm
+frame of P1000352.MOV, which is what `k0` sitting at 0.999 there means.
+The camera chooses that trade. `CRAW_FRAME_FLAG_LENS_KEEP_ALL` makes the
+other choice: shrink the corrected picture until the whole of the source
+fits inside the frame, and paint everything outside it black.
+
+**The mapping.** One global scale `s <= 1` per frame, the same for all
+three channels so that the chromatic correction stays consistent. For an
+output pixel at normalized position `p` (centred, half-diagonal units),
+
+    r' = |p| / s
+    source_c = centre + p * poly_c(r') / s
+
+which is the fill mapping of 16.2 evaluated at `p / s`. It extrapolates the
+polynomial a little past r = 1 — to r = 1.07 at the corner of the 24 mm
+frame — which is fine: it is a smooth even polynomial and the coefficients
+are small.
+
+**The scale.** `s` is the largest value for which every source pixel has an
+output position inside the frame. The source rectangle's boundary is
+walked, 512 segments a side and each side carrying its starting corner, so
+2048 points; an even number of segments puts a sample exactly on every
+corner and every edge midpoint. For each boundary point at radius `R` (half
+diagonals from the centre):
+
+    needed = max over channels of invert_c(R),    invert_c = inverse of r * poly_c(r)
+    s      = min over the boundary of frame_radius(theta) / needed,  capped at 1
+
+`invert_c` is found by bisection over [0, 2], forty halvings, in double.
+`frame_radius(theta)` is where the ray leaves the frame rectangle, which
+for the camera's centred record is `min(half_w / |cos|, half_h / |sin|)`
+in pixels over the half diagonal; `craw_lens_keep_all_scale()` writes it as
+a per-side ray-rectangle intersection so that an off-centre record measures
+against the edge it is actually heading for.
+
+Because the source rectangle and the output frame *are* the same rectangle,
+`frame_radius(theta) = R` at every boundary point, and the ratio reduces to
+`poly_c(invert_c(R))`: it depends on the boundary only through `R`. For a
+polynomial that is monotone over the range — every record seen — the
+smallest ratio is therefore at the smallest or the largest `R`, i.e. at an
+edge midpoint or at a corner, and the sampling in between is insurance
+against a polynomial that turns over. Which one binds says what the record
+is doing:
+
+- **barrel** (24 mm, poly falling with r): the corner binds.
+  `s = 1 / invert(1)`. Measured on P1000352.MOV at 0.96 s: **0.9332**.
+- **pincushion** (60 mm, poly rising with r): the short edge midpoint
+  binds. Measured on P1000387.MOV: **0.9772**.
+- **a pure crop** (poly constant at k0): every boundary point binds equally
+  and `s = k0` exactly.
+- **a correction that samples outward everywhere**: the source already fits
+  and the cap holds `s` at 1; the corners then come out black rather than
+  being magnified to fill, because "keep everything" is not "fill with
+  something".
+
+The cap at 1 is what makes fill mode the default and this mode a shrink.
+
+**The border.** An output pixel is black when the source position of *any*
+channel falls outside the source rectangle — one boundary for all three, so
+the border is one shape and not three, which is what would show as a
+coloured fringe along it. The cost is a sliver: the scale is set by the
+channel needing the *largest* output radius and the border by the channel
+whose source leaves *first*, and between them lies the lateral chromatic
+aberration, 2.4 px at the corner of the 24 mm frame. That sliver is black
+although one channel still had data there, which is the right way round.
+Inside the border nothing changes: the same sixteen-tap Catmull-Rom with
+the same mirrored edge rule.
+
+Alpha stays exactly 1.0. It is read from the output pixel's own position,
+as it is everywhere else in this stage (16.4), and the colour stage wrote
+1.0 there: the border is black, not transparent, and the library has no
+transparent output to offer.
+
+**Where the scale is computed.** On the host, in
+`craw_lens_keep_all_scale()` in `lib/lens.c`, and it reaches the shader as
+`1 / s` in the push constants. It is a property of the record and the frame
+size, so it changes frame by frame on a clip that is zooming and not at all
+on one that is not; the pipeline keeps the last record and its scale and
+recomputes only when the record's 64 bytes change. The walk costs **0.87 ms**
+on this machine for a fresh record — 2048 points times three channels times
+forty halvings — which is why the three bisections run in one loop with
+their brackets moved by conditional assignment rather than by a branch:
+written the obvious way it was 2.07 ms. Both tools call the same function
+to show the number, `cineraw --lens keep -v` once per move of the lens and
+cineview's Lens section in its readout.
+
+**Filling the frame is bit for bit what it was.** The two modes are written
+out as separate branches of the shader, and the filling one is the code
+that was there before the mode existed, down to the expression. Sharing one
+code path — computing the source position into an array and tapping from it
+— left 1557 samples of a 5760x3040 frame one unit in the last place of the
+fp16 output away from the old ones, because the driver's compiler contracts
+`centre + d * poly - 0.5` into a multiply-add differently depending on what
+else reads it. The push constant `inv_scale` is exactly 1.0 when filling
+and a multiply by one is exact, so the two paths start from the same `d`.
+Verified: `cineraw --lens on` on P1000352.MOV at 0.96 s, full frame,
+linear float out, md5 `e7f1d3b6741c8add850992655e3e4348` from the build
+before this change and from the build after it.
+
+**Tests.** `test_lens` checks the scale itself against a second derivation:
+the ratio identity above, with the inverse found by Newton rather than
+bisection, evaluated at the corner and at both edge midpoints; it names
+which one binds, checks that the ratio really is monotone between them, and
+compares. On the real 60 mm record it is the short edge midpoint at
+0.977178; on a ten-times barrel it is the corner at 0.846483, which is
+`1 / r_c` with `r_c + k1 r_c^3 = 1` solved in closed form; on a pure crop it
+is k0 exactly. Then the contract itself, on boundary points the library
+does not sample (331 a side, offset half a step): every source point lands
+inside the frame, and a scale a thousandth larger puts one outside, so the
+answer is the largest one.
+
+`test_pipeline` runs the mode on the 512x320 synthetic frame with the
+exaggerated record of 16.5, whose corner binds at s = 0.846483. A mark at
+0.95 of the half diagonal — which fill mode would have to show at output
+radius 1.074, past the frame corner, and therefore does not have at all —
+comes back at 0.21 px from where the scaled inverse puts it, well inside
+the frame: 23 px from the right edge and 15 from the bottom. The two measurable marks land within 0.057 px of their
+predictions, the same tolerance the fill-mode geometry check uses. 27496
+pixels, 16.8% of that frame, are outside the mapped source and every one of
+them is exactly black with alpha exactly 1; every pixel inside still
+carries the flat field it was given; 36 pixels sit within a hundredth of a
+pixel of the boundary and are only counted. The GPU is within 1.4e-3 of
+`craw_ref_lens()`, against the stage's 8e-3, and the border is in the same
+place in both, pixel for pixel. Filling the frame through the same pipeline
+before and after the mode has run is compared with `memcmp`.
+
+**On real frames.** P1000352.MOV at 0.96 s, 24 mm, s = 0.9332, exported by
+`cineraw --lens keep`: the black mask of three 1000x1000 crops — the
+top-left corner, the middle of the left edge and the middle of the top edge
+— matches the mask computed from the record and the scale in double
+**pixel for pixel**, 0 disagreements in 3 million pixels. 17 px of black on
+the row through the left edge midpoint against 16.67 predicted, 66 px on
+the column through the top edge midpoint against 66.46, and at the corner
+only the 1.5 px chromatic sliver, because that is where this record binds.
+On P1000387.MOV, 60 mm, s = 0.9772, the binding point moves to the short
+edge midpoint and the corner carries 69 px of black against 68.79
+predicted; there 27 pixels of 640000 disagree, all within 0.026 px of the
+boundary, which is fp32 against double. A cloud edge 80 px from the left
+edge of the 24 mm frame, which fill mode puts 99 px off the frame and which
+is not in its export at all, is found in the keep export 0.64 px from its
+predicted place with a correlation of 0.995.
+
+**Cost.** Nothing measurable on the GPU. `cineraw --bench`, 12 frames of
+P1000352.MOV, four alternating passes: fill 5.917 / 6.619 / 6.353 / 6.424
+ms a frame, keep 6.684 / 6.302 / 5.994 / 6.375, which is the same number
+inside a ±0.35 ms spread — the in-bounds test is six comparisons against
+49 image loads, and the border pixels skip the taps entirely. The cost of
+the mode is the host-side scale above.

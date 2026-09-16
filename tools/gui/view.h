@@ -121,8 +121,11 @@ struct view_pipeline_look {
     float denoise;
     /* Whether the lens warp ran, for the same reason. The record itself is
      * the frame's own and changes with it, so a replay of the *same* frame
-     * only has to notice the switch. */
+     * only has to notice the switch. `lens_keep` is the same for the
+     * fill / keep all row: the two produce different pictures from the same
+     * record. */
     bool lens;
+    bool lens_keep;
 };
 
 struct view_name_map {
@@ -611,6 +614,15 @@ struct view_lens {
      * while `record.valid`. */
     float corner[3];
 
+    /* Keep every source pixel instead of filling the frame, DESIGN.md 16.8,
+     * and the scale that takes for the record on screen. `keep_sel` is the
+     * panel row's index, 0 fill and 1 keep all, because a cycle row wants
+     * an int. The scale is worked out once per frame beside `corner`, not
+     * once per panel redraw. */
+    bool keep;
+    int keep_sel;
+    float scale;
+
     /* libcraw's own pass time with and without the warp, smoothed
      * separately, the way the Denoise section measures its own. */
     double ms_on, ms_off;
@@ -902,6 +914,10 @@ bool view_denoise_model(const struct view_state *st, CRAWNoiseModel *nm, float *
  * the stage ran - the frame parameters, the look the picture was processed
  * with, the panel - asks this. */
 bool view_lens_active(const struct view_state *st);
+
+/* And whether it will run in the keep-everything mode of DESIGN.md 16.8,
+ * which is the same question plus the panel's fill / keep all row. */
+bool view_lens_keep_all(const struct view_state *st);
 
 /* The strength the denoise stage will actually run at: zero unless the
  * switch is on, the strength is positive and a model exists. */

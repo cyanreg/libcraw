@@ -139,7 +139,8 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
         }
 
         memcpy(linear, out, n * sizeof(*linear));
-        ret = craw_ref_lens(linear, width, height, &fp->lens, out);
+        ret = craw_ref_lens(linear, width, height, &fp->lens,
+                            (fp->flags & CRAW_FRAME_FLAG_LENS_KEEP_ALL) != 0, out);
         free(linear);
     }
 

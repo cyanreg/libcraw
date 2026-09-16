@@ -16,7 +16,12 @@
  * detail RCD was chosen for.
  *
  * Alpha is read straight from the output pixel's own position, not warped:
- * the colour stage writes 1.0 and it stays exactly 1.0. */
+ * the colour stage writes 1.0 and it stays exactly 1.0.
+ *
+ * With `keep_all` the frame is not filled: the output position is divided
+ * by a scale worked out on the host so that the whole warped source fits
+ * inside the frame, and an output pixel whose source lies outside the
+ * source frame in any channel is written black. See DESIGN.md 16.8. */
 
 #extension GL_GOOGLE_include_directive : require
 
@@ -31,6 +36,8 @@ layout(push_constant, scalar) uniform CRAWLensPushBuf {
     vec2  centre;          /* optical centre in pixels, pixel centre origin */
     float inv_half_diag;   /* 1 / the corner distance from `centre` */
     vec4  k[3];            /* k0..k3 per channel, R G B */
+    float inv_scale;       /* 1 / s of DESIGN.md 16.8; exactly 1.0 to fill */
+    int   keep_all;        /* 1: black outside the mapped source */
 } pc;
 
 /* Catmull-Rom cubic weights for taps at -1, 0, +1, +2 around a sample
@@ -84,16 +91,61 @@ void main()
     /* Pixel centres: integer p sits at p + 0.5 in the continuous frame, so
      * a centre of (0.5, 0.5) of the frame is size * 0.5 and the geometry
      * is symmetric about it. */
-    vec2  d  = vec2(p) + 0.5 - pc.centre;
-    float r2 = dot(d, d) * (pc.inv_half_diag * pc.inv_half_diag);
-
+    vec2 d = vec2(p) + 0.5 - pc.centre;
     vec4 o;
-    for (int c = 0; c < 3; c++) {
-        vec4  k = pc.k[c];
-        float poly = k.x + r2 * (k.y + r2 * (k.z + r2 * k.w));
+
+    /* The two modes are written out separately, and the filling one is
+     * written exactly as it was before the other existed. `keep_all` is a
+     * push constant, so the branch is uniform across the dispatch and costs
+     * nothing; what it buys is that the compiler sees the same expressions
+     * it always saw on the filling path and contracts them into the same
+     * multiply-adds. Sharing the code instead moved 1557 samples of a
+     * 5760x3040 frame by one unit in the last place of the fp16 output,
+     * which is not a difference anyone can see and is exactly the kind of
+     * difference a mode switch must not make. */
+    if (pc.keep_all != 0) {
+        /* DESIGN.md 16.8: the whole mode is the filling mapping evaluated
+         * at p / s, plus a black border where that lands off the source. */
+        vec2  q  = d * pc.inv_scale;
+        float r2 = dot(q, q) * (pc.inv_half_diag * pc.inv_half_diag);
+        vec2  sp[3];
+        bool  inside = true;
+
+        for (int c = 0; c < 3; c++) {
+            vec4  k = pc.k[c];
+            float poly = k.x + r2 * (k.y + r2 * (k.z + r2 * k.w));
+
+            sp[c] = pc.centre + q * poly;
+
+            /* One boundary for all three channels - the pixel is black
+             * unless every channel has something to read - so the border is
+             * one shape and not three, which is what would show as a
+             * coloured fringe along it. Half a dozen comparisons against 49
+             * image loads. */
+            inside = inside && all(greaterThanEqual(sp[c], vec2(0.0))) &&
+                               all(lessThanEqual(sp[c], vec2(pc.size)));
+        }
+
+        /* Black, not transparent: alpha is the output pixel's own, which
+         * the colour stage wrote as 1.0. */
+        if (!inside) {
+            imageStore(dst, p, vec4(0.0, 0.0, 0.0, imageLoad(src, p).a));
+            return;
+        }
 
         /* Back from the continuous frame into pixel index space. */
-        o[c] = craw_lens_tap(pc.centre + d * poly - 0.5, c);
+        for (int c = 0; c < 3; c++)
+            o[c] = craw_lens_tap(sp[c] - 0.5, c);
+    } else {
+        float r2 = dot(d, d) * (pc.inv_half_diag * pc.inv_half_diag);
+
+        for (int c = 0; c < 3; c++) {
+            vec4  k = pc.k[c];
+            float poly = k.x + r2 * (k.y + r2 * (k.z + r2 * k.w));
+
+            /* Back from the continuous frame into pixel index space. */
+            o[c] = craw_lens_tap(pc.centre + d * poly - 0.5, c);
+        }
     }
 
     o.a = imageLoad(src, p).a;

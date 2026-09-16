@@ -108,4 +108,31 @@ CRAW_API int craw_lens_corner_shift(const CRAWLensCorrection *lc,
                                     uint32_t width, uint32_t height,
                                     bool relative, float px[3]);
 
+/* The uniform scale the "keep everything" mode of DESIGN.md 16.8 needs for
+ * this record on a frame of `width` x `height`: the largest s <= 1 for
+ * which every source pixel, put through the correction, still lands inside
+ * the output frame. One number for all three channels, so the chromatic
+ * correction stays consistent; the shader divides the output position by it
+ * before evaluating the polynomial, which shrinks the corrected picture
+ * until the whole warped source fits and leaves black around it.
+ *
+ * It is computed by walking the source rectangle's boundary, inverting
+ * r * poly(r) per channel at each point to find the output radius that
+ * source pixel needs, and taking the smallest ratio of the output frame's
+ * boundary radius to it. A few hundred microseconds of arithmetic, no
+ * allocation and no Vulkan; the answer changes with the record, so it is a
+ * per-frame number on a clip that zooms.
+ *
+ * Only a record whose polynomial cannot be inverted at all — one no lens
+ * has — fails, with CRAW_ERROR(EINVAL), which is also what a NULL or
+ * invalid correction and a zero frame size give.
+ *
+ * The pipeline works this out for itself when the frame carries
+ * CRAW_FRAME_FLAG_LENS_KEEP_ALL; this is exported so that a tool can show
+ * the number, which is the only way a person can see how much of the frame
+ * the mode costs. */
+CRAW_API int craw_lens_keep_all_scale(const CRAWLensCorrection *lc,
+                                      uint32_t width, uint32_t height,
+                                      float *scale);
+
 #endif /* CRAW_LENS_H */

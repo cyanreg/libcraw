@@ -243,3 +243,170 @@ int craw_lens_corner_shift(const CRAWLensCorrection *lc, uint32_t width,
 
     return 0;
 }
+
+/* ------------------------------------------- keeping every source pixel */
+
+/* The boundary walk of DESIGN.md 16.8. 512 segments per side, each side
+ * carrying its own starting corner, so 2048 points around the rectangle.
+ * An even number of segments per side puts a sample exactly on every
+ * corner and exactly on every edge midpoint, which for a monotone
+ * polynomial are the only two places the constraint can bind; everything
+ * between them is there for a polynomial that turns over. */
+#define CRAW_LENS_KEEP_SEGS 512
+
+/* The bisection's bracket and its iteration count. r * poly(r) is monotone
+ * over this range for every record seen and for anything resembling a
+ * lens; a polynomial that turns over inside it would make the inverse
+ * ambiguous, and bisection would find one of the crossings, which is as
+ * meaningful an answer as there is. 40 halvings of [0, 2] land within
+ * 2e-12, far inside the float the answer comes back as. */
+#define CRAW_LENS_KEEP_HI 2.0
+#define CRAW_LENS_KEEP_ITERS 40
+
+/* In double, and from coefficients already widened by the caller: the walk
+ * evaluates this a quarter of a million times and a float array would
+ * convert four coefficients on every one of them. */
+static double craw_lens_poly(const double k[4], double r)
+{
+    double r2 = r * r;
+
+    return k[0] + r2 * (k[1] + r2 * (k[2] + r2 * k[3]));
+}
+
+/* The output radius whose source radius is `r_src`, i.e. the inverse of
+ * r * poly(r), by bisection, for the three channels at once. False when
+ * `r_src` is out of the map's reach over [0, CRAW_LENS_KEEP_HI], which
+ * takes a record twice as aggressive as any lens.
+ *
+ * Three brackets are halved in one loop and each is moved by a conditional
+ * assignment rather than a branch, because this loop is the entire cost of
+ * the scale: the three chains interleave where three separate searches
+ * would each wait on their own compare, and a bisection's branch is
+ * unpredictable by construction. Measured on this machine the whole walk
+ * is 0.87 ms a frame this way and 2.07 ms written the obvious way, with a
+ * branch and a float coefficient array. The bracket is carried as its low
+ * end and its width, both dyadic and therefore exact, so the halving
+ * introduces no rounding of its own. */
+static bool craw_lens_invert3(const double k[3][4], double r_src, double u[3])
+{
+    double lo0 = 0.0, lo1 = 0.0, lo2 = 0.0, w = CRAW_LENS_KEEP_HI;
+
+    for (int c = 0; c < 3; c++)
+        if (CRAW_LENS_KEEP_HI * craw_lens_poly(k[c], CRAW_LENS_KEEP_HI) < r_src)
+            return false;
+
+    for (int i = 0; i < CRAW_LENS_KEEP_ITERS; i++) {
+        double m0, m1, m2;
+
+        w *= 0.5;
+        m0 = lo0 + w;
+        m1 = lo1 + w;
+        m2 = lo2 + w;
+        lo0 = (m0 * craw_lens_poly(k[0], m0) < r_src) ? m0 : lo0;
+        lo1 = (m1 * craw_lens_poly(k[1], m1) < r_src) ? m1 : lo1;
+        lo2 = (m2 * craw_lens_poly(k[2], m2) < r_src) ? m2 : lo2;
+    }
+
+    u[0] = lo0 + 0.5 * w;
+    u[1] = lo1 + 0.5 * w;
+    u[2] = lo2 + 0.5 * w;
+
+    return true;
+}
+
+/* How far the ray (ux, uy) from (cx, cy) travels before it leaves the
+ * w x h rectangle, in pixels. With the camera's centred record this is the
+ * min(half_w / |cos|, half_h / |sin|) of DESIGN.md 16.8; written per side
+ * so that an off-centre record measures against the edge it is actually
+ * heading for. */
+static double craw_lens_frame_radius(double ux, double uy, double cx, double cy,
+                                     double w, double h)
+{
+    double t = HUGE_VAL;
+
+    if (ux > 0.0)
+        t = CRAW_MIN(t, (w - cx) / ux);
+    else if (ux < 0.0)
+        t = CRAW_MIN(t, cx / -ux);
+
+    if (uy > 0.0)
+        t = CRAW_MIN(t, (h - cy) / uy);
+    else if (uy < 0.0)
+        t = CRAW_MIN(t, cy / -uy);
+
+    return t;
+}
+
+int craw_lens_keep_all_scale(const CRAWLensCorrection *lc, uint32_t width,
+                             uint32_t height, float *scale)
+{
+    double k[3][4], w, h, cx, cy, hx, hy, half_diag, s = 1.0;
+
+    if (!lc || !lc->valid || !scale || !width || !height)
+        return CRAW_ERROR(EINVAL);
+    if (lc->centre[0] < 0.0f || lc->centre[0] > 1.0f ||
+        lc->centre[1] < 0.0f || lc->centre[1] > 1.0f)
+        return CRAW_ERROR(EINVAL);
+
+    for (int c = 0; c < 3; c++)
+        for (int i = 0; i < 4; i++)
+            k[c][i] = (double)lc->k[c][i];
+
+    w = (double)width;
+    h = (double)height;
+    cx = (double)lc->centre[0] * w;
+    cy = (double)lc->centre[1] * h;
+    hx = (double)CRAW_MAX(lc->centre[0], 1.0f - lc->centre[0]) * w;
+    hy = (double)CRAW_MAX(lc->centre[1], 1.0f - lc->centre[1]) * h;
+    half_diag = sqrt(hx * hx + hy * hy);
+    if (!(half_diag > 0.0))
+        return CRAW_ERROR(EINVAL);
+
+    /* Every source pixel lies inside the source rectangle, and the map is
+     * radial and monotone along each ray, so an interior point never needs
+     * a larger output radius than the boundary point on its own ray: the
+     * boundary is the whole constraint. */
+    for (int side = 0; side < 4; side++) {
+        for (int i = 0; i < CRAW_LENS_KEEP_SEGS; i++) {
+            double t = (double)i / CRAW_LENS_KEEP_SEGS;
+            double px, py, dx, dy, len, r_src, r_frame, u[3], needed = 0.0;
+
+            switch (side) {
+            case 0:  px = t * w;         py = 0.0;           break;
+            case 1:  px = w;             py = t * h;         break;
+            case 2:  px = (1.0 - t) * w; py = h;             break;
+            default: px = 0.0;           py = (1.0 - t) * h; break;
+            }
+
+            dx = px - cx;
+            dy = py - cy;
+            len = sqrt(dx * dx + dy * dy);
+            /* An optical centre sitting exactly on the frame edge, which no
+             * record has: that one point constrains nothing. */
+            if (!(len > 0.0))
+                continue;
+            r_src = len / half_diag;
+
+            /* The channel that needs the largest output radius decides, so
+             * that one scale serves all three and the black border is one
+             * shape rather than three coloured ones. */
+            if (!craw_lens_invert3(k, r_src, u))
+                return CRAW_ERROR(EINVAL);
+            for (int c = 0; c < 3; c++)
+                needed = CRAW_MAX(needed, u[c]);
+
+            r_frame = craw_lens_frame_radius(dx / len, dy / len, cx, cy, w, h) / half_diag;
+            s = CRAW_MIN(s, r_frame / needed);
+        }
+    }
+
+    /* Capped at 1 by the initial value: a correction that samples outward
+     * everywhere would otherwise be magnified to fill the frame, which is
+     * not what keeping everything means. */
+    if (!(s > 0.0) || !isfinite(s))
+        return CRAW_ERROR(EINVAL);
+
+    *scale = (float)s;
+
+    return 0;
+}

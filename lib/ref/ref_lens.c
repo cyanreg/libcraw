@@ -4,7 +4,9 @@
  * same Catmull-Rom weights, same border rule and the same order of
  * operations as lib/shaders/lens.comp.glsl, in fp32 throughout: what
  * separates the two on a real frame is the fp16 storage of the image the
- * warp reads, not the arithmetic. */
+ * warp reads, not the arithmetic. The keep-everything mode of 16.8 is here
+ * too, scale and black border both, and it gets its scale from the same
+ * craw_lens_keep_all_scale() the pipeline calls. */
 
 #include <math.h>
 #include <stdlib.h>
@@ -38,9 +40,9 @@ static int craw_ref_mirror(int i, int n)
 }
 
 int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
-                  const CRAWLensCorrection *lc, float *dst)
+                  const CRAWLensCorrection *lc, bool keep_all, float *dst)
 {
-    float cx, cy, hx, hy, half_diag, inv_hd;
+    float cx, cy, hx, hy, half_diag, inv_hd, inv_scale = 1.0f;
 
     if (!src || !dst || !lc || !width || !height || src == dst)
         return CRAW_ERROR(EINVAL);
@@ -66,18 +68,51 @@ int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
         return CRAW_ERROR(EINVAL);
     inv_hd = 1.0f / half_diag;
 
+    /* DESIGN.md 16.8. The same library call the pipeline makes, so that the
+     * two cannot answer differently; filling the frame is a scale of
+     * exactly one and a multiply by one changes no bits. */
+    if (keep_all) {
+        float scale;
+        int ret = craw_lens_keep_all_scale(lc, width, height, &scale);
+
+        if (ret < 0)
+            return ret;
+        inv_scale = 1.0f / scale;
+    }
+
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
             float *out = &dst[((size_t)y * width + x) * 4];
-            float dx = (float)x + 0.5f - cx;
-            float dy = (float)y + 0.5f - cy;
+            float dx = ((float)x + 0.5f - cx) * inv_scale;
+            float dy = ((float)y + 0.5f - cy) * inv_scale;
             float r2 = (dx * dx + dy * dy) * (inv_hd * inv_hd);
+            float px[3], py[3];
+            bool inside = true;
 
             for (int c = 0; c < 3; c++) {
                 const float *k = lc->k[c];
                 float poly = k[0] + r2 * (k[1] + r2 * (k[2] + r2 * k[3]));
-                float sx = cx + dx * poly - 0.5f;
-                float sy = cy + dy * poly - 0.5f;
+
+                px[c] = cx + dx * poly;
+                py[c] = cy + dy * poly;
+
+                /* One boundary for all three channels, so the border is one
+                 * shape and not three coloured ones. */
+                inside = inside && px[c] >= 0.0f && px[c] <= (float)width &&
+                                   py[c] >= 0.0f && py[c] <= (float)height;
+            }
+
+            if (keep_all && !inside) {
+                /* Black, not transparent: alpha is still the output pixel's
+                 * own, which the colour stage wrote as 1.0. */
+                out[0] = out[1] = out[2] = 0.0f;
+                out[3] = src[((size_t)y * width + x) * 4 + 3];
+                continue;
+            }
+
+            for (int c = 0; c < 3; c++) {
+                float sx = px[c] - 0.5f;
+                float sy = py[c] - 0.5f;
                 int bx = (int)floorf(sx);
                 int by = (int)floorf(sy);
                 float wx[4], wy[4];

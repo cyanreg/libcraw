@@ -68,10 +68,12 @@ enum tool_wb {
 
 /* Geometric lens correction. AUTO and ON both mean "apply the frame's own
  * record"; they differ only in whether a clip that carries none is worth a
- * warning, which it is when the user asked for the correction by name. */
+ * warning, which it is when the user asked for the correction by name.
+ * KEEP is ON with the keep-everything mode of DESIGN.md 16.8 on top. */
 enum tool_lens {
     TOOL_LENS_AUTO = 0,
     TOOL_LENS_ON,
+    TOOL_LENS_KEEP,
     TOOL_LENS_OFF,
 };
 
@@ -143,6 +145,7 @@ static const struct tool_name_map tool_spaces[] = {
 static const struct tool_name_map tool_lenses[] = {
     { "auto", TOOL_LENS_AUTO },
     { "on",   TOOL_LENS_ON   },
+    { "keep", TOOL_LENS_KEEP },
     { "off",  TOOL_LENS_OFF  },
     { NULL,   0              },
 };
@@ -253,7 +256,7 @@ static void tool_usage(FILE *f)
 "  --noise A,B         override the noise model: variance = A * u + B with u\n"
 "                      the signal above black over the sensor range. Print a\n"
 "                      clip's own pair with --noise-estimate\n"
-"  --lens on|off       geometric lens correction from the frame's own\n"
+"  --lens on|off|keep  geometric lens correction from the frame's own\n"
 "                      com.panasonic.Semi-Pro.optical_correction record: a\n"
 "                      per-channel radial warp after the colour stage that\n"
 "                      takes the distortion out and the lateral chromatic\n"
@@ -265,7 +268,11 @@ static void tool_usage(FILE *f)
 "                      channel is printed for the first frame and again\n"
 "                      whenever it moves by more than half a pixel, which on\n"
 "                      a clip that zooms while recording is once per step of\n"
-"                      the zoom ring\n"
+"                      the zoom ring.\n"
+"                      `keep` corrects the same way but keeps every source\n"
+"                      pixel instead of filling the frame: the corrected\n"
+"                      picture is scaled down until all of it fits and the\n"
+"                      rest of the frame is black. -v prints the scale\n"
 "  --noise-estimate    fit A and B on every decoded frame and print them,\n"
 "                      then a summary; no GPU work and no output is written.\n"
 "                      Point it at a flat, evenly lit, unclipped field (a\n"
@@ -2123,14 +2130,34 @@ have_device:
                         (double)dist[0], (double)dist[1], (double)dist[2],
                         (double)net[0], (double)net[1], (double)net[2],
                         (double)(dist[0] - dist[2]));
+
+                /* The scale is what the mode costs: the corrected picture
+                 * is the filled one shrunk about the centre by exactly
+                 * this much, which is what makes room for the corners fill
+                 * mode cuts off. Under the same "only when the lens moved"
+                 * rule as the line above, because it moves with the
+                 * record. */
+                if (cfg.lens == TOOL_LENS_KEEP) {
+                    float scale = 0.0f;
+
+                    if (craw_lens_keep_all_scale(&lens, w, h, &scale) == 0)
+                        fprintf(stderr, "              keep all: scaled %.4f\n",
+                                (double)scale);
+                    else
+                        fprintf(stderr, "              keep all: this record "
+                                        "cannot be inverted\n");
+                }
+
                 last_lens_dist = dist[1];
                 have_lens_report = true;
             }
         }
 
-        if (cfg.lens == TOOL_LENS_ON && !lens.valid && !warned_no_lens) {
-            fprintf(stderr, "warning: --lens on, but this clip's frames carry no "
-                            "optical_correction record; nothing is corrected\n");
+        if ((cfg.lens == TOOL_LENS_ON || cfg.lens == TOOL_LENS_KEEP) &&
+            !lens.valid && !warned_no_lens) {
+            fprintf(stderr, "warning: --lens %s, but this clip's frames carry no "
+                            "optical_correction record; nothing is corrected\n",
+                    cfg.lens == TOOL_LENS_KEEP ? "keep" : "on");
             warned_no_lens = true;
         }
 
@@ -2148,6 +2175,8 @@ have_device:
         fp.profile = &prof;
         fp.exposure_stops = cfg.exposure;
         fp.flags = cfg.clamp_negative ? CRAW_FRAME_FLAG_CLAMP_NEGATIVE : 0;
+        if (cfg.lens == TOOL_LENS_KEEP)
+            fp.flags |= CRAW_FRAME_FLAG_LENS_KEEP_ALL;
         fp.denoise_strength = cfg.denoise;
         fp.noise_override = cfg.noise;
         fp.lens = lens;

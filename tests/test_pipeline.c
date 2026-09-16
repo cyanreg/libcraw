@@ -830,7 +830,7 @@ static double test_lens_invert(const float k[4], double r_src)
  * term: this frame is measured, not compared. */
 static void test_lens_gen_dots(uint16_t *m, uint32_t w, uint32_t h,
                                const double (*dots)[2], int nb, double sigma,
-                               double peak)
+                               double peak, double base)
 {
     double inv2s2 = 1.0 / (2.0 * sigma * sigma);
 
@@ -838,7 +838,7 @@ static void test_lens_gen_dots(uint16_t *m, uint32_t w, uint32_t h,
         for (uint32_t x = 0; x < w; x++) {
             int s = (int)((y & 1) * 2 + (x & 1));
             int c = (s == 0) ? 0 : (s == 3) ? 2 : 1;
-            double v = 0.0;
+            double v = base;
             double raw;
             int iv;
 
@@ -859,12 +859,15 @@ static void test_lens_gen_dots(uint16_t *m, uint32_t w, uint32_t h,
 /* First moment of one channel over a window, in the same pixel centre
  * coordinates the warp uses. The Catmull-Rom undershoot around a bright
  * mark is symmetric, so the samples go in signed rather than clamped:
- * clamping them would be the thing that moved the answer. */
+ * clamping them would be the thing that moved the answer. `bg` is the flat
+ * field the mark sits on, subtracted because a first moment of a mark plus
+ * a constant is a first moment of the window, not of the mark. */
 static bool test_lens_centroid(const float *img, uint32_t w, uint32_t h, int c,
-                               double cx, double cy, double out[2])
+                               double cx, double cy, int win, double bg,
+                               double out[2])
 {
-    int x0 = (int)floor(cx) - TEST_LENS_WIN, x1 = (int)floor(cx) + TEST_LENS_WIN;
-    int y0 = (int)floor(cy) - TEST_LENS_WIN, y1 = (int)floor(cy) + TEST_LENS_WIN;
+    int x0 = (int)floor(cx) - win, x1 = (int)floor(cx) + win;
+    int y0 = (int)floor(cy) - win, y1 = (int)floor(cy) + win;
     double sum = 0.0, sx = 0.0, sy = 0.0;
 
     if (x0 < 0 || y0 < 0 || x1 >= (int)w || y1 >= (int)h)
@@ -872,7 +875,7 @@ static bool test_lens_centroid(const float *img, uint32_t w, uint32_t h, int c,
 
     for (int y = y0; y <= y1; y++) {
         for (int x = x0; x <= x1; x++) {
-            double v = img[((size_t)y * w + x) * 4 + c];
+            double v = img[((size_t)y * w + x) * 4 + c] - bg;
 
             sum += v;
             sx += v * ((double)x + 0.5);
@@ -897,7 +900,8 @@ static bool test_lens_centroid(const float *img, uint32_t w, uint32_t h, int c,
  * cancels out and what is left is the warp. */
 static int test_lens_geometry(const char *what, const float *off, const float *on,
                               uint32_t w, uint32_t h, const CRAWLensCorrection *lc,
-                              const double (*dots)[2], int nb, double tol)
+                              const double (*dots)[2], const int *wins, int nb,
+                              double scale, double bg, double tol)
 {
     double cx = lc->centre[0] * (double)w;
     double cy = lc->centre[1] * (double)h;
@@ -910,22 +914,25 @@ static int test_lens_geometry(const char *what, const float *off, const float *o
     for (int i = 0; i < nb; i++) {
         for (int c = 0; c < 3; c++) {
             double src[2], got[2], want[2];
-            double r_src, r_dst, scale, err;
+            double r_src, r_dst, factor, err;
 
-            if (!test_lens_centroid(off, w, h, c, dots[i][0], dots[i][1], src)) {
+            if (!test_lens_centroid(off, w, h, c, dots[i][0], dots[i][1], wins[i],
+                                    bg, src)) {
                 fprintf(stderr, "%s: mark %d channel %c was not found in the "
                         "uncorrected frame\n", what, i, "RGB"[c]);
                 return -1;
             }
 
-            /* Where the warp has to put what sits at `src`. */
+            /* Where the warp has to put what sits at `src`. Filling the
+             * frame is `scale` 1; keeping everything shrinks the whole
+             * picture by the mode's own factor on top of the inverse. */
             r_src = hypot(src[0] - cx, src[1] - cy) / half_diag;
-            r_dst = test_lens_invert(lc->k[c], r_src);
-            scale = r_dst / r_src;
-            want[0] = cx + (src[0] - cx) * scale;
-            want[1] = cy + (src[1] - cy) * scale;
+            r_dst = test_lens_invert(lc->k[c], r_src) * scale;
+            factor = r_dst / r_src;
+            want[0] = cx + (src[0] - cx) * factor;
+            want[1] = cy + (src[1] - cy) * factor;
 
-            if (!test_lens_centroid(on, w, h, c, want[0], want[1], got)) {
+            if (!test_lens_centroid(on, w, h, c, want[0], want[1], wins[i], bg, got)) {
                 fprintf(stderr, "%s: mark %d channel %c was not found near "
                         "(%.2f, %.2f) in the corrected frame\n", what, i,
                         "RGB"[c], want[0], want[1]);
@@ -967,6 +974,7 @@ static int test_lens_analytic(CRAWTestDevice *td, CRAWContext *ctx,
     const double ux = (TEST_LENS_W * 0.5) / half_diag;
     const double uy = (TEST_LENS_H * 0.5) / half_diag;
     double dots[8][2];
+    int wins[8];
     CRAWTestImage src = { 0 }, dst = { 0 };
     bool have_src = false, have_dst = false;
     CRAWPipelineParams pp;
@@ -979,6 +987,7 @@ static int test_lens_analytic(CRAWTestDevice *td, CRAWContext *ctx,
     for (int i = 0; i < nb_dots; i++) {
         dots[i][0] = TEST_LENS_W * 0.5 + ux * test_lens_radii[i] * half_diag;
         dots[i][1] = TEST_LENS_H * 0.5 + uy * test_lens_radii[i] * half_diag;
+        wins[i] = TEST_LENS_WIN;
     }
 
     mosaic = malloc(npix * sizeof(*mosaic));
@@ -989,7 +998,7 @@ static int test_lens_analytic(CRAWTestDevice *td, CRAWContext *ctx,
         goto done;
     }
 
-    test_lens_gen_dots(mosaic, TEST_LENS_W, TEST_LENS_H, dots, nb_dots, 3.0, 0.40);
+    test_lens_gen_dots(mosaic, TEST_LENS_W, TEST_LENS_H, dots, nb_dots, 3.0, 0.40, 0.0);
 
     ret = craw_testdev_image_create(td, &src, TEST_LENS_W, TEST_LENS_H, VK_FORMAT_R16_UNORM);
     if (ret < 0)
@@ -1025,7 +1034,7 @@ static int test_lens_analytic(CRAWTestDevice *td, CRAWContext *ctx,
         goto done;
 
     ret = test_lens_geometry("gpu", off, on, TEST_LENS_W, TEST_LENS_H,
-                             &test_lens_synth, dots, nb_dots, 0.25);
+                             &test_lens_synth, dots, wins, nb_dots, 1.0, 0.0, 0.25);
     if (ret < 0)
         goto done;
 
@@ -1042,7 +1051,7 @@ static int test_lens_analytic(CRAWTestDevice *td, CRAWContext *ctx,
         goto done;
 
     ret = test_lens_geometry("ref", off, on, TEST_LENS_W, TEST_LENS_H,
-                             &test_lens_synth, dots, nb_dots, 0.25);
+                             &test_lens_synth, dots, wins, nb_dots, 1.0, 0.0, 0.25);
 
 done:
     if (ret < 0)
@@ -1052,6 +1061,366 @@ done:
     if (have_src)
         craw_testdev_image_free(td, &src);
     free(on);
+    free(off);
+    free(mosaic);
+
+    return ret;
+}
+
+
+/* ------------------------------------- keeping everything (DESIGN.md 16.8) */
+
+/* Where the marks sit for the keep-everything test, as a fraction of the
+ * half diagonal: one near the centre as a control, one as far out as a 14
+ * pixel measuring window still fits, and one at 0.97, which fill mode
+ * throws away outright - the output radius that would have to show it is
+ * past the frame corner - and which keeping everything has to bring back. */
+static const double test_keep_radii[] = { 0.35, 0.86, 0.95 };
+static const int test_keep_wins[] = { TEST_LENS_WIN, TEST_LENS_WIN, 4 };
+
+/* The first two are measured by centroid the way the fill-mode geometry
+ * check measures its own. The last one sits too close to the frame edge
+ * for a centroid window to fit around it in the source, so it is checked
+ * by where its peak lands instead - which is all that mark is for: fill
+ * mode does not have it at all. */
+#define TEST_KEEP_MEASURED 2
+
+/* A flat field under the marks, so that "exactly black" means the border
+ * the mode paints and nothing else: on a frame that was black to begin with
+ * the check would pass without the mode doing anything. */
+#define TEST_KEEP_BASE 0.25
+
+/* Is the source position of the output pixel (x, y) outside the source
+ * frame in any channel, and by how far? In double, the same geometry the
+ * shader and the reference do in float, from the record and the scale
+ * rather than from either of them. `margin` comes back positive outside
+ * the frame and negative inside, in pixels, so that the pixels the two
+ * arithmetics can legitimately disagree about are the ones near zero. */
+static bool test_keep_outside(const CRAWLensCorrection *lc, double w, double h,
+                              double s, int x, int y, double *margin)
+{
+    double cx = lc->centre[0] * w, cy = lc->centre[1] * h;
+    double hx = (double)CRAW_MAX(lc->centre[0], 1.0f - lc->centre[0]) * w;
+    double hy = (double)CRAW_MAX(lc->centre[1], 1.0f - lc->centre[1]) * h;
+    double half_diag = hypot(hx, hy);
+    double dx = ((double)x + 0.5 - cx) / s;
+    double dy = ((double)y + 0.5 - cy) / s;
+    double r2 = (dx * dx + dy * dy) / (half_diag * half_diag);
+    double worst = -HUGE_VAL;
+
+    for (int c = 0; c < 3; c++) {
+        double poly = test_lens_poly(lc->k[c], sqrt(r2));
+        double sx = cx + dx * poly, sy = cy + dy * poly;
+        double over = CRAW_MAX(CRAW_MAX(-sx, sx - w), CRAW_MAX(-sy, sy - h));
+
+        worst = CRAW_MAX(worst, over);
+    }
+
+    *margin = worst;
+
+    return worst > 0.0;
+}
+
+/* The mode end to end on the synthetic frame: the marks land where the
+ * scaled inverse says, everything outside the mapped source is exactly
+ * black, the GPU agrees with the reference, and filling the frame is
+ * untouched by any of it. */
+static int test_lens_keep(CRAWTestDevice *td, CRAWContext *ctx,
+                          const CRAWProfile *identity)
+{
+    const size_t npix = (size_t)TEST_LENS_W * TEST_LENS_H;
+    const int nb_dots = (int)CRAW_ARRAY_ELEMS(test_keep_radii);
+    const double half_diag = sqrt((double)(TEST_LENS_W * TEST_LENS_W +
+                                           TEST_LENS_H * TEST_LENS_H)) * 0.5;
+    const double ux = (TEST_LENS_W * 0.5) / half_diag;
+    const double uy = (TEST_LENS_H * 0.5) / half_diag;
+    double dots[8][2], want_corner[2], r_fill, r_keep;
+    int wins[8];
+    CRAWTestImage src = { 0 }, dst = { 0 };
+    bool have_src = false, have_dst = false;
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    uint16_t *mosaic = NULL;
+    float *off = NULL, *fill = NULL, *fill2 = NULL, *keep = NULL, *ref = NULL;
+    size_t black = 0, guard = 0, lit = 0;
+    double ms = 0.0, err;
+    float scale = 1.0f;
+    int ret;
+
+    ret = craw_lens_keep_all_scale(&test_lens_synth, TEST_LENS_W, TEST_LENS_H, &scale);
+    if (ret < 0) {
+        fprintf(stderr, "craw_lens_keep_all_scale failed: %d\n", ret);
+        return ret;
+    }
+
+    for (int i = 0; i < nb_dots; i++) {
+        dots[i][0] = TEST_LENS_W * 0.5 + ux * test_keep_radii[i] * half_diag;
+        dots[i][1] = TEST_LENS_H * 0.5 + uy * test_keep_radii[i] * half_diag;
+        wins[i] = test_keep_wins[i];
+    }
+
+    /* What the outermost mark does in each mode. Fill mode would have to
+     * show it past the frame corner, which is what "the corner is thrown
+     * away" means; keeping everything brings it to `want_corner`, and the
+     * test insists that is well inside the frame rather than a pixel from
+     * the edge. */
+    r_fill = test_lens_invert(test_lens_synth.k[1], test_keep_radii[nb_dots - 1]);
+    r_keep = r_fill * (double)scale;
+    want_corner[0] = TEST_LENS_W * 0.5 + ux * r_keep * half_diag;
+    want_corner[1] = TEST_LENS_H * 0.5 + uy * r_keep * half_diag;
+
+    printf("  keep all: scale %.6f; the mark at r %.2f wants output radius %.4f, "
+           "which fill has no room for, and lands at (%.1f, %.1f)\n",
+           (double)scale, test_keep_radii[nb_dots - 1], r_fill,
+           want_corner[0], want_corner[1]);
+
+    if (!(r_fill > 1.0)) {
+        fprintf(stderr, "the outermost mark is not actually lost by fill mode "
+                        "(output radius %.4f); the test proves nothing\n", r_fill);
+        return -1;
+    }
+    if (!(want_corner[0] < TEST_LENS_W - 8.0 && want_corner[1] < TEST_LENS_H - 8.0)) {
+        fprintf(stderr, "the outermost mark lands at (%.1f, %.1f), not well inside "
+                        "a %dx%d frame\n", want_corner[0], want_corner[1],
+                        TEST_LENS_W, TEST_LENS_H);
+        return -1;
+    }
+
+    mosaic = malloc(npix * sizeof(*mosaic));
+    off = malloc(npix * 4 * sizeof(*off));
+    fill = malloc(npix * 4 * sizeof(*fill));
+    fill2 = malloc(npix * 4 * sizeof(*fill2));
+    keep = malloc(npix * 4 * sizeof(*keep));
+    ref = malloc(npix * 4 * sizeof(*ref));
+    if (!mosaic || !off || !fill || !fill2 || !keep || !ref) {
+        ret = CRAW_ERROR(ENOMEM);
+        goto done;
+    }
+
+    test_lens_gen_dots(mosaic, TEST_LENS_W, TEST_LENS_H, dots, nb_dots, 3.0, 0.40,
+                       TEST_KEEP_BASE);
+
+    ret = craw_testdev_image_create(td, &src, TEST_LENS_W, TEST_LENS_H, VK_FORMAT_R16_UNORM);
+    if (ret < 0)
+        goto done;
+    have_src = true;
+    ret = craw_testdev_image_create(td, &dst, TEST_LENS_W, TEST_LENS_H,
+                                    VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (ret < 0)
+        goto done;
+    have_dst = true;
+    ret = craw_testdev_image_upload(td, &src, mosaic, npix * sizeof(*mosaic));
+    if (ret < 0)
+        goto done;
+
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_LENS_W;
+    pp.height = TEST_LENS_H;
+    pp.debayer = CRAW_DEBAYER_RCD;
+    pp.out_space = CRAW_CS_XYZ_D65;
+    pp.flags = CRAW_PIPELINE_FLAG_LENS;
+
+    /* Uncorrected, so that each mark's source position is measured rather
+     * than assumed, exactly as the fill-mode geometry check does it. */
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+    ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, off, NULL, NULL, &ms);
+    if (ret < 0)
+        goto done;
+
+    fp.lens = test_lens_synth;
+    ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, fill, NULL, NULL, &ms);
+    if (ret < 0)
+        goto done;
+
+    fp.flags = CRAW_FRAME_FLAG_LENS_KEEP_ALL;
+    ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, keep, NULL, NULL, &ms);
+    if (ret < 0)
+        goto done;
+
+    /* Fill mode again, after the mode has run: the flag is the only thing
+     * that may change the picture, so these two have to be equal bit for
+     * bit. Anything the keep path caches or leaves behind shows up here. */
+    fp.flags = 0;
+    ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, fill2, NULL, NULL, &ms);
+    if (ret < 0)
+        goto done;
+
+    if (memcmp(fill, fill2, npix * 4 * sizeof(*fill))) {
+        fprintf(stderr, "filling the frame changed after the keep-everything mode "
+                        "ran; the flag has to be the only difference\n");
+        ret = -1;
+        goto done;
+    }
+
+    /* The geometry: each mark measured in the uncorrected frame, and where
+     * the scaled inverse of its own channel's polynomial says it has to be
+     * in the corrected one. */
+    ret = test_lens_geometry("keep", off, keep, TEST_LENS_W, TEST_LENS_H,
+                             &test_lens_synth, dots, wins, TEST_KEEP_MEASURED,
+                             (double)scale, TEST_KEEP_BASE, 0.25);
+    if (ret < 0)
+        goto done;
+
+    /* The corner mark. Fill mode would need an output radius past the frame
+     * corner to show it at all - that is checked above, from the record's
+     * own polynomial - so the only question left is whether keeping
+     * everything brings it back, and its peak has to be within a pixel of
+     * where the scaled inverse puts it. The same window of the filled frame
+     * is printed beside it, and what shows up there is not this mark: it is
+     * the *inner* mark, which fill mode has pushed out to about here. */
+    {
+        double peak_keep = -HUGE_VAL, peak_fill = -HUGE_VAL, at[2] = { 0, 0 };
+        int w0 = (int)floor(want_corner[0]) - wins[nb_dots - 1];
+        int w1 = (int)floor(want_corner[0]) + wins[nb_dots - 1];
+        int h0 = (int)floor(want_corner[1]) - wins[nb_dots - 1];
+        int h1 = (int)floor(want_corner[1]) + wins[nb_dots - 1];
+
+        for (int y = h0; y <= h1; y++) {
+            for (int x = w0; x <= w1; x++) {
+                double vk = keep[((size_t)y * TEST_LENS_W + x) * 4 + 1];
+                double vf = fill[((size_t)y * TEST_LENS_W + x) * 4 + 1];
+
+                if (vk > peak_keep) {
+                    peak_keep = vk;
+                    at[0] = (double)x + 0.5;
+                    at[1] = (double)y + 0.5;
+                }
+                peak_fill = CRAW_MAX(peak_fill, vf);
+            }
+        }
+
+        printf("    keep mark %d G: peak %.3f at (%.1f, %.1f), %.2f px from the "
+               "prediction (the filled frame's own %.3f there is the inner mark)\n",
+               nb_dots - 1, peak_keep, at[0], at[1],
+               hypot(at[0] - want_corner[0], at[1] - want_corner[1]), peak_fill);
+
+        if (!(peak_keep > TEST_KEEP_BASE + 0.15)) {
+            fprintf(stderr, "the corner mark is not in the kept frame: the window "
+                            "peaks at %.3f over a flat %.2f\n", peak_keep, TEST_KEEP_BASE);
+            ret = -1;
+            goto done;
+        }
+        if (!(hypot(at[0] - want_corner[0], at[1] - want_corner[1]) <= 1.0)) {
+            fprintf(stderr, "the corner mark peaks at (%.1f, %.1f), the scaled "
+                            "inverse says (%.1f, %.1f)\n", at[0], at[1],
+                            want_corner[0], want_corner[1]);
+            ret = -1;
+            goto done;
+        }
+    }
+
+    /* The border. Every pixel whose source lies outside the source frame in
+     * any channel has to be exactly black with alpha exactly 1, and every
+     * pixel whose source lies inside has to have kept the flat field it was
+     * given. The handful of pixels within a hundredth of a pixel of the
+     * boundary are where double and float can legitimately disagree and are
+     * only counted. */
+    for (uint32_t y = 0; y < TEST_LENS_H; y++) {
+        for (uint32_t x = 0; x < TEST_LENS_W; x++) {
+            const float *px = &keep[((size_t)y * TEST_LENS_W + x) * 4];
+            double margin;
+            bool outside = test_keep_outside(&test_lens_synth, TEST_LENS_W,
+                                             TEST_LENS_H, (double)scale,
+                                             (int)x, (int)y, &margin);
+
+            if (fabs(margin) < 0.01) {
+                guard++;
+                continue;
+            }
+
+            if (outside) {
+                black++;
+                if (px[0] != 0.0f || px[1] != 0.0f || px[2] != 0.0f) {
+                    fprintf(stderr, "pixel (%u, %u) is %.4f px outside the source "
+                            "and came out (%g, %g, %g), not black\n", x, y, margin,
+                            (double)px[0], (double)px[1], (double)px[2]);
+                    ret = -1;
+                    goto done;
+                }
+                if (px[3] != 1.0f) {
+                    fprintf(stderr, "pixel (%u, %u) is black with alpha %g; the "
+                            "border is black, not transparent\n", x, y,
+                            (double)px[3]);
+                    ret = -1;
+                    goto done;
+                }
+            } else {
+                lit++;
+                if (!(px[1] > 0.5 * TEST_KEEP_BASE)) {
+                    fprintf(stderr, "pixel (%u, %u) is %.4f px inside the source "
+                            "and came out at %g, well under the %.2f flat field\n",
+                            x, y, -margin, (double)px[1], TEST_KEEP_BASE);
+                    ret = -1;
+                    goto done;
+                }
+            }
+        }
+    }
+
+    printf("  keep all: %zu pixels black outside the mapped source (%.1f%% of the "
+           "frame), %zu inside, %zu within a hundredth of a pixel of the boundary\n",
+           black, 100.0 * (double)black / (double)npix, lit, guard);
+
+    if (!black || !lit) {
+        fprintf(stderr, "the border check saw %zu black and %zu lit pixels; one of "
+                        "them is not a picture\n", black, lit);
+        ret = -1;
+        goto done;
+    }
+
+    /* And the CPU reference, which runs the same mode from the same
+     * craw_lens_keep_all_scale(). */
+    ret = craw_ref_process(mosaic, TEST_LENS_W, TEST_LENS_H, TEST_LENS_W, &pp, &fp, ref);
+    if (ret < 0)
+        goto done;
+    fp.flags = CRAW_FRAME_FLAG_LENS_KEEP_ALL;
+    ret = craw_ref_process(mosaic, TEST_LENS_W, TEST_LENS_H, TEST_LENS_W, &pp, &fp, ref);
+    if (ret < 0)
+        goto done;
+
+    err = test_max_abs(keep, ref, npix);
+    printf("  keep all: max abs %.3e against the reference (tol %.1e)\n",
+           err, TEST_LENS_TOL);
+    if (!(err <= TEST_LENS_TOL)) {
+        fprintf(stderr, "the GPU keep-everything warp differs from the reference by "
+                        "%.3e, tolerance %.1e\n", err, TEST_LENS_TOL);
+        ret = -1;
+        goto done;
+    }
+
+    /* The border has to be in the same place in both, to the pixel: a
+     * tolerance on the values would hide a border drawn half a pixel out. */
+    for (size_t i = 0; i < npix; i++) {
+        bool gb = keep[i * 4] == 0.0f && keep[i * 4 + 1] == 0.0f && keep[i * 4 + 2] == 0.0f;
+        bool rb = ref[i * 4] == 0.0f && ref[i * 4 + 1] == 0.0f && ref[i * 4 + 2] == 0.0f;
+        double margin;
+
+        if (gb == rb)
+            continue;
+        test_keep_outside(&test_lens_synth, TEST_LENS_W, TEST_LENS_H, (double)scale,
+                          (int)(i % TEST_LENS_W), (int)(i / TEST_LENS_W), &margin);
+        if (fabs(margin) < 0.01)
+            continue;
+
+        fprintf(stderr, "pixel %zu is %s on the GPU and %s in the reference, %.4f px "
+                "from the boundary\n", i, gb ? "black" : "lit", rb ? "black" : "lit",
+                margin);
+        ret = -1;
+        goto done;
+    }
+
+done:
+    if (ret < 0)
+        fprintf(stderr, "the keep-everything check failed: %d\n", ret);
+    if (have_dst)
+        craw_testdev_image_free(td, &dst);
+    if (have_src)
+        craw_testdev_image_free(td, &src);
+    free(ref);
+    free(keep);
+    free(fill2);
+    free(fill);
     free(off);
     free(mosaic);
 
@@ -1159,6 +1528,10 @@ static int test_lens(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *id
     }
 
     ret = test_lens_analytic(td, ctx, identity);
+    if (ret < 0)
+        goto done;
+
+    ret = test_lens_keep(td, ctx, identity);
 
 done:
     free(plain);

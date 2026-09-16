@@ -1186,6 +1186,38 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
             : ln->on             ? "on"
                                  : "off");
 
+    /* What the warp does with the frame, DESIGN.md 16.8: fill it and lose
+     * the source's corners, which is the trade the camera's own crop makes,
+     * or shrink the corrected picture until all of the source fits and
+     * paint the rest black. The row keeps its place on the ring on a clip
+     * with no record too, for the same reason the switch above does. */
+    {
+        int sel = ln->keep_sel;
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 3);
+
+        if (have) {
+            view_adjust_cycle(st, view_row(st, ctx), &sel, 2);
+        } else {
+            view_row(st, ctx);
+            view_step(st, false);
+        }
+
+        nk_label(ctx, "frame", NK_TEXT_LEFT);
+        if (have) {
+            if (nk_option_label(ctx, "fill", sel == 0))
+                sel = 0;
+            if (nk_option_label(ctx, "keep all", sel == 1))
+                sel = 1;
+        } else {
+            nk_label(ctx, "fill", NK_TEXT_LEFT);
+            nk_label(ctx, "keep all", NK_TEXT_LEFT);
+        }
+
+        ln->keep_sel = sel;
+        ln->keep = sel != 0;
+    }
+
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
 
     if (have) {
@@ -1197,6 +1229,17 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
         nk_labelf(ctx, NK_TEXT_LEFT, "CA R-B %+.2f px, centre %.3f, %.3f",
                   (double)(ln->corner[0] - ln->corner[2]),
                   (double)ln->record.centre[0], (double)ln->record.centre[1]);
+
+        /* The scale is the price of keeping the corners, so it is only
+         * shown while the mode that charges it is on. */
+        if (view_lens_keep_all(st)) {
+            if (ln->scale > 0.0f)
+                nk_labelf(ctx, NK_TEXT_LEFT, "keep all: scaled %.3f",
+                          (double)ln->scale);
+            else
+                nk_label(ctx, "keep all: this record cannot be inverted",
+                         NK_TEXT_LEFT);
+        }
     } else {
         nk_label(ctx, "no lens record in this clip", NK_TEXT_LEFT);
     }

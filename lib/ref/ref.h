@@ -46,9 +46,13 @@ int craw_ref_color(float *rgb, uint32_t width, uint32_t height,
 /* Lens correction, DESIGN.md 16: the per-channel radial warp of the linear
  * output. `src` and `dst` are width*height*4 floats and must not be the
  * same buffer. A correction with valid = false is a copy, which is what
- * the pipeline's skipping the pass amounts to. */
+ * the pipeline's skipping the pass amounts to.
+ *
+ * `keep_all` is CRAW_FRAME_FLAG_LENS_KEEP_ALL (16.8): the scale comes from
+ * craw_lens_keep_all_scale(), the same call the pipeline makes, so the two
+ * cannot drift apart. */
 int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
-                  const CRAWLensCorrection *lc, float *dst);
+                  const CRAWLensCorrection *lc, bool keep_all, float *dst);
 
 /* Whole chain: [denoise,] debayer, colour, [lens]. `out` receives
  * width*height*4 floats. The denoise runs when `params` carries
