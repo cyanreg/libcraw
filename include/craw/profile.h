@@ -182,9 +182,19 @@ CRAW_API int craw_profile_illuminant_to_neutral(const CRAWProfile *p,
                                                 const CRAWIlluminant *illum,
                                                 float *raw_rg, float *raw_bg);
 
-/* Output colour spaces. All are linear light. Spaces with a D65 white
- * are reached by a plain XYZ to RGB matrix; the ACES spaces include a
- * Bradford adaptation from D65 to the ACES white point. */
+/* Output colour spaces. All are linear light, scene referred, with 1.0 at
+ * diffuse white. Spaces with a D65 white are reached by a plain XYZ to RGB
+ * matrix; the ACES spaces include a Bradford adaptation from D65 (which is
+ * what the camera matrix is relative to) to the ACES white point
+ * (x 0.32168, y 0.33767).
+ *
+ * The two ACES spaces are the pair the specification intends:
+ * CRAW_CS_ACES_AP0_LINEAR is ACES2065-1, the archival encoding, wide enough
+ * that nothing the camera matrix produces falls outside it and therefore
+ * never gamut compressed; CRAW_CS_ACES_AP1_LINEAR is ACEScg, the rendering
+ * and display hand-off, which ends with the ACES 1.3 Reference Gamut
+ * Compression unless the frame sets
+ * CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION. See DESIGN.md 8 and 8.1. */
 enum CRAWColorSpace {
     CRAW_CS_XYZ_D65 = 0,
     CRAW_CS_BT709_LINEAR,
@@ -208,5 +218,12 @@ CRAW_API int craw_profile_noise_eval(const CRAWProfile *p, float iso,
 /* Fills `m` with the row-major matrix taking CIE XYZ (D65 relative) to
  * the given space. Identity for CRAW_CS_XYZ_D65. */
 CRAW_API int craw_colorspace_from_xyz_d65(enum CRAWColorSpace cs, float m[3][3]);
+
+/* The inverse: the row-major matrix taking the given space back to CIE XYZ
+ * relative to D65. The two compose to the identity to within float
+ * rounding, and chaining one with the other is how a caller converts
+ * between two output spaces, e.g. the ACEScg the pipeline rendered into
+ * back out to the ACES2065-1 an archive wants. */
+CRAW_API int craw_colorspace_to_xyz_d65(enum CRAWColorSpace cs, float m[3][3]);
 
 #endif /* CRAW_PROFILE_H */

@@ -13,6 +13,7 @@
 #include <craw/pipeline.h>
 
 #include "vk_runtime.h"
+#include "gamut.h"
 
 #include "debayer_bilinear.spv.h"
 #include "debayer_mhc.spv.h"
@@ -81,13 +82,21 @@ typedef struct CRAWColorPush {
     int32_t  size[2];
     float    matrix[3][3];   /* M_out * cam_to_xyz * gain * 2^exposure_stops */
     float    wb_ratio[3];    /* frame wb / as-shot wb */
+    CRAWGamutCompress gc;    /* ACES 1.3 RGC constants, only read when asked */
     uint32_t flags;
 } CRAWColorPush;
 
-static_assert(sizeof(CRAWColorPush) == 60, "CRAWColorPush layout");
+static_assert(sizeof(CRAWColorPush) == 92, "CRAWColorPush layout");
 static_assert(offsetof(CRAWColorPush, matrix) == 8, "CRAWColorPush layout");
 static_assert(offsetof(CRAWColorPush, wb_ratio) == 44, "CRAWColorPush layout");
-static_assert(offsetof(CRAWColorPush, flags) == 56, "CRAWColorPush layout");
+static_assert(offsetof(CRAWColorPush, gc) == 56, "CRAWColorPush layout");
+static_assert(offsetof(CRAWColorPush, flags) == 88, "CRAWColorPush layout");
+
+/* Mirrors CRAW_COLOR_GAMUT_COMPRESS in lib/shaders/color.comp.glsl. It is
+ * not CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION: the public flag is a veto and
+ * this is the positive answer the host works out from it and the output
+ * space together. */
+#define CRAW_COLOR_PUSH_GAMUT_COMPRESS 2u
 
 /* Mirrors CRAWLensPushBuf in lib/shaders/lens.comp.glsl. The centre and
  * the normalizing radius are turned into pixels on the host, because they
@@ -759,6 +768,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     CRAWAwbPush ap;
     CRAWDenoisePush dp;
     CRAWLensPush lp;
+    enum CRAWColorSpace out_space;
     bool denoise, lens;
     float m_out[3][3], scale;
     uint32_t w, h;
@@ -827,14 +837,30 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
             return ret;
     }
 
-    ret = craw_colorspace_from_xyz_d65(p->params.out_space, m_out);
-    if (ret < 0)
+    /* The output space is per frame when the frame asks for one: nothing
+     * the pipeline owns depends on it, only this 3x3 and the compression
+     * below, so alternating spaces costs a different push constant and
+     * nothing else. DESIGN.md 4.3. */
+    out_space = fp->out_space_set ? fp->out_space : p->params.out_space;
+
+    ret = craw_colorspace_from_xyz_d65(out_space, m_out);
+    if (ret < 0) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Unknown output colour space %d\n", (int)out_space);
         return ret;
+    }
 
     cp = (CRAWColorPush) {
         .size  = { (int32_t)w, (int32_t)h },
         .flags = fp->flags & CRAW_FRAME_FLAG_CLAMP_NEGATIVE,
     };
+
+    /* DESIGN.md 8.1: ACEScg is the working space, so what leaves it has to
+     * fit inside AP1; ACES2065-1 is the archive and is never touched. */
+    craw_gamut_compress_params(&cp.gc);
+    if (out_space == CRAW_CS_ACES_AP1_LINEAR &&
+        !(fp->flags & CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION))
+        cp.flags |= CRAW_COLOR_PUSH_GAMUT_COMPRESS;
+
     craw_mat3_mul(cp.matrix, m_out, frame.cam_to_xyz);
     scale = frame.gain * exp2f(fp->exposure_stops);
     for (int i = 0; i < 3; i++) {

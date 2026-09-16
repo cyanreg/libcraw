@@ -37,6 +37,7 @@ craw_sources = files(
     # Colour science (CPU)
     'profile.c',
     'colorspace.c',
+    'gamut.c',
     'awb.c',
     'awb_smoother.c',
     'noise.c',

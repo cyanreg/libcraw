@@ -327,27 +327,128 @@ static void craw_test_colorspaces(void)
         { -0.659926f,  1.608392f,  0.017299f },
         {  0.009003f, -0.003567f,  0.913643f },
     };
+    /* The sRGB/BT.709 to ACEScg matrix as it is published everywhere,
+     * Bradford adapted D65 to the ACES white. The library never stores it:
+     * it comes out of XYZ_to_AP1 * BT709_to_XYZ, so matching it is a check
+     * that both halves and the adaptation between them are right. */
+    static const float srgb_to_ap1[3][3] = {
+        { 0.6130974f, 0.3395231f, 0.0473795f },
+        { 0.0701937f, 0.9163538f, 0.0134524f },
+        { 0.0206156f, 0.1095698f, 0.8698146f },
+    };
+    /* ACEScg to ACES2065-1, from the ACES documentation. Both spaces share
+     * the ACES white, so the two adaptations in the chain have to cancel
+     * exactly; this is what catches an adaptation applied in the wrong
+     * direction, which the published matrices above would not. */
+    static const float ap1_to_ap0[3][3] = {
+        {  0.6954522414f, 0.1406786965f, 0.1638690622f },
+        {  0.0447945634f, 0.8596711185f, 0.0955343182f },
+        { -0.0055258826f, 0.0040252103f, 1.0015006723f },
+    };
     static const enum CRAWColorSpace d65_rgb[] = {
         CRAW_CS_BT709_LINEAR, CRAW_CS_BT2020_LINEAR,
         CRAW_CS_P3D65_LINEAR, CRAW_CS_V_GAMUT_LINEAR,
     };
     const double wx = 0.3127, wy = 0.3290;
     const double white[3] = { wx / wy, 1.0, (1.0 - wx - wy) / wy };
-    float m[3][3];
+    float m[3][3], n[3][3];
+    double worst;
     int ret;
 
+    worst = 0.0;
     ret = craw_colorspace_from_xyz_d65(CRAW_CS_ACES_AP0_LINEAR, m);
     CHECK(ret == 0, "AP0 matrix failed: %d", ret);
     for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++)
+        for (int c = 0; c < 3; c++) {
             CHECK_NEAR(m[r][c], ap0[r][c], 1e-3, "XYZ to AP0 [%d][%d]", r, c);
+            worst = fmax(worst, fabs(m[r][c] - ap0[r][c]));
+        }
     }
+    printf("  XYZ(D65) to AP0: max error %.3e against DESIGN.md 8\n", worst);
 
+    worst = 0.0;
     ret = craw_colorspace_from_xyz_d65(CRAW_CS_ACES_AP1_LINEAR, m);
     CHECK(ret == 0, "AP1 matrix failed: %d", ret);
     for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++)
+        for (int c = 0; c < 3; c++) {
             CHECK_NEAR(m[r][c], ap1[r][c], 1e-3, "XYZ to AP1 [%d][%d]", r, c);
+            worst = fmax(worst, fabs(m[r][c] - ap1[r][c]));
+        }
+    }
+    printf("  XYZ(D65) to AP1: max error %.3e against DESIGN.md 8\n", worst);
+
+    /* Every space's two matrices must undo each other. */
+    for (int cs = 0; cs < CRAW_CS_NB; cs++) {
+        double id_err = 0.0;
+
+        ret = craw_colorspace_from_xyz_d65((enum CRAWColorSpace)cs, m);
+        CHECK(ret == 0, "from_xyz %d failed: %d", cs, ret);
+        ret = craw_colorspace_to_xyz_d65((enum CRAWColorSpace)cs, n);
+        CHECK(ret == 0, "to_xyz %d failed: %d", cs, ret);
+
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                double o = (double)m[r][0] * n[0][c] + (double)m[r][1] * n[1][c]
+                         + (double)m[r][2] * n[2][c];
+                CHECK_NEAR(o, r == c ? 1.0 : 0.0, 1e-5,
+                           "space %d round trip [%d][%d]", cs, r, c);
+                id_err = fmax(id_err, fabs(o - (r == c ? 1.0 : 0.0)));
+            }
+        }
+        printf("  space %d round trip: max error %.3e\n", cs, id_err);
+    }
+
+    /* BT.709 through XYZ into AP1, against the published composed matrix,
+     * and the white of one landing on the white of the other. */
+    {
+        double comp[3][3], sum[3] = { 0.0, 0.0, 0.0 };
+
+        ret = craw_colorspace_to_xyz_d65(CRAW_CS_BT709_LINEAR, n);
+        CHECK(ret == 0, "BT.709 to XYZ failed: %d", ret);
+        ret = craw_colorspace_from_xyz_d65(CRAW_CS_ACES_AP1_LINEAR, m);
+        CHECK(ret == 0, "XYZ to AP1 failed: %d", ret);
+
+        worst = 0.0;
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                comp[r][c] = (double)m[r][0] * n[0][c] + (double)m[r][1] * n[1][c]
+                           + (double)m[r][2] * n[2][c];
+                CHECK_NEAR(comp[r][c], srgb_to_ap1[r][c], 1e-3,
+                           "sRGB to ACEScg [%d][%d]", r, c);
+                worst = fmax(worst, fabs(comp[r][c] - srgb_to_ap1[r][c]));
+                sum[r] += comp[r][c];
+            }
+        }
+        printf("  sRGB to ACEScg: max error %.3e against the published matrix\n", worst);
+
+        /* sRGB white is (1, 1, 1), so the row sums are what it becomes. */
+        worst = 0.0;
+        for (int r = 0; r < 3; r++) {
+            CHECK_NEAR(sum[r], 1.0, 1e-4, "sRGB white in ACEScg, channel %d", r);
+            worst = fmax(worst, fabs(sum[r] - 1.0));
+        }
+        printf("  sRGB white in ACEScg: max error %.3e from (1, 1, 1)\n", worst);
+    }
+
+    /* AP1 to AP0, where the two adaptations have to cancel. */
+    {
+        ret = craw_colorspace_to_xyz_d65(CRAW_CS_ACES_AP1_LINEAR, n);
+        CHECK(ret == 0, "AP1 to XYZ failed: %d", ret);
+        ret = craw_colorspace_from_xyz_d65(CRAW_CS_ACES_AP0_LINEAR, m);
+        CHECK(ret == 0, "XYZ to AP0 failed: %d", ret);
+
+        worst = 0.0;
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++) {
+                double o = (double)m[r][0] * n[0][c] + (double)m[r][1] * n[1][c]
+                         + (double)m[r][2] * n[2][c];
+                CHECK_NEAR(o, ap1_to_ap0[r][c], 1e-4, "ACEScg to ACES2065-1 [%d][%d]",
+                           r, c);
+                worst = fmax(worst, fabs(o - ap1_to_ap0[r][c]));
+            }
+        }
+        printf("  ACEScg to ACES2065-1: max error %.3e against the published matrix\n",
+               worst);
     }
 
     /* D65 at unit luminance is white in every D65 space. */
@@ -389,6 +490,9 @@ static void craw_test_colorspaces(void)
     }
 
     ret = craw_colorspace_from_xyz_d65(CRAW_CS_NB, m);
+    CHECK(ret == CRAW_ERROR(EINVAL), "an unknown space must fail, got %d", ret);
+
+    ret = craw_colorspace_to_xyz_d65(CRAW_CS_NB, m);
     CHECK(ret == CRAW_ERROR(EINVAL), "an unknown space must fail, got %d", ret);
 }
 

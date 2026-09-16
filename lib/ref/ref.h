@@ -38,10 +38,20 @@ int craw_ref_debayer(const uint16_t *bayer, uint32_t width, uint32_t height,
                      enum CRAWDebayer method, float *rgb);
 
 /* Runs the colour stage on a camera RGB buffer in place: matrix, gain and
- * exposure for the frame's illuminant, then XYZ to `out_space`. The buffer
+ * exposure for the frame's illuminant, then XYZ to `out_space`, which is
+ * the *effective* space — the caller has already resolved the frame's own
+ * override against the pipeline's, with craw_ref_out_space(). The buffer
  * must have been debayered with the gains of that same illuminant. */
 int craw_ref_color(float *rgb, uint32_t width, uint32_t height,
                    const CRAWFrameParams *fp, enum CRAWColorSpace out_space);
+
+/* The space a frame actually lands in: its own when it set one, else the
+ * pipeline's. The same choice craw_pipeline_record() makes. */
+static inline enum CRAWColorSpace craw_ref_out_space(const CRAWPipelineParams *params,
+                                                     const CRAWFrameParams *fp)
+{
+    return fp->out_space_set ? fp->out_space : params->out_space;
+}
 
 /* Lens correction, DESIGN.md 16: the per-channel radial warp of the linear
  * output. `src` and `dst` are width*height*4 floats and must not be the

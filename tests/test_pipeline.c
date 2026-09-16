@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <inttypes.h>
 
 #include <craw/craw.h>
 #include <craw/vulkan.h>
@@ -29,6 +30,7 @@
 #include <craw/noise.h>
 
 #include "vkdev.h"
+#include "gamut.h"
 #include "ref/ref.h"
 
 #define TEST_W 256
@@ -367,9 +369,11 @@ static const char *test_method_name(enum CRAWDebayer m)
 static const char *test_space_name(enum CRAWColorSpace cs)
 {
     switch (cs) {
-    case CRAW_CS_XYZ_D65:        return "XYZ_D65";
-    case CRAW_CS_BT2020_LINEAR:  return "BT2020";
-    default:                     return "?";
+    case CRAW_CS_XYZ_D65:         return "XYZ_D65";
+    case CRAW_CS_BT2020_LINEAR:   return "BT2020";
+    case CRAW_CS_ACES_AP0_LINEAR: return "AP0";
+    case CRAW_CS_ACES_AP1_LINEAR: return "AP1";
+    default:                      return "?";
     }
 }
 
@@ -1539,6 +1543,849 @@ done:
     return ret;
 }
 
+/* ----------------------------------------------------- gamut compression */
+
+/* DESIGN.md 8.1. First the ACES 1.3 curve on its own, without a GPU: its
+ * shape, what it leaves alone and which way it moves what it does not.
+ * Then the whole chain through four output spaces on the device, with the
+ * negative components counted in each. */
+
+/* An RGB triple of `src` carried into AP1 linear through XYZ D65. */
+static int test_to_ap1(enum CRAWColorSpace src, const float in[3], float out[3])
+{
+    float to[3][3], from[3][3], xyz[3];
+    int ret;
+
+    ret = craw_colorspace_to_xyz_d65(src, to);
+    if (ret < 0)
+        return ret;
+
+    ret = craw_colorspace_from_xyz_d65(CRAW_CS_ACES_AP1_LINEAR, from);
+    if (ret < 0)
+        return ret;
+
+    for (int r = 0; r < 3; r++)
+        xyz[r] = to[r][0] * in[0] + to[r][1] * in[1] + to[r][2] * in[2];
+    for (int r = 0; r < 3; r++)
+        out[r] = from[r][0] * xyz[0] + from[r][1] * xyz[1] + from[r][2] * xyz[2];
+
+    return 0;
+}
+
+/* One channel's compressed distance, read back off the operator itself: a
+ * triple whose other two channels sit at the achromatic value 1.0 and whose
+ * channel `c` sits a distance `d` below it exercises exactly one curve. */
+static double test_gamut_curve_at(const CRAWGamutCompress *g, int c, double d)
+{
+    float rgb[3] = { 1.0f, 1.0f, 1.0f };
+
+    rgb[c] = (float)(1.0 - d);
+    craw_gamut_compress(g, rgb);
+
+    return 1.0 - (double)rgb[c];
+}
+
+/* The published ACES 1.3 parameters, repeated here so that the test is a
+ * check against the specification and not against lib/gamut.c's arithmetic
+ * spelled a second way. Order is the operator's: cyan is the red channel's
+ * curve, magenta the green one's, yellow the blue one's. */
+static const double test_rgc_lim[3] = { 1.147, 1.264, 1.312 };
+static const double test_rgc_thr[3] = { 0.815, 0.803, 0.880 };
+
+static int test_gamut_curve(void)
+{
+    static const char *chan[3] = { "cyan (R)", "magenta (G)", "yellow (B)" };
+    CRAWGamutCompress g;
+    int bad = 0;
+
+    craw_gamut_compress_params(&g);
+
+    if (!(fabs((double)g.pwr - 1.2) < 1e-6)) {
+        fprintf(stderr, "gamut: power is %.9g, the specification says 1.2\n", (double)g.pwr);
+        bad++;
+    }
+
+    for (int c = 0; c < 3; c++) {
+        const double thr = test_rgc_thr[c], lim = test_rgc_lim[c];
+        const double asym = thr + (double)g.scl[c];
+        double worst_step = 0.0, worst_below = 0.0;
+        double at_lim, prev, jump;
+        int steps = 40000;
+
+        if (!(fabs((double)g.thr[c] - thr) < 1e-6)) {
+            fprintf(stderr, "gamut: %s threshold is %.9g, want %.9g\n",
+                    chan[c], (double)g.thr[c], thr);
+            bad++;
+        }
+
+        /* Nothing below the threshold moves at all: not "within 1e-5",
+         * bit for bit, because the operator does not touch it. Compared on
+         * the triple itself rather than on the distance, because turning a
+         * float back into a distance and out again is what loses the last
+         * bits, not the operator. The divisor is 201 so that the last
+         * sample is still strictly below the threshold. */
+        for (int i = 0; i <= 200; i++) {
+            float rgb[3] = { 1.0f, 1.0f, 1.0f }, was[3];
+
+            rgb[c] = (float)(1.0 - thr * (double)i / 201.0);
+            memcpy(was, rgb, sizeof(was));
+            craw_gamut_compress(&g, rgb);
+
+            for (int k = 0; k < 3; k++)
+                worst_below = fmax(worst_below, fabs((double)rgb[k] - was[k]));
+        }
+        if (!(worst_below == 0.0)) {
+            fprintf(stderr, "gamut: %s moves a distance below the threshold by %.3e\n",
+                    chan[c], worst_below);
+            bad++;
+        }
+
+        /* A distance of exactly the limit lands on 1.0, which puts the
+         * channel at exactly zero: that is what "distance limit" means and
+         * it is the whole reason anything further out stops being
+         * negative. */
+        at_lim = test_gamut_curve_at(&g, c, lim);
+        if (!(fabs(at_lim - 1.0) < 1e-5)) {
+            fprintf(stderr, "gamut: %s at the limit gives %.9g, want 1.0\n", chan[c], at_lim);
+            bad++;
+        }
+
+        /* Monotone, and never expanding: a step in the distance can only
+         * produce a step no larger in the compressed distance. Sweeping
+         * straight across the threshold is what makes this a continuity
+         * check — a break there would show up as one oversized step. */
+        prev = test_gamut_curve_at(&g, c, 0.0);
+        for (int i = 1; i <= steps; i++) {
+            double d = 2.0 * (double)i / (double)steps;
+            double f = test_gamut_curve_at(&g, c, d);
+            double h = 2.0 / (double)steps;
+
+            if (!(f >= prev - 1e-9)) {
+                fprintf(stderr, "gamut: %s is not monotone at d = %.6f\n", chan[c], d);
+                bad++;
+                break;
+            }
+            worst_step = fmax(worst_step, (f - prev) / h);
+            prev = f;
+        }
+        if (!(worst_step <= 1.0 + 1e-3)) {
+            fprintf(stderr, "gamut: %s expands by %.6f at its steepest\n", chan[c], worst_step);
+            bad++;
+        }
+
+        /* And the same across the threshold at a step far finer than the
+         * sweep, which is where a discontinuity would hide. */
+        jump = fabs(test_gamut_curve_at(&g, c, thr + 1e-6) -
+                    test_gamut_curve_at(&g, c, thr - 1e-6));
+        if (!(jump < 1e-5)) {
+            fprintf(stderr, "gamut: %s jumps by %.3e across the threshold\n", chan[c], jump);
+            bad++;
+        }
+
+        /* However far out the colour is, the compressed distance cannot
+         * pass thr + scl, so the channel cannot fall below -(scl + thr - 1)
+         * of the achromatic value. Beyond the limit it is negative again,
+         * which is the specification's own trade and worth stating. */
+        if (!(test_gamut_curve_at(&g, c, 1e6) <= asym + 1e-6)) {
+            fprintf(stderr, "gamut: %s passes its asymptote\n", chan[c]);
+            bad++;
+        }
+
+        printf("  %-12s thr %.3f lim %.3f scl %.6f: limit -> %.6f, asymptote %.6f,"
+               " steepest %.6f, jump %.1e\n",
+               chan[c], thr, lim, (double)g.scl[c], at_lim, asym, worst_step, jump);
+    }
+
+    return bad ? CRAW_ERROR(EINVAL) : 0;
+}
+
+/* Is this AP1 colour one the operator promises not to touch? Every channel
+ * has to sit closer to the achromatic value than its own threshold. */
+static bool test_gamut_protected(const CRAWGamutCompress *g, const float rgb[3])
+{
+    float ach = CRAW_MAX(rgb[0], CRAW_MAX(rgb[1], rgb[2]));
+
+    if (ach == 0.0f)
+        return true;
+
+    for (int c = 0; c < 3; c++) {
+        if ((ach - rgb[c]) / fabsf(ach) >= g->thr[c])
+            return false;
+    }
+
+    return true;
+}
+
+struct test_gamut_colour {
+    const char *name;
+    enum CRAWColorSpace space;
+    float rgb[3];
+};
+
+static int test_gamut_invariance(void)
+{
+    static const struct test_gamut_colour colours[] = {
+        { "neutral",      CRAW_CS_BT709_LINEAR,  { 1.0f, 1.0f, 1.0f } },
+        { "709 red",      CRAW_CS_BT709_LINEAR,  { 1.0f, 0.0f, 0.0f } },
+        { "709 green",    CRAW_CS_BT709_LINEAR,  { 0.0f, 1.0f, 0.0f } },
+        { "709 blue",     CRAW_CS_BT709_LINEAR,  { 0.0f, 0.0f, 1.0f } },
+        { "709 cyan",     CRAW_CS_BT709_LINEAR,  { 0.0f, 1.0f, 1.0f } },
+        { "709 magenta",  CRAW_CS_BT709_LINEAR,  { 1.0f, 0.0f, 1.0f } },
+        { "709 yellow",   CRAW_CS_BT709_LINEAR,  { 1.0f, 1.0f, 0.0f } },
+        { "2020 red",     CRAW_CS_BT2020_LINEAR, { 1.0f, 0.0f, 0.0f } },
+        { "2020 green",   CRAW_CS_BT2020_LINEAR, { 0.0f, 1.0f, 0.0f } },
+        { "2020 blue",    CRAW_CS_BT2020_LINEAR, { 0.0f, 0.0f, 1.0f } },
+        { "2020 cyan",    CRAW_CS_BT2020_LINEAR, { 0.0f, 1.0f, 1.0f } },
+        { "2020 magenta", CRAW_CS_BT2020_LINEAR, { 1.0f, 0.0f, 1.0f } },
+        { "2020 yellow",  CRAW_CS_BT2020_LINEAR, { 1.0f, 1.0f, 0.0f } },
+    };
+    /* Each colour at four levels, and each again pulled 40% of the way to
+     * neutral: a real surface under a real light is nowhere near a display
+     * primary, and the desaturated set is the one the specification's
+     * thresholds were fitted to protect. */
+    static const float levels[4] = { 0.05f, 0.25f, 0.60f, 1.00f };
+    CRAWGamutCompress g;
+    int bad = 0, nprot = 0, nmoved = 0;
+
+    craw_gamut_compress_params(&g);
+
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(colours); i++) {
+        for (int desat = 0; desat < 2; desat++) {
+            double worst_move = 0.0, worst_scale = 0.0;
+            bool protect = true, outward = false, ach_moved = false;
+            float base[3];
+            int ret;
+
+            ret = test_to_ap1(colours[i].space, colours[i].rgb, base);
+            if (ret < 0) {
+                fprintf(stderr, "gamut: test_to_ap1 failed: %d\n", ret);
+                return ret;
+            }
+
+            if (desat) {
+                float mean = (base[0] + base[1] + base[2]) / 3.0f;
+                for (int c = 0; c < 3; c++)
+                    base[c] = 0.6f * base[c] + 0.4f * mean;
+            }
+
+            for (size_t li = 0; li < CRAW_ARRAY_ELEMS(levels); li++) {
+                float in[3], out[3], unit[3];
+                float ach_in, ach_out;
+
+                for (int c = 0; c < 3; c++)
+                    in[c] = out[c] = base[c] * levels[li];
+
+                ach_in = CRAW_MAX(in[0], CRAW_MAX(in[1], in[2]));
+                protect = protect && test_gamut_protected(&g, in);
+                craw_gamut_compress(&g, out);
+                ach_out = CRAW_MAX(out[0], CRAW_MAX(out[1], out[2]));
+
+                if (ach_out != ach_in)
+                    ach_moved = true;
+
+                for (int c = 0; c < 3; c++) {
+                    /* The operator only ever pulls a channel up towards
+                     * the achromatic value; a channel moving the other way
+                     * would mean the sign of the distance was wrong. */
+                    if (out[c] < in[c] - 1e-7f * fabsf(ach_in))
+                        outward = true;
+                    worst_move = fmax(worst_move, fabs((double)out[c] - in[c]));
+                }
+
+                /* Scale invariance: the distances are ratios, so the whole
+                 * operator has to commute with a change of exposure. This
+                 * is what makes "at several levels" a real check rather
+                 * than four repetitions of one. */
+                for (int c = 0; c < 3; c++)
+                    unit[c] = base[c];
+                craw_gamut_compress(&g, unit);
+                for (int c = 0; c < 3; c++) {
+                    double want = (double)unit[c] * levels[li];
+                    double rel = fabs((double)out[c] - want) /
+                                 fmax(1e-6, fabs((double)ach_in));
+                    worst_scale = fmax(worst_scale, rel);
+                }
+            }
+
+            if (ach_moved) {
+                fprintf(stderr, "gamut: %s%s moved its achromatic value\n",
+                        colours[i].name, desat ? " (desaturated)" : "");
+                bad++;
+            }
+            if (outward) {
+                fprintf(stderr, "gamut: %s%s was pushed away from achromatic\n",
+                        colours[i].name, desat ? " (desaturated)" : "");
+                bad++;
+            }
+            if (!(worst_scale < 1e-5)) {
+                fprintf(stderr, "gamut: %s%s is not scale invariant, off by %.3e\n",
+                        colours[i].name, desat ? " (desaturated)" : "", worst_scale);
+                bad++;
+            }
+            if (protect) {
+                nprot++;
+                /* The promise for a colour inside the thresholds is exact,
+                 * not approximate. */
+                if (!(worst_move == 0.0)) {
+                    fprintf(stderr, "gamut: %s%s is inside the thresholds but moved by %.3e\n",
+                            colours[i].name, desat ? " (desaturated)" : "", worst_move);
+                    bad++;
+                }
+            } else {
+                nmoved++;
+            }
+
+            printf("  %-13s%-15s %s, max move %.2e (AP1 %+.4f %+.4f %+.4f)\n",
+                   colours[i].name, desat ? " desaturated" : "",
+                   protect ? "untouched" : "compressed", worst_move,
+                   (double)base[0], (double)base[1], (double)base[2]);
+        }
+    }
+
+    printf("  %d of %d colour/saturation combinations sit inside the ACES thresholds\n",
+           nprot, nprot + nmoved);
+
+    return bad ? CRAW_ERROR(EINVAL) : 0;
+}
+
+/* How far out of AP1 this camera's matrix can possibly reach, and what is
+ * left of that after the operator has pulled it in.
+ *
+ * The per-channel distance is (max(Mc) - (Mc)_i) / |max(Mc)| with M the
+ * composed camera-RGB-to-AP1 matrix: a ratio of linear forms in c, so it is
+ * invariant to the scale of c, and each of the three ratios it is a maximum
+ * of attains its own maximum over the cone of non-negative camera RGB on one
+ * of that cone's three extreme rays. Running the three camera primaries
+ * through the real operator therefore bounds every colour the sensor can
+ * produce, which is what makes "ACEScg output has no negative component" a
+ * property of this camera rather than something the test scene happened not
+ * to trip. Each of the profile's matrix knots is measured too, because
+ * CRAW_WB_REBALANCE interpolates between them and a grade can land on any.
+ *
+ * The camera primaries themselves are imaginary colours — a camera's
+ * spectral responses overlap, so no light gives (0, 0, 1) — and at the warm
+ * end of the table one of them reaches a hair past the operator's magenta
+ * limit, which is why the knots are held to a small residual rather than to
+ * none. The as-shot matrix, which is the default path, clears it outright. */
+static int test_gamut_reach(const CRAWProfile *profile)
+{
+    static const char *chan[3] = { "cyan (R)", "magenta (G)", "yellow (B)" };
+    CRAWGamutCompress g;
+    double worst_knot = 0.0, worst_shot = 0.0;
+    double dist_shot[3] = { 0.0, 0.0, 0.0 }, dist_knot[3] = { 0.0, 0.0, 0.0 };
+    float worst_cct = 0.0f;
+    float ap1[3][3];
+    int ret, bad = 0;
+
+    craw_gamut_compress_params(&g);
+
+    ret = craw_colorspace_from_xyz_d65(CRAW_CS_ACES_AP1_LINEAR, ap1);
+    if (ret < 0)
+        return ret;
+
+    /* Index nb_matrix_knots is the as-shot matrix, which CRAW_WB_AS_SHOT
+     * uses in place of the table. */
+    for (uint32_t k = 0; k <= profile->nb_matrix_knots; k++) {
+        bool as_shot = k == profile->nb_matrix_knots;
+        const float (*cam)[3] = as_shot ? profile->as_shot_matrix
+                                        : profile->matrix_knots[k].m;
+        double worst = 0.0;
+
+        for (int j = 0; j < 3; j++) {
+            float prim[3];
+            float ach;
+
+            /* Column j of ap1 * cam is where camera primary j lands. */
+            for (int i = 0; i < 3; i++) {
+                prim[i] = ap1[i][0] * cam[0][j] + ap1[i][1] * cam[1][j]
+                        + ap1[i][2] * cam[2][j];
+            }
+
+            ach = CRAW_MAX(prim[0], CRAW_MAX(prim[1], prim[2]));
+            if (!(ach > 0.0f))
+                continue;
+
+            for (int i = 0; i < 3; i++) {
+                double d = ((double)ach - prim[i]) / fabs(ach);
+                if (as_shot)
+                    dist_shot[i] = fmax(dist_shot[i], d);
+                else
+                    dist_knot[i] = fmax(dist_knot[i], d);
+            }
+
+            craw_gamut_compress(&g, prim);
+
+            for (int i = 0; i < 3; i++)
+                worst = fmax(worst, -(double)prim[i] / ach);
+        }
+
+        if (as_shot) {
+            worst_shot = worst;
+        } else if (worst > worst_knot) {
+            worst_knot = worst;
+            worst_cct = profile->matrix_knots[k].cct;
+        }
+    }
+
+    for (int i = 0; i < 3; i++) {
+        printf("  camera reach %-12s as-shot %.4f, worst knot %.4f, limit %.3f\n",
+               chan[i], dist_shot[i], dist_knot[i], test_rgc_lim[i]);
+    }
+    printf("  camera primaries after compression: as-shot leaves %.3e of the pixel "
+           "negative, the worst knot (%.0f K) %.3e\n", worst_shot, (double)worst_cct,
+           worst_knot);
+
+    /* The as-shot matrix is what every frame uses unless a grade rebalances
+     * it, and it has room to spare. */
+    if (!(worst_shot == 0.0)) {
+        fprintf(stderr, "gamut: the as-shot matrix still leaves %.3e negative after "
+                "compression\n", worst_shot);
+        bad++;
+    }
+
+    /* Across the rebalance table the reach may graze the operator's limit;
+     * what must not happen is a residual anyone could see. */
+    if (!(worst_knot < 1e-3)) {
+        fprintf(stderr, "gamut: a matrix knot leaves %.3e of the pixel negative after "
+                "compression, which is more than rounding\n", worst_knot);
+        bad++;
+    }
+
+    return bad ? CRAW_ERROR(EINVAL) : 0;
+}
+
+/* ------------------------------------------------ gamut compression, GPU */
+
+/* A scene made of the camera's own extremes: eight vertical bands of
+ * saturated camera RGB at four levels. Through this camera's matrix the
+ * blue band in particular lands well outside both BT.2020 and AP1, which is
+ * the point.
+ *
+ * The bands cross-fade into each other over the last fifth of their width
+ * rather than butting up against one another. A one-pixel step from a
+ * saturated blue to a saturated yellow is not a scene, it is a test of how
+ * RCD behaves when its directional ratios divide by a low pass sum that is
+ * itself nearly zero, and it pushes the GPU and the reference apart by more
+ * than the tolerances of DESIGN.md 11 allow for reasons that have nothing
+ * to do with colour. The ramp still gives the debayer plenty of gradient to
+ * ring on while leaving the flat middle of every band fully saturated. */
+static void test_gamut_gen_mosaic(uint16_t *m)
+{
+    static const float band[8][3] = {
+        { 1.00f, 0.02f, 0.02f },   /* camera red */
+        { 0.02f, 1.00f, 0.02f },   /* camera green */
+        { 0.02f, 0.02f, 1.00f },   /* camera blue, the one far outside AP1 */
+        { 1.00f, 1.00f, 0.02f },   /* yellow */
+        { 0.02f, 1.00f, 1.00f },   /* cyan */
+        { 1.00f, 0.02f, 1.00f },   /* magenta */
+        { 1.00f, 1.00f, 1.00f },   /* neutral */
+        { 0.18f, 0.06f, 1.00f },   /* an LED blue with a little red in it */
+    };
+    static const float level[4] = { 0.12f, 0.35f, 0.65f, 0.95f };
+
+    for (int y = 0; y < TEST_H; y++) {
+        float fy = ((float)y + 0.5f) / (float)TEST_H * 4.0f;
+        int l0 = CRAW_MIN((int)fy, 3), l1 = CRAW_MIN(l0 + 1, 3);
+        float ly = fy - (float)l0;
+        float lw = ly < 0.8f ? 0.0f : (ly - 0.8f) / 0.2f;
+        float lv = level[l0] + (level[l1] - level[l0]) * lw;
+
+        for (int x = 0; x < TEST_W; x++) {
+            int s = (y & 1) * 2 + (x & 1);
+            int c = (s == 0) ? 0 : (s == 3) ? 2 : 1;
+            float fx = ((float)x + 0.5f) / (float)TEST_W * 8.0f;
+            int b0 = CRAW_MIN((int)fx, 7), b1 = CRAW_MIN(b0 + 1, 7);
+            float bx = fx - (float)b0;
+            float bw = bx < 0.8f ? 0.0f : (bx - 0.8f) / 0.2f;
+            float v = (band[b0][c] + (band[b1][c] - band[b0][c]) * bw) * lv;
+            float raw = TEST_BLACK + (v / test_wb[c]) * (TEST_WHITE - TEST_BLACK);
+            int iv = (int)lrintf(raw * 65535.0f);
+
+            /* The same deterministic +-8 count noise the other scene uses,
+             * so that nothing here passes on a perfectly smooth signal. */
+            iv += (int)(test_hash((uint32_t)(y * TEST_W + x) * 2654435761u) % 17u) - 8;
+            iv = iv < 0 ? 0 : (iv > 65535 ? 65535 : iv);
+
+            m[y * TEST_W + x] = (uint16_t)iv;
+        }
+    }
+}
+
+/* Pixels with any component below zero, and how far below the worst one
+ * goes relative to that pixel's own magnitude. */
+static uint64_t test_count_negative(const float *img, size_t npix, double *worst)
+{
+    uint64_t n = 0;
+
+    *worst = 0.0;
+
+    for (size_t i = 0; i < npix; i++) {
+        const float *px = &img[i * 4];
+        double ach = CRAW_MAX(px[0], CRAW_MAX(px[1], px[2]));
+        bool neg = false;
+
+        for (int c = 0; c < 3; c++) {
+            if (px[c] < 0.0f) {
+                neg = true;
+                if (ach > 0.0)
+                    *worst = fmax(*worst, -(double)px[c] / ach);
+            }
+        }
+
+        n += neg;
+    }
+
+    return n;
+}
+
+/* What a space is allowed to leave negative on the scene above. */
+enum test_gamut_expect {
+    /* Negatives are the point of the case and are not constrained. */
+    TEST_GAMUT_ANY = 0,
+    /* Only where the debayer itself rang the camera RGB below zero. The
+     * compression's reach is a property of the camera-to-AP1 matrix over
+     * the cone of non-negative camera RGB (test_gamut_reach above); a
+     * debayer with negative kernel weights leaves that cone at a hard edge
+     * between two saturated colours, and outside it nothing is promised.
+     * Bilinear, whose weights are all positive, never leaves it. */
+    TEST_GAMUT_IN_CONE,
+    /* ACES2065-1 holds every colour a real light can be, but the scene
+     * below is not made of real light: camera RGB of (0.02, 0.02, 1.0) is
+     * a response no spectrum gives, and such a colour can fall outside the
+     * spectral locus and so outside AP0 as well. What is checked here is
+     * the relation — ACES2065-1 must still be far cleaner than an
+     * uncompressed ACEScg — with the breakdown printed for the record.
+     * "AP0 has no negatives" is a claim about real footage and is
+     * measured on real clips, not here. */
+    TEST_GAMUT_REAL,
+};
+
+struct test_gamut_case {
+    const char *name;
+    enum CRAWColorSpace space;
+    uint32_t frame_flags;
+    enum test_gamut_expect expect;
+};
+
+static const struct test_gamut_case test_gamut_cases[] = {
+    { "BT.2020",          CRAW_CS_BT2020_LINEAR,   0,                                    TEST_GAMUT_ANY },
+    { "AP1 uncompressed", CRAW_CS_ACES_AP1_LINEAR, CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION, TEST_GAMUT_ANY },
+    { "AP1 compressed",   CRAW_CS_ACES_AP1_LINEAR, 0,                                    TEST_GAMUT_IN_CONE },
+    { "AP0",              CRAW_CS_ACES_AP0_LINEAR, 0,                                    TEST_GAMUT_REAL },
+    /* The flag is documented to do nothing outside ACEScg; this is the
+     * pair that proves ACES2065-1 keeps every value the matrix produced. */
+    { "AP0 (flag set)",   CRAW_CS_ACES_AP0_LINEAR, CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION, TEST_GAMUT_REAL },
+};
+
+static int test_gamut_gpu(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile,
+                          CRAWTestImage *src, CRAWTestImage *dst, float *gpu, float *ref)
+{
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    uint16_t *mosaic = NULL;
+    float *ap0_plain = NULL, *xyz = NULL, *cam = NULL;
+    int ret;
+
+    mosaic = malloc(npix * sizeof(*mosaic));
+    ap0_plain = malloc(npix * 4 * sizeof(*ap0_plain));
+    xyz = malloc(npix * 4 * sizeof(*xyz));
+    cam = malloc(npix * 4 * sizeof(*cam));
+    if (!mosaic || !ap0_plain || !xyz || !cam) {
+        ret = CRAW_ERROR(ENOMEM);
+        goto done;
+    }
+
+    test_gamut_gen_mosaic(mosaic);
+
+    ret = craw_testdev_image_upload(td, src, mosaic, npix * sizeof(*mosaic));
+    if (ret < 0) {
+        fprintf(stderr, "gamut: upload failed: %d\n", ret);
+        goto done;
+    }
+
+    for (int mi = 0; mi < CRAW_DEBAYER_NB; mi++) {
+        enum CRAWDebayer method = (enum CRAWDebayer)mi;
+        const char *mname = test_method_name(method);
+        double tol_rel = method == CRAW_DEBAYER_RCD ? 1.5e-2 : 1e-2;
+        CRAWPipelineParams xp;
+        CRAWFrameParams xf;
+        uint64_t uncompressed_neg = 0;
+
+        /* The same scene in XYZ, on the CPU only: the luminance channel is
+         * what says whether a pixel is a colour at all. */
+        craw_pipeline_params_init(&xp);
+        xp.width = TEST_W;
+        xp.height = TEST_H;
+        xp.debayer = method;
+        xp.out_space = CRAW_CS_XYZ_D65;
+
+        craw_frame_params_init(&xf);
+        xf.profile = profile;
+
+        ret = craw_ref_process(mosaic, TEST_W, TEST_H, TEST_W, &xp, &xf, xyz);
+        if (ret < 0) {
+            fprintf(stderr, "gamut: craw_ref_process (XYZ) failed: %d\n", ret);
+            goto done;
+        }
+
+        /* And the camera RGB the colour stage was handed, which is where
+         * the debayer's ringing shows up. */
+        ret = craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, profile, method, cam);
+        if (ret < 0) {
+            fprintf(stderr, "gamut: craw_ref_debayer failed: %d\n", ret);
+            goto done;
+        }
+
+        for (size_t ci = 0; ci < CRAW_ARRAY_ELEMS(test_gamut_cases); ci++) {
+            const struct test_gamut_case *tc = &test_gamut_cases[ci];
+            CRAWPipelineParams pp;
+            CRAWFrameParams fp;
+            uint64_t neg_gpu, neg_ref;
+            double worst_gpu, worst_ref, err, ms = 0.0;
+
+
+            craw_pipeline_params_init(&pp);
+            pp.width = TEST_W;
+            pp.height = TEST_H;
+            pp.debayer = method;
+            pp.out_space = tc->space;
+
+            craw_frame_params_init(&fp);
+            fp.profile = profile;
+            fp.flags = tc->frame_flags;
+
+            ret = craw_ref_process(mosaic, TEST_W, TEST_H, TEST_W, &pp, &fp, ref);
+            if (ret < 0) {
+                fprintf(stderr, "gamut: craw_ref_process failed: %d\n", ret);
+                goto done;
+            }
+
+            ret = test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms);
+            if (ret < 0)
+                goto done;
+
+            err = test_max_rel(gpu, ref, npix);
+            neg_gpu = test_count_negative(gpu, npix, &worst_gpu);
+            neg_ref = test_count_negative(ref, npix, &worst_ref);
+
+            if (tc->space == CRAW_CS_ACES_AP1_LINEAR && tc->frame_flags)
+                uncompressed_neg = neg_ref;
+
+            printf("  %-8s %-17s: %6" PRIu64 " negative px gpu (%5.2f%%, worst %.3f of the pixel),"
+                   " %6" PRIu64 " ref, max rel %.3e\n",
+                   mname, tc->name, neg_gpu, 100.0 * (double)neg_gpu / (double)npix,
+                   worst_gpu, neg_ref, err);
+
+            if (!(err <= tol_rel)) {
+                fprintf(stderr, "gamut: %s %s differs by %.3e relative, tolerance %.1e\n",
+                        mname, tc->name, err, tol_rel);
+                ret = CRAW_ERROR(EINVAL);
+                goto done;
+            }
+
+            /* Every negative the case does not excuse, counted on both
+             * the GPU result and the reference so that neither can hide
+             * one the other has. */
+            if (tc->expect != TEST_GAMUT_ANY) {
+                uint64_t unexplained = 0, rang = 0, imaginary = 0;
+
+                for (size_t i = 0; i < npix; i++) {
+                    bool neg = false;
+
+                    for (int c = 0; c < 3; c++)
+                        neg = neg || ref[i * 4 + c] < 0.0f || gpu[i * 4 + c] < 0.0f;
+                    if (!neg)
+                        continue;
+
+                    /* A camera RGB the debayer rang below zero is no more a
+                     * real camera response than a colour of no luminance is
+                     * a real colour, so it excuses both kinds of case. */
+                    if (cam[i * 4] < 0.0f || cam[i * 4 + 1] < 0.0f || cam[i * 4 + 2] < 0.0f)
+                        rang++;
+                    else if (tc->expect == TEST_GAMUT_REAL && !(xyz[i * 4 + 1] > 0.0f))
+                        imaginary++;
+                    else
+                        unexplained++;
+                }
+
+                if (rang || imaginary || unexplained)
+                    printf("      (%" PRIu64 " rang negative in the debayer, %" PRIu64
+                           " have no positive luminance, %" PRIu64 " otherwise outside"
+                           " the space)\n", rang, imaginary, unexplained);
+
+                /* ACEScg after compression is held to the exact property:
+                 * nothing negative anywhere the camera RGB stayed in the
+                 * non-negative cone that test_gamut_reach bounds. */
+                if (tc->expect == TEST_GAMUT_IN_CONE && unexplained) {
+                    fprintf(stderr, "gamut: %s %s left %" PRIu64 " negative pixels on "
+                            "camera RGB the debayer did not ring negative\n",
+                            mname, tc->name, unexplained);
+                    ret = CRAW_ERROR(EINVAL);
+                    goto done;
+                }
+
+                /* ACES2065-1 is held to the relation instead, see the enum. */
+                if (tc->expect == TEST_GAMUT_REAL && !(neg_ref * 2 < uncompressed_neg)) {
+                    fprintf(stderr, "gamut: %s %s has %" PRIu64 " negative pixels against "
+                            "%" PRIu64 " for an uncompressed ACEScg; it should be far "
+                            "cleaner\n", mname, tc->name, neg_ref, uncompressed_neg);
+                    ret = CRAW_ERROR(EINVAL);
+                    goto done;
+                }
+            } else if (!neg_ref) {
+                /* The uncompressed spaces are only interesting if they do
+                 * produce negatives here; a scene that stayed in gamut
+                 * would make the whole comparison vacuous. */
+                fprintf(stderr, "gamut: %s %s produced no negatives at all, "
+                        "the test scene is not out of gamut\n", mname, tc->name);
+                ret = CRAW_ERROR(EINVAL);
+                goto done;
+            }
+
+            /* Keep the plain ACES2065-1 result to compare the flagged one
+             * against: the flag must not change a single bit there. */
+            if (tc->space == CRAW_CS_ACES_AP0_LINEAR && !tc->frame_flags) {
+                memcpy(ap0_plain, gpu, npix * 4 * sizeof(*ap0_plain));
+            } else if (tc->space == CRAW_CS_ACES_AP0_LINEAR) {
+                if (memcmp(ap0_plain, gpu, npix * 4 * sizeof(*ap0_plain)) != 0) {
+                    fprintf(stderr, "gamut: %s the flag changed ACES2065-1 output\n", mname);
+                    ret = CRAW_ERROR(EINVAL);
+                    goto done;
+                }
+            }
+        }
+    }
+
+    /* One pipeline, two spaces, frame by frame: this is the case the
+     * viewer needs, where a display frame in ACEScg and an archival frame
+     * in ACES2065-1 come out of the same pipeline with no rebuild. The
+     * pipeline is created for a third space on purpose, so that a frame
+     * silently falling back to the pipeline's own would be caught. */
+    {
+        CRAWPipelineParams pp;
+        CRAWFrameParams fp;
+        static const enum CRAWColorSpace per_frame[] = {
+            CRAW_CS_ACES_AP1_LINEAR, CRAW_CS_ACES_AP0_LINEAR, CRAW_CS_ACES_AP1_LINEAR,
+        };
+        CRAWPipeline *pipe = NULL;
+        struct test_run run;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = CRAW_DEBAYER_RCD;
+        pp.out_space = CRAW_CS_BT2020_LINEAR;
+
+        ret = craw_pipeline_create(ctx, &pp, &pipe);
+        if (ret < 0) {
+            fprintf(stderr, "gamut: craw_pipeline_create failed: %d\n", ret);
+            goto done;
+        }
+
+        for (size_t i = 0; i < CRAW_ARRAY_ELEMS(per_frame); i++) {
+            uint16_t *half = NULL;
+            uint64_t neg;
+            double worst, err, ms = 0.0;
+
+            craw_frame_params_init(&fp);
+            fp.profile = profile;
+            fp.out_space = per_frame[i];
+            fp.out_space_set = true;
+
+            ret = craw_ref_process(mosaic, TEST_W, TEST_H, TEST_W, &pp, &fp, ref);
+            if (ret < 0) {
+                fprintf(stderr, "gamut: craw_ref_process failed: %d\n", ret);
+                craw_pipeline_free(&pipe);
+                goto done;
+            }
+
+            run = (struct test_run) { .pipe = pipe, .src = src, .dst = dst, .fp = &fp };
+            ret = craw_testdev_run_timed(td, test_record, &run, &ms);
+            if (ret < 0) {
+                fprintf(stderr, "gamut: submission failed: %d\n", ret);
+                craw_pipeline_free(&pipe);
+                goto done;
+            }
+
+            half = malloc(npix * 4 * sizeof(*half));
+            if (!half) {
+                ret = CRAW_ERROR(ENOMEM);
+                craw_pipeline_free(&pipe);
+                goto done;
+            }
+
+            ret = craw_testdev_image_download(td, dst, half, npix * 4 * sizeof(*half));
+            if (ret == 0) {
+                for (size_t k = 0; k < npix * 4; k++)
+                    gpu[k] = test_half_to_float(half[k]);
+            }
+            free(half);
+            if (ret < 0) {
+                fprintf(stderr, "gamut: download failed: %d\n", ret);
+                craw_pipeline_free(&pipe);
+                goto done;
+            }
+
+            err = test_max_rel(gpu, ref, npix);
+            neg = test_count_negative(gpu, npix, &worst);
+
+            printf("  per frame #%zu %-8s on a BT.2020 pipeline: %" PRIu64
+                   " negative px, max rel %.3e, %.3f ms\n",
+                   i, test_space_name(per_frame[i]), neg, err, ms);
+
+            /* ACEScg comes out clean because it was compressed, which is
+             * the proof that the frame did not quietly fall back to the
+             * pipeline's own BT.2020: that would leave thousands of
+             * negatives here and fail the reference comparison too. */
+            if (per_frame[i] == CRAW_CS_ACES_AP1_LINEAR && neg) {
+                fprintf(stderr, "gamut: per frame %s left %" PRIu64 " negative pixels\n",
+                        test_space_name(per_frame[i]), neg);
+                ret = CRAW_ERROR(EINVAL);
+                craw_pipeline_free(&pipe);
+                goto done;
+            }
+            if (!(err <= 1.5e-2)) {
+                fprintf(stderr, "gamut: per frame %s differs by %.3e relative\n",
+                        test_space_name(per_frame[i]), err);
+                ret = CRAW_ERROR(EINVAL);
+                craw_pipeline_free(&pipe);
+                goto done;
+            }
+        }
+
+        craw_pipeline_free(&pipe);
+    }
+
+    ret = 0;
+
+done:
+    free(cam);
+    free(xyz);
+    free(ap0_plain);
+    free(mosaic);
+
+    return ret;
+}
+
+static int test_gamut(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile,
+                      CRAWTestImage *src, CRAWTestImage *dst, float *gpu, float *ref)
+{
+    int ret;
+
+    ret = test_gamut_curve();
+    if (ret < 0)
+        return ret;
+
+    ret = test_gamut_reach(profile);
+    if (ret < 0)
+        return ret;
+
+    ret = test_gamut_invariance();
+    if (ret < 0)
+        return ret;
+
+    return test_gamut_gpu(td, ctx, profile, src, dst, gpu, ref);
+}
+
 static int test_validation(CRAWContext *ctx)
 {
     CRAWAwbHistogram hist;
@@ -1943,6 +2790,9 @@ int main(void)
         goto done;
 
     if (test_lens(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
+
+    if (test_gamut(&td, ctx, &profile, &src, &dst, gpu, ref) < 0)
         goto done;
 
     if (test_real_frame(&td, ctx, &profile) < 0)

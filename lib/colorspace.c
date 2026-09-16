@@ -177,21 +177,24 @@ static int craw_bradford(const double src[2], const double dst[2],
     return 0;
 }
 
-int craw_colorspace_from_xyz_d65(enum CRAWColorSpace cs, float m[3][3])
+/* The space's RGB to CIE XYZ relative to D65, in double. Everything public
+ * here is this matrix or its inverse, so the primaries, the white and the
+ * adaptation are written out exactly once. */
+static int craw_colorspace_to_xyz_d(enum CRAWColorSpace cs, double out[3][3])
 {
     static const double d65[2] = { CRAW_D65_X, CRAW_D65_Y };
     static const double aces[2] = { CRAW_ACES_X, CRAW_ACES_Y };
     const struct CRAWColorSpaceDesc *d;
-    double to_xyz[3][3], from_xyz[3][3];
+    double to_xyz[3][3];
     int ret;
 
-    if (!m || (unsigned)cs >= CRAW_CS_NB)
+    if ((unsigned)cs >= CRAW_CS_NB)
         return CRAW_ERROR(EINVAL);
 
     if (cs == CRAW_CS_XYZ_D65) {
         for (int i = 0; i < 3; i++) {
             for (int j = 0; j < 3; j++)
-                m[i][j] = i == j ? 1.0f : 0.0f;
+                out[i][j] = i == j ? 1.0 : 0.0;
         }
         return 0;
     }
@@ -202,26 +205,66 @@ int craw_colorspace_from_xyz_d65(enum CRAWColorSpace cs, float m[3][3])
     if (ret < 0)
         return ret;
 
+    /* Everything the pipeline carries is relative to D65, because the
+     * camera matrix is a D65 matrix; a space defined against another white
+     * lands in its own XYZ and has to be adapted back. */
+    if (d->aces_white) {
+        double cat[3][3];
+
+        ret = craw_bradford(aces, d65, cat);
+        if (ret < 0)
+            return ret;
+
+        craw_mat3_mul(cat, to_xyz, to_xyz);
+    }
+
+    memcpy(out, to_xyz, sizeof(to_xyz));
+
+    return 0;
+}
+
+static void craw_mat3_store(const double in[3][3], float out[3][3])
+{
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++)
+            out[i][j] = (float)in[i][j];
+    }
+}
+
+int craw_colorspace_from_xyz_d65(enum CRAWColorSpace cs, float m[3][3])
+{
+    double to_xyz[3][3], from_xyz[3][3];
+    int ret;
+
+    if (!m)
+        return CRAW_ERROR(EINVAL);
+
+    ret = craw_colorspace_to_xyz_d(cs, to_xyz);
+    if (ret < 0)
+        return ret;
+
     ret = craw_mat3_invert(to_xyz, from_xyz);
     if (ret < 0)
         return ret;
 
-    /* The input is always relative to D65; a space defined against another
-     * white needs the chromatic adaptation applied first. */
-    if (d->aces_white) {
-        double cat[3][3];
+    craw_mat3_store(from_xyz, m);
 
-        ret = craw_bradford(d65, aces, cat);
-        if (ret < 0)
-            return ret;
+    return 0;
+}
 
-        craw_mat3_mul(from_xyz, cat, from_xyz);
-    }
+int craw_colorspace_to_xyz_d65(enum CRAWColorSpace cs, float m[3][3])
+{
+    double to_xyz[3][3];
+    int ret;
 
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++)
-            m[i][j] = (float)from_xyz[i][j];
-    }
+    if (!m)
+        return CRAW_ERROR(EINVAL);
+
+    ret = craw_colorspace_to_xyz_d(cs, to_xyz);
+    if (ret < 0)
+        return ret;
+
+    craw_mat3_store(to_xyz, m);
 
     return 0;
 }

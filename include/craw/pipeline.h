@@ -68,6 +68,9 @@ typedef struct CRAWPipelineParams {
     uint32_t width, height;     /* Bayer frame size; both must be even */
     enum CRAWCfa cfa;           /* this version: CRAW_CFA_RGGB only */
     enum CRAWDebayer debayer;
+
+    /* The default output colour space, which any frame can override for
+     * itself with CRAWFrameParams.out_space. */
     enum CRAWColorSpace out_space;
 
     /* VK_FORMAT_R16G16B16A16_SFLOAT or VK_FORMAT_R32G32B32A32_SFLOAT. The
@@ -95,6 +98,19 @@ typedef struct CRAWPipelineParams {
  * handled by the consumer's gamut mapping. */
 #define CRAW_FRAME_FLAG_CLAMP_NEGATIVE (1 << 0)
 
+/* Skip the ACES 1.3 Reference Gamut Compression that CRAW_CS_ACES_AP1_LINEAR
+ * output normally ends with, and hand back the unmodified AP1 values, which
+ * for a saturated light source means components below zero.
+ *
+ * It is a frame flag rather than a pipeline parameter because a caller
+ * comparing the two wants them frame by frame on one pipeline, and because
+ * it costs nothing: it is a bit in the colour shader's push constant and the
+ * branch is uniform across the dispatch. It has no effect on any other
+ * output space; CRAW_CS_ACES_AP0_LINEAR in particular is never compressed,
+ * being the archival encoding that has to keep every value the camera
+ * matrix produced. See DESIGN.md 8.1. */
+#define CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION (1 << 2)
+
 /* Lens correction: keep every source pixel instead of filling the frame.
  * The corrected picture is scaled down uniformly, by one factor for all
  * three channels, until the whole warped source fits inside the output,
@@ -117,6 +133,23 @@ typedef struct CRAWFrameParams {
     float exposure_stops;
 
     uint32_t flags;               /* CRAW_FRAME_FLAG_* */
+
+    /* Output colour space for this frame, overriding the pipeline's own
+     * CRAWPipelineParams.out_space when out_space_set is true. Nothing in
+     * the pipeline's shape depends on the space — it is one 3x3 composed on
+     * the host per frame, plus the gamut compression that ACEScg output
+     * ends with — so a caller can alternate spaces frame by frame on one
+     * pipeline with no rebuild and no extra memory. That is what a viewer
+     * showing ACEScg while writing an ACES2065-1 archive of the same frames
+     * needs, which is otherwise two pipelines over one clip.
+     *
+     * The separate bool, rather than a sentinel in the enum: 0 is
+     * CRAW_CS_XYZ_D65, a perfectly real space, so the enum has no value
+     * free to mean "unset", and a CRAWFrameParams a caller merely zeroed
+     * has to keep meaning "whatever the pipeline was created with", which
+     * is what it meant before this field existed. */
+    enum CRAWColorSpace out_space;
+    bool out_space_set;
 
     /* Denoise strength, in units of the modelled noise level: 1.0 removes
      * noise at exactly the level the model predicts, larger values smooth
@@ -142,17 +175,20 @@ typedef struct CRAWFrameParams {
      * CRAW_PIPELINE_FLAG_LENS. See <craw/lens.h> and DESIGN.md 16. */
     CRAWLensCorrection lens;
 
-    /* Padding to allow for future options. Must always be set to 0. */
-    uint8_t padding[256 - 4*4 - 8 - 12 - 64];
+    /* Padding to allow for future options. Must always be set to 0. The
+     * trailing `- 8` is out_space, out_space_set and the alignment hole
+     * after it, taken out of the tail so that sizeof stays what it was. */
+    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8];
 } CRAWFrameParams;
 
 /* Fills `p` with defaults: RGGB, RCD, XYZ D65 output, RGBA16F, no flags.
  * width and height are left at 0 and must be set by the caller. */
 CRAW_API void craw_pipeline_params_init(CRAWPipelineParams *p);
 
-/* Fills `fp` with defaults: as-shot white balance, no exposure change, no
- * denoising, no noise model override, no lens correction. The profile
- * pointer is left NULL and must be set by the caller. */
+/* Fills `fp` with defaults: as-shot white balance, the pipeline's own
+ * output colour space, no exposure change, no denoising, no noise model
+ * override, no lens correction. The profile pointer is left NULL and must
+ * be set by the caller. */
 CRAW_API void craw_frame_params_init(CRAWFrameParams *fp);
 
 /* Allocates the pipeline's intermediate images and histogram buffers for
@@ -171,7 +207,9 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
  *     -> debayer to full resolution camera RGB
  *     -> [auto white balance histogram]
  *     -> white balance re-balance, camera matrix, gain and exposure
- *     -> XYZ to out_space
+ *     -> XYZ to the frame's output space (CRAWFrameParams.out_space when
+ *        it is set, else the pipeline's)
+ *     -> [ACES 1.3 gamut compression, ACEScg output only]
  *     -> [per-channel lens correction warp, on the linear output]
  *   dst (out_format, same size)
  *

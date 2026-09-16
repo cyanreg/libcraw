@@ -4,15 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gamut.h"
 #include "ref.h"
 
 int craw_ref_color(float *rgb, uint32_t width, uint32_t height,
                    const CRAWFrameParams *fp, enum CRAWColorSpace out_space)
 {
     CRAWColorParams par;
+    CRAWGamutCompress gc;
     float m_out[3][3];
     float scale;
-    bool clamp_negative;
+    bool clamp_negative, compress;
     int ret;
 
     if (!rgb || !fp || !fp->profile)
@@ -28,6 +30,12 @@ int craw_ref_color(float *rgb, uint32_t width, uint32_t height,
 
     scale = par.gain * exp2f(fp->exposure_stops);
     clamp_negative = (fp->flags & CRAW_FRAME_FLAG_CLAMP_NEGATIVE) != 0;
+
+    /* DESIGN.md 8.1: only ACEScg, and only when the frame has not vetoed
+     * it. ACES2065-1 is the archive and keeps whatever the matrix made. */
+    compress = out_space == CRAW_CS_ACES_AP1_LINEAR &&
+               !(fp->flags & CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION);
+    craw_gamut_compress_params(&gc);
 
     for (size_t i = 0; i < (size_t)width * height; i++) {
         float *px = &rgb[i * 4];
@@ -46,9 +54,15 @@ int craw_ref_color(float *rgb, uint32_t width, uint32_t height,
             out[r] = m_out[r][0] * xyz[0]
                    + m_out[r][1] * xyz[1]
                    + m_out[r][2] * xyz[2];
-            /* Negatives are normal outside the characterized gamut and are
-             * only removed when the caller asks for it. */
-            if (clamp_negative)
+        }
+
+        if (compress)
+            craw_gamut_compress(&gc, out);
+
+        /* Negatives are normal outside the characterized gamut and are
+         * only removed when the caller asks for it. */
+        if (clamp_negative) {
+            for (int r = 0; r < 3; r++)
                 out[r] = CRAW_MAX(out[r], 0.0f);
         }
 
@@ -123,7 +137,7 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
             goto done;
     }
 
-    ret = craw_ref_color(out, width, height, fp, params->out_space);
+    ret = craw_ref_color(out, width, height, fp, craw_ref_out_space(params, fp));
     if (ret < 0)
         goto done;
 

@@ -102,6 +102,7 @@ struct tool_cfg {
     float meta_as_shot_ei;  /* from the container, 0 if absent */
     float meta_apple_ei;    /* Apple's stored ExposureIndex, 0 if absent */
     bool clamp_negative;
+    bool no_gamut_compression;
     bool float32;
     bool bench;
     bool stats;
@@ -139,6 +140,10 @@ static const struct tool_name_map tool_spaces[] = {
     { "vgamut", CRAW_CS_V_GAMUT_LINEAR  },
     { "ap0",    CRAW_CS_ACES_AP0_LINEAR },
     { "ap1",    CRAW_CS_ACES_AP1_LINEAR },
+    /* The ACES names for the same two. tool_space_name() returns the first
+     * match, so the short names above stay what -v prints. */
+    { "aces",   CRAW_CS_ACES_AP0_LINEAR },
+    { "acescg", CRAW_CS_ACES_AP1_LINEAR },
     { NULL,     0                       },
 };
 
@@ -211,9 +216,19 @@ static void tool_usage(FILE *f)
 "  -h                  this text\n"
 "\n"
 "  --debayer METHOD    bilinear, mhc or rcd (default: rcd)\n"
-"  --space SPACE       xyz, bt709, bt2020, p3d65, vgamut, ap0 or ap1;\n"
-"                      the linear output space of the pipeline\n"
-"                      (default: bt709)\n"
+"  --space SPACE       xyz, bt709, bt2020, p3d65, vgamut, ap0 (also `aces`)\n"
+"                      or ap1 (also `acescg`); the linear output space of\n"
+"                      the pipeline (default: bt709).\n"
+"                      ap1 and ap0 are the ACES pair: both are scene-linear\n"
+"                      against the ACES white point (x 0.32168, y 0.33767,\n"
+"                      adapted from the camera matrix\'s D65 with Bradford)\n"
+"                      with 1.0 at diffuse white, not display referred, so\n"
+"                      pair them with --encode linear and a float or 16-bit\n"
+"                      writer. ap1 (ACEScg) is the rendering and display\n"
+"                      hand-off and ends with the ACES 1.3 Reference Gamut\n"
+"                      Compression, so it has no negative components; ap0\n"
+"                      (ACES2065-1) is the archival encoding and is never\n"
+"                      compressed. See DESIGN.md 8.1\n"
 "  --encode TRC        transfer function applied on the CPU after download:\n"
 "                      linear, srgb, sdr, pq, hlg or vlog (default: sdr, or\n"
 "                      linear for .pfm). srgb clips at 1.0; sdr first rolls\n"
@@ -237,6 +252,11 @@ static void tool_usage(FILE *f)
 "                      of at most one stop; --exposure is that bias, unclamped\n"
 "  --exposure STOPS    exposure offset in stops on top of --ei (default: 0)\n"
 "  --clamp-negative    clamp negative output components to zero\n"
+"  --no-gamut-compression\n"
+"                      skip the ACES 1.3 Reference Gamut Compression that\n"
+"                      --space ap1 normally ends with, and write the raw\n"
+"                      ACEScg values, negative components and all. No\n"
+"                      effect on any other space\n"
 "  --float32           RGBA32F pipeline output instead of RGBA16F\n"
 "  --crop X,Y,W,H      write, and compute --stats over, only this rectangle\n"
 "                      of the output. The pipeline still runs on the whole\n"
@@ -1610,6 +1630,7 @@ enum {
     TOOL_OPT_EXPOSURE,
     TOOL_OPT_EI,
     TOOL_OPT_CLAMP_NEG,
+    TOOL_OPT_NO_GAMUT,
     TOOL_OPT_FLOAT32,
     TOOL_OPT_BENCH,
     TOOL_OPT_STATS,
@@ -1636,6 +1657,8 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         { "exposure",       required_argument, NULL, TOOL_OPT_EXPOSURE  },
         { "ei",             required_argument, NULL, TOOL_OPT_EI        },
         { "clamp-negative", no_argument,       NULL, TOOL_OPT_CLAMP_NEG },
+        { "no-gamut-compression",
+                            no_argument,       NULL, TOOL_OPT_NO_GAMUT  },
         { "float32",        no_argument,       NULL, TOOL_OPT_FLOAT32   },
         { "bench",          no_argument,       NULL, TOOL_OPT_BENCH     },
         { "stats",          no_argument,       NULL, TOOL_OPT_STATS     },
@@ -1734,6 +1757,9 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
             break;
         case TOOL_OPT_CLAMP_NEG:
             cfg->clamp_negative = true;
+            break;
+        case TOOL_OPT_NO_GAMUT:
+            cfg->no_gamut_compression = true;
             break;
         case TOOL_OPT_FLOAT32:
             cfg->float32 = true;
@@ -2175,6 +2201,8 @@ have_device:
         fp.profile = &prof;
         fp.exposure_stops = cfg.exposure;
         fp.flags = cfg.clamp_negative ? CRAW_FRAME_FLAG_CLAMP_NEGATIVE : 0;
+        if (cfg.no_gamut_compression)
+            fp.flags |= CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION;
         if (cfg.lens == TOOL_LENS_KEEP)
             fp.flags |= CRAW_FRAME_FLAG_LENS_KEEP_ALL;
         fp.denoise_strength = cfg.denoise;

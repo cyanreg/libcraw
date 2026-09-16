@@ -141,11 +141,24 @@ With `c` the camera RGB from the intermediate and the frame's
     xyz = p.cam_to_xyz * c'
     xyz = xyz * p.gain * 2^exposure_stops
     out = M_out * xyz                     M_out from craw_colorspace_from_xyz_d65()
+    if (out_space is ACEScg and !(flags & NO_GAMUT_COMPRESSION))
+        out = gamut_compress(out)         ACES 1.3 RGC, section 8.1
     if (flags & CLAMP_NEGATIVE) out = max(out, 0)
     alpha = 1
 
 No clamp of any kind unless the flag is set. Values above 1.0 are normal
 (sensor clip sits at `gain` times diffuse white).
+
+`out_space` is the frame's own `CRAWFrameParams.out_space` when it set
+`out_space_set`, and the pipeline's `CRAWPipelineParams.out_space`
+otherwise. Nothing the pipeline owns depends on the choice — it is this one
+3x3, composed on the host per frame, plus the compression above — so a
+caller may alternate spaces frame by frame on one pipeline without a
+rebuild and without a second set of intermediates. That is what a viewer
+showing ACEScg while writing an ACES2065-1 archive of the same frames
+needs. The flag is a separate bool rather than a sentinel in the enum
+because 0 is `CRAW_CS_XYZ_D65`, a real space, so a zeroed CRAWFrameParams
+has to keep meaning "whatever the pipeline was created with".
 
 ### 4.4 Auto white balance histogram (optional stage)
 
@@ -386,6 +399,115 @@ R(0.680,0.320) G(0.265,0.690) B(0.150,0.060); V-Gamut R(0.730,0.280)
 G(0.165,0.840) B(0.100,-0.030); AP0 R(0.7347,0.2653) G(0.0,1.0)
 B(0.0001,-0.0770); AP1 R(0.713,0.293) G(0.165,0.830) B(0.128,0.044).
 
+`craw_colorspace_to_xyz_d65()` is the other direction, built from the same
+primaries and the same adaptation and inverted from the same double
+precision matrix, so the two compose to the identity to about 1e-7 in
+float. Chaining one with the other is how a caller moves between two output
+spaces; for the ACES pair the two adaptations cancel and the composition
+reproduces the published ACEScg to ACES2065-1 matrix to 1e-7.
+
+`test_profile` checks all of this: both ACES matrices against the values
+above, every space's round trip, BT.709 through XYZ into AP1 against the
+published sRGB to ACEScg matrix, and sRGB white landing on AP1 (1, 1, 1).
+
+### 8.1 Why ACEScg, and the reference gamut compression
+
+The pipeline's hand-off to the display path is ACEScg, not linear BT.2020.
+BT.2020 does not contain what this camera's matrix produces: a saturated
+LED blue or cyan comes out with a negative component, and a display side
+gamut mapper then clips it hard, which is where the flat, plastic edges on
+coloured light sources come from. ACES2065-1 is not a working space either
+— its primaries are imaginary and its hull is enormous, so a hull-based
+perceptual gamut mapper spends its compression budget on colours that do
+not exist and desaturates the ones that do.
+
+So the two ACES spaces do the two jobs the Academy intended. ACEScg (AP1)
+is the rendering and display hand-off: wide enough that almost everything
+real is inside it, bounded enough that a gamut mapper downstream has a
+meaningful hull to work against. ACES2065-1 (AP0) is the archive: it is
+never compressed and keeps every value the camera matrix produced,
+negative components included, which is what an archival export and a
+re-grade years later need.
+
+What pulls the rare colours outside AP1 inward is the ACES 1.3 Reference
+Gamut Compression, applied to the AP1 linear RGB at the end of the colour
+stage. It is transcribed from the Academy's own CTL
+(`transforms/ctl/lmt/LMT.Academy.ReferenceGamutCompress.ctl` in
+ampas/aces-dev at v1.3, functions `compress()` and `gamut_compress()`);
+OpenColorIO's built-in `ACES-GamutComp-v13` is the same operator with the
+same seven numbers, and libcraw implements no variant of it. With
+`ach = max(R, G, B)` and, per channel, `d = (ach - c) / |ach|`:
+
+    scl  = (lim - thr) / (((1 - thr) / (lim - thr))^-pwr - 1)^(1/pwr)
+    d'   = d                                            if d < thr
+    d'   = thr + scl * nd / (1 + nd^pwr)^(1/pwr)        otherwise,
+                                            with nd = (d - thr) / scl
+    c'   = ach - d' * |ach|
+
+Parameters, per channel in the order R, G, B, i.e. the cyan, magenta and
+yellow directions: limits 1.147, 1.264, 1.312; thresholds 0.815, 0.803,
+0.880; power 1.2. `scl` is solved so that a distance of exactly `lim`
+compresses to exactly 1.0, which puts the channel on zero: that is what
+"distance limit" means and it is the whole reason anything nearer stops
+being negative. The solved scales are 0.327302, 0.285938 and 0.146821.
+
+`lib/gamut.c` derives the scales once per frame and the pipeline pushes
+them to the colour shader, so the shader and the CPU reference cannot
+disagree about a constant. The curve is C1 at the threshold (its slope
+there is exactly 1 from both sides), it is monotone, and it never expands a
+distance, so it cannot reorder channels or move the achromatic axis.
+
+Three consequences worth stating rather than discovering:
+
+- Below the threshold nothing moves at all, bit for bit. Above it,
+  saturated *in-gamut* colours do move: BT.709 blue is at distance 0.946 in
+  the cyan direction, past the 0.815 threshold, and the operator pulls it
+  by 0.050 in AP1 units. That is the specification's own trade — the
+  thresholds were fitted to protect the ColorChecker Classic, not the whole
+  of BT.709 — and it is why the display primaries are not a useful
+  invariance test. Real surfaces are well inside: every one of the test's
+  BT.709 and BT.2020 primaries and secondaries pulled 40% towards neutral
+  is untouched exactly, except the two most saturated, which move by 1.6e-4.
+- The guarantee is bounded by the limits, not unconditional. A distance
+  past `lim` still compresses to more than 1.0 and leaves the channel
+  negative. For this camera the reach is a property of the composed
+  camera-RGB-to-AP1 matrix, and because the distance is a scale invariant
+  ratio of linear forms its maximum over the cone of non-negative camera
+  RGB sits on one of the three camera primaries. The as-shot matrix reaches
+  (1.0668, 1.1572, 0.9901) against limits of (1.147, 1.264, 1.312), so the
+  whole sensor is inside and ACEScg output is non-negative. Across the
+  rebalance table the reach grows to (1.1131, 1.2656, 1.0997): the 7500 K
+  knot's blue primary is a hair past the magenta limit and leaves 2.5e-4 of
+  the pixel negative, on a colour of negative luminance that no light
+  produces.
+- The compression is a colour stage operation, and two stages around it
+  can put negatives back. A debayer with negative kernel weights (MHC, RCD)
+  can ring the camera RGB itself below zero at a hard edge, which leaves
+  the cone the bound above is taken over; and the lens warp of section 16
+  runs *after* the colour stage with a Catmull-Rom kernel whose lobes are
+  negative. On P1000387 frame 0 the colour stage alone leaves zero negative
+  pixels in ACEScg, RCD adds 10 of 17.5 M and the lens warp 1; with both,
+  26. A consumer that needs the output strictly non-negative under any
+  chain should add `CRAW_FRAME_FLAG_CLAMP_NEGATIVE`, which then only ever
+  has ringing to clamp rather than real colour.
+
+ACES2065-1 is never compressed: every real light is inside AP0, so on real
+footage it does not need it, and compressing the archive would be exactly
+the wrong thing to do to it. It is not unconditionally non-negative either
+— the camera matrix is a 3x3 fit and extrapolates outside the spectral
+locus for the most saturated sources — but the counts are an order of
+magnitude below the uncompressed ACEScg ones.
+
+`CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION` turns the operator off for one
+frame, which is what a caller comparing the two wants; it is a frame flag
+rather than a pipeline parameter because it costs nothing (a bit in the
+colour shader's push constant, and the branch is uniform across the
+dispatch) and because comparing with and without should not mean rebuilding
+a pipeline. Measured on an RX 6900 XT over 40 frames of P1000387, three
+runs each: BT.2020 5.943 to 6.019 ms a frame, ACEScg 5.906 to 5.990, AP0
+5.923. The spread within one space is larger than the difference between
+them.
+
 ## 9. Test vectors (Panasonic DC-S1M2, clip P1000387.MOV, ProRes RAW)
 
 Per-frame header: black 256/65535, white 63743/65535, wb_r 2.02539,
@@ -510,6 +632,32 @@ for containers without them.
   chain bit for bit, and that a mark lands within 0.25 px of where the
   polynomial's inverse says it should. lavapipe is acceptable for these tests; it exposes
   everything required.
+- `test_pipeline`, gamut compression (section 8.1), in three parts. The
+  operator alone, on the CPU: the thresholds and power against the
+  specification, nothing below the threshold moving by a single bit, a
+  distance of exactly the limit landing on 1.0, monotone and never
+  expanding across a sweep that crosses the threshold, and no jump there at
+  a step of 1e-6. What it leaves alone: BT.709 and BT.2020 primaries and
+  secondaries, each at four levels and each also pulled 40% towards
+  neutral, checked for scale invariance, for never being pushed away from
+  achromatic, for never moving the achromatic value, and — for the ones
+  inside the thresholds — for not moving at all. And the camera's reach,
+  which bounds the whole sensor from the three camera primaries.
+  Then the chain on the device, on a scene of eight saturated camera-RGB
+  bands at four levels: BT.2020 and uncompressed ACEScg must produce
+  negatives (or the scene is not testing anything), compressed ACEScg must
+  produce none except where the debayer rang the camera RGB out of the
+  non-negative cone, ACES2065-1 must be far cleaner than uncompressed
+  ACEScg and must be unchanged bit for bit by the compression flag, and all
+  of it must match the reference within the tolerances above. Finally one
+  pipeline created for BT.2020 records ACEScg, ACES2065-1 and ACEScg again
+  through `CRAWFrameParams.out_space`, each against its own reference.
+
+  The bands cross-fade over the last fifth of their width. A one-pixel step
+  between two saturated colours is a test of RCD's behaviour when its
+  directional ratios divide by a near-zero low pass sum, not of colour, and
+  it pushes GPU and reference apart by 2.5e-2 relative for reasons that
+  have nothing to do with this section.
 
 ## 11b. Known API limitations to revisit
 
@@ -1942,6 +2090,14 @@ image is created in the pipeline's own `out_format`, so RGBA16F by default
 and RGBA32F when the caller asked for 32-bit output: a caller who asked for
 32 bits asked for them all the way, and an internal image is no place to
 quantize them away.
+
+Being last, it also runs after the gamut compression of section 8.1, and
+its Catmull-Rom kernel has negative lobes: at a hard edge it can put a
+small negative back into an ACEScg frame the colour stage had made clean.
+On P1000387 frame 0 that is 1 pixel in 17.5 M. Moving the compression after
+the warp would mean the lens shader knowing the output space and carrying
+the operator, for a residual that `CRAW_FRAME_FLAG_CLAMP_NEGATIVE` removes
+for nothing; it is documented here instead.
 
 The auto white balance histogram is not affected. It reads the *camera RGB*
 intermediate (section 4.4), two stages ahead of the warp, so it describes
