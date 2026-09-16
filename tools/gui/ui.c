@@ -1991,12 +1991,14 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     bool busy = v->active;
     bool scene;
 
-    /* The range follows the picture until it has been set: a fresh panel
-     * offers the second from the frame on screen, which is the range
-     * someone pressing the button once was going to draw anyway. */
+    /* The whole clip until a range has been set: Ctrl+1 and Ctrl+2 mark
+     * the start and the end at the frame on screen, and the two fields
+     * below take numbers. A clip whose length FFmpeg cannot tell ends at
+     * its last frame anyway, which the engine finds by running into it. */
     if (!v->range_set && !busy) {
-        v->start_ui = (int)st->index;
-        v->end_ui = v->start_ui + 59;
+        v->start_ui = 0;
+        v->end_ui = st->dec.nb_frames > 0 ? (int)(st->dec.nb_frames - 1)
+                                          : INT_MAX - 1;
     }
 
     /* One question of the device per frame, and never more than one

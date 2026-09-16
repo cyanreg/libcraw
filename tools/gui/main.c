@@ -2510,8 +2510,28 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
             view_zoom_reset(st, false);
         break;
     case SDLK_1:
-        if (!repeat)
+        /* Ctrl+1 marks the export's start at the frame on screen; plain 1
+         * is the 1:1 zoom. The end follows if it was before the new
+         * start, so the range never turns inside out. */
+        if (ctrl) {
+            if (!repeat) {
+                st->video.start_ui = (int)st->index;
+                if (st->video.end_ui < st->video.start_ui)
+                    st->video.end_ui = st->video.start_ui;
+                st->video.range_set = true;
+            }
+        } else if (!repeat) {
             view_zoom_reset(st, true);
+        }
+        break;
+    case SDLK_2:
+        /* Ctrl+2 marks the export's end at the frame on screen. */
+        if (ctrl && !repeat) {
+            st->video.end_ui = (int)st->index;
+            if (st->video.start_ui > st->video.end_ui)
+                st->video.start_ui = st->video.end_ui;
+            st->video.range_set = true;
+        }
         break;
 
     case SDLK_C:

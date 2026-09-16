@@ -87,8 +87,10 @@ Control with the arrows pans; Tab or `0` fits the picture again and `1` is
 one to one; Enter expands or collapses the section header it is on and
 opens the film simulation menu on that row, and Escape closes the menu; the
 wheel zooms about the pointer and a left drag pans; `r` and `t` go to the
-previous and the next file; `m` mutes; `q`, or Escape with no menu open,
-quits. Zoom and pan only touch the view, never the export.
+previous and the next file; Ctrl+1 and Ctrl+2 mark the start and the end of
+the video export at the frame on screen, the whole clip being the default;
+`m` mutes; `q`, or Escape with no menu open, quits. Zoom and pan only touch
+the view, never the export.
 
 The panel is a column of sections — White balance, Exposure, Debayer,
 Denoise, Lens, Look, Adjustments, Film grain, Crop, Export — each behind a
