@@ -573,6 +573,7 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
 
     vkGetPhysicalDeviceProperties(g->vk->phys_device, &props);
     g->timestamp_period = props.limits.timestampPeriod;
+    g->verbose = cfg->verbose;
 
     if (cfg->verbose)
         fprintf(stderr, "device %s, Vulkan %u.%u, queue family %u\n", props.deviceName,
@@ -831,11 +832,76 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
         return ret;
     }
 
+    if (g->verbose)
+        fprintf(stderr, "pipeline: built for %ux%u, %s\n", w, h,
+                (unsigned)debayer < CRAW_DEBAYER_NB
+                    ? view_debayer_names[debayer] : "?");
+
     g->width = w;
     g->height = h;
     g->pipe_debayer = debayer;
 
     return 0;
+}
+
+/* The clip that is going away, while its decoder is still alive: an image
+ * view must not outlive its image, and everything below points at frames
+ * the decoder is about to free.
+ *
+ *  - the cached views of its frame pool, because the next decoder
+ *    allocates a pool of its own and a recycled VkImage handle would
+ *    otherwise find a view of an image that no longer exists;
+ *  - the developed path's mapping, which holds one of its frames;
+ *  - the slot bookkeeping, because the auto white balance reads back the
+ *    histogram of submission N - 1 and the next clip has submitted none;
+ *  - the peak detection track in both renderers, since two clips are a cut
+ *    and the old scene's peak must not tone map the new one's first
+ *    frames. */
+void view_gpu_release_frames(struct view_gpu *g)
+{
+    if (!g->vk)
+        return;
+
+    /* Every fence and every command buffer is retired before the images
+     * they were recorded against go. */
+    vkDeviceWaitIdle(g->vk->device);
+
+    view_gpu_drop_src_views(g);
+    view_gpu_unmap(g);
+
+    for (int i = 0; i < VIEW_SLOTS; i++)
+        g->slots[i].busy = false;
+    g->slot = g->display_slot = 0;
+    g->submitted = 0;
+    g->last_gpu_ms = 0.0;
+
+    view_gpu_reset_peak(g, false);
+    view_gpu_reset_peak(g, true);
+}
+
+/* And what the clip that is arriving needs, once its kind is known. A
+ * developed clip can use neither the pipeline nor its full-size output
+ * textures, and on a 5.8K clip that is several hundred megabytes to sit on
+ * for nothing; two raw clips of the same size keep both and
+ * view_gpu_ensure() then has nothing to do at all. */
+void view_gpu_new_clip(struct view_gpu *g, bool raw)
+{
+    if (!g->vk || raw || !g->pipe)
+        return;
+
+    craw_pipeline_free(&g->pipe);
+
+    for (int i = 0; i < VIEW_SLOTS; i++) {
+        vkDestroyImageView(g->vk->device, g->slots[i].view, NULL);
+        g->slots[i].view = VK_NULL_HANDLE;
+        pl_tex_destroy(g->gpu, &g->slots[i].tex);
+    }
+
+    if (g->verbose)
+        fprintf(stderr, "pipeline: released, %ux%u, the clip is developed\n",
+                g->width, g->height);
+
+    g->width = g->height = 0;
 }
 
 /* --------------------------------------------------------- frame bridge */

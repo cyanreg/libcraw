@@ -770,8 +770,12 @@ void view_crop_drag(struct view_state *st, int px, int py)
     c->x1 = x1;
     c->y1 = y1;
     c->have = true;
-    /* Drawn by hand, so it is no longer the clip's own rectangle. */
+    /* Drawn by hand, so it is no longer the clip's own rectangle - and it
+     * belongs to the frame it was drawn on, which is what makes it a
+     * rectangle to drop when the next clip is another size. */
     c->from_clip = false;
+    c->frame_w = (int)st->gpu.width;
+    c->frame_h = (int)st->gpu.height;
 }
 
 void view_crop_end(struct view_state *st)
@@ -815,6 +819,21 @@ static void view_crop_from_clip(struct view_state *st, const AVFrame *f)
     if (c->clip_read)
         return;
     c->clip_read = true;
+
+    /* A rectangle is a region of a frame of a particular size, so a clip of
+     * another size cannot hold it: it is dropped and the whole frame is
+     * exported until another is drawn. A rectangle from --crop has met no
+     * frame yet and is bound to this one. */
+    if (c->have && c->frame_w && (c->frame_w != f->width || c->frame_h != f->height)) {
+        view_log(st, "crop: %dx%d at %d,%d was drawn on a %dx%d frame and this "
+                     "clip is %dx%d, so it is dropped\n",
+                 c->x1 - c->x0, c->y1 - c->y0, c->x0, c->y0,
+                 c->frame_w, c->frame_h, f->width, f->height);
+        c->have = false;
+        c->from_clip = false;
+    }
+    c->frame_w = f->width;
+    c->frame_h = f->height;
 
     if (c->have)
         return;
@@ -1052,10 +1071,17 @@ int view_replay_frame(struct view_state *st)
 
 int view_step_frame(struct view_state *st)
 {
-    AVStream *vs = st->dec.fmt->streams[st->dec.stream_index];
+    AVStream *vs;
     CRAWLensCorrection prev_lens;
     int64_t start, pts, t0;
     int ret;
+
+    /* There is no clip open, which only happens when a switch could not
+     * open the new one and could not get the old one back either: there is
+     * nothing left to show and the run loop is told so. */
+    if (!st->dec.fmt)
+        return CRAW_ERROR(EIO);
+    vs = st->dec.fmt->streams[st->dec.stream_index];
 
     if (st->seek_to >= 0) {
         /* Replaying the picture already on screen, which is how a grade
@@ -1286,11 +1312,19 @@ static int view_parse_crop(struct view_crop *c, const char *arg)
 static void view_usage(FILE *f)
 {
     fprintf(f,
-"usage: cineview [options] INPUT\n"
+"usage: cineview [options] FILE...\n"
 "\n"
 "Opens a camera raw clip, decodes it with FFmpeg's Vulkan hwaccel, runs\n"
 "every frame through libcraw on the same device and displays the result\n"
 "through libplacebo, with a nuklear panel for the grade.\n"
+"\n"
+"More than one file makes a playlist: `r` and `t` step to the previous and\n"
+"the next clip, wrapping at both ends, and the panel's clip line says which\n"
+"one of how many is open. The clips need not match - raw and already\n"
+"developed, any size, any audio layout - and every setting below stays as\n"
+"it was set across a switch; only what is read from the clip itself is\n"
+"read again. A headless export (--export, --export-video) uses the first\n"
+"file and ignores the rest.\n"
 "\n"
 "  --device SUBSTR     use the Vulkan device whose name contains SUBSTR\n"
 "  --debug             turn the Vulkan validation layer on\n"
@@ -1300,7 +1334,8 @@ static void view_usage(FILE *f)
 "  --loops N           play the clip N times and quit, printing the A/V\n"
 "                      statistics (default: loop for ever)\n"
 "  --audio-dump FILE   write exactly the float samples handed to the audio\n"
-"                      device, raw interleaved float32 48 kHz stereo\n"
+"                      device, raw interleaved float32 48 kHz stereo. The\n"
+"                      file is the clip\'s: switching clips starts it again\n"
 "  --audio-map A[,B]   audio stream indices, in audio stream order, to use\n"
 "                      as left and right; one index means a stereo stream\n"
 "                      or a mono one sent to both ears\n"
@@ -1406,6 +1441,7 @@ static void view_usage(FILE *f)
 "enter opens the film simulation menu on its row and escape closes it;\n"
 "the wheel zooms about the pointer and dragging pans; c turns crop mode on\n"
 "and off, where a left drag draws the rectangle the export is cut to;\n"
+"r and t go to the previous and the next file on the command line;\n"
 "m mutes; q, or escape with no menu open, quits.\n",
     craw_tool_profile_builtin_list());
 }
@@ -1740,28 +1776,37 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         }
     }
 
+    /* Every remaining argument is a clip. getopt has moved them all to the
+     * tail by now, including the ones --export and --export-video took off
+     * it themselves, so what is left from optind on is the playlist in the
+     * order it was typed. */
     if (optind >= argc) {
         fprintf(stderr, "no input file\n");
         view_usage(stderr);
         return CRAW_ERROR(EINVAL);
     }
-    st->cfg.input = argv[optind++];
-    if (optind < argc) {
-        fprintf(stderr, "unexpected argument `%s`\n", argv[optind]);
-        return CRAW_ERROR(EINVAL);
-    }
+
+    st->cfg.inputs = argv + optind;
+    st->cfg.nb_inputs = argc - optind;
+    st->cfg.input = st->cfg.inputs[0];
 
     return 0;
 }
 
 /* ------------------------------------------------------------ the profile */
 
-static int view_profile_setup(struct view_state *st, const char *profile,
-                              const char *tables)
+/* `first` says this is the clip the command line opened, which is the only
+ * one whose choices are worth arguing with: a later clip that brings no
+ * per-CCT tables is no reason to throw away a white balance the user set
+ * three clips ago, and view_frame_params() falls back to as shot by itself
+ * on a profile that has none. */
+static int view_profile_setup(struct view_state *st, bool first)
 {
+    const char *profile = st->cfg.profile, *tables = st->cfg.tables;
     int ret;
 
     craw_profile_init(&st->base);
+    st->have_prof = false;
 
     /* An already developed clip has no raw to balance, so none of this
      * applies and its absence must not be reported as a problem. */
@@ -1797,14 +1842,291 @@ static int view_profile_setup(struct view_state *st, const char *profile,
                  st->base.nb_wb_knots, st->base.nb_matrix_knots, tables);
     }
 
-    if (st->look.wb != VIEW_WB_AS_SHOT && !st->base.nb_wb_knots) {
+    if (first && st->look.wb != VIEW_WB_AS_SHOT && !st->base.nb_wb_knots) {
         fprintf(stderr, "warning: %s white balance needs the camera's per-CCT table "
                         "and none was found; staying as shot\n",
                 st->look.wb == VIEW_WB_AUTO ? "auto" : "manual");
         st->look.wb = VIEW_WB_AS_SHOT;
+    } else if (!first && st->look.wb != VIEW_WB_AS_SHOT && !st->base.nb_wb_knots) {
+        view_log(st, "this clip has no per-CCT table, so it develops as shot; "
+                     "the %s setting is kept for the next one that has\n",
+                 st->look.wb == VIEW_WB_AUTO ? "auto" : "manual");
     }
 
     return 0;
+}
+
+/* ---------------------------------------------------------------- clips */
+
+/* Everything the clip that is going away owns: both readers, the audio
+ * device stream, the picture on screen and what it put on the device. None
+ * of the user's settings is in here - not one of them is the clip's - so
+ * whatever the panel and the command line have made of them is untouched.
+ * What the clip itself said is read again by view_open_clip(). */
+static void view_close_clip(struct view_state *st)
+{
+    /* The device stream is only destroyed after the ramp down has been
+     * rendered, so a switch is a fade and never a cut. */
+    if (st->audio.playing)
+        view_audio_pause(&st->audio);
+
+    /* The figure the end of a run prints is the session's, not the last
+     * clip's. */
+    st->underruns += st->audio.underruns;
+    st->underrun_frames += st->audio.underrun_frames;
+
+    view_audio_close(&st->audio);
+
+    /* Before the decoder: the picture on screen is one of its frames, and
+     * so is anything libplacebo still holds mapped. */
+    av_frame_unref(st->frame);
+    st->have_frame = false;
+    view_gpu_release_frames(&st->gpu);
+
+    view_decoder_close(&st->dec);
+    /* view_decoder_open() fills what it needs and nothing else, so what the
+     * last clip said - its model, its metadata, its V-Log flag, whether its
+     * frames carried lens records - has to go here rather than linger into
+     * the next one's panel. */
+    st->dec = (struct view_decoder) { 0 };
+}
+
+/* One -v line for everything the user has set, printed as each clip opens.
+ * A playlist's whole promise is that a switch changes the clip and nothing
+ * else, and this is what makes that visible: the line is the same before
+ * and after every switch, whatever the clips are. */
+static void view_log_look(const struct view_state *st)
+{
+    const struct view_look *lk = &st->look;
+    char adj[128], gr[64];
+
+    if (!st->cfg.verbose)
+        return;
+
+    fprintf(stderr, "settings: wb ");
+    switch (lk->wb) {
+    case VIEW_WB_MANUAL:
+        fprintf(stderr, "manual %.0f K", lk->manual.cct);
+        if (lk->manual.tint != 0.0f)
+            fprintf(stderr, " tint %+.3f", lk->manual.tint);
+        break;
+    case VIEW_WB_AUTO:   fprintf(stderr, "auto"); break;
+    default:             fprintf(stderr, "as shot"); break;
+    }
+
+    if (lk->ei > 0.0f)
+        fprintf(stderr, ", ei %.0f", lk->ei);
+    else
+        fprintf(stderr, ", ei as shot");
+
+    fprintf(stderr, ", exposure %+.2f, debayer %s", lk->exposure,
+            (unsigned)lk->debayer < CRAW_DEBAYER_NB
+                ? view_debayer_names[lk->debayer] : "?");
+
+    if (st->denoise.on && st->denoise.strength > 0.0f)
+        fprintf(stderr, ", denoise %.2f", st->denoise.strength);
+    else
+        fprintf(stderr, ", denoise off");
+
+    fprintf(stderr, ", lens %s", st->lens.on ? st->lens.keep ? "on (keep all)"
+                                                             : "on (fill)" : "off");
+    fprintf(stderr, ", tone %s, gamut %s, peak detect %s",
+            view_tone_map_names[lk->tone_map], view_gamut_map_names[lk->gamut_map],
+            lk->peak_detect ? "on" : "off");
+    fprintf(stderr, ", lut %s", lk->lut_path[0] ? lk->lut_path
+                                                : view_lut_film_name(st));
+    fprintf(stderr, ", adjustments %s",
+            view_adjust_summary(&st->adjustments, adj, sizeof(adj)));
+    /* The gauge and the stock as the panel holds them, not the readout of
+     * the last build: what carries across a clip is the setting. */
+    fprintf(stderr, ", grain %s", view_grain_setting(&st->grain, gr, sizeof(gr)));
+    fprintf(stderr, ", zoom %s", st->view.fit ? "fit" : "set");
+    fprintf(stderr, ", volume %.0f%%%s\n", st->volume * 100.0f,
+            st->mute ? ", muted" : "");
+}
+
+/* Opens one clip of the playlist and leaves it at frame 0. This is the only
+ * path that opens a clip: startup is "open clip 0", and r and t are the
+ * same call with another index. `first` is that startup one; see
+ * view_profile_setup().
+ *
+ * The transport is not touched: a switch while paused stays paused, and one
+ * while playing plays. */
+static int view_open_clip(struct view_state *st, int index, bool first)
+{
+    int ret;
+
+    st->clip = index;
+    st->cfg.input = st->cfg.inputs[index];
+
+    view_log(st, "clip %d/%d: %s\n", index + 1, st->cfg.nb_inputs, st->cfg.input);
+
+    ret = view_decoder_open(&st->dec, st->cfg.input, &st->gpu, st->cfg.verbose);
+    if (ret < 0)
+        return ret;
+
+    /* Now that the kind is known: a developed clip has no use for the raw
+     * pipeline, and a raw one of the same size as the last keeps it. */
+    view_gpu_new_clip(&st->gpu, st->dec.raw);
+
+    view_crop_new_clip(st);
+
+    /* A headless export has no transport to pace and no speakers to reach,
+     * and --bench measures the picture pipeline: an audio track would pace
+     * the loop at the clip's own rate and the draining at each loop point
+     * would dominate a short clip's average. */
+    if (!st->cfg.headless && !st->cfg.bench) {
+        ret = view_audio_open(&st->audio, st->cfg.input, st->cfg.audio_map,
+                              st->cfg.verbose);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* Only where there is playback to dump. The file is the clip's, so a
+     * switch starts it again rather than running two clips together. */
+    if (!st->cfg.headless && st->cfg.audio_dump) {
+        ret = view_audio_dump_open(&st->audio, st->cfg.audio_dump);
+        if (ret < 0)
+            return ret;
+    }
+
+    ret = view_profile_setup(st, first);
+    if (ret < 0)
+        return ret;
+
+    /* The clip's own state, all of it read again from the clip that is now
+     * open: the frame it is showing, the clock, the illuminant track, the
+     * lens record and the two pass timings, the noise model, and whatever
+     * an export on the last clip left in the panel. */
+    st->index = 0;
+    st->pts = 0.0;
+    st->seek_to = -1;
+    st->seek_target = -1;
+    st->seek_tries = 0;
+    st->need_frame = true;
+    st->warm = false;
+    st->loops_done = 0;
+    st->starved = 0;
+    st->decode_ms = 0.0;
+    st->processed = (struct view_pipeline_look) { 0 };
+    st->sync.run_frames = 0;
+    st->timing = (struct view_timing) { 0 };
+
+    craw_awb_smoother_reset(st->awb.smoother);
+    st->awb.have_illum = false;
+
+    st->lens.record = (CRAWLensCorrection) { 0 };
+    st->lens.scale = 0.0f;
+    st->lens.ms_on = st->lens.ms_off = 0.0;
+    st->denoise.have_model = false;
+    st->denoise.ms_on = st->denoise.ms_off = 0.0;
+
+    st->clip_status[0] = '\0';
+    st->exp.status[0] = '\0';
+    st->video.status[0] = '\0';
+    st->video.path[0] = '\0';
+    st->video.progress = 0.0;
+    /* The range follows the frame on screen again: the last clip's numbers
+     * mean nothing on a clip of another length. */
+    st->video.range_set = false;
+
+    view_wall_restart(st, 0.0);
+
+    /* A 1:1 zoom is about a point of the old frame, which the new one may
+     * not have; fit needs nothing. */
+    if (!st->view.fit) {
+        st->view.cx = st->view.cy = 0.0f;
+        view_log(st, "zoom: %.2fx kept, re-centred on the new clip\n", st->view.zoom);
+    }
+
+    view_log_look(st);
+
+    return 0;
+}
+
+/* Can this path be opened and does it hold a video stream? Asked before the
+ * clip on screen is touched, so that a name that is not there - a card that
+ * was unplugged, a typo in the list - leaves the viewer exactly where it
+ * was rather than on nothing at all. */
+static bool view_clip_probe(const char *path, char *err, size_t n)
+{
+    AVFormatContext *fmt = NULL;
+    const AVCodec *codec = NULL;
+    int ret;
+
+    ret = avformat_open_input(&fmt, path, NULL, NULL);
+    if (ret < 0) {
+        snprintf(err, n, "%s", av_err2str(ret));
+        return false;
+    }
+
+    ret = avformat_find_stream_info(fmt, NULL);
+    if (ret >= 0)
+        ret = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &codec, 0);
+
+    avformat_close_input(&fmt);
+
+    if (ret < 0 || !codec) {
+        snprintf(err, n, "no decodable video stream");
+        return false;
+    }
+
+    return true;
+}
+
+/* r and t: the previous and the next clip, wrapping. */
+static void view_switch_clip(struct view_state *st, int delta)
+{
+    const char *name;
+    char err[128];
+    int want, from;
+
+    if (st->cfg.nb_inputs < 2)
+        return;
+
+    /* An export owns the decoder: it seeks it, it steps it, and its file is
+     * half written. Refused rather than queued, because the one thing the
+     * user would not want is the range they asked for silently coming from
+     * two different clips. */
+    if (st->exp.active || st->video.active) {
+        snprintf(st->clip_status, sizeof(st->clip_status),
+                 "export running: the clip changes when it ends");
+        fprintf(stderr, "%s\n", st->clip_status);
+        return;
+    }
+
+    want = (st->clip + delta + st->cfg.nb_inputs) % st->cfg.nb_inputs;
+    name = st->cfg.inputs[want];
+
+    if (!view_clip_probe(name, err, sizeof(err))) {
+        snprintf(st->clip_status, sizeof(st->clip_status), "%s: %.80s",
+                 strrchr(name, '/') ? strrchr(name, '/') + 1 : name, err);
+        fprintf(stderr, "%s: %s\n", name, err);
+        return;
+    }
+
+    from = st->clip;
+    view_close_clip(st);
+
+    if (view_open_clip(st, want, false) < 0) {
+        /* It opened a moment ago as a probe and will not open now, so the
+         * clip that was on screen comes back and the panel says why. The
+         * message is written after that, because a clip that opens clears
+         * it. If even the old one will not come back there is nothing left
+         * to show and the run loop's next step says so. */
+        fprintf(stderr, "%s: cannot be opened; staying on the previous clip\n", name);
+
+        view_close_clip(st);
+        if (view_open_clip(st, from, false) < 0) {
+            view_close_clip(st);
+            fprintf(stderr, "%s could not be re-opened either; there is no "
+                            "clip left to show\n", st->cfg.inputs[from]);
+        }
+
+        snprintf(st->clip_status, sizeof(st->clip_status),
+                 "%.60s could not be opened",
+                 strrchr(name, '/') ? strrchr(name, '/') + 1 : name);
+    }
 }
 
 /* ----------------------------------------------------------------- main */
@@ -1860,8 +2182,9 @@ static void view_seek_by(struct view_state *st, int64_t frames)
  * they land on; Shift with Left or Right seeks a second; Page Up and Page
  * Down zoom and Shift with them goes to the ends of the clip; Control with
  * the arrows pans, which only does anything while the picture is larger
- * than its area; c turns crop mode on and off. A key that toggles or seeks
- * acts once per press, the ones that step act on every repeat. */
+ * than its area; c turns crop mode on and off; r and t walk the files the
+ * command line was given. A key that toggles, seeks or changes clip acts
+ * once per press, the ones that step act on every repeat. */
 static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *running)
 {
     bool shift = (e->key.mod & SDL_KMOD_SHIFT) != 0;
@@ -1985,6 +2308,18 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
         }
         break;
 
+    /* The playlist, one clip per press: holding the key down would tear
+     * through a card's worth of files, so the repeats are ignored the way
+     * every other toggle's are. */
+    case SDLK_R:
+        if (!repeat)
+            view_switch_clip(st, -1);
+        break;
+    case SDLK_T:
+        if (!repeat)
+            view_switch_clip(st, 1);
+        break;
+
     case SDLK_ESCAPE:
     case SDLK_Q:
         *running = false;
@@ -2039,38 +2374,21 @@ static int view_run_window(struct view_state *st)
         return CRAW_ERROR(EIO);
     }
 
-    ret = view_decoder_open(&st->dec, st->cfg.input, &st->gpu, st->cfg.verbose);
-    if (ret < 0)
-        return ret;
+    /* Before the first clip: a LUT is a setting, and nothing about
+     * resolving one - a file or a name out of the embedded pack - has
+     * anything to do with which clip is open. */
+    if (view_lut_startup(st) < 0)
+        fprintf(stderr, "--lut %s: %s\n", st->look.lut_path, st->lut_error);
 
-    view_crop_new_clip(st);
-
-    /* --bench measures the picture pipeline; an audio track would pace the
-     * loop at the clip's own rate and the draining at each loop point would
-     * dominate a short clip's average. */
-    if (!st->cfg.bench) {
-        ret = view_audio_open(&st->audio, st->cfg.input, st->cfg.audio_map,
-                              st->cfg.verbose);
-        if (ret < 0)
-            return ret;
-    }
-
-    if (st->cfg.audio_dump) {
-        ret = view_audio_dump_open(&st->audio, st->cfg.audio_dump);
-        if (ret < 0)
-            return ret;
-    }
-
-    ret = view_profile_setup(st, st->cfg.profile, st->cfg.tables);
+    /* Startup is nothing more than opening the first clip: r and t take
+     * exactly this path with another index. */
+    ret = view_open_clip(st, 0, true);
     if (ret < 0)
         return ret;
 
     ret = view_ui_open(st, win);
     if (ret < 0)
         return ret;
-
-    if (view_lut_startup(st) < 0)
-        fprintf(stderr, "--lut %s: %s\n", st->look.lut_path, st->lut_error);
 
     fps_t0 = av_gettime_relative();
     iter_t0 = fps_t0;
@@ -2390,7 +2708,8 @@ static int view_run_window(struct view_state *st)
                         " sample frames of silence)\n",
                 st->loops_done, st->sync.presented, st->sync.dropped,
                 st->sync.max_abs * 1000.0, st->sync.max_abs_settled * 1000.0,
-                st->audio.underruns, st->audio.underrun_frames);
+                st->underruns + st->audio.underruns,
+                st->underrun_frames + st->audio.underrun_frames);
 
     return ret > 0 ? 0 : ret;
 }
@@ -2410,6 +2729,8 @@ static void view_close(struct view_state *st)
     view_ui_close(st);
     view_audio_close(&st->audio);
     view_decoder_close(&st->dec);
+    /* Once per program, whatever the playlist did. */
+    view_decoder_cleanup();
     /* The grain hooks hold shader objects, so they go before the pl_gpu. */
     view_grain_close(&st->grain);
     view_adjust_close(&st->adjustments);
@@ -2442,23 +2763,18 @@ static int view_run_headless(struct view_state *st)
         return ret;
     t0 = view_phase(st, t0, "device and pipeline");
 
-    ret = view_decoder_open(&st->dec, st->cfg.input, &st->gpu, st->cfg.verbose);
-    if (ret < 0)
-        return ret;
-    t0 = view_phase(st, t0, "decoder");
-
-    view_crop_new_clip(st);
-
-    ret = view_profile_setup(st, st->cfg.profile, st->cfg.tables);
-    if (ret < 0)
-        return ret;
-
     ret = view_lut_startup(st);
     if (ret < 0) {
         fprintf(stderr, "--lut %s: %s\n", st->look.lut_path, st->lut_error);
         return ret;
     }
-    t0 = view_phase(st, t0, "profile and LUT");
+
+    /* The first file and only the first: an export writes one clip to one
+     * file, and a playlist is a thing the window has. */
+    ret = view_open_clip(st, 0, true);
+    if (ret < 0)
+        return ret;
+    t0 = view_phase(st, t0, "decoder, profile and LUT");
 
     if (st->cfg.export_video) {
         struct view_encode_opts o = {

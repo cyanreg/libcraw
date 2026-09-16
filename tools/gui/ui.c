@@ -1513,10 +1513,24 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         else
             nk_labelf(ctx, NK_TEXT_LEFT, "zoom: %.2fx", z);
     }
-    nk_labelf(ctx, NK_TEXT_LEFT, "%s  [%s %s]", file,
-              st->dec.codec_name ? st->dec.codec_name : "?",
-              st->dec.raw ? "raw"
-                          : st->dec.hwaccel ? "video, gpu" : "video, cpu");
+    /* Which of how many, whenever there is more than one: a playlist is
+     * the only thing that makes the question worth the room. */
+    if (st->cfg.nb_inputs > 1)
+        nk_labelf(ctx, NK_TEXT_LEFT, "%d/%d %s [%s %s]",
+                  st->clip + 1, st->cfg.nb_inputs, file,
+                  st->dec.codec_name ? st->dec.codec_name : "?",
+                  st->dec.raw ? "raw"
+                              : st->dec.hwaccel ? "video, gpu" : "video, cpu");
+    else
+        nk_labelf(ctx, NK_TEXT_LEFT, "%s  [%s %s]", file,
+                  st->dec.codec_name ? st->dec.codec_name : "?",
+                  st->dec.raw ? "raw"
+                              : st->dec.hwaccel ? "video, gpu" : "video, cpu");
+    /* Whatever the playlist has to report: a file that would not open, a
+     * switch refused. Under the clip line, because that is what it is
+     * about, and never behind a fold. */
+    if (st->clip_status[0])
+        nk_labelf(ctx, NK_TEXT_LEFT, "%.46s", st->clip_status);
     /* The clip's own words, when they are what the picture is being read
      * as: a V-Log clip's stream tags say BT.709 and the panel would
      * otherwise give no sign that they are being ignored. */

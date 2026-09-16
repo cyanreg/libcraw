@@ -45,6 +45,11 @@ void view_grain_close(struct view_grain *g);
  * settings at the current magnification. Returns `buf`. */
 const char *view_grain_summary(const struct view_grain *g, char *buf, size_t n);
 
+/* And one for what was asked for rather than what was built: the gauge, the
+ * stock and the amount, which is the part that is a setting and carries
+ * from clip to clip. Returns `buf`. */
+const char *view_grain_setting(const struct view_grain *g, char *buf, size_t n);
+
 /* The "Film grain" section of the panel. Emits its rows through the same
  * focus ring as every other section. */
 void view_panel_grain(struct nk_context *ctx, struct view_state *st);

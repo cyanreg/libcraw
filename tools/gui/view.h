@@ -376,6 +376,7 @@ struct view_gpu {
     CRAWPipeline *pipe;
     uint32_t width, height;
     enum CRAWDebayer pipe_debayer;
+    bool verbose;               /* -v, for the pipeline's own lines */
 
     /* Whether the denoise stage ran in each slot's submission, so that the
      * timestamp read back from a slot VIEW_SLOTS frames later is charged to
@@ -440,7 +441,13 @@ struct view_gpu {
 /* --------------------------------------------------------- program state */
 
 struct view_cfg {
+    /* The playlist: every non-option argument, in the order they were
+     * given, and `input` the one clip that is open. `r` and `t` walk the
+     * list; a headless export only ever looks at the first entry. */
+    char *const *inputs;
+    int nb_inputs;
     const char *input;
+
     const char *device;         /* physical device name substring */
     bool verbose;
     bool debug;                 /* validation layer */
@@ -547,6 +554,13 @@ struct view_crop {
      * the flag, and the panel says "(clip)" only while it holds. */
     bool from_clip;
     bool clip_read;             /* the clip's own crop has been looked at */
+
+    /* The frame the rectangle was last measured against. A rectangle is in
+     * source pixels and means nothing on a frame of another size, so
+     * switching to a clip that is not this size drops it; zero until the
+     * first frame a rectangle has met, which is where one from --crop is
+     * bound. */
+    int frame_w, frame_h;
 };
 
 /* How well the picture is keeping up with the master clock. */
@@ -702,6 +716,18 @@ struct view_state {
     CRAWProfile prof;           /* base plus the current frame's side data */
     bool have_prof;
 
+    /* Which of cfg.inputs is open. `r` and `t` step it, wrapping. */
+    int clip;
+    /* What the playlist has to say, on its own line under the clip line: a
+     * file that would not open, a switch refused because an export is
+     * running. Empty when there is nothing to report, and cleared by the
+     * next switch that works. */
+    char clip_status[160];
+    /* Audio underruns of the clips that have been closed, so that the
+     * figure printed at the end of a run is the session's and not just the
+     * last clip's; the panel shows the open clip's own count. */
+    uint64_t underruns, underrun_frames;
+
     void *win;                  /* SDL_Window, NULL when headless */
     bool sdl_init;
     int win_w, win_h;           /* window points, which mouse events use */
@@ -758,6 +784,16 @@ void view_gpu_close(struct view_gpu *g);
 /* Creates or resizes the pipeline and the output texture. */
 int  view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
                      enum CRAWDebayer debayer);
+
+/* Everything on the device that points at the closing clip's frames, while
+ * its decoder is still alive to own them. */
+void view_gpu_release_frames(struct view_gpu *g);
+
+/* And what the arriving clip needs, once its kind is known: a developed one
+ * cannot use the pipeline or its full-size output textures, so they go;
+ * two raw clips of the same size keep both and view_gpu_ensure() then does
+ * nothing at all. */
+void view_gpu_new_clip(struct view_gpu *g, bool raw);
 
 /* Records one decoded hardware frame through libcraw and submits it,
  * without waiting for the result. */
@@ -824,6 +860,8 @@ void view_gpu_unlock(struct view_gpu *g);
 int  view_decoder_open(struct view_decoder *d, const char *path,
                        struct view_gpu *g, bool verbose);
 void view_decoder_close(struct view_decoder *d);
+/* Once per program, after the last clip: the XML parser's globals. */
+void view_decoder_cleanup(void);
 
 /* 0: a frame, 1: end of stream, negative: an error. */
 int  view_decoder_next(struct view_decoder *d, AVFrame *frame);

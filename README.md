@@ -85,8 +85,9 @@ focused one; Shift with Left and Right seeks one second; Page Up and Page
 Down zoom in and out, and Shift with them goes to the first and last frame;
 Control with the arrows pans; Tab or `0` fits the picture again and `1` is
 one to one; Enter opens the film simulation menu on its row and Escape
-closes it; the wheel zooms about the pointer and a left drag pans; `m`
-mutes; `q`, or Escape with no menu open, quits. Zoom and pan only touch the
+closes it; the wheel zooms about the pointer and a left drag pans; `r` and
+`t` go to the previous and the next file; `m` mutes; `q`, or Escape with no
+menu open, quits. Zoom and pan only touch the
 view, never the export. Its "Denoise" section switches the raw stage on and
 sets its strength, and reports the noise model it found for the clip's own
 ISO — the stage stays off when the camera has none, which the section says
@@ -94,6 +95,21 @@ rather than leaving you guessing; `--denoise STRENGTH` sets it from the
 command line. With four mono audio tracks the last two are taken
 as the stereo pair (`--audio-map` overrides). `cineview -h` lists the
 options.
+
+It takes any number of files, which makes a playlist: `r` and `t` step to
+the previous and the next clip and wrap at both ends, and the panel's clip
+line reads `3/7 P1000347.MOV [hevc video, gpu]`. The clips need not match —
+ProRes RAW and already developed, different sizes, stereo or four-channel or
+no audio at all — and a switch keeps every setting exactly as it was: the
+white balance mode and a manual CCT, the exposure index and bias, debayer,
+denoise, lens correction and its fit, tone and gamut mapping, the film
+simulation, the adjustments, the grain and the zoom. A setting a clip's kind
+cannot use is kept rather than dropped, so the white balance a raw clip was
+graded with is still there after a developed one. Only what is read from the
+clip is read again: its tables and as-shot values, its crop, its lens
+records, its metadata. A file that cannot be opened is reported and leaves
+the viewer on the clip it is showing, and `--export` and `--export-video`
+take the first file only.
 
 It also carries 296 film simulation LUTs from
 [filmgrid.org](https://filmgrid.org/), which derive from the open-source

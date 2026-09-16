@@ -292,9 +292,10 @@ static void view_read_clip_xml(struct view_decoder *d, const char *xml)
     char iso[32];
 
     /* Idempotent, and matched by the xmlCleanupParser() in
-     * view_decoder_close(): one decoder is opened per run and nothing else
-     * in the program uses libxml2, so the global state is set up once and
-     * released once. */
+     * view_decoder_cleanup(): the viewer opens a decoder per clip and
+     * libxml2's global state is not a per-clip thing, so it is set up
+     * whenever a document is read and released once, when the program
+     * ends. */
     xmlInitParser();
 
     doc = xmlReadMemory(xml, (int)strlen(xml), NULL, NULL,
@@ -504,10 +505,14 @@ void view_decoder_close(struct view_decoder *d)
     avcodec_free_context(&d->dec);
     av_buffer_unref(&d->hw_device);
     avformat_close_input(&d->fmt);
-    /* Pairs with the xmlInitParser() in view_read_clip_xml(). Safe when no
-     * document was ever read, and this is the last use of libxml2 in the
-     * program either way: the clip is what it parses, and the clip is
-     * closing. */
+}
+
+/* Pairs with the xmlInitParser() in view_read_clip_xml(), once per program
+ * rather than once per clip: libxml2's globals are not a decoder's to
+ * release while the next clip may still parse a document. Safe when none
+ * ever did. */
+void view_decoder_cleanup(void)
+{
     xmlCleanupParser();
 }
 

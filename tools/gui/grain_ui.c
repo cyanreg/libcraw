@@ -287,6 +287,17 @@ void view_grain_close(struct view_grain *g)
     craw_grain_hook_destroy(&g->hook_export);
 }
 
+const char *view_grain_setting(const struct view_grain *g, char *buf, size_t n)
+{
+    if (!g->on || g->amount <= 0.0f)
+        snprintf(buf, n, "off");
+    else
+        snprintf(buf, n, "%s/%s %.2f", craw_grain_gauge_name(g->gauge),
+                 craw_grain_stock_name(g->stock), (double)g->amount);
+
+    return buf;
+}
+
 const char *view_grain_summary(const struct view_grain *g, char *buf, size_t n)
 {
     if (!g->on || g->amount <= 0.0f)
