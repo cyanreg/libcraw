@@ -84,7 +84,9 @@ struct view_preset_family {
     const char *always;
 
     /* The format a scene-referred export uses instead of the preset's, or
-     * AV_PIX_FMT_NONE when this family cannot carry linear light. */
+     * AV_PIX_FMT_NONE when this family cannot carry linear light. Spelled
+     * out in every entry, because AV_PIX_FMT_NONE is -1 and a field left
+     * out of a designated initializer is AV_PIX_FMT_YUV420P. */
     enum AVPixelFormat scene_fmt;
 
     int async_min, async_max, async_def;
@@ -111,17 +113,21 @@ extern const int view_nb_preset_families;
 /* What the export is written in.
  *
  * The display-referred entries are render targets: the export renderer
- * tone maps and gamut maps into them exactly as it does for the screen.
+ * tone maps and gamut maps into them exactly as it does for the screen,
+ * with the Export section's own tone mapping, peak detection and gamut
+ * mapping settings.
  *
- * The scene-referred three are a selection the panel and the command line
- * accept and remember, but not yet an export: linear light has to reach
- * the encoder from libcraw's own output rather than through the display
- * pipeline, and that path is not in this build. Asking for one is refused
- * with a status line. The bookkeeping around them - `needs_deep_rgb`, the
- * family's `scene_fmt` and a preset's `scene_ok` - is what that path will
- * key on, and it is already measured: FFV1 writes gbrpf32 at version 4 and
- * refuses it below, so the only family that can carry linear light here is
- * FFv1 (Vulkan) with an L4 preset. */
+ * The scene-referred three never touch the renderer at all. The pipeline is
+ * run a second time for the frame with CRAWFrameParams.out_space set to the
+ * space asked for, into an RGBA32F texture, and those floats are read back
+ * and handed to the encoder through libswscale and, for a Vulkan encoder,
+ * an upload - no pl_renderer, no pl_shader, no pl_dispatch. Nothing
+ * display-referred can therefore reach them: no tone curve, no gamut
+ * mapping, no film simulation, no grain, which is why those sections grey
+ * out while one is selected. `needs_deep_rgb`, the family's `scene_fmt` and
+ * a preset's `scene_ok` are what that path keys on: FFV1 writes gbrpf32 at
+ * version 4 and refuses it below, so the only family that can carry linear
+ * light is FFv1 (Vulkan) with an L4 preset. */
 enum view_colour_id {
     VIEW_COLOUR_709 = 0,
     VIEW_COLOUR_2020_SDR,
@@ -140,7 +146,10 @@ struct view_colour {
      * one, the transfers under it. `group` is the first column's entry. */
     const char *group;          /* "BT.2020" */
 
-    bool scene;                 /* scene referred: not a render target */
+    /* Scene referred: written by the direct path above, never rendered.
+     * Every consequence of that - the greyed sections, the refusal of a
+     * size, the tone mapping settings not applying - is this one bit. */
+    bool scene;
     bool hdr;                   /* tone mapped to an HDR target */
     bool needs_deep_rgb;        /* linear light: float RGB codecs only */
 
@@ -175,8 +184,57 @@ struct view_preset_sel {
     int colour;                 /* enum view_colour_id */
     int hdr_peak;               /* PQ's target peak in nits */
 
+    /* How the picture is mapped into a display-referred target. These are
+     * export settings and not look settings: what the window shows is
+     * whatever the compositor negotiated, mapped with libplacebo's own
+     * defaults for it, and what a file holds is a decision. Index 0 of
+     * view_tone_map_names[] and view_gamut_map_names[] is "off"; a
+     * scene-referred colour ignores all three. */
+    int tone_map;
+    int gamut_map;
+    int peak;                   /* nuklear's checkbox wants an int */
+
+    int size;                   /* enum view_size_id */
+    int size_w, size_h;         /* VIEW_SIZE_TYPED's own, in pixels */
+
     bool set;                   /* false until something chose: use the defaults */
 };
+
+/* The first real entry of each list, which is what the Look section used to
+ * start on and what an untouched Export section still does. */
+#define VIEW_TONE_MAP_DEF  1    /* bt.2390 */
+#define VIEW_GAMUT_MAP_DEF 1    /* perceptual */
+
+/* --------------------------------------------------------------- the size */
+
+/* What the exported picture is scaled to. The crop rectangle's own size is
+ * the default and everything else is a fraction or a width of it; a typed
+ * WxH is the escape hatch. A software encoder at 5.8K wants three and a half
+ * gigabytes, which is the reason this row exists. */
+enum view_size_id {
+    VIEW_SIZE_FULL = 0,
+    VIEW_SIZE_HALF,
+    VIEW_SIZE_QUARTER,
+    VIEW_SIZE_3840,
+    VIEW_SIZE_1920,
+    VIEW_SIZE_TYPED,
+    VIEW_NB_SIZES,
+};
+
+extern const char *const view_size_names[VIEW_NB_SIZES];
+
+/* The size a selection means for a crop of `cw` x `ch`, both even. A width
+ * larger than the crop's own never upscales: the row shrinks, it does not
+ * enlarge. */
+void view_presets_size(const struct view_preset_sel *s, int cw, int ch,
+                       int *w, int *h);
+
+/* `--size full|1/2|1/4|3840|1920|WxH`. */
+int view_presets_parse_size(struct view_preset_sel *s, const char *arg);
+
+/* One line for the panel and the log: "1/2 (2880x1520)". */
+const char *view_presets_size_label(const struct view_preset_sel *s,
+                                    int cw, int ch, char *buf, size_t n);
 
 /* Fills a selection with the table's defaults. */
 void view_presets_default(struct view_preset_sel *s);

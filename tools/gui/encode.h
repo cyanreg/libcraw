@@ -36,7 +36,8 @@ struct view_state;
 struct view_encode;
 struct view_preset_sel;
 
-/* What one run is asked for. Sizes of zero mean the crop's own size. */
+/* What one run is asked for. The size is the selection's, which is an
+ * export setting like the rest of them. */
 struct view_encode_opts {
     int64_t start, end;         /* inclusive frame range */
     const char *path;
@@ -47,7 +48,6 @@ struct view_encode_opts {
     const struct view_preset_sel *sel;
     const char *codec;          /* encoder name, NULL: the preset's */
     const char *enc;            /* KEY=VALUE,... on top of the preset's */
-    int width, height;          /* 0: the crop rectangle's size */
     bool audio;                 /* remux the clip's own audio */
 };
 

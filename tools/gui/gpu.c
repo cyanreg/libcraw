@@ -41,7 +41,14 @@
 
 /* --------------------------------------------------------------- tables */
 
+/* Both lists start with "off", which is the export's own setting and not a
+ * libplacebo function: NULL for the tone map, so nothing is attached and the
+ * target carries the source's own luminance range; libplacebo's `clip` for
+ * the gamut map, whose map callback is literally a no-op that
+ * pl_gamut_map_params_noop() recognises, so the conversion is the primaries
+ * matrix and nothing else. */
 static const struct pl_tone_map_function *const view_tone_map_fns[] = {
+    NULL,
     &pl_tone_map_bt2390,
     &pl_tone_map_spline,
     &pl_tone_map_reinhard,
@@ -49,23 +56,24 @@ static const struct pl_tone_map_function *const view_tone_map_fns[] = {
 };
 
 const char *const view_tone_map_names[] = {
-    "bt.2390", "spline", "reinhard", "clip",
+    "off", "bt.2390", "spline", "reinhard", "clip",
 };
 
 const int view_nb_tone_maps = (int)(sizeof(view_tone_map_fns) / sizeof(view_tone_map_fns[0]));
 
 static const struct pl_gamut_map_function *const view_gamut_map_fns[] = {
+    &pl_gamut_map_clip,
     &pl_gamut_map_perceptual,
     &pl_gamut_map_softclip,
     &pl_gamut_map_relative,
-    &pl_gamut_map_clip,
     &pl_gamut_map_desaturate,
 };
 
 /* One word each: the same strings name the choice in the panel and on the
- * command line. */
+ * command line. libplacebo's "clip" is not a mode of its own here because it
+ * is the absence of one, which is what "off" says. */
 const char *const view_gamut_map_names[] = {
-    "perceptual", "softclip", "relative", "clip", "desaturate",
+    "off", "perceptual", "softclip", "relative", "desaturate",
 };
 
 const int view_nb_gamut_maps = (int)(sizeof(view_gamut_map_fns) / sizeof(view_gamut_map_fns[0]));
@@ -668,6 +676,10 @@ void view_gpu_close(struct view_gpu *g)
     if (g->vk)
         vkDeviceWaitIdle(g->vk->device);
 
+    /* Before the context: the direct path owns a pipeline of its own, and a
+     * command buffer out of the pool below. */
+    view_gpu_direct_close(g);
+
     craw_pipeline_free(&g->pipe);
     craw_context_free(&g->ctx);
 
@@ -811,7 +823,14 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
     pp.height     = h;
     pp.cfa        = CRAW_CFA_RGGB;
     pp.debayer    = debayer;
-    pp.out_space  = CRAW_CS_BT2020_LINEAR;
+    /* ACEScg, not linear BT.2020: DESIGN.md 8.1. BT.2020 does not contain
+     * what this camera's matrix produces on a saturated light source, and
+     * the negative components that leaves are what a display side gamut
+     * mapper clips flat. AP1 holds them, and the ACES 1.3 reference gamut
+     * compression at the end of the colour stage pulls the few that are
+     * still outside back in. An export in another space asks the same
+     * pipeline for it per frame through CRAWFrameParams.out_space. */
+    pp.out_space  = CRAW_CS_ACES_AP1_LINEAR;
     pp.out_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     /* All three always built: the panel can switch to auto white balance,
      * to denoising or to lens correction at any time and a pipeline rebuild
@@ -868,6 +887,10 @@ void view_gpu_release_frames(struct view_gpu *g)
 
     view_gpu_drop_src_views(g);
     view_gpu_unmap(g);
+    /* The next clip may be another size or already developed, and the
+     * direct path's pipeline is built for exactly one size; an export that
+     * survives a clip switch is not a thing anyway. */
+    view_gpu_direct_close(g);
 
     for (int i = 0; i < VIEW_SLOTS; i++)
         g->slots[i].busy = false;
@@ -1345,7 +1368,17 @@ void view_gpu_image(const struct view_gpu *g, struct pl_frame *out,
             .alpha  = PL_ALPHA_NONE,
         },
         .color = {
-            .primaries = PL_COLOR_PRIM_BT_2020,
+            /* The pipeline's hand-off space, DESIGN.md 8.1. libplacebo's
+             * AP1 is the same primaries libcraw builds the matrix from -
+             * R(0.713,0.293) G(0.165,0.830) B(0.128,0.044) - with the ACES
+             * white (0.32168, 0.33767), checked against its own table, so
+             * the two agree about what an AP1 sample means. libplacebo then
+             * adapts that white to the display's with CAT16 rather than the
+             * Bradford libcraw used to get here; a von Kries transform maps
+             * the source white onto the destination white by construction,
+             * so neutrals come back exactly and only chromatic colours
+             * differ. */
+            .primaries = PL_COLOR_PRIM_ACES_AP1,
             /* Linear light with an absolute scale, which is what scRGB is.
              * Tagging it PL_COLOR_TRC_LINEAR instead would be equivalent
              * arithmetically - libplacebo neither scales nor clamps either
@@ -1357,7 +1390,7 @@ void view_gpu_image(const struct view_gpu *g, struct pl_frame *out,
              * between a sample and diffuse white is undone in
              * view_render_params(). */
             .transfer  = PL_COLOR_TRC_SCRGB,
-            /* The pipeline writes scene-linear BT.2020 with diffuse white
+            /* The pipeline writes scene-linear ACEScg with diffuse white
              * at 1.0, so what the tone mapper is told about is the sensor
              * clip: the gain the colour stage applied, in nits. It is a
              * ceiling, not a measurement - peak detection finds the real
@@ -1369,6 +1402,33 @@ void view_gpu_image(const struct view_gpu *g, struct pl_frame *out,
         },
         .crop = { 0, 0, (float)g->width, (float)g->height },
     };
+}
+
+/* "Tone mapping off" is not a clip and not a function: it is the target
+ * carrying the source's own luminance range, which is exactly the condition
+ * pl_tone_map_params_noop() tests, so libplacebo attaches no tone curve at
+ * all and every value passes through into the target's encoding. Left alone
+ * when tone mapping is on, and when it is the target's own peak that says
+ * what the picture is mapped to. */
+void view_export_tone_off(struct view_state *st, struct pl_color_space *c)
+{
+    struct pl_color_space src;
+
+    if (st->look.video_preset.tone_map != 0)
+        return;
+
+    if (st->dec.raw) {
+        c->hdr.min_luma = PL_COLOR_HDR_BLACK;
+        c->hdr.max_luma = view_peak_ceiling(st);
+        return;
+    }
+
+    /* A developed clip's range is the stream's own, once libplacebo has
+     * filled in whatever the tags left out. */
+    src = st->gpu.mapped.color;
+    pl_color_space_infer(&src);
+    c->hdr.min_luma = src.hdr.min_luma;
+    c->hdr.max_luma = src.hdr.max_luma;
 }
 
 /* The hook state for one of the two renderers, made on first use the way
@@ -1392,11 +1452,24 @@ static void view_render_params(struct view_state *st,
                                struct pl_color_adjustment *adj,
                                const struct pl_hook **hook, bool export_path)
 {
-    *cmp = pl_color_map_default_params;
-    cmp->tone_mapping_function = view_tone_map(st->look.tone_map);
-    cmp->gamut_mapping = view_gamut_map(st->look.gamut_map);
+    const struct view_preset_sel *sel = &st->look.video_preset;
+    /* The look is bypassed entirely while a scene-referred export space is
+     * selected, on screen as well as in the file: what that export holds is
+     * the pipeline's own linear light, so the window has to show the same
+     * picture up to the display transform or the panel would be grading
+     * something nobody is going to get. */
+    bool scene = view_export_is_scene(st);
 
+    *cmp = pl_color_map_default_params;
     *pdp = pl_peak_detect_default_params;
+
+    /* The window's mapping is the compositor's business: libplacebo knows
+     * what the swapchain negotiated and its defaults are for exactly that.
+     * Only the export chooses, and only into a display-referred target. */
+    if (export_path) {
+        cmp->tone_mapping_function = view_tone_map(sel->tone_map);
+        cmp->gamut_mapping = view_gamut_map(sel->gamut_map);
+    }
 
     /* The raw path's texture is tagged scRGB, whose 1.0 is 80 nits, while
      * the pipeline's 1.0 is diffuse white at 203. Scaling the samples by
@@ -1415,8 +1488,10 @@ static void view_render_params(struct view_state *st,
      * measuring the real peak stops an ordinary frame from being tone
      * mapped as though it were full of blown highlights. libplacebo's
      * defaults for the smoothing window, the scene cut thresholds and the
-     * percentile are kept: nothing measured here argues with them. */
-    rp->peak_detect_params = st->look.peak_detect ? pdp : NULL;
+     * percentile are kept: nothing measured here argues with them, and the
+     * window keeps them whatever the export was set to. */
+    if (export_path)
+        rp->peak_detect_params = sel->peak ? pdp : NULL;
     /* A user .cube goes on the image as asked; a film simulation never
      * does: it is a display-referred sRGB look and belongs after tone
      * mapping, in the output's own encoding. It used to ride on the target
@@ -1426,7 +1501,7 @@ static void view_render_params(struct view_state *st,
      * the same values and through the same pl_shader_custom_lut, so that
      * vibrance and soft light can follow it the way they follow film
      * simulation in RawTherapee. */
-    rp->lut = st->look.film_sim >= 0 ? NULL : st->lut;
+    rp->lut = st->look.film_sim >= 0 || scene ? NULL : st->lut;
     rp->lut_type = st->look.lut_space > 0 ? PL_LUT_CONVERSION : st->look.lut_type;
 
     /* Only the non-raw path needs a shader for exposure; on the raw path
@@ -1456,7 +1531,7 @@ static void view_render_params(struct view_state *st,
      * The export path gets its own shader state throughout - and, for the
      * grain, its own frame-index seed - so exporting a range twice gives
      * the same files. */
-    {
+    if (!scene) {
         craw_adjust *aj = view_adjust_state(st, export_path);
         const struct pl_hook *h;
 
@@ -1568,10 +1643,11 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
         return CRAW_ERROR(EIO);
     }
 
-    /* Whatever the detector settled on for the frame just rendered. It is
-     * reported in PQ, so it comes back through the same rescale libplacebo
-     * uses internally. */
-    if (st->look.peak_detect && pl_renderer_get_hdr_metadata(g->rr, &measured))
+    /* Whatever the detector settled on for the frame just rendered - the
+     * window's own, which libplacebo runs by default and nothing here turns
+     * off any more. It is reported in PQ, so it comes back through the same
+     * rescale libplacebo uses internally. */
+    if (pl_renderer_get_hdr_metadata(g->rr, &measured))
         g->measured_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, measured.max_pq_y);
     else
         g->measured_peak = 0.0;
@@ -1700,6 +1776,12 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
         .crop  = { 0, 0, (float)cw, (float)ch },
     };
 
+    /* The Export section's tone mapping setting reaches the still as well as
+     * the movie: they are one export with one set of settings, and a still
+     * that tone mapped while the video beside it did not would be a
+     * different picture of the same frame. */
+    view_export_tone_off(st, &target.color);
+
     /* The export has its own renderer so that the peak detection track it
      * walks through depends only on the exported frames: the same frame
      * exported twice then gives the same file. */
@@ -1715,6 +1797,398 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
         fprintf(stderr, "cannot read the export texture back\n");
         return CRAW_ERROR(EIO);
     }
+
+    return 0;
+}
+
+/* ------------------------------------------------ the direct export path */
+
+/* A scene-referred export never goes near the renderer. The picture is put
+ * through the pipeline a second time with CRAWFrameParams.out_space set to
+ * the space asked for, into an RGBA32F texture, and the crop of that texture
+ * is read straight back: the only libplacebo call these pixels see is
+ * pl_tex_download, which is a copy and nothing else. Everything the display
+ * path does - the scRGB scale, tone mapping, gamut mapping, the LUT, the
+ * grade, the grain - is display-referred by definition and has no business
+ * touching linear light on its way to an archive.
+ *
+ * It costs a second pipeline because the first one writes RGBA16F: libcraw
+ * binds the destination as a storage image of the pipeline's own out_format,
+ * so a 32 bit target needs a pipeline built for 32 bits. Making the display
+ * one RGBA32F instead would double the bandwidth of every frame played for
+ * the sake of the frames that are exported, which is the wrong way round. */
+
+void view_gpu_direct_close(struct view_gpu *g)
+{
+    if (!g->vk)
+        return;
+
+    if (g->direct_pipe || g->direct_tex)
+        vkDeviceWaitIdle(g->vk->device);
+
+    craw_pipeline_free(&g->direct_pipe);
+
+    if (g->direct_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(g->vk->device, g->direct_view, NULL);
+        g->direct_view = VK_NULL_HANDLE;
+    }
+    pl_tex_destroy(g->gpu, &g->direct_tex);
+    g->direct_image = VK_NULL_HANDLE;
+
+    if (g->direct_fence != VK_NULL_HANDLE) {
+        vkDestroyFence(g->vk->device, g->direct_fence, NULL);
+        g->direct_fence = VK_NULL_HANDLE;
+    }
+    if (g->direct_cmd != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(g->vk->device, g->pool, 1, &g->direct_cmd);
+        g->direct_cmd = VK_NULL_HANDLE;
+    }
+
+    g->direct_w = g->direct_h = 0;
+}
+
+int view_gpu_direct_open(struct view_gpu *g)
+{
+    CRAWPipelineParams pp;
+    VkImageUsageFlags usage;
+    VkFormat fmt;
+    pl_fmt plfmt;
+    int ret;
+
+    if (!g->pipe || !g->width || !g->height) {
+        fprintf(stderr, "a scene-referred export needs the raw pipeline, and "
+                        "this clip is already developed\n");
+        return CRAW_ERROR(ENOTSUP);
+    }
+
+    if (g->direct_pipe && g->direct_w == g->width && g->direct_h == g->height &&
+        g->direct_debayer == g->pipe_debayer)
+        return 0;
+
+    view_gpu_direct_close(g);
+
+    plfmt = pl_find_named_fmt(g->gpu, "rgba32f");
+    if (!plfmt || !(plfmt->caps & PL_FMT_CAP_STORABLE) ||
+        !(plfmt->caps & PL_FMT_CAP_HOST_READABLE)) {
+        fprintf(stderr, "the GPU has no storable, readable RGBA32F format, "
+                        "which a scene-referred export is written through\n");
+        return CRAW_ERROR(ENOTSUP);
+    }
+
+    g->direct_tex = pl_tex_create(g->gpu, pl_tex_params(
+        .w             = (int)g->width,
+        .h             = (int)g->height,
+        .format        = plfmt,
+        .storable      = true,
+        .host_readable = true,
+    ));
+    if (!g->direct_tex) {
+        fprintf(stderr, "cannot create the %ux%u RGBA32F export texture\n",
+                g->width, g->height);
+        ret = CRAW_ERROR(ENOMEM);
+        goto fail;
+    }
+
+    g->direct_image = pl_vulkan_unwrap(g->gpu, g->direct_tex, &fmt, &usage);
+    if (!g->direct_image || fmt != VK_FORMAT_R32G32B32A32_SFLOAT) {
+        fprintf(stderr, "the export texture is not an R32G32B32A32_SFLOAT "
+                        "image\n");
+        ret = CRAW_ERROR(ENOTSUP);
+        goto fail;
+    }
+
+    VkImageViewCreateInfo vinfo = {
+        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image    = g->direct_image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format   = fmt,
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1,
+        },
+    };
+    if (vkCreateImageView(g->vk->device, &vinfo, NULL, &g->direct_view) != VK_SUCCESS) {
+        ret = CRAW_ERROR(ENOMEM);
+        goto fail;
+    }
+
+    VkCommandBufferAllocateInfo cb_info = {
+        .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool        = g->pool,
+        .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+
+    if (vkAllocateCommandBuffers(g->vk->device, &cb_info, &g->direct_cmd) != VK_SUCCESS ||
+        vkCreateFence(g->vk->device, &fence_info, NULL, &g->direct_fence) != VK_SUCCESS) {
+        ret = CRAW_ERROR(ENOMEM);
+        goto fail;
+    }
+
+    /* The same stages as the display's, so that what is exported is what is
+     * on screen up to the output space: a denoise strength or a lens warp
+     * set in the panel has to be in the file too. The histogram is not: the
+     * auto white balance reads the display pipeline's own, and a second set
+     * of slots would only be another buffer to zero every frame. */
+    craw_pipeline_params_init(&pp);
+    pp.width      = g->width;
+    pp.height     = g->height;
+    pp.cfa        = CRAW_CFA_RGGB;
+    pp.debayer    = g->pipe_debayer;
+    pp.out_space  = CRAW_CS_ACES_AP1_LINEAR;
+    pp.out_format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    pp.flags      = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_LENS;
+
+    ret = craw_pipeline_create(g->ctx, &pp, &g->direct_pipe);
+    if (ret < 0) {
+        fprintf(stderr, "the export pipeline (%ux%u, RGBA32F) failed: %d\n",
+                g->width, g->height, ret);
+        goto fail;
+    }
+
+    g->direct_w = g->width;
+    g->direct_h = g->height;
+    g->direct_debayer = g->pipe_debayer;
+
+    if (g->verbose)
+        fprintf(stderr, "export pipeline: built for %ux%u, RGBA32F\n",
+                g->width, g->height);
+
+    return 0;
+
+fail:
+    view_gpu_direct_close(g);
+
+    return ret;
+}
+
+int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
+                          enum CRAWColorSpace space, int x, int y, int w, int h,
+                          float *rgba, double *gpu_ms, double *dl_ms)
+{
+    const AVFrame *frame = st->frame;
+    AVHWFramesContext *fc;
+    AVVulkanFramesContext *vkfc;
+    AVVkFrame *vkf;
+    const VkFormat *vkfmt;
+    VkImageView src_view;
+    CRAWFrameParams fp;
+    CRAWImage src, dst;
+    uint64_t hold;
+    int64_t t0;
+    int ret;
+
+    if (!g->direct_pipe)
+        return CRAW_ERROR(EINVAL);
+    if (!frame || !frame->hw_frames_ctx || frame->format != AV_PIX_FMT_VULKAN)
+        return CRAW_ERROR(ENOTSUP);
+
+    fc    = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+    vkfc  = fc->hwctx;
+    vkf   = (AVVkFrame *)frame->data[0];
+    vkfmt = av_vkfmt_from_pixfmt(fc->sw_format);
+
+    if (!vkfmt || vkfmt[0] != VK_FORMAT_R16_UNORM)
+        return CRAW_ERROR(ENOTSUP);
+
+    src_view = view_src_view(g, vkf->img[0], vkfmt[0]);
+    if (src_view == VK_NULL_HANDLE)
+        return CRAW_ERROR(ENOMEM);
+
+    view_frame_params(st, &fp);
+    /* The one thing that differs from the frame on screen: where the colour
+     * stage lands. No CRAW_FRAME_FLAG_CLAMP_NEGATIVE - an archive keeps
+     * what the camera matrix produced, negatives included - and no
+     * NO_GAMUT_COMPRESSION either, so ACEScg carries the same reference
+     * gamut compression the hand-off does and the file holds the numbers
+     * the screen was shown. */
+    fp.out_space     = space;
+    fp.out_space_set = true;
+    fp.flags        &= ~(uint32_t)CRAW_FRAME_FLAG_CLAMP_NEGATIVE;
+
+    src = (CRAWImage) {
+        .image  = vkf->img[0],
+        .view   = src_view,
+        .format = vkfmt[0],
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+        .width  = g->direct_w,
+        .height = g->direct_h,
+    };
+    dst = (CRAWImage) {
+        .image  = g->direct_image,
+        .view   = g->direct_view,
+        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+        .width  = g->direct_w,
+        .height = g->direct_h,
+    };
+
+    t0 = av_gettime_relative();
+
+    hold = g->out_value + 1;
+    if (!pl_vulkan_hold_ex(g->gpu, pl_vulkan_hold_params(
+            .tex       = g->direct_tex,
+            .layout    = VK_IMAGE_LAYOUT_GENERAL,
+            .qf        = g->qf,
+            .semaphore = (pl_vulkan_sem) { g->out_sem, hold },
+        ))) {
+        fprintf(stderr, "cannot hold the export texture\n");
+        return CRAW_ERROR(EBUSY);
+    }
+    g->out_value = hold;
+
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (vkBeginCommandBuffer(g->direct_cmd, &begin) != VK_SUCCESS) {
+        ret = CRAW_ERROR(EIO);
+        goto release;
+    }
+
+    vkfc->lock_frame(fc, vkf);
+
+    VkImageMemoryBarrier2 to_general = {
+        .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = vkf->access[0],
+        .dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        .oldLayout     = vkf->layout[0],
+        .newLayout     = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image         = vkf->img[0],
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1,
+        },
+    };
+
+    if (vkf->queue_family[0] != VK_QUEUE_FAMILY_IGNORED &&
+        vkf->queue_family[0] != g->qf) {
+        to_general.srcQueueFamilyIndex = vkf->queue_family[0];
+        to_general.dstQueueFamilyIndex = g->qf;
+    }
+
+    vkCmdPipelineBarrier2(g->direct_cmd, &(VkDependencyInfo) {
+        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers    = &to_general,
+    });
+
+    ret = craw_pipeline_record(g->direct_pipe, g->direct_cmd, &src, &dst, &fp);
+    if (ret < 0) {
+        vkfc->unlock_frame(fc, vkf);
+        vkEndCommandBuffer(g->direct_cmd);
+        goto release;
+    }
+
+    if (vkEndCommandBuffer(g->direct_cmd) != VK_SUCCESS) {
+        vkfc->unlock_frame(fc, vkf);
+        ret = CRAW_ERROR(EIO);
+        goto release;
+    }
+
+    VkSemaphoreSubmitInfo waits[2] = {
+        {
+            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = vkf->sem[0],
+            .value     = vkf->sem_value[0],
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        }, {
+            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = g->out_sem,
+            .value     = hold,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        },
+    };
+    VkSemaphoreSubmitInfo signals[2] = {
+        {
+            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = vkf->sem[0],
+            .value     = vkf->sem_value[0] + 1,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        }, {
+            .sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = g->out_sem,
+            .value     = hold + 1,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        },
+    };
+    VkCommandBufferSubmitInfo cmd_info = {
+        .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .commandBuffer = g->direct_cmd,
+    };
+    VkSubmitInfo2 submit = {
+        .sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+        .waitSemaphoreInfoCount   = 2,
+        .pWaitSemaphoreInfos      = waits,
+        .commandBufferInfoCount   = 1,
+        .pCommandBufferInfos      = &cmd_info,
+        .signalSemaphoreInfoCount = 2,
+        .pSignalSemaphoreInfos    = signals,
+    };
+
+    vkResetFences(g->vk->device, 1, &g->direct_fence);
+
+    view_gpu_lock(g);
+    ret = vkQueueSubmit2(g->queue, 1, &submit, g->direct_fence) == VK_SUCCESS
+        ? 0 : CRAW_ERROR(EIO);
+    view_gpu_unlock(g);
+
+    /* The same hand-back contract view_gpu_process() keeps: the value we
+     * signalled is what the next user waits on. */
+    if (ret >= 0) {
+        vkf->sem_value[0] += 1;
+        vkf->layout[0] = VK_IMAGE_LAYOUT_GENERAL;
+        vkf->access[0] = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        if (vkf->queue_family[0] != VK_QUEUE_FAMILY_IGNORED)
+            vkf->queue_family[0] = g->qf;
+    }
+
+    vkfc->unlock_frame(fc, vkf);
+
+    if (ret >= 0 &&
+        vkWaitForFences(g->vk->device, 1, &g->direct_fence, VK_TRUE,
+                        UINT64_MAX) != VK_SUCCESS)
+        ret = CRAW_ERROR(EIO);
+
+release:
+    pl_vulkan_release_ex(g->gpu, pl_vulkan_release_params(
+        .tex       = g->direct_tex,
+        .layout    = VK_IMAGE_LAYOUT_GENERAL,
+        .qf        = g->qf,
+        .semaphore = (pl_vulkan_sem) { g->out_sem, ret >= 0 ? hold + 1 : hold },
+    ));
+    if (ret >= 0)
+        g->out_value = hold + 1;
+
+    if (ret < 0)
+        return ret;
+
+    if (gpu_ms)
+        *gpu_ms = (double)(av_gettime_relative() - t0) / 1000.0;
+
+    t0 = av_gettime_relative();
+
+    /* The crop is a rectangle of the read-back and nothing else: no
+     * resample, no second pass, and the rows come out tightly packed
+     * because the default row pitch is the rectangle's own width. */
+    if (!pl_tex_download(g->gpu, pl_tex_transfer_params(
+            .tex = g->direct_tex,
+            .rc  = { x, y, 0, x + w, y + h, 1 },
+            .ptr = rgba,
+        ))) {
+        fprintf(stderr, "cannot read the export texture back\n");
+        return CRAW_ERROR(EIO);
+    }
+
+    if (dl_ms)
+        *dl_ms = (double)(av_gettime_relative() - t0) / 1000.0;
 
     return 0;
 }

@@ -100,9 +100,6 @@ struct view_look {
 
     enum CRAWDebayer debayer;
 
-    int tone_map;               /* index into view_tone_maps[] */
-    int gamut_map;              /* index into view_gamut_maps[] */
-
     char lut_path[VIEW_MAX_PATH];
     /* The embedded film simulation, or -1 for none. Mutually exclusive
      * with lut_path: one LUT is active at a time, so picking a film
@@ -113,15 +110,17 @@ struct view_look {
      * conversion from that space to a BT.709 display. */
     int lut_space;
 
-    /* Measure the real peak of every frame instead of tone mapping against
-     * the sensor clip the profile implies. */
-    bool peak_detect;
-    int peak_detect_flag;       /* nuklear's checkbox wants an int */
-
-    /* Which encoder, which preset, which knobs and which colour space the
-     * video export runs with. It lives here rather than beside the run in
-     * struct view_video because it is a setting: it survives a finished
-     * export and it carries from clip to clip, the way the grade does. */
+    /* Which encoder, which preset, which knobs, which colour space and how
+     * the picture is mapped into it: everything the export decides. It
+     * lives here rather than beside the run in struct view_video because it
+     * is a setting - it survives a finished export and it carries from clip
+     * to clip, the way the grade does.
+     *
+     * Tone mapping, peak detection and gamut mapping are in here and not
+     * above because they are not a look. What the window shows is whatever
+     * the compositor negotiated for it, mapped with libplacebo's own
+     * defaults for that display; what a file holds is a decision, and a
+     * decision that only means anything for a display-referred target. */
     struct view_preset_sel video_preset;
 };
 
@@ -227,6 +226,9 @@ extern const char *const view_gamut_map_names[];
 extern const int view_nb_tone_maps;
 extern const int view_nb_gamut_maps;
 
+/* Index 0 of both name lists is "off", for which these return NULL: no tone
+ * map function at all, and libplacebo's own `clip`, whose map callback is
+ * the no-op its gamut mapper skips entirely. */
 const struct pl_tone_map_function *view_tone_map(int idx);
 const struct pl_gamut_map_function *view_gamut_map(int idx);
 
@@ -460,6 +462,27 @@ struct view_gpu {
     pl_tex export_tex;
     int export_w, export_h;
 
+    /* The scene-referred export's direct path: a second pipeline writing
+     * RGBA32F, a texture to write into and a command buffer and fence of
+     * its own. Nothing here goes through pl_renderer, pl_shader or
+     * pl_dispatch - the only libplacebo call on these pixels is the
+     * pl_tex_download that reads them back - because linear light must
+     * reach the encoder as the numbers libcraw produced and not as
+     * something a display path had an opinion about.
+     *
+     * Built when such an export starts and freed when it ends: at 5.8K the
+     * second pipeline's intermediates and this texture are most of a
+     * gigabyte of device memory, which a viewer that is only playing has no
+     * reason to be holding. */
+    CRAWPipeline *direct_pipe;
+    enum CRAWDebayer direct_debayer;
+    uint32_t direct_w, direct_h;
+    pl_tex direct_tex;
+    VkImage direct_image;
+    VkImageView direct_view;
+    VkCommandBuffer direct_cmd;
+    VkFence direct_fence;
+
     double last_gpu_ms;
     /* What libplacebo's peak detection measured for the last displayed
      * frame, in nits; 0 when it has nothing to report. */
@@ -497,12 +520,11 @@ struct view_cfg {
     const char *export_enc;     /* --enc KEY=VALUE,... for the encoder */
 
     /* --export-video START END OUT, the same headless run for a range of
-     * frames. `video_w` and `video_h` are --size, zero for the crop's own
-     * size. */
+     * frames. The size is --size, which is an export setting and lives in
+     * the selection with the rest of them. */
     bool export_video;
     int64_t video_start, video_end;
     char video_path[VIEW_MAX_PATH];
-    int video_w, video_h;
     bool video_audio;           /* --audio copy, which is the default */
 };
 
@@ -737,6 +759,11 @@ struct view_state {
     int focus;
     int ui_row, ui_rows;
     int adjust;
+    /* Set while a greyed section is being laid out: its rows are drawn but
+     * take no input and are left off the ring entirely, so Up and Down walk
+     * past the whole section rather than stopping on a row that does
+     * nothing. */
+    bool ui_greyed;
     bool ui_edit_active;        /* a text field is being typed into */
     struct view_lut_menu menu;
 
@@ -873,6 +900,28 @@ int  view_gpu_render_export(struct view_gpu *g, struct view_state *st,
 int  view_gpu_render_target(struct view_gpu *g, struct view_state *st,
                             struct pl_frame *target);
 
+/* An export target's colour space carries the source's own luminance range
+ * when the export's tone mapping is off: libplacebo's tone mapping is a
+ * no-op exactly when the two ends of the range agree, so this is what turns
+ * the map off rather than clipping with it. A no-op when it is on. */
+void view_export_tone_off(struct view_state *st, struct pl_color_space *c);
+
+/* ------------------------------------------------ the direct export path */
+
+/* The second pipeline and the RGBA32F texture a scene-referred export
+ * writes through, for the size the clip is now. Idempotent; call again
+ * after a clip switch. */
+int  view_gpu_direct_open(struct view_gpu *g);
+void view_gpu_direct_close(struct view_gpu *g);
+
+/* Runs the picture on screen through that pipeline in `space` - no gamut
+ * clamp, the reference gamut compression left to the space's own rule - and
+ * reads the rectangle (x, y, w, h) back as w * h packed RGBA floats. The two
+ * times are the device's own and the read-back's, in milliseconds. */
+int  view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
+                           enum CRAWColorSpace space, int x, int y, int w, int h,
+                           float *rgba, double *gpu_ms, double *dl_ms);
+
 /* The overlay texture nuklear draws into. On a resize the previous texture
  * and view are kept until view_gpu_ui_drop_old(), which must be called once
  * nuklear has rebuilt its framebuffers from the new view. */
@@ -989,6 +1038,16 @@ float view_total_gain(const struct view_state *st);
  * the non-raw path there is no such calculation and libplacebo's own
  * inference is reported instead. */
 float view_peak_ceiling(const struct view_state *st);
+
+/* Whether the selected export colour space is scene referred, which is the
+ * one question the greying, the refusal of a size, the bypassed look hooks
+ * and the direct write all turn on. */
+bool view_export_is_scene(const struct view_state *st);
+
+/* The colour space libcraw is asked for on the direct path, for the
+ * selected export space. CRAW_CS_XYZ_D65 for anything that is not scene
+ * referred, which nothing asks for. */
+enum CRAWColorSpace view_export_craw_space(const struct view_state *st);
 
 /* Linear gain the non-raw path's exposure hook applies: the bias in stops
  * times the working exposure index over the as-shot one, which is the same

@@ -97,7 +97,11 @@ static float view_matrix_headroom(const CRAWColorParams *cp)
     float out[3][3];
     float headroom = 1.0f;
 
-    if (craw_colorspace_from_xyz_d65(CRAW_CS_BT2020_LINEAR, out) < 0)
+    /* The hand-off space, so the bound is over the values the display path
+     * really sees. The gamut compression that follows it never raises the
+     * largest channel - it only moves the others towards it - so the row
+     * sums below still bound the output. */
+    if (craw_colorspace_from_xyz_d65(CRAW_CS_ACES_AP1_LINEAR, out) < 0)
         return headroom;
 
     for (int i = 0; i < 3; i++) {
@@ -153,6 +157,22 @@ float view_peak_ceiling(const struct view_state *st)
 
     return VIEW_REF_WHITE_NITS * cp.gain * exp2f(st->look.exposure)
          * view_matrix_headroom(&cp);
+}
+
+bool view_export_is_scene(const struct view_state *st)
+{
+    int c = st->look.video_preset.colour;
+
+    return c >= 0 && c < VIEW_NB_COLOURS && view_colours[c].scene;
+}
+
+enum CRAWColorSpace view_export_craw_space(const struct view_state *st)
+{
+    switch (st->look.video_preset.colour) {
+    case VIEW_COLOUR_ACESCG: return CRAW_CS_ACES_AP1_LINEAR;
+    case VIEW_COLOUR_ACES:   return CRAW_CS_ACES_AP0_LINEAR;
+    default:                 return CRAW_CS_XYZ_D65;
+    }
 }
 
 /* The noise model the denoise stage would use for the frame on screen, and
@@ -1364,8 +1384,6 @@ static void view_usage(FILE *f)
 "                      itself makes; keep shrinks the corrected picture until\n"
 "                      every source pixel fits and paints the rest black. The\n"
 "                      Lens section cycles the same row and prints the scale\n"
-"  --tone-map NAME     bt.2390, spline, reinhard or clip (default: bt.2390)\n"
-"  --gamut-map NAME    perceptual, softclip, relative, clip or desaturate\n"
 "  --lut NAME          a .cube LUT applied by the renderer: a file, or the\n"
 "                      name or slug of one of the embedded film simulations\n"
 "                      (a file of that name wins). --list-luts prints them\n"
@@ -1376,8 +1394,6 @@ static void view_usage(FILE *f)
 "                      vlog (V-Log in V-Gamut, what Panasonic's own\n"
 "                      V-Log to V-709 cubes take). Anything but native\n"
 "                      makes it a conversion LUT to a BT.709 display.\n"
-"  --no-peak-detect    tone map against the profile's sensor clip instead of\n"
-"                      the peak libplacebo measures per frame\n"
 "  --softlight PERCENT blend the picture with itself through the soft light\n"
 "                      blend mode, 0 to 100 (default: 0, off)\n"
 "  --vibrance PASTELS[,SATURATED[,THRESHOLD]]\n"
@@ -1412,8 +1428,25 @@ static void view_usage(FILE *f)
 "                      libswscale. The picture is what --export writes.\n"
 "  --list-encoders     print every video encoder this FFmpeg has, marking\n"
 "                      the ones that take Vulkan frames, and exit\n"
-"  --size WxH          scale the exported video to that size; the default is\n"
-"                      the crop rectangle's own, which is the source's\n"
+"  --size SIZE         how large the export is written: full (the default,\n"
+"                      the crop rectangle's own size), 1/2, 1/4, 3840, 1920\n"
+"                      or a typed WxH. A width larger than the source never\n"
+"                      upscales. A software encoder at 5.8K wants three and\n"
+"                      a half gigabytes, which is what this is for. Refused\n"
+"                      for a scene-referred --colour, which is written at\n"
+"                      native resolution or not at all\n"
+"  --tone-map NAME     how the export maps the picture into a display\n"
+"                      referred space: off, bt.2390 (the default), spline,\n"
+"                      reinhard or clip. Off means the target carries the\n"
+"                      source's own luminance range, so nothing is mapped\n"
+"                      and nothing is clipped. The window is not affected:\n"
+"                      it is mapped with libplacebo's defaults for whatever\n"
+"                      the compositor negotiated\n"
+"  --gamut-map NAME    the export's gamut mapping: off, perceptual (the\n"
+"                      default), softclip, relative or desaturate\n"
+"  --no-peak-detect    the export tone maps against the profile's sensor\n"
+"                      clip instead of the peak libplacebo measures per\n"
+"                      frame\n"
 "  --audio copy|none   copy the clip's audio into the exported video, which\n"
 "                      is the default. The stream is the one playback uses,\n"
 "                      and a four channel stream is copied whole rather than\n"
@@ -1430,9 +1463,14 @@ static void view_usage(FILE *f)
 "                      \"FFv1 (Vulkan)/L4 (experimental)\" or \"x264\".\n"
 "                      A family on its own takes its default preset\n"
 "  --colour NAME       the colour space the video is written in: bt709 (the\n"
-"                      display look, the default), bt2020-sdr, bt2020-pq,\n"
-"                      bt2020-hlg, or the scene referred aces, acescg and\n"
-"                      xyz, which bypass tone mapping and the grade\n"
+"                      display look, the default), bt2020-sdr, bt2020-pq or\n"
+"                      bt2020-hlg, all four rendered and tone mapped; or\n"
+"                      the scene referred acescg, aces and xyz, which are\n"
+"                      written straight from the pipeline as float and so\n"
+"                      carry no tone curve, no gamut mapping, no film\n"
+"                      simulation and no grain at all. Those three need\n"
+"                      float samples, which means FFv1 (Vulkan) with an L4\n"
+"                      preset, and are written at native resolution\n"
 "  --list-presets      print every family, preset and colour space with the\n"
 "                      options each one means, and exit\n"
 "  --crop WxH+X+Y      export only that region of the source, in source\n"
@@ -1597,8 +1635,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             }
             break;
         case VIEW_OPT_NO_PEAK:
-            st->look.peak_detect = false;
-            st->look.peak_detect_flag = 0;
+            st->look.video_preset.peak = 0;
             break;
         case VIEW_OPT_GRAIN:
             if ((ret = view_grain_parse(&st->grain, optarg)) < 0)
@@ -1677,17 +1714,27 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return ret;
             st->look.debayer = (enum CRAWDebayer)v;
             break;
+        /* Both are export options now: the window's mapping is libplacebo's
+         * own for whatever the compositor negotiated. */
         case VIEW_OPT_TONE_MAP:
             if ((ret = view_lookup(view_tone_map_names, view_nb_tone_maps,
                                    "--tone-map", optarg, &v)) < 0)
                 return ret;
-            st->look.tone_map = v;
+            st->look.video_preset.tone_map = v;
             break;
         case VIEW_OPT_GAMUT_MAP:
+            /* "clip" is what this option called the absence of a gamut
+             * mapper before the list grew an "off": libplacebo's clip
+             * function is a no-op its mapper skips, so the two are the same
+             * thing and the old spelling still works. */
+            if (!strcmp(optarg, "clip")) {
+                st->look.video_preset.gamut_map = 0;
+                break;
+            }
             if ((ret = view_lookup(view_gamut_map_names, view_nb_gamut_maps,
                                    "--gamut-map", optarg, &v)) < 0)
                 return ret;
-            st->look.gamut_map = v;
+            st->look.video_preset.gamut_map = v;
             break;
         case VIEW_OPT_LUT:
             snprintf(st->look.lut_path, sizeof(st->look.lut_path), "%s", optarg);
@@ -1761,11 +1808,8 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             view_encode_list();
             return 1;
         case VIEW_OPT_SIZE:
-            if (sscanf(optarg, "%dx%d", &st->cfg.video_w, &st->cfg.video_h) != 2 ||
-                st->cfg.video_w <= 0 || st->cfg.video_h <= 0) {
-                fprintf(stderr, "--size: expected WxH, got `%s`\n", optarg);
-                return CRAW_ERROR(EINVAL);
-            }
+            if ((ret = view_presets_parse_size(&st->look.video_preset, optarg)) < 0)
+                return ret;
             break;
         case VIEW_OPT_AUDIO:
             if (!strcmp(optarg, "copy")) {
@@ -1964,9 +2008,14 @@ static void view_log_look(const struct view_state *st)
 
     fprintf(stderr, ", lens %s", st->lens.on ? st->lens.keep ? "on (keep all)"
                                                              : "on (fill)" : "off");
-    fprintf(stderr, ", tone %s, gamut %s, peak detect %s",
-            view_tone_map_names[lk->tone_map], view_gamut_map_names[lk->gamut_map],
-            lk->peak_detect ? "on" : "off");
+    /* The export's mapping, which is where these three live now: the window
+     * takes libplacebo's own defaults for whatever it is displaying on. */
+    fprintf(stderr, ", export tone %s, gamut %s, peak detect %s",
+            view_tone_map_names[CRAW_CLAMP(lk->video_preset.tone_map, 0,
+                                           view_nb_tone_maps - 1)],
+            view_gamut_map_names[CRAW_CLAMP(lk->video_preset.gamut_map, 0,
+                                            view_nb_gamut_maps - 1)],
+            lk->video_preset.peak ? "on" : "off");
     fprintf(stderr, ", lut %s", lk->lut_path[0] ? lk->lut_path
                                                 : view_lut_film_name(st));
     fprintf(stderr, ", adjustments %s",
@@ -2818,8 +2867,6 @@ static int view_run_headless(struct view_state *st)
             .sel    = &st->look.video_preset,
             .codec  = st->cfg.export_codec,
             .enc    = st->cfg.export_enc,
-            .width  = st->cfg.video_w,
-            .height = st->cfg.video_h,
             .audio  = st->cfg.video_audio,
         };
 
@@ -2864,14 +2911,11 @@ int main(int argc, char **argv)
         .wb        = VIEW_WB_AS_SHOT,
         .manual    = { .cct = 5500.0f, .tint = 0.0f },
         .debayer   = CRAW_DEBAYER_RCD,
-        .tone_map  = 0,
-        .gamut_map = 0,
         .lut_type  = PL_LUT_NATIVE,
         .film_sim  = -1,
-        .peak_detect = true,
-        .peak_detect_flag = 1,
     };
-    /* Before the arguments, so that --preset and --colour override it. */
+    /* Before the arguments, so that --preset, --colour, --size, --tone-map,
+     * --gamut-map and --no-peak-detect all override it. */
     view_presets_default(&st.look.video_preset);
     st.menu.kb = -1;
     for (int i = 0; i < VIEW_MENU_COLS; i++)

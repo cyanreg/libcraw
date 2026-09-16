@@ -208,7 +208,15 @@ static const char *view_wb_source_name(enum CRAWAwbSource s)
  * the order the rows are emitted in. */
 static bool view_row(struct view_state *st, struct nk_context *ctx)
 {
-    bool focused = st->ui_row == st->focus;
+    bool focused;
+
+    /* A greyed row is not on the ring at all, which is what "the focus
+     * skips greyed rows" has to mean for a row that is still drawn: Up and
+     * Down walk straight past the whole section. */
+    if (st->ui_greyed)
+        return false;
+
+    focused = st->ui_row == st->focus;
 
     if (focused) {
         struct nk_rect b = nk_widget_bounds(ctx);
@@ -257,6 +265,47 @@ static void view_adjust_cycle(struct view_state *st, bool focused, int *v, int n
 
     if (adj)
         *v = (*v + adj + n) % n;
+}
+
+/* The three sections a scene-referred export takes out of the picture: the
+ * look, the adjustments and the grain. All three are display-referred
+ * operators on values in [0,1], and a scene-referred export is written
+ * straight out of the pipeline with none of them on it - so they are drawn
+ * at half strength, take no input, and are off the focus ring. The same
+ * hooks are left off the display too, which is the point: what is on screen
+ * is what the file holds, up to the display transform, so a live control
+ * here would be lying about the file and about the window at once.
+ *
+ * The section's own tree tab is deliberately left alive, because a section
+ * you cannot open is a section that cannot tell you why it is greyed. */
+static bool view_grey_begin(struct view_state *st, struct nk_context *ctx,
+                            const char *why)
+{
+    if (!view_export_is_scene(st))
+        return false;
+
+    /* At full strength, before the disable: the one line that explains the
+     * rest is the one line that has to be readable. Three rows of height,
+     * because nk_label_wrap() wraps inside the rectangle it is given and
+     * clips what does not fit rather than growing. */
+    if (why) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW * 3.0f, 1);
+        nk_label_wrap(ctx, why);
+    }
+
+    nk_widget_disable_begin(ctx);
+    st->ui_greyed = true;
+
+    return true;
+}
+
+static void view_grey_end(struct view_state *st, struct nk_context *ctx, bool on)
+{
+    if (!on)
+        return;
+
+    nk_widget_disable_end(ctx);
+    st->ui_greyed = false;
 }
 
 /* ------------------------------------------------- the cascading menus */
@@ -982,6 +1031,12 @@ void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind)
     if (m->open)
         return;
 
+    /* The film simulation is one of the three things a scene-referred
+     * export takes away, and a cascade that opened over a greyed row would
+     * be offering a choice that changes neither the file nor the screen. */
+    if (kind == VIEW_MENU_FILM && view_export_is_scene(st))
+        return;
+
     m->open = true;
     m->kind = kind;
     m->row = m->rows[kind];
@@ -1198,7 +1253,10 @@ static void view_menu_row(struct nk_context *ctx, struct view_state *st,
     struct nk_rect content = nk_window_get_content_region(ctx);
     struct nk_rect b;
 
-    m->rows[kind] = st->ui_row - 1;  /* view_row() has already stepped it */
+    /* view_row() has already stepped the ring, except when it refused the
+     * row for being greyed - in which case this cascade owns no ring entry
+     * and Enter on whatever is focused must not find it. */
+    m->rows[kind] = st->ui_greyed ? -1 : st->ui_row - 1;
 
     nk_label(ctx, label, NK_TEXT_LEFT);
 
@@ -1631,6 +1689,7 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
 {
     struct view_adjust *a = &st->adjustments;
     char buf[128];
+    bool grey;
 
     /* Open when something is already on, which after --softlight or
      * --vibrance it is. nuklear remembers the state per title from the
@@ -1639,6 +1698,10 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
                       (a->softlight > 0.0f || a->pastels != 0.0f ||
                        a->saturated != 0.0f) ? NK_MAXIMIZED : NK_MINIMIZED))
         return;
+
+    grey = view_grey_begin(st, ctx,
+        "not applied: the export is scene referred, and these two are "
+        "display-referred operators on values in [0,1]");
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "%s",
@@ -1689,6 +1752,7 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     nk_label(ctx, a->avoid_shift ? "chroma kept in gamut" : "chroma clipped",
              NK_TEXT_LEFT);
 
+    view_grey_end(st, ctx, grey);
     nk_tree_pop(ctx);
 }
 
@@ -1705,6 +1769,7 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     char path[VIEW_MAX_PATH], label[128];
     const char *codec, *why;
     bool busy = v->active;
+    bool scene;
 
     /* The range follows the picture until it has been set: a fresh panel
      * offers the second from the frame on screen, which is the range
@@ -1735,20 +1800,100 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
                   view_colours[CRAW_CLAMP(sel->colour, 0,
                                           VIEW_NB_COLOURS - 1)].name);
 
+    scene = view_colours[CRAW_CLAMP(sel->colour, 0, VIEW_NB_COLOURS - 1)].scene;
+
     /* Why the selection cannot be used, said once and in full rather than
      * left for the encoder to discover. */
     why = view_presets_preset_why_not(sel->family, sel->preset);
     if (!why)
         why = view_presets_colour_why_not(sel->family, sel->preset,
                                           sel->colour);
+    /* The size row and a scene-referred space cannot both have their way:
+     * the direct path has nothing to resample with, and inventing a scaler
+     * for linear light is a decision nobody asked this program to make. */
+    if (!why && scene && sel->size != VIEW_SIZE_FULL)
+        why = "a scene-referred export is written straight from the "
+              "pipeline, at the source's own size; set the size row to full";
+    if (!why && scene && !st->dec.raw)
+        why = "a scene-referred export comes out of the raw pipeline, and "
+              "this clip is already developed";
+    /* Three rows of height for both: a wrapped label clips at the bottom of
+     * the rectangle it is given, and a refusal that ends mid-sentence is
+     * not a refusal anybody can act on. */
     if (why) {
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        nk_layout_row_dynamic(ctx, VIEW_ROW * 3.0f, 1);
         nk_labelf_wrap(ctx, "cannot export: %s", why);
-    } else if (view_colours[sel->colour].scene) {
+    } else if (scene) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW * 3.0f, 1);
+        nk_label_wrap(ctx, "scene referred: written straight from the "
+                           "pipeline as float, with no tone curve, no gamut "
+                           "mapping, no film simulation and no grain");
+    }
+
+    /* The size, which every export has and the direct one refuses. */
+    {
+        int x, y, cw, ch;
+
+        view_crop_rect(st, &x, &y, &cw, &ch);
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        view_adjust_cycle(st, view_row(st, ctx), &sel->size, VIEW_NB_SIZES);
+        nk_label(ctx, "size", NK_TEXT_LEFT);
+        sel->size = nk_combo(ctx, view_size_names, VIEW_NB_SIZES, sel->size,
+                             20, nk_vec2(160, 200));
+
+        if (sel->size == VIEW_SIZE_TYPED) {
+            nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+            view_row(st, ctx);
+            nk_property_int(ctx, "#width", 2, &sel->size_w, 16384, 2, 1.0f);
+            nk_property_int(ctx, "#height", 2, &sel->size_h, 16384, 2, 1.0f);
+        }
+
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        nk_label_wrap(ctx, "scene referred: the direct path from the "
-                           "pipeline's linear output to the encoder is not "
-                           "in this build yet");
+        nk_labelf(ctx, NK_TEXT_LEFT, "writes %s",
+                  view_presets_size_label(sel, cw, ch, label, sizeof(label)));
+    }
+
+    /* How the picture is mapped into the target, which only means anything
+     * for a display-referred one: the direct path has no renderer to map
+     * with. Greyed rather than hidden, so that switching the colour space
+     * does not make three rows appear and disappear under the pointer. */
+    {
+        bool grey = scene;
+
+        if (grey) {
+            nk_widget_disable_begin(ctx);
+            st->ui_greyed = true;
+        }
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        view_adjust_cycle(st, view_row(st, ctx), &sel->tone_map,
+                          view_nb_tone_maps);
+        nk_label(ctx, "tone map", NK_TEXT_LEFT);
+        sel->tone_map = nk_combo(ctx, view_tone_map_names, view_nb_tone_maps,
+                                 CRAW_CLAMP(sel->tone_map, 0, view_nb_tone_maps - 1),
+                                 20, nk_vec2(160, 180));
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        view_adjust_cycle(st, view_row(st, ctx), &sel->gamut_map,
+                          view_nb_gamut_maps);
+        nk_label(ctx, "gamut map", NK_TEXT_LEFT);
+        sel->gamut_map = nk_combo(ctx, view_gamut_map_names, view_nb_gamut_maps,
+                                  CRAW_CLAMP(sel->gamut_map, 0, view_nb_gamut_maps - 1),
+                                  20, nk_vec2(160, 180));
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        if (view_step(st, view_row(st, ctx)))
+            sel->peak = !sel->peak;
+        nk_checkbox_label(ctx, "peak detection", &sel->peak);
+        nk_label(ctx, sel->tone_map ? (sel->peak ? "per-frame peak"
+                                                 : "the profile's clip")
+                                    : "nothing to map", NK_TEXT_LEFT);
+
+        if (grey) {
+            nk_widget_disable_end(ctx);
+            st->ui_greyed = false;
+        }
     }
 
     /* Only the rows the family declares. */
@@ -1992,30 +2137,25 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
     }
 
     if (nk_tree_push(ctx, NK_TREE_TAB, "Look", NK_MINIMIZED)) {
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        view_adjust_cycle(st, view_row(st, ctx), &lk->tone_map, view_nb_tone_maps);
-        nk_label(ctx, "tone map", NK_TEXT_LEFT);
-        lk->tone_map = nk_combo(ctx, view_tone_map_names, view_nb_tone_maps,
-                                lk->tone_map, 20, nk_vec2(160, 160));
-        view_adjust_cycle(st, view_row(st, ctx), &lk->gamut_map, view_nb_gamut_maps);
-        nk_label(ctx, "gamut map", NK_TEXT_LEFT);
-        lk->gamut_map = nk_combo(ctx, view_gamut_map_names, view_nb_gamut_maps,
-                                 lk->gamut_map, 20, nk_vec2(160, 180));
+        /* Tone mapping, peak detection and gamut mapping used to be here.
+         * They are not a look: the window is mapped with libplacebo's own
+         * defaults for whatever the compositor negotiated, and choosing is
+         * the export's business. The Export section has them. */
+        bool grey;
 
+        /* A readout and not a control: what libplacebo measured for the
+         * window against what the pipeline can have produced. */
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        {
-            bool f = view_row(st, ctx);
-
-            if (view_step(st, f))
-                lk->peak_detect_flag = !lk->peak_detect_flag;
-        }
-        nk_checkbox_label(ctx, "peak detection", &lk->peak_detect_flag);
-        lk->peak_detect = lk->peak_detect_flag != 0;
-        if (lk->peak_detect && st->gpu.measured_peak > 0.0)
+        nk_label(ctx, "display peak", NK_TEXT_LEFT);
+        if (st->gpu.measured_peak > 0.0)
             nk_labelf(ctx, NK_TEXT_LEFT, "%.0f / %.0f nits",
                       st->gpu.measured_peak, view_peak_ceiling(st));
         else
             nk_labelf(ctx, NK_TEXT_LEFT, "ceiling %.0f nits", view_peak_ceiling(st));
+
+        grey = view_grey_begin(st, ctx,
+            "not applied: the export is scene referred, so the film "
+            "simulation is off and the screen shows what the file holds");
 
         view_panel_film_sim(ctx, st);
 
@@ -2049,6 +2189,8 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
             nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
             nk_labelf(ctx, NK_TEXT_LEFT, "%s", st->lut_error);
         }
+
+        view_grey_end(st, ctx, grey);
         nk_tree_pop(ctx);
     }
 

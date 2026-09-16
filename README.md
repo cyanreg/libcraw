@@ -102,7 +102,8 @@ line reads `3/7 P1000347.MOV [hevc video, gpu]`. The clips need not match —
 ProRes RAW and already developed, different sizes, stereo or four-channel or
 no audio at all — and a switch keeps every setting exactly as it was: the
 white balance mode and a manual CCT, the exposure index and bias, debayer,
-denoise, lens correction and its fit, tone and gamut mapping, the film
+denoise, lens correction and its fit, the export's colour space, size, tone
+and gamut mapping, the film
 simulation, the adjustments, the grain and the zoom. A setting a clip's kind
 cannot use is kept rather than dropped, so the white balance a raw clip was
 graded with is still there after a developed one. Only what is read from the
@@ -157,6 +158,62 @@ fifth of the time of the default level for a per cent of the size) and
 TIFF uncompressed. The stream is tagged as what the export really is: full
 range, BT.709 primaries, sRGB transfer, display referred. A sequence of
 stills is deliberately not offered — that is a video encode.
+
+### Two kinds of export
+
+There are two, and they are not two settings of one thing.
+
+A **display-referred** export — BT.709, BT.2020 SDR, BT.2020 PQ, BT.2020
+HLG — is the picture as the viewer shows it. libplacebo renders it into the
+target the way it renders the window: tone mapped, gamut mapped, with the
+film simulation, the adjustments and the grain on it, and encoded with the
+target's own transfer. The Export section chooses how that mapping is done:
+a tone mapping function (`off`, bt.2390, spline, reinhard, clip) with PQ's
+target peak beside it, peak detection on or off, and a gamut mapping mode
+(`off`, perceptual, softclip, relative, desaturate). `off` for tone mapping
+is not a clip: the target is given the source's own luminance range, which
+is exactly when libplacebo attaches no tone curve at all, so every value
+passes through into the target's encoding. `off` for gamut mapping is
+libplacebo's own `clip`, whose mapping step is a no-op, so the conversion is
+the primaries matrix and nothing else.
+
+None of those three are look settings and none of them touch the window.
+What the window shows is mapped with libplacebo's defaults for whatever the
+compositor negotiated for it, which is the only thing that can be right on a
+display this program knows nothing about.
+
+A **scene-referred** export — ACEScg, ACES2065-1, CIE XYZ D65 — never goes
+near the renderer. The frame is put through the pipeline a second time with
+the output space asked for, into an RGBA32F texture, and those floats are
+read back and handed to the encoder: no tone curve, no gamut mapping, no
+film simulation, no grain, nothing display-referred anywhere between
+libcraw's output and the file. ACEScg carries the ACES 1.3 reference gamut
+compression the display hand-off carries, so the file holds the numbers the
+screen was shown; ACES2065-1 and XYZ are uncompressed, and none of the three
+clamp negatives.
+
+Because those four display-referred operators cannot reach such a file, the
+Look, Adjustments and Film grain sections grey out while one is selected,
+each with a line saying why, and their hooks come off the *display* too — so
+what is on screen is what the file holds, up to the display transform. Greyed
+rows take no input and are off the keyboard's focus ring, and the film
+simulation cascade will not open.
+
+Linear light needs float samples, which of the encoder families here means
+FFV1 at version 4 — `FFv1 (Vulkan)` or `FFv1` with an L4 preset, writing
+gbrpf32. Any other family or preset is refused with the reason rather than
+opened with whatever format it happened to accept. The scene-referred paths
+are written at the source's own resolution only; the size row is refused for
+them, while the crop rectangle still works, because a crop is a rectangle of
+the read-back and a resize is a display decision. H.273 has no code points
+for the ACES spaces, so those files carry unspecified primaries with a linear
+transfer and a `COLOUR_SPACE` container tag naming the space; XYZ uses the
+ST 428-1 primaries code point and the same tag.
+
+The Export section's size row — full, 1/2, 1/4, 3840 wide, 1920 wide, or a
+typed WxH — applies to a display-referred export. `--size` sets the same
+thing from the command line and still takes a bare `WxH`. It exists because a
+software encoder at 5.8K wants three and a half gigabytes.
 
 ## Layout
 

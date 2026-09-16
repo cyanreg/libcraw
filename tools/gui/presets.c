@@ -172,6 +172,7 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_prores),
         .def = VIEW_PRORES_DEF,
         .ctrl = VIEW_CTRL_ASYNC, .container = "mov",
+        .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
     },
     {
@@ -193,6 +194,7 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_apv),
         .def = 0,
         .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_QP, .container = "mov",
+        .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
         .qp_min = 0, .qp_max = 63, .qp_def = 22,
     },
@@ -203,6 +205,13 @@ const struct view_preset_family view_preset_families[] = {
         .def = 0,
         .container = "mkv",
         .always = "slices=1024",
+        /* The software encoder carries float too, and nothing about the
+         * direct path stops it: the read-back is RGBA32F either way and the
+         * frame it is handed is the same planar float the Vulkan one gets.
+         * What used to rule this family out was the rendered path's 16 bit
+         * unorm texture, and linear light does not go through that any
+         * more. */
+        .scene_fmt = AV_PIX_FMT_GBRPF32,
     },
     {
         .name = "ProRes", .encoder = "prores_ks",
@@ -210,6 +219,7 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_prores),
         .def = VIEW_PRORES_DEF,
         .container = "mov",
+        .scene_fmt = AV_PIX_FMT_NONE,
     },
     {
         .name = "SVT-AV1", .encoder = "libsvtav1",
@@ -218,6 +228,7 @@ const struct view_preset_family view_preset_families[] = {
         .def = 0,
         .ctrl = VIEW_CTRL_CPU | VIEW_CTRL_RC, .container = "mkv",
         .always = "svtav1-params=" VIEW_SVT_PARAMS,
+        .scene_fmt = AV_PIX_FMT_NONE,
         /* SVT's own default speed, so an untouched slider is the encoder's
          * own behaviour. */
         .cpu_min = 0, .cpu_max = 13, .cpu_def = 10,
@@ -237,6 +248,7 @@ const struct view_preset_family view_preset_families[] = {
         .def = VIEW_X264_DEF,
         .ctrl = VIEW_CTRL_RC, .container = "mp4",
         .always = "profile=high10",
+        .scene_fmt = AV_PIX_FMT_NONE,
         .rc = {
             { "CRF", false, 0, 51, 18 },
             { "VBR", true },
@@ -250,6 +262,7 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_av1_vk),
         .def = 0,
         .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_RC, .container = "mkv",
+        .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
         .rc = {
             { "VBR", true },
@@ -276,15 +289,16 @@ const int view_nb_preset_families =
  * player, and the two decode a file differently.
  *
  * The scene entries are the pipeline's own linear light with nothing
- * display-referred on it. They are selectable and they persist, but the
- * path that writes one does not exist yet: it has to come from libcraw's
- * output space rather than from the display renderer's target. The tags
- * below are what it will write. H.273 has no code points for the ACES
- * spaces, so those go out as unspecified primaries with a linear transfer
- * and are named in container metadata instead; CIE XYZ does have one,
- * SMPTE ST 428-1's - though note that libplacebo reads that tag back as
- * PL_COLOR_SYSTEM_XYZ and means DCDM X'Y'Z' by it, which is a DCI white
- * point and an ST 428 transfer, not this. */
+ * display-referred on it, written by the direct path: a second pipeline run
+ * per frame into an RGBA32F texture, read back and handed to the encoder.
+ * H.273 has no code points for the ACES spaces, so those go out as
+ * unspecified primaries with a linear transfer and are named in container
+ * metadata instead; CIE XYZ does have one, SMPTE ST 428-1's - though note
+ * that libplacebo reads that tag back as PL_COLOR_SYSTEM_XYZ and means DCDM
+ * X'Y'Z' by it, which is a DCI white point and an ST 428 transfer, not
+ * this. That is a reason never to make XYZ a libplacebo target and no
+ * reason not to write the tag, which is the only code point the standard
+ * has for these values. */
 const struct view_colour view_colours[VIEW_NB_COLOURS] = {
     [VIEW_COLOUR_709] = {
         .name = "BT.709", .key = "bt709", .group = "BT.709",
@@ -379,7 +393,103 @@ void view_presets_default(struct view_preset_sel *s)
     s->preset = view_preset_families[1].def;
     s->colour = VIEW_COLOUR_709;
     s->hdr_peak = 1000;
+    s->tone_map = VIEW_TONE_MAP_DEF;
+    s->gamut_map = VIEW_GAMUT_MAP_DEF;
+    s->peak = 1;
+    s->size = VIEW_SIZE_FULL;
     view_presets_family_defaults(s);
+}
+
+/* --------------------------------------------------------------- the size */
+
+const char *const view_size_names[VIEW_NB_SIZES] = {
+    "full", "1/2", "1/4", "3840 wide", "1920 wide", "typed",
+};
+
+void view_presets_size(const struct view_preset_sel *s, int cw, int ch,
+                       int *w, int *h)
+{
+    int ow = cw, oh = ch;
+
+    switch (s->size) {
+    case VIEW_SIZE_HALF:    ow = cw / 2; oh = ch / 2; break;
+    case VIEW_SIZE_QUARTER: ow = cw / 4; oh = ch / 4; break;
+    case VIEW_SIZE_3840:
+    case VIEW_SIZE_1920: {
+        int want = s->size == VIEW_SIZE_3840 ? 3840 : 1920;
+
+        /* Never upscale: a clip narrower than the target keeps its own
+         * size rather than being blown up to fill a number. */
+        if (cw > want && cw > 0) {
+            ow = want;
+            /* Rounded rather than truncated, so a 5760x3040 frame at 3840
+             * comes out 2027 and not 2026: the aspect ratio is the thing
+             * being preserved. */
+            oh = (int)(((int64_t)ch * want + cw / 2) / cw);
+        }
+        break;
+    }
+    case VIEW_SIZE_TYPED:
+        if (s->size_w > 0 && s->size_h > 0) {
+            ow = s->size_w;
+            oh = s->size_h;
+        }
+        break;
+    default:
+        break;
+    }
+
+    /* Even, which is what a subsampled encoder wants and what the crop
+     * already is, and never empty. */
+    *w = CRAW_MAX(ow & ~1, 2);
+    *h = CRAW_MAX(oh & ~1, 2);
+}
+
+const char *view_presets_size_label(const struct view_preset_sel *s,
+                                    int cw, int ch, char *buf, size_t n)
+{
+    int w, h;
+
+    view_presets_size(s, cw, ch, &w, &h);
+    snprintf(buf, n, "%s (%dx%d)",
+             view_size_names[CRAW_CLAMP(s->size, 0, VIEW_NB_SIZES - 1)], w, h);
+
+    return buf;
+}
+
+int view_presets_parse_size(struct view_preset_sel *s, const char *arg)
+{
+    static const char *const alias[VIEW_NB_SIZES] = {
+        "full", "1/2", "1/4", "3840", "1920", NULL,
+    };
+    int w, h;
+    char tail;
+
+    if (!arg || !arg[0]) {
+        fprintf(stderr, "--size: expected full, 1/2, 1/4, 3840, 1920 or WxH\n");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    for (int i = 0; i < VIEW_NB_SIZES; i++) {
+        if (alias[i] && (!strcasecmp(alias[i], arg) ||
+                         !strcasecmp(view_size_names[i], arg))) {
+            s->size = i;
+            return 0;
+        }
+    }
+
+    /* WxH, which is what this option took before the row existed. */
+    if (sscanf(arg, "%dx%d%c", &w, &h, &tail) == 2 && w > 0 && h > 0) {
+        s->size = VIEW_SIZE_TYPED;
+        s->size_w = w;
+        s->size_h = h;
+        return 0;
+    }
+
+    fprintf(stderr, "--size: expected full, 1/2, 1/4, 3840, 1920 or WxH, "
+                    "got `%s`\n", arg);
+
+    return CRAW_ERROR(EINVAL);
 }
 
 const char *view_presets_label(const struct view_preset_sel *s, char *buf, size_t n)
@@ -620,7 +730,7 @@ const char *view_presets_colour_why_not(int family, int preset, int colour)
      * is FFV1's gbrpf32. */
     if (f->scene_fmt == AV_PIX_FMT_NONE)
         return "linear light needs float samples, which of these families "
-               "only FFv1 (Vulkan) can write";
+               "only the two FFv1 ones can write";
     if (!p->scene_ok)
         return "linear light needs FFV1 version 4 for float samples: pick "
                "an L4 preset";
@@ -768,8 +878,15 @@ void view_presets_list(void)
     for (int i = 0; i < VIEW_NB_COLOURS; i++)
         printf("  %-12s %s%s\n", view_colours[i].key, view_colours[i].name,
                view_colours[i].scene
-               ? "  (scene referred; needs float samples, so FFv1 (Vulkan) "
-                 "with an L4 preset)" : "");
+               ? "  (scene referred, written straight from the pipeline: "
+                 "float samples only, so FFv1 (Vulkan) with an L4 preset, "
+                 "native resolution, no look and no tone mapping)" : "");
+
+    printf("\nsizes. --size NAME\n\n");
+    for (int i = 0; i < VIEW_NB_SIZES; i++)
+        printf("  %-12s %s\n", view_size_names[i],
+               i == VIEW_SIZE_TYPED ? "WxH, given as e.g. --size 2048x1080"
+                                    : "of the crop rectangle");
 }
 
 int view_presets_parse(struct view_preset_sel *s, const char *arg)

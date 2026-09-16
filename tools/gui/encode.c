@@ -92,8 +92,22 @@ struct view_encode {
     AVFrame *ss;                /* the RGBA64 read-back, as libswscale input */
     SwsContext *sws;
 
+    /* The scene-referred path: the pipeline's own RGBA32F read-back and the
+     * planar float frame the encoder takes. No renderer, no slots, no
+     * double buffering - the read-back is synchronous because the second
+     * pipeline run it belongs to is, and a lossless float encode is the
+     * slow end of this anyway. */
+    bool direct;
+    enum CRAWColorSpace direct_space;
+    int crop_x, crop_y;         /* where the read-back rectangle starts */
+    float *rgba;                /* w * h packed RGBA floats */
+    size_t rgba_values;
+    AVFrame *df;                /* gbrpf32, the staging for a Vulkan upload */
+    /* Where the time went, summed over the run: the device, the read-back,
+     * the de-interleave, the upload and the encoder. */
+    double ms_gpu, ms_dl, ms_pack, ms_up, ms_enc;
+
     int w, h;
-    int req_w, req_h;           /* --size, zero for the crop's own */
     bool req_audio;
     AVRational fr;
     int64_t start, end, next;
@@ -700,14 +714,16 @@ static int view_enc_audio_pump(struct view_encode *e, double until)
 /* ------------------------------------------------------------- the colour */
 
 /* libplacebo's side of the selected colour space: the target the renderer
- * tone maps and gamut maps into, exactly as it does for the screen.
+ * tone maps and gamut maps into, with the Export section's own settings for
+ * both.
  *
- * Only the display-referred spaces are here. The three scene-referred ones
- * are a selection the panel and the command line accept, but they are not
- * a render target: linear light has to reach the encoder from libcraw's
- * own output rather than through the display pipeline, and that path is
- * not in yet, so an export that asks for one is refused before it starts.
- * view_encode_begin() is where that happens. */
+ * Only the display-referred spaces are here, and only they ever reach a
+ * renderer at all: the three scene-referred ones are written by the direct
+ * path, which never builds a pl_frame. XYZ in particular must never be a
+ * libplacebo target - pl_frame_from_avframe() maps SMPTE428 to
+ * PL_COLOR_SYSTEM_XYZ and the renderer then forces DCI X'Y'Z' with the
+ * ST 428 transfer on it, which is a different white point and a different
+ * curve from what the tag is being used for here. */
 static struct pl_color_space view_enc_target_csp(const struct view_encode *e)
 {
     struct pl_color_space c = { 0 };
@@ -800,8 +816,9 @@ static int view_enc_render_sw(struct view_encode *e, struct view_state *st,
 
     /* The colour the export was asked for. The read-back texture is 16 bit
      * unorm, so this path is display referred by construction - anything
-     * above 1.0 would be clipped on the way out - which is why the
-     * scene-referred spaces are offered on the Vulkan FFV1 family alone. */
+     * above 1.0 would be clipped on the way out - which is one more reason
+     * the scene-referred spaces do not come through here at all: they take
+     * the direct path below, whose texture is float. */
     target = (struct pl_frame) {
         .num_planes = 1,
         .planes[0] = {
@@ -818,6 +835,7 @@ static int view_enc_render_sw(struct view_encode *e, struct view_state *st,
         .color = view_enc_target_csp(e),
         .crop  = { 0, 0, (float)e->w, (float)e->h },
     };
+    view_export_tone_off(st, &target.color);
 
     ret = view_gpu_render_target(e->g, st, &target);
     if (ret < 0)
@@ -992,6 +1010,7 @@ static int view_enc_send_hw(struct view_encode *e, struct view_state *st,
      * not how bright it is; the peak an HDR target is mapped to comes from
      * here. */
     target.color = view_enc_target_csp(e);
+    view_export_tone_off(st, &target.color);
 
     ret = view_gpu_render_target(e->g, st, &target);
     pl_unmap_avframe(e->g->gpu, &target);
@@ -1059,6 +1078,133 @@ static int view_enc_send_sw(struct view_encode *e, struct view_enc_slot *s,
     return 0;
 }
 
+/* --------------------------------------------------- the scene-referred path */
+
+/* Packed RGBA into the encoder's three planes.
+ *
+ * There is nothing for libswscale to do here: same component type, same
+ * size - the direct path is native resolution - same primaries, same range,
+ * no alpha to keep. What is left is dropping the fourth component and
+ * splitting the planes, which is a copy, and the sixteen bit path already
+ * does the same thing for the packed RGB formats in view_enc_pack().
+ *
+ * GBRP is G, B, R in that order, which is the one thing about the format
+ * worth saying out loud. */
+static void view_enc_deinterleave(AVFrame *f, const float *rgba)
+{
+    uint32_t w = (uint32_t)f->width, h = (uint32_t)f->height;
+
+    for (uint32_t y = 0; y < h; y++) {
+        const float *s = rgba + (size_t)y * w * 4;
+        float *g = (float *)(f->data[0] + (ptrdiff_t)y * f->linesize[0]);
+        float *b = (float *)(f->data[1] + (ptrdiff_t)y * f->linesize[1]);
+        float *r = (float *)(f->data[2] + (ptrdiff_t)y * f->linesize[2]);
+
+        for (uint32_t x = 0; x < w; x++) {
+            r[x] = s[x * 4 + 0];
+            g[x] = s[x * 4 + 1];
+            b[x] = s[x * 4 + 2];
+        }
+    }
+}
+
+/* One scene-referred frame: the pipeline again in the export's own space,
+ * a read-back, a de-interleave, and for a Vulkan encoder an upload into a
+ * picture of its own pool. Nothing between libcraw's output and the encoder
+ * looks at a colour. */
+static int view_enc_send_direct(struct view_encode *e, struct view_state *st,
+                                int64_t pts)
+{
+    AVFrame *hw = NULL;
+    AVFrame *f = e->df;
+    double gpu_ms = 0.0, dl_ms = 0.0;
+    int64_t t0;
+    size_t need = (size_t)e->w * e->h * 4;
+    int ret;
+
+    if (e->rgba_values < need) {
+        float *p = realloc(e->rgba, need * sizeof(*p));
+
+        if (!p)
+            return CRAW_ERROR(ENOMEM);
+        e->rgba = p;
+        e->rgba_values = need;
+    }
+
+    ret = view_gpu_direct_frame(e->g, st, e->direct_space, e->crop_x, e->crop_y,
+                                e->w, e->h, e->rgba, &gpu_ms, &dl_ms);
+    if (ret < 0)
+        return ret;
+
+    e->ms_gpu += gpu_ms;
+    e->ms_dl  += dl_ms;
+
+    /* The encoder may still hold the last one, and a float plane is worth
+     * not copying twice. */
+    if (!av_frame_is_writable(f)) {
+        av_frame_unref(f);
+        f->format = AV_PIX_FMT_GBRPF32;
+        f->width  = e->w;
+        f->height = e->h;
+        ret = av_frame_get_buffer(f, 0);
+        if (ret < 0)
+            return CRAW_ERROR(ENOMEM);
+    }
+
+    t0 = av_gettime_relative();
+    view_enc_deinterleave(f, e->rgba);
+    e->ms_pack += (double)(av_gettime_relative() - t0) / 1000.0;
+
+    view_enc_tag_frame(e, f);
+    f->pts      = pts;
+    f->duration = 1;
+
+    if (e->hw) {
+        t0 = av_gettime_relative();
+
+        hw = av_frame_alloc();
+        if (!hw)
+            return CRAW_ERROR(ENOMEM);
+
+        ret = av_hwframe_get_buffer(e->frames, hw, 0);
+        if (ret < 0) {
+            fprintf(stderr, "av_hwframe_get_buffer: %s\n", av_err2str(ret));
+            goto out;
+        }
+
+        /* The one copy on this path, and the only way in: a Vulkan encoder
+         * reads its own images and these floats are in host memory. A
+         * planar float output in libcraw would let the pipeline write the
+         * encoder's planes directly and make the whole read-back and upload
+         * disappear; that is a library change and not this one. */
+        ret = av_hwframe_transfer_data(hw, f, 0);
+        if (ret < 0) {
+            fprintf(stderr, "av_hwframe_transfer_data: %s\n", av_err2str(ret));
+            goto out;
+        }
+
+        ret = av_frame_copy_props(hw, f);
+        if (ret < 0)
+            goto out;
+        view_enc_tag_frame(e, hw);
+        hw->pts      = pts;
+        hw->duration = 1;
+
+        e->ms_up += (double)(av_gettime_relative() - t0) / 1000.0;
+    }
+
+    t0 = av_gettime_relative();
+    ret = avcodec_send_frame(e->avc, e->hw ? hw : f);
+    e->ms_enc += (double)(av_gettime_relative() - t0) / 1000.0;
+    if (ret < 0)
+        fprintf(stderr, "avcodec_send_frame: %s\n", av_err2str(ret));
+
+out:
+    av_frame_free(&hw);
+
+    return ret < 0 ? ret : 0;
+}
+
 /* ---------------------------------------------------------------- the run */
 
 void view_encode_default_path(const struct view_state *st, int64_t start,
@@ -1115,8 +1261,6 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     e->start = CRAW_MAX(o->start, 0);
     e->end   = CRAW_MAX(o->end, e->start);
     e->next  = e->start;
-    e->req_w = o->width;
-    e->req_h = o->height;
     e->req_audio = o->audio;
     e->t0 = e->last_report = av_gettime_relative();
 
@@ -1132,20 +1276,51 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     e->col = &view_colours[e->sel.colour];
     e->pin = view_presets_pix_fmt(&e->sel);
 
-    /* The scene-referred spaces are a selection, not yet an export. They
-     * have to reach the encoder from libcraw's own linear output rather
-     * than through the display pipeline - everything in that pipeline,
-     * from the tone curve to the grain, is display referred - and that
-     * path is not written yet. Refused here, with the reason on the panel
-     * rather than a file that quietly holds the wrong numbers. */
-    if (e->col->scene) {
-        fprintf(stderr, "%s is scene referred, and the direct path from the "
-                        "pipeline's linear output to the encoder is not in "
-                        "this build yet; nothing was written\n", e->col->name);
-        snprintf(v->status, sizeof(v->status),
-                 "%s: the direct linear path is not in yet", e->col->name);
-        view_encode_close(st);
-        return CRAW_ERROR(ENOSYS);
+    /* The scene-referred spaces never touch the renderer: the pipeline runs
+     * a second time into the space asked for and those floats go straight
+     * to the encoder. What that path cannot do is resample - a scaler is a
+     * display decision and there is nothing here to make it with - so a
+     * size is refused rather than quietly ignored. */
+    e->direct = e->col->scene;
+    if (e->direct) {
+        const char *why = view_presets_colour_why_not(e->sel.family,
+                                                      e->sel.preset,
+                                                      e->sel.colour);
+
+        e->direct_space = view_export_craw_space(st);
+
+        /* The panel greys a family or a preset that cannot carry float, but
+         * --preset and --colour can still be combined into one, and an
+         * encoder opened with whatever it happened to accept would write a
+         * quietly wrong file rather than none. */
+        if (why) {
+            fprintf(stderr, "%s cannot be written this way: %s\n",
+                    e->col->name, why);
+            snprintf(v->status, sizeof(v->status), "%.*s",
+                     (int)sizeof(v->status) - 1, why);
+            view_encode_close(st);
+            return CRAW_ERROR(ENOTSUP);
+        }
+
+        if (e->sel.size != VIEW_SIZE_FULL) {
+            fprintf(stderr, "%s is written straight from the pipeline and only "
+                            "at the source's own size; clear the size row or "
+                            "pick a display-referred colour space\n",
+                    e->col->name);
+            snprintf(v->status, sizeof(v->status),
+                     "%s: native resolution only, no size", e->col->name);
+            view_encode_close(st);
+            return CRAW_ERROR(EINVAL);
+        }
+
+        if (!st->dec.raw) {
+            fprintf(stderr, "%s comes out of the raw pipeline, and this clip "
+                            "is already developed\n", e->col->name);
+            snprintf(v->status, sizeof(v->status),
+                     "%s: the clip is already developed", e->col->name);
+            view_encode_close(st);
+            return CRAW_ERROR(ENOTSUP);
+        }
     }
 
     v->start = e->start;
@@ -1190,12 +1365,19 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     int x, y, cw, ch;
     int ret;
 
-    /* The size: what was asked for, or the crop rectangle's own. Always
-     * even, which is what a subsampled encoder wants and what the crop
-     * already is. */
+    /* The size row against the crop rectangle. Always even, which is what a
+     * subsampled encoder wants and what the crop already is; the direct
+     * path is the crop's own size and nothing else, which
+     * view_encode_begin() has already refused anything but. */
     view_crop_rect(st, &x, &y, &cw, &ch);
-    e->w = (e->req_w > 0 ? e->req_w : cw) & ~1;
-    e->h = (e->req_h > 0 ? e->req_h : ch) & ~1;
+    e->crop_x = x;
+    e->crop_y = y;
+    if (e->direct) {
+        e->w = cw & ~1;
+        e->h = ch & ~1;
+    } else {
+        view_presets_size(&e->sel, cw, ch, &e->w, &e->h);
+    }
     if (e->w <= 0 || e->h <= 0) {
         fprintf(stderr, "the output size is empty\n");
         ret = CRAW_ERROR(EINVAL);
@@ -1264,11 +1446,43 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
             goto fail;
     }
 
-    /* The preset's own format where it has one: a ProRes profile is a
-     * chroma format as much as a bitrate, and letting the engine pick the
-     * deepest format the encoder lists would write 4:4:4 under an HQ
-     * label. Only a preset with nothing to say falls back to the search. */
-    if (e->pin != AV_PIX_FMT_NONE) {
+    /* A scene-referred export has exactly one format, whatever the preset
+     * pins: float samples, which for FFV1 is gbrpf32 at version 4. The
+     * family's own scene_fmt says so, and view_presets_colour_why_not() has
+     * already refused every family and preset that cannot open with it. */
+    if (e->direct) {
+        const struct view_preset_family *fam =
+            &view_preset_families[CRAW_CLAMP(e->sel.family, 0,
+                                             view_nb_preset_families - 1)];
+
+        ret = view_enc_try(e, st, fam->scene_fmt, v->enc);
+        if (ret < 0) {
+            fprintf(stderr, "%s: cannot open the %s encoder with %s, which is "
+                            "what %s needs: %s\n", v->path, e->codec->name,
+                    av_get_pix_fmt_name(fam->scene_fmt), e->col->name,
+                    av_err2str(ret));
+            ret = CRAW_ERROR(EINVAL);
+            goto fail;
+        }
+
+        ret = view_gpu_direct_open(e->g);
+        if (ret < 0)
+            goto fail;
+
+        e->df = av_frame_alloc();
+        if (!e->df) {
+            ret = CRAW_ERROR(ENOMEM);
+            goto fail;
+        }
+        e->df->format = AV_PIX_FMT_GBRPF32;
+        e->df->width  = e->w;
+        e->df->height = e->h;
+        ret = av_frame_get_buffer(e->df, 0);
+        if (ret < 0) {
+            ret = CRAW_ERROR(ENOMEM);
+            goto fail;
+        }
+    } else if (e->pin != AV_PIX_FMT_NONE) {
         ret = view_enc_try(e, st, e->pin, v->enc);
         if (ret < 0) {
             fprintf(stderr, "%s: cannot open the %s encoder with %s, which is "
@@ -1393,7 +1607,9 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     }
     e->header = true;
 
-    if (!e->hw) {
+    /* The rendered path's read-back frames. The direct one has its own
+     * planar float frame and no scaler at all. */
+    if (!e->hw && !e->direct) {
         e->sf = av_frame_alloc();
         e->ss = av_frame_alloc();
         if (!e->sf || !e->ss) {
@@ -1420,7 +1636,8 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
              e->start, e->end, v->path, e->oc->oformat->name, e->codec->name,
              e->w, e->h, av_get_pix_fmt_name(e->sw_fmt), e->fr.num, e->fr.den,
              e->hw ? ", Vulkan frames" : "",
-             e->nb_audio ? ", audio copied" : "");
+             e->direct ? ", straight from the pipeline"
+                       : e->nb_audio ? ", audio copied" : "");
 
     return 0;
 
@@ -1554,9 +1771,10 @@ int view_encode_step(struct view_state *st)
 
     if (e->next > e->end) {
         /* The software path runs a frame behind the renderer, so the last
-         * slot is still waiting to be encoded when the range runs out. */
+         * slot is still waiting to be encoded when the range runs out. The
+         * direct path never runs behind: its read-back is synchronous. */
         prev = &e->slot[e->cur ^ 1];
-        if (e->hw || !prev->busy)
+        if (e->hw || e->direct || !prev->busy)
             goto finish;
 
         view_enc_wait_slot(e, prev);
@@ -1580,7 +1798,12 @@ int view_encode_step(struct view_state *st)
         goto finish;
     }
 
-    if (e->hw) {
+    if (e->direct) {
+        ret = view_enc_send_direct(e, st, e->next - e->start);
+        if (ret < 0)
+            goto fail;
+        e->encoded++;
+    } else if (e->hw) {
         ret = view_enc_send_hw(e, st, e->next - e->start);
         if (ret < 0)
             goto fail;
@@ -1642,6 +1865,17 @@ finish:
              el > 0.0 ? (double)total / el : 0.0, mb);
     view_log(st, "%s: %s in %.1f s\n", v->path, v->status, el);
 
+    /* Where the direct path's time went, per frame. The decode and the
+     * display pass are not in here - they are the viewer's own and happen
+     * whether anything is being exported or not - so these five add up to
+     * what the export costs on top of playing the clip. */
+    if (e->direct && total > 0)
+        view_log(st, "  per frame: pipeline %.1f ms, read-back %.1f, "
+                     "de-interleave %.1f, upload %.1f, encoder %.1f\n",
+                 e->ms_gpu / (double)total, e->ms_dl / (double)total,
+                 e->ms_pack / (double)total, e->ms_up / (double)total,
+                 e->ms_enc / (double)total);
+
     v->progress = 1.0;
     v->active = false;
     view_encode_close(st);
@@ -1687,11 +1921,20 @@ void view_encode_close(struct view_state *st)
     sws_freeContext(e->sws);
     av_frame_free(&e->sf);
     av_frame_free(&e->ss);
+    av_frame_free(&e->df);
+    free(e->rgba);
     av_packet_free(&e->pkt);
     av_packet_free(&e->apkt);
     avcodec_free_context(&e->avc);
     av_buffer_unref(&e->frames);
     avformat_close_input(&e->aic);
+
+    /* The second pipeline and its RGBA32F texture are most of a gigabyte of
+     * device memory, and a viewer that is done exporting has no use for
+     * them. The encoder is freed first: its frames pool lives on the same
+     * device and the finish above has already retired everything. */
+    if (e->direct && e->g)
+        view_gpu_direct_close(e->g);
 
     if (e->oc) {
         if (e->oc->pb && !(e->oc->oformat->flags & AVFMT_NOFILE))

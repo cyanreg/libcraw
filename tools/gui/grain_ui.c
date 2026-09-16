@@ -62,7 +62,13 @@
  * the step - these have to change with it. */
 static bool grain_row(struct view_state *st, struct nk_context *ctx)
 {
-    bool focused = st->ui_row == st->focus;
+    bool focused;
+
+    /* The same rule as ui.c's: a greyed row is off the ring entirely. */
+    if (st->ui_greyed)
+        return false;
+
+    focused = st->ui_row == st->focus;
 
     if (focused) {
         struct nk_rect b = nk_widget_bounds(ctx);
@@ -331,6 +337,7 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
     static const char *stocks[CRAW_GRAIN_STOCK_NB];
     static bool names_done;
     char buf[128];
+    bool grey = false;
     int on;
 
     if (!names_done) {
@@ -348,6 +355,21 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
     if (!nk_tree_push(ctx, NK_TREE_TAB, "Film grain",
                       g->on ? NK_MAXIMIZED : NK_MINIMIZED))
         return;
+
+    /* Grain is applied after colour management, on display-encoded values,
+     * so a scene-referred export carries none of it and neither does the
+     * screen while one is selected. ui.c owns the greying; this is the one
+     * line of it this section needs. */
+    if (view_export_is_scene(st)) {
+        /* Two rows of height: nk_label_wrap() wraps inside the rectangle it
+         * is given and clips whatever does not fit. */
+        nk_layout_row_dynamic(ctx, GRAIN_ROW * 2.0f, 1);
+        nk_label_wrap(ctx, "not applied: the export is scene referred, and "
+                           "grain is a display-referred operator");
+        nk_widget_disable_begin(ctx);
+        st->ui_greyed = true;
+        grey = true;
+    }
 
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
     on = g->on ? 1 : 0;
@@ -423,6 +445,11 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
     /* Where the numbers came from, since half the stocks are estimates. */
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "%.72s", craw_grain_stock_source(g->stock));
+
+    if (grey) {
+        nk_widget_disable_end(ctx);
+        st->ui_greyed = false;
+    }
 
     nk_tree_pop(ctx);
 }
