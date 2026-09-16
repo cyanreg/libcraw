@@ -2082,11 +2082,14 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
                            "mapping, no film simulation and no grain");
     }
 
-    /* The size, which every export has and the direct one refuses. */
+    /* The size, which every export has and the direct one refuses. The
+     * rectangle is the rotated one, because the file is written upright:
+     * what the row halves and what the readout says are the picture as it
+     * comes out, not the readout behind it. */
     {
         int x, y, cw, ch;
 
-        view_crop_rect(st, &x, &y, &cw, &ch);
+        view_crop_disp_rect(st, &x, &y, &cw, &ch);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
         view_adjust_cycle(st, view_row(st, ctx), &sel->size, VIEW_NB_SIZES);
@@ -2255,9 +2258,11 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
 
 /* The "Crop" section: what a left drag has drawn and a way to take it back.
  * The mode the drag draws in is the header's switch, which `c` is the other
- * hand on; the rectangle is in source pixels, so the readout says which
- * region of the frame the export will write whatever the window is doing
- * with it. */
+ * hand on; the rectangle is held in source pixels and reported on the
+ * picture as it is shown, so the readout says which region the export will
+ * write whatever the window is doing with it. On a rotated clip those are
+ * two different rectangles and the one worth printing is the one that was
+ * drawn - `--crop` takes the source's, which is that one turned back. */
 static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
 {
     int x, y, w, h;
@@ -2273,7 +2278,7 @@ static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
     /* "(clip)" while the rectangle is the one the clip's own frame header
      * marked rather than one that was drawn or asked for: it says why a
      * picture that was never cropped by hand is shaded all the same. */
-    if (view_crop_rect(st, &x, &y, &w, &h))
+    if (view_crop_disp_rect(st, &x, &y, &w, &h))
         nk_labelf(ctx, NK_TEXT_LEFT, "crop: %dx%d at %d,%d%s", w, h, x, y,
                   st->crop.from_clip ? " (clip)" : "");
     else
@@ -2300,18 +2305,31 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
             nk_labelf(ctx, NK_TEXT_LEFT, "zoom: %.2fx", z);
     }
     /* Which of how many, whenever there is more than one: a playlist is
-     * the only thing that makes the question worth the room. */
-    if (st->cfg.nb_inputs > 1)
-        nk_labelf(ctx, NK_TEXT_LEFT, "%d/%d %s [%s %s]",
-                  st->clip + 1, st->cfg.nb_inputs, file,
-                  st->dec.codec_name ? st->dec.codec_name : "?",
-                  st->dec.raw ? "raw"
-                              : st->dec.hwaccel ? "video, gpu" : "video, cpu");
-    else
-        nk_labelf(ctx, NK_TEXT_LEFT, "%s  [%s %s]", file,
-                  st->dec.codec_name ? st->dec.codec_name : "?",
-                  st->dec.raw ? "raw"
-                              : st->dec.hwaccel ? "video, gpu" : "video, cpu");
+     * the only thing that makes the question worth the room. The rotation
+     * joins the codec inside the brackets when the clip carries one, since
+     * it is the other thing about the clip that decides what is on screen
+     * and it is otherwise invisible - a portrait picture looks like a
+     * portrait clip. */
+    {
+        char rot[12] = "";
+
+        if (st->dec.rotation)
+            snprintf(rot, sizeof(rot), ", %d°", st->dec.rotation_deg);
+
+        if (st->cfg.nb_inputs > 1)
+            nk_labelf(ctx, NK_TEXT_LEFT, "%d/%d %s [%s %s%s]",
+                      st->clip + 1, st->cfg.nb_inputs, file,
+                      st->dec.codec_name ? st->dec.codec_name : "?",
+                      st->dec.raw ? "raw"
+                                  : st->dec.hwaccel ? "video, gpu" : "video, cpu",
+                      rot);
+        else
+            nk_labelf(ctx, NK_TEXT_LEFT, "%s  [%s %s%s]", file,
+                      st->dec.codec_name ? st->dec.codec_name : "?",
+                      st->dec.raw ? "raw"
+                                  : st->dec.hwaccel ? "video, gpu" : "video, cpu",
+                      rot);
+    }
     /* Whatever the playlist has to report: a file that would not open, a
      * switch refused. Under the clip line, because that is what it is
      * about, and never behind a fold. */
@@ -2517,9 +2535,11 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
             view_export_begin(st, st->index, path, codec);
         }
         {
+            /* What the file will be, which is the rotated size: the still
+             * is written upright like everything else. */
             int x, y, w, h;
 
-            if (view_crop_rect(st, &x, &y, &w, &h))
+            if (view_crop_disp_rect(st, &x, &y, &w, &h))
                 nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d cropped", w, h);
             else
                 nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d full", w, h);

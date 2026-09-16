@@ -164,6 +164,20 @@ number, so a frame exported twice with the same settings is the same file
 twice. DESIGN.md section 13 has the derivation, the published granularity
 figures behind the stocks, and which of them are estimates.
 
+A clip shot with the camera on its side carries a display matrix in its
+track header, and cineview turns the picture by it the way mpv and ffmpeg's
+autorotate do: a 5760x3040 clip with a quarter turn is 3040 wide and 5760
+tall everywhere it is looked at or written. The fit, the zoom, the pan about
+the pointer, `1` and Tab, the crop rectangle as it is drawn and every size
+the panel reports are in those pixels, and every export is written upright
+and carries no display matrix of its own. Nothing upstream of the renderer
+turns: libcraw's pipeline, the lens correction, the auto white balance
+histogram and the denoise all run on the mosaic the sensor read out, in its
+own orientation. The clip line says which turn it is — `P1001019.MOV
+[prores_raw raw, 90°]` — and a matrix that is not a multiple of ninety
+degrees, or that mirrors as well as turns, is reported and left alone rather
+than approximated.
+
 The picture can be cropped for the export. `c` turns crop mode on, a left
 drag over the picture then draws the rectangle instead of panning, and
 everything outside it is shaded with a thin border around what is kept; the
@@ -171,10 +185,14 @@ Crop section's switch is that same mode, and its body reports the region
 and clears it. The rectangle is held in
 source pixels with even edges, so zoom, pan and a resized window leave it
 where it is, and the export writes exactly that region at source
-resolution. `--crop WxH+X+Y` sets the same rectangle from the command line.
+resolution. On a rotated clip it is drawn on the picture as it is shown and
+mapped through the turn both ways, so the shade and the readout follow what
+was drawn and the file holds exactly that region, upright. `--crop WxH+X+Y`
+sets the same rectangle from the command line, in source pixels — which on a
+rotated clip is the readout's rectangle turned back.
 
 `--export FRAME OUT` writes one frame to one file and exits without opening
-a window; the Export panel does the same for the frame on screen. The file
+a window, upright and at the crop rectangle's own size; the Export panel does the same for the frame on screen. The file
 name picks the format through libavformat, which knows both the muxer and
 the codec an extension implies: `.png` and `.tif` take the sixteen bit RGB
 the frame is rendered as, `.jpg`, `.webp` and `.avif` whatever their encoder
@@ -217,7 +235,10 @@ film simulation, no grain, nothing display-referred anywhere between
 libcraw's output and the file. ACEScg carries the ACES 1.3 reference gamut
 compression the display hand-off carries, so the file holds the numbers the
 screen was shown; ACES2065-1 and XYZ are uncompressed, and none of the three
-clamp negatives.
+clamp negatives. A rotated clip is turned during the de-interleave that
+splits those floats into the encoder's planes — a strided walk of the
+read-back rather than a pass on the device, which at 5.8K takes the
+de-interleave from 77 ms a frame to 225.
 
 Because those four display-referred operators cannot reach such a file, the
 Look, Adjustments and Film grain sections grey out while one is selected,
@@ -240,7 +261,11 @@ ST 428-1 primaries code point and the same tag.
 The Export section's size row — full, 1/2, 1/4, 3840 wide, 1920 wide, or a
 typed WxH — applies to a display-referred export. `--size` sets the same
 thing from the command line and still takes a bare `WxH`. It exists because a
-software encoder at 5.8K wants three and a half gigabytes.
+software encoder at 5.8K wants three and a half gigabytes. The row and its
+`writes` readout are about the picture as it comes out, so on a clip with a
+quarter turn `1/2` of a 5760x3040 frame is 1520x2880 and `1920 wide` is 1920
+across the turned frame — and a Vulkan H.264 or HEVC encoder meets its 4096
+limit on what is now the height.
 
 ### The pixel format
 

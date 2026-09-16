@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include <libavutil/dict.h>
+#include <libavutil/display.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/pixdesc.h>
@@ -406,6 +407,62 @@ static void view_read_metadata(struct view_decoder *d)
     }
 }
 
+/* The track header's display matrix, which is how a camera says the body
+ * was on its side.
+ *
+ * FFmpeg carries it as AV_PKT_DATA_DISPLAYMATRIX in the stream's coded side
+ * data, and av_display_rotation_get() reduces it to the angle the matrix
+ * turns the frame counter-clockwise - the turn that displays it upright,
+ * not the one that was applied when shooting. pl_rotation counts quarter
+ * turns clockwise, so the two are each other's negation and nothing else.
+ * The Lumix writes 90 on every clip shot on its side, and ffmpeg's
+ * autorotate answers it with `transpose=cclock`.
+ *
+ * Anything that is not a quarter turn is refused rather than approximated:
+ * an arbitrary angle needs a resample and a mirror is not a rotation at
+ * all, so a matrix carrying either leaves the picture alone and says so.
+ * The determinant of the linear part is what a mirror shows up in - a
+ * reflection reverses orientation and so makes it negative - and it is
+ * taken in 64 bits because the entries are 16.16 fixed point and their
+ * products do not fit in 32. */
+static void view_read_display_matrix(struct view_decoder *d, const AVStream *st)
+{
+    const AVPacketSideData *sd;
+    const int32_t *m;
+    double angle;
+    int64_t det;
+    int deg;
+
+    sd = av_packet_side_data_get(st->codecpar->coded_side_data,
+                                 st->codecpar->nb_coded_side_data,
+                                 AV_PKT_DATA_DISPLAYMATRIX);
+    if (!sd || sd->size < 9 * sizeof(int32_t))
+        return;
+
+    m = (const int32_t *)sd->data;
+    angle = av_display_rotation_get(m);
+    if (isnan(angle)) {
+        fprintf(stderr, "the display matrix is singular; the picture is left "
+                        "as it was decoded\n");
+        return;
+    }
+
+    deg = ((int)lrint(angle) % 360 + 360) % 360;
+    det = (int64_t)m[0] * m[4] - (int64_t)m[1] * m[3];
+
+    if (fabs(angle - lrint(angle)) > 0.5 || deg % 90 || det <= 0) {
+        fprintf(stderr, "the display matrix is %.2f degrees%s, which this "
+                        "viewer does not apply; the picture is left as it was "
+                        "decoded\n",
+                angle, det < 0 ? " with a flip" : "");
+        return;
+    }
+
+    d->rotation_deg = deg;
+    /* Counter-clockwise degrees to clockwise quarter turns. */
+    d->rotation = pl_rotation_normalize(-(deg / 90));
+}
+
 int view_decoder_open(struct view_decoder *d, const char *path,
                       struct view_gpu *g, bool verbose)
 {
@@ -454,6 +511,8 @@ int view_decoder_open(struct view_decoder *d, const char *path,
         d->nb_frames = av_rescale_q(st->duration, d->time_base,
                                     av_inv_q(d->frame_rate));
 
+    view_read_display_matrix(d, st);
+
     view_read_metadata(d);
 
     ret = view_hw_device_create(d, g);
@@ -477,13 +536,25 @@ int view_decoder_open(struct view_decoder *d, const char *path,
     if (ret < 0)
         return ret;
 
-    if (verbose)
-        fprintf(stderr, "input %s: stream %d, %s (%s), %dx%d, %.3f fps, "
+    if (verbose) {
+        char rot[32] = "";
+
+        /* The size printed is the decoder's; the rotation says what is put
+         * on screen and into a file, which for a quarter turn is the other
+         * way round. */
+        if (d->rotation)
+            snprintf(rot, sizeof(rot), ", rotated %d deg -> %dx%d",
+                     d->rotation_deg,
+                     d->rotation % PL_ROTATION_180 ? d->dec->height : d->dec->width,
+                     d->rotation % PL_ROTATION_180 ? d->dec->width : d->dec->height);
+
+        fprintf(stderr, "input %s: stream %d, %s (%s), %dx%d%s, %.3f fps, "
                         "%" PRId64 " frames, model `%s`, as-shot ISO %.0f\n",
                 path, d->stream_index, codec->name, d->raw ? "raw" : "video",
-                d->dec->width, d->dec->height,
+                d->dec->width, d->dec->height, rot,
                 d->frame_rate.den ? av_q2d(d->frame_rate) : 0.0, d->nb_frames,
                 d->model[0] ? d->model : "(unknown)", d->meta_as_shot_ei);
+    }
 
     if (verbose && (d->capture_gamma[0] || d->capture_gamut[0] ||
                     d->essence_codec[0]))

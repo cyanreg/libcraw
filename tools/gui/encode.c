@@ -100,7 +100,8 @@ struct view_encode {
     bool direct;
     enum CRAWColorSpace direct_space;
     int crop_x, crop_y;         /* where the read-back rectangle starts */
-    float *rgba;                /* w * h packed RGBA floats */
+    int crop_w, crop_h;         /* and how big it is, in source pixels */
+    float *rgba;                /* crop_w * crop_h packed RGBA floats */
     size_t rgba_values;
     AVFrame *df;                /* gbrpf32, the staging for a Vulkan upload */
     /* Where the time went, summed over the run: the device, the read-back,
@@ -108,6 +109,10 @@ struct view_encode {
     double ms_gpu, ms_dl, ms_pack, ms_up, ms_enc;
 
     int w, h;
+    /* The clip's display matrix, as quarter turns clockwise. The file is
+     * written upright and carries no matrix of its own, so `w` and `h`
+     * above are the turned ones and the crop rectangle is not. */
+    pl_rotation rotation;
     bool req_audio;
     AVRational fr;
     int64_t start, end, next;
@@ -1088,7 +1093,7 @@ static int view_enc_send_sw(struct view_encode *e, struct view_enc_slot *s,
 
 /* --------------------------------------------------- the scene-referred path */
 
-/* Packed RGBA into the encoder's three planes.
+/* Packed RGBA into the encoder's three planes, turned upright on the way.
  *
  * There is nothing for libswscale to do here: same component type, same
  * size - the direct path is native resolution - same primaries, same range,
@@ -1096,22 +1101,59 @@ static int view_enc_send_sw(struct view_encode *e, struct view_enc_slot *s,
  * splitting the planes, which is a copy, and the sixteen bit path already
  * does the same thing for the packed RGB formats in view_enc_pack().
  *
+ * This is also the one place the direct path meets the clip's display
+ * matrix: it never goes near the renderer, so the turn is the walk through
+ * the read-back rather than a pass on the device. Two strides say which
+ * turn it is - how far one output pixel is from the next, and one output
+ * row from the next - and a quarter turn simply makes the inner one a
+ * column walk of the source. It reads the whole read-back either way and
+ * writes the planes in order; what it costs is the cache, not the copy.
+ *
+ * `sw` and `sh` are the read-back's own dimensions, which the caller keeps
+ * even, so the walk covers it exactly.
+ *
  * GBRP is G, B, R in that order, which is the one thing about the format
  * worth saying out loud. */
-static void view_enc_deinterleave(AVFrame *f, const float *rgba)
+static void view_enc_deinterleave(AVFrame *f, const float *rgba,
+                                  int sw, int sh, pl_rotation rot)
 {
-    uint32_t w = (uint32_t)f->width, h = (uint32_t)f->height;
+    int w = f->width, h = f->height;
+    ptrdiff_t step, row;
+    const float *base;
 
-    for (uint32_t y = 0; y < h; y++) {
-        const float *s = rgba + (size_t)y * w * 4;
+    switch (pl_rotation_normalize(rot)) {
+    case PL_ROTATION_90:
+        base = rgba + (size_t)(sh - 1) * sw * 4;
+        step = -(ptrdiff_t)sw * 4;
+        row  = 4;
+        break;
+    case PL_ROTATION_180:
+        base = rgba + ((size_t)(sh - 1) * sw + sw - 1) * 4;
+        step = -4;
+        row  = -(ptrdiff_t)sw * 4;
+        break;
+    case PL_ROTATION_270:
+        base = rgba + (size_t)(sw - 1) * 4;
+        step = (ptrdiff_t)sw * 4;
+        row  = -4;
+        break;
+    default:
+        base = rgba;
+        step = 4;
+        row  = (ptrdiff_t)sw * 4;
+        break;
+    }
+
+    for (int y = 0; y < h; y++) {
+        const float *s = base + row * y;
         float *g = (float *)(f->data[0] + (ptrdiff_t)y * f->linesize[0]);
         float *b = (float *)(f->data[1] + (ptrdiff_t)y * f->linesize[1]);
         float *r = (float *)(f->data[2] + (ptrdiff_t)y * f->linesize[2]);
 
-        for (uint32_t x = 0; x < w; x++) {
-            r[x] = s[x * 4 + 0];
-            g[x] = s[x * 4 + 1];
-            b[x] = s[x * 4 + 2];
+        for (int x = 0; x < w; x++, s += step) {
+            r[x] = s[0];
+            g[x] = s[1];
+            b[x] = s[2];
         }
     }
 }
@@ -1127,7 +1169,10 @@ static int view_enc_send_direct(struct view_encode *e, struct view_state *st,
     AVFrame *f = e->df;
     double gpu_ms = 0.0, dl_ms = 0.0;
     int64_t t0;
-    size_t need = (size_t)e->w * e->h * 4;
+    /* The read-back is the source rectangle; the frame the encoder takes is
+     * that rectangle turned, which for a quarter turn is the same number of
+     * pixels the other way up. */
+    size_t need = (size_t)e->crop_w * e->crop_h * 4;
     int ret;
 
     if (e->rgba_values < need) {
@@ -1140,7 +1185,7 @@ static int view_enc_send_direct(struct view_encode *e, struct view_state *st,
     }
 
     ret = view_gpu_direct_frame(e->g, st, e->direct_space, e->crop_x, e->crop_y,
-                                e->w, e->h, e->rgba, &gpu_ms, &dl_ms);
+                                e->crop_w, e->crop_h, e->rgba, &gpu_ms, &dl_ms);
     if (ret < 0)
         return ret;
 
@@ -1160,7 +1205,7 @@ static int view_enc_send_direct(struct view_encode *e, struct view_state *st,
     }
 
     t0 = av_gettime_relative();
-    view_enc_deinterleave(f, e->rgba);
+    view_enc_deinterleave(f, e->rgba, e->crop_w, e->crop_h, e->rotation);
     e->ms_pack += (double)(av_gettime_relative() - t0) / 1000.0;
 
     view_enc_tag_frame(e, f);
@@ -1397,10 +1442,25 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     /* The size row against the crop rectangle. Always even, which is what a
      * subsampled encoder wants and what the crop already is; the direct
      * path is the crop's own size and nothing else, which
-     * view_encode_begin() has already refused anything but. */
+     * view_encode_begin() has already refused anything but.
+     *
+     * Two rectangles, because the file is written upright: the read-back
+     * and the render both take the source's, and everything about the
+     * output - the size row, the presets, what the encoder is opened for -
+     * is about the picture after the turn. A quarter turn makes a 5760x3040
+     * crop a 3040x5760 file, so "3840 wide" is 3840 across the tall side
+     * and a Vulkan H.264 or HEVC encoder meets its 4096 limit on what is
+     * now the height. */
     view_crop_rect(st, &x, &y, &cw, &ch);
+    e->rotation = st->dec.rotation;
     e->crop_x = x;
     e->crop_y = y;
+    /* Even, so that the de-interleave's walk covers the read-back exactly
+     * however the picture is turned. */
+    e->crop_w = cw & ~1;
+    e->crop_h = ch & ~1;
+
+    view_crop_disp_rect(st, &x, &y, &cw, &ch);
     if (e->direct) {
         e->w = cw & ~1;
         e->h = ch & ~1;

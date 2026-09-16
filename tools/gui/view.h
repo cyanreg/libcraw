@@ -367,6 +367,17 @@ struct view_decoder {
      * clip - see `raw` above - so the same XML in a ProRes RAW file changes
      * nothing about how that clip is developed. */
     bool vlog;
+
+    /* The track header's display matrix, reduced to the number of quarter
+     * turns clockwise the picture is turned by before it is shown or
+     * written: what mpv and ffmpeg's autorotate do with it. Zero for a clip
+     * that carries no matrix, and for one whose matrix is not a multiple of
+     * ninety degrees or carries a flip - a mirror is not a rotation, and
+     * view_decoder_open() logs one rather than guessing at it. */
+    pl_rotation rotation;
+    /* The matrix's own angle, in the counter-clockwise degrees
+     * av_display_rotation_get() reports, for the clip line and the log. */
+    int rotation_deg;
 };
 
 /* --------------------------------------------------------------- the gpu */
@@ -1332,11 +1343,31 @@ const char *view_clip_dir(const struct view_state *st);
 /* The part of the window the picture gets: everything left of the panel. */
 void view_picture_area(const struct view_state *st, pl_rect2df *out);
 
+/* ------------------------------------------------------- the rotation */
+
+/* The picture as it is looked at and written: the source turned by the
+ * clip's display matrix. A 5760x3040 clip with a quarter turn is 3040 wide
+ * and 5760 tall here, and every geometry below - fit, zoom, pan, the crop
+ * rectangle as it is drawn, the export's size - is in these pixels.
+ * Everything in source space stays in source space: libcraw's pipeline, the
+ * lens correction, the histogram and the denoise never see the rotation. */
+void view_disp_size(const struct view_state *st, int *w, int *h);
+
+/* A rectangle of the picture as it is shown, in the source pixels it came
+ * from, and back again. Both are exact: a quarter turn maps an even
+ * coordinate to an even one whenever the frame's own dimensions are even,
+ * which every sensor readout's are. */
+void view_rot_to_src(const struct view_state *st, const pl_rect2df *in,
+                     pl_rect2df *out);
+void view_rot_to_disp(const struct view_state *st, const pl_rect2df *in,
+                      pl_rect2df *out);
+
 /* Screen pixels per source pixel at the current setting, resolving "fit". */
 float view_zoom_scale(const struct view_state *st);
 
-/* The rectangles pl_render_image is given: `src` in source pixels, `dst` in
- * window pixels. */
+/* The rectangles the display path is built from: `src` in the rotated
+ * picture's pixels, `dst` in window pixels. The renderer is handed `src`
+ * through view_rot_to_src() and turns the picture itself. */
 void view_zoom_rects(const struct view_state *st, pl_rect2df *src, pl_rect2df *dst);
 
 /* Zoom by `notches` quarter-octaves about a window position, or about the
@@ -1360,6 +1391,12 @@ void view_crop_clear(struct view_state *st);
  * Clamped to the frame, which is where a rectangle from the command line
  * meets the clip's real size for the first time. */
 bool view_crop_rect(const struct view_state *st, int *x, int *y, int *w, int *h);
+
+/* The same rectangle on the rotated picture, which is what the user drew
+ * and what the export writes: the size every readout reports and the size
+ * the export's target is made. */
+bool view_crop_disp_rect(const struct view_state *st, int *x, int *y,
+                         int *w, int *h);
 
 /* Where that rectangle lands on screen, in window pixels, through the same
  * transform the renderer is handed. False when there is nothing to draw. */

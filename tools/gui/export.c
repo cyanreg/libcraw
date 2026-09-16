@@ -118,9 +118,14 @@ int view_export_step(struct view_state *st)
     }
 
     /* The render target is the crop, or the whole frame when there is
-     * none, always at source resolution. */
+     * none, always at source resolution - and upright, so its dimensions
+     * are the crop's turned by the clip's display matrix. The region the
+     * line reports is the source rectangle, which is the one `--crop`
+     * takes; view_still_write() reports the size that was written. */
     if (view_crop_rect(st, &x, &y, &w, &h))
         snprintf(region, sizeof(region), " crop %dx%d+%d+%d", w, h, x, y);
+
+    view_crop_disp_rect(st, &x, &y, &w, &h);
 
     nval = (size_t)w * h * 4;
     if (e->rgba_values < nval) {

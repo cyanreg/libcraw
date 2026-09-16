@@ -669,18 +669,95 @@ void view_picture_area(const struct view_state *st, pl_rect2df *out)
     };
 }
 
+/* ------------------------------------------------------- the rotation */
+
+/* The picture as it is looked at: the source turned by the clip's display
+ * matrix. Everything below is in these pixels, so a portrait clip fits,
+ * zooms, pans and crops as the tall picture it is on screen, and the
+ * renderer is the only thing that ever hears about the turn.
+ *
+ * Nothing upstream of the renderer does: the frame libcraw develops, the
+ * lens warp, the auto white balance histogram and the denoise all run on
+ * the mosaic the sensor read out, in its own orientation. */
+void view_disp_size(const struct view_state *st, int *w, int *h)
+{
+    bool quarter = st->dec.rotation % PL_ROTATION_180 == PL_ROTATION_90;
+
+    *w = (int)(quarter ? st->gpu.height : st->gpu.width);
+    *h = (int)(quarter ? st->gpu.width  : st->gpu.height);
+}
+
+/* One corner of the rotated picture, in source pixels.
+ *
+ * The turn is about the picture's centre, so undoing it is the turn the
+ * other way: for a quarter turn clockwise the source's top-left corner is
+ * the display's top-right, and so on round. Written out rather than built
+ * from a matrix because four cases are shorter than one, and because the
+ * arithmetic is exact - these are integers in float clothing. */
+static void view_rot_src_point(pl_rotation rot, float sw, float sh,
+                               float dx, float dy, float *x, float *y)
+{
+    switch (pl_rotation_normalize(rot)) {
+    case PL_ROTATION_90:  *x = dy;      *y = sh - dx; break;
+    case PL_ROTATION_180: *x = sw - dx; *y = sh - dy; break;
+    case PL_ROTATION_270: *x = sw - dy; *y = dx;      break;
+    default:              *x = dx;      *y = dy;      break;
+    }
+}
+
+/* And the same corner the other way. */
+static void view_rot_disp_point(pl_rotation rot, float sw, float sh,
+                                float x, float y, float *dx, float *dy)
+{
+    switch (pl_rotation_normalize(rot)) {
+    case PL_ROTATION_90:  *dx = sh - y; *dy = x;      break;
+    case PL_ROTATION_180: *dx = sw - x; *dy = sh - y; break;
+    case PL_ROTATION_270: *dx = y;      *dy = sw - x; break;
+    default:              *dx = x;      *dy = y;      break;
+    }
+}
+
+/* A rectangle through either of those: two opposite corners turned and the
+ * result put back in order, since a quarter turn swaps which corner is the
+ * lower one on an axis. */
+void view_rot_to_src(const struct view_state *st, const pl_rect2df *in,
+                     pl_rect2df *out)
+{
+    float sw = (float)st->gpu.width, sh = (float)st->gpu.height;
+
+    view_rot_src_point(st->dec.rotation, sw, sh, in->x0, in->y0,
+                       &out->x0, &out->y0);
+    view_rot_src_point(st->dec.rotation, sw, sh, in->x1, in->y1,
+                       &out->x1, &out->y1);
+    pl_rect2df_normalize(out);
+}
+
+void view_rot_to_disp(const struct view_state *st, const pl_rect2df *in,
+                      pl_rect2df *out)
+{
+    float sw = (float)st->gpu.width, sh = (float)st->gpu.height;
+
+    view_rot_disp_point(st->dec.rotation, sw, sh, in->x0, in->y0,
+                        &out->x0, &out->y0);
+    view_rot_disp_point(st->dec.rotation, sw, sh, in->x1, in->y1,
+                        &out->x1, &out->y1);
+    pl_rect2df_normalize(out);
+}
+
 /* The scale at which the whole picture just fits the area. */
 static float view_fit_scale(const struct view_state *st)
 {
     pl_rect2df area;
+    int dw, dh;
 
     if (!st->gpu.width || !st->gpu.height)
         return 1.0f;
 
     view_picture_area(st, &area);
+    view_disp_size(st, &dw, &dh);
 
-    return CRAW_MIN(pl_rect_w(area) / (float)st->gpu.width,
-                    pl_rect_h(area) / (float)st->gpu.height);
+    return CRAW_MIN(pl_rect_w(area) / (float)dw,
+                    pl_rect_h(area) / (float)dh);
 }
 
 float view_zoom_scale(const struct view_state *st)
@@ -691,11 +768,16 @@ float view_zoom_scale(const struct view_state *st)
 void view_zoom_rects(const struct view_state *st, pl_rect2df *src, pl_rect2df *dst)
 {
     float z = view_zoom_scale(st);
-    float sw = (float)st->gpu.width, sh = (float)st->gpu.height;
     pl_rect2df area;
-    float dw, dh, vw, vh, cx, cy;
+    float sw, sh, dw, dh, vw, vh, cx, cy;
+    int pw, ph;
 
     view_picture_area(st, &area);
+    /* The rotated picture's own pixels: the centre and the zoom are about
+     * what is on screen, not about the readout behind it. */
+    view_disp_size(st, &pw, &ph);
+    sw = (float)pw;
+    sh = (float)ph;
 
     /* What of the picture is on screen, and how big it is there. */
     dw = CRAW_MIN(sw * z, pl_rect_w(area));
@@ -729,9 +811,12 @@ void view_zoom_by(struct view_state *st, float notches, int sx, int sy,
     float want = z * powf(VIEW_ZOOM_STEP, notches);
     pl_rect2df src, dst;
     float px, py;
+    int dw, dh;
 
     if (!st->gpu.width)
         return;
+
+    view_disp_size(st, &dw, &dh);
 
     /* One-to-one is the stop a raw tool is judged on, so a step that would
      * pass it lands on it exactly. */
@@ -754,8 +839,8 @@ void view_zoom_by(struct view_state *st, float notches, int sx, int sy,
     if (want <= fit * 1.0001f) {
         st->view.fit = true;
         st->view.zoom = fit;
-        st->view.cx = (float)st->gpu.width * 0.5f;
-        st->view.cy = (float)st->gpu.height * 0.5f;
+        st->view.cx = (float)dw * 0.5f;
+        st->view.cy = (float)dh * 0.5f;
         return;
     }
 
@@ -771,13 +856,17 @@ void view_zoom_by(struct view_state *st, float notches, int sx, int sy,
 
 void view_zoom_reset(struct view_state *st, bool one_to_one)
 {
+    int dw, dh;
+
+    view_disp_size(st, &dw, &dh);
+
     st->view.fit = !one_to_one;
     st->view.zoom = one_to_one ? 1.0f : view_fit_scale(st);
     /* Fitting forgets the pan as well; one to one keeps looking where the
      * picture was, unless nowhere has been looked at yet. */
     if (!one_to_one || (!st->view.cx && !st->view.cy)) {
-        st->view.cx = (float)st->gpu.width * 0.5f;
-        st->view.cy = (float)st->gpu.height * 0.5f;
+        st->view.cx = (float)dw * 0.5f;
+        st->view.cy = (float)dh * 0.5f;
     }
 }
 
@@ -808,11 +897,11 @@ void view_pan_pixels(struct view_state *st, int dx, int dy)
 
 /* ------------------------------------------------------------- the crop */
 
-/* Window pixels to source pixels, through the same two rectangles the
- * renderer is handed, so that the rubber band lands on the pixels it is
- * drawn over at any zoom and pan. */
-static void view_source_pos(const struct view_state *st, int px, int py,
-                            float *sx, float *sy)
+/* Window pixels to the rotated picture's pixels, through the same two
+ * rectangles the display path is built from, so that the rubber band lands
+ * on the pixels it is drawn over at any zoom and pan. */
+static void view_picture_pos(const struct view_state *st, int px, int py,
+                             float *sx, float *sy)
 {
     pl_rect2df src, dst;
     float dw, dh;
@@ -838,24 +927,33 @@ static int view_crop_snap(float v, int max)
 void view_crop_begin(struct view_state *st, int px, int py)
 {
     st->crop.dragging = true;
-    view_source_pos(st, px, py, &st->crop.ax, &st->crop.ay);
+    view_picture_pos(st, px, py, &st->crop.ax, &st->crop.ay);
 }
 
 void view_crop_drag(struct view_state *st, int px, int py)
 {
     struct view_crop *c = &st->crop;
+    pl_rect2df drawn, r;
     float bx, by;
     int x0, y0, x1, y1;
 
     if (!c->dragging || !st->gpu.width || !st->gpu.height)
         return;
 
-    view_source_pos(st, px, py, &bx, &by);
+    view_picture_pos(st, px, py, &bx, &by);
 
-    x0 = view_crop_snap(CRAW_MIN(c->ax, bx), (int)st->gpu.width);
-    y0 = view_crop_snap(CRAW_MIN(c->ay, by), (int)st->gpu.height);
-    x1 = view_crop_snap(CRAW_MAX(c->ax, bx), (int)st->gpu.width);
-    y1 = view_crop_snap(CRAW_MAX(c->ay, by), (int)st->gpu.height);
+    /* Drawn on the picture as it is shown and kept in source pixels: the
+     * rectangle has to outlive a zoom, a pan and a resized window, and the
+     * only frame of reference that does is the sensor's own. The turn back
+     * is exact, so what is stored is the rectangle that was drawn. */
+    drawn = (pl_rect2df) { c->ax, c->ay, bx, by };
+    pl_rect2df_normalize(&drawn);
+    view_rot_to_src(st, &drawn, &r);
+
+    x0 = view_crop_snap(r.x0, (int)st->gpu.width);
+    y0 = view_crop_snap(r.y0, (int)st->gpu.height);
+    x1 = view_crop_snap(r.x1, (int)st->gpu.width);
+    y1 = view_crop_snap(r.y1, (int)st->gpu.height);
 
     /* The rectangle is replaced only once the pointer has really moved, so
      * that a stray click keeps the one that is already there. */
@@ -999,14 +1097,40 @@ bool view_crop_rect(const struct view_state *st, int *x, int *y, int *w, int *h)
     return have;
 }
 
+/* The same rectangle on the rotated picture: what the user drew, and the
+ * region the export writes once it has been turned upright. */
+bool view_crop_disp_rect(const struct view_state *st, int *x, int *y,
+                         int *w, int *h)
+{
+    pl_rect2df r, d;
+    int sx, sy, sw, sh;
+    bool have = view_crop_rect(st, &sx, &sy, &sw, &sh);
+
+    r = (pl_rect2df) { (float)sx, (float)sy, (float)(sx + sw), (float)(sy + sh) };
+    view_rot_to_disp(st, &r, &d);
+
+    *x = (int)lrintf(d.x0);
+    *y = (int)lrintf(d.y0);
+    *w = (int)lrintf(pl_rect_w(d));
+    *h = (int)lrintf(pl_rect_h(d));
+
+    return have;
+}
+
 bool view_crop_screen(const struct view_state *st, pl_rect2df *out)
 {
-    pl_rect2df src, dst;
+    pl_rect2df src, dst, r, d;
     float zx, zy;
     int x, y, w, h;
 
     if (!st->crop.have || !view_crop_rect(st, &x, &y, &w, &h))
         return false;
+
+    /* The zoom rectangles are in the rotated picture's pixels and the crop
+     * is in the source's, so it turns on its way to the window - which is
+     * what keeps the shade on the pixels the rubber band was drawn over. */
+    r = (pl_rect2df) { (float)x, (float)y, (float)(x + w), (float)(y + h) };
+    view_rot_to_disp(st, &r, &d);
 
     view_zoom_rects(st, &src, &dst);
     if (!(pl_rect_w(src) > 0.0f) || !(pl_rect_h(src) > 0.0f))
@@ -1016,10 +1140,10 @@ bool view_crop_screen(const struct view_state *st, pl_rect2df *out)
     zy = pl_rect_h(dst) / pl_rect_h(src);
 
     *out = (pl_rect2df) {
-        dst.x0 + ((float)x - src.x0) * zx,
-        dst.y0 + ((float)y - src.y0) * zy,
-        dst.x0 + ((float)(x + w) - src.x0) * zx,
-        dst.y0 + ((float)(y + h) - src.y0) * zy,
+        dst.x0 + (d.x0 - src.x0) * zx,
+        dst.y0 + (d.y0 - src.y0) * zy,
+        dst.x0 + (d.x1 - src.x0) * zx,
+        dst.y0 + (d.y1 - src.y0) * zy,
     };
 
     return true;
@@ -1576,7 +1700,9 @@ static void view_usage(FILE *f)
 "                      upscales. A software encoder at 5.8K wants three and\n"
 "                      a half gigabytes, which is what this is for. Refused\n"
 "                      for a scene-referred --colour, which is written at\n"
-"                      native resolution or not at all\n"
+"                      native resolution or not at all. On a clip the camera\n"
+"                      rotated this is the picture as it is written, upright:\n"
+"                      1/2 of a 5760x3040 frame turned a quarter is 1520x2880\n"
 "  --tone-map NAME     how the export maps the picture into a display\n"
 "                      referred space: off, bt.2390 (the default), spline,\n"
 "                      reinhard or clip. Off means the target carries the\n"
@@ -1633,7 +1759,15 @@ static void view_usage(FILE *f)
 "                      frame headers mark a picture inside the readout\n"
 "                      starts with that rectangle; the whole readout is\n"
 "                      developed either way, and `clear` in the panel shows\n"
-"                      all of it.\n"
+"                      all of it. These are the source's pixels before the\n"
+"                      clip's display matrix is applied; the panel reports\n"
+"                      the rectangle on the picture as it is shown, which is\n"
+"                      also what a drag draws and what the file holds.\n"
+"\n"
+"A clip whose track header carries a display matrix is turned by it, the way\n"
+"mpv and ffmpeg's autorotate turn one: the window, the crop rectangle and\n"
+"every export are the picture upright, and the files written carry no matrix\n"
+"of their own. Anything but a quarter turn is reported and left alone.\n"
 "\n"
 "Audio is the master clock. The clip's PCM track plays through SDL3 with\n"
 "5 ms fades at every boundary; a silent clip falls back to wall time.\n"
@@ -3038,8 +3172,13 @@ static int view_run_window(struct view_state *st)
         }
 
         if (!st->view.cx && !st->view.cy && st->gpu.width) {
-            st->view.cx = (float)st->gpu.width * 0.5f;
-            st->view.cy = (float)st->gpu.height * 0.5f;
+            int dw, dh;
+
+            /* The centre of the picture as it is shown, which for a rotated
+             * clip is not the centre of the readout. */
+            view_disp_size(st, &dw, &dh);
+            st->view.cx = (float)dw * 0.5f;
+            st->view.cy = (float)dh * 0.5f;
         }
 
         if (!st->warm && st->have_frame) {

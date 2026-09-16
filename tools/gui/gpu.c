@@ -1772,14 +1772,23 @@ static bool view_gpu_pic_pass(struct view_gpu *g, struct view_state *st,
             image = g->mapped;
 
         /* Zoom and pan are nothing but these two rectangles: the window of
-         * source pixels to show and where on screen to put it. libplacebo
+         * the picture to show and where on screen to put it. libplacebo
          * scales between them with its ordinary scaler, so at one-to-one it
          * samples a source pixel per output pixel and nothing is resampled
-         * twice. */
+         * twice.
+         *
+         * The first is in the rotated picture's pixels and libplacebo wants
+         * the source's, so it turns back here and the renderer is told to
+         * turn the picture itself: pl_frame.rotation is a transpose in the
+         * output stage, which costs nothing and is the one place the clip's
+         * display matrix reaches. The destination rectangle is already the
+         * rotated picture's shape, which is what libplacebo asks for. */
         view_zoom_rects(st, &src, &dst);
-        image.crop = src;
+        view_rot_to_src(st, &src, &image.crop);
+        image.rotation = st->dec.rotation;
         sig = view_hash(sig, &src, sizeof(src));
         sig = view_hash(sig, &dst, sizeof(dst));
+        sig = view_hash(sig, &image.rotation, sizeof(image.rotation));
     }
 
     sig = view_hash(sig, &g->pic_serial, sizeof(g->pic_serial));
@@ -1969,7 +1978,11 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
             else
                 image = g->mapped;
             view_zoom_rects(st, &src, &dst);
-            image.crop = src;
+            /* The same pair as the picture pass, and the same turn: `src`
+             * is in the rotated picture's pixels and libplacebo wants the
+             * source's. */
+            view_rot_to_src(st, &src, &image.crop);
+            image.rotation = st->dec.rotation;
             target.crop = dst;
         }
 
@@ -2038,6 +2051,11 @@ int view_gpu_render_target(struct view_gpu *g, struct view_state *st,
     image.crop = (pl_rect2df) {
         (float)cx, (float)cy, (float)(cx + cw), (float)(cy + ch),
     };
+    /* Written upright, the way ffmpeg's autorotate writes it: the target the
+     * caller sized already has the rotated shape, and this is what turns the
+     * picture into it. The file then carries no display matrix, because its
+     * pixels no longer need one. */
+    image.rotation = st->dec.rotation;
 
     if (!pl_render_image(g->rr_export, &image, target, &rp)) {
         fprintf(stderr, "pl_render_image failed while encoding\n");
@@ -2057,13 +2075,17 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
     const struct pl_hook *hook[VIEW_MAX_HOOKS];
     struct pl_frame image, target;
     pl_fmt fmt;
-    int cx, cy, cw, ch;
+    int cx, cy, cw, ch, tw, th;
 
     /* The target is the crop, or the whole frame when there is none: the
-     * export writes source pixels, never a rescale of them. */
+     * export writes source pixels, never a rescale of them. Upright, so its
+     * dimensions are the crop's turned - a quarter turn makes a 5760x3040
+     * frame 3040x5760 - which is the size ffmpeg's autorotate writes too. */
     view_crop_rect(st, &cx, &cy, &cw, &ch);
+    tw = st->dec.rotation % PL_ROTATION_180 ? ch : cw;
+    th = st->dec.rotation % PL_ROTATION_180 ? cw : ch;
 
-    if (!g->export_tex || g->export_w != cw || g->export_h != ch) {
+    if (!g->export_tex || g->export_w != tw || g->export_h != th) {
         pl_tex_destroy(g->gpu, &g->export_tex);
 
         fmt = pl_find_named_fmt(g->gpu, "rgba16");
@@ -2074,8 +2096,8 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
         }
 
         g->export_tex = pl_tex_create(g->gpu, pl_tex_params(
-            .w             = cw,
-            .h             = ch,
+            .w             = tw,
+            .h             = th,
             .format        = fmt,
             .renderable    = true,
             .storable      = !!(fmt->caps & PL_FMT_CAP_STORABLE),
@@ -2083,11 +2105,11 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
             .host_readable = true,
         ));
         if (!g->export_tex) {
-            fprintf(stderr, "cannot create the %dx%d export texture\n", cw, ch);
+            fprintf(stderr, "cannot create the %dx%d export texture\n", tw, th);
             return CRAW_ERROR(ENOMEM);
         }
-        g->export_w = cw;
-        g->export_h = ch;
+        g->export_w = tw;
+        g->export_h = th;
     }
 
     if (st->dec.raw)
@@ -2097,10 +2119,12 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
     view_render_params(st, &rp, &cmp, &pdp, &adj, hook, true, NULL);
 
     /* The crop is nothing but this rectangle, the same way zoom and pan are
-     * nothing but the pair of them on the display path. */
+     * nothing but the pair of them on the display path; the turn is
+     * libplacebo's, so the file holds the picture the right way up. */
     image.crop = (pl_rect2df) {
         (float)cx, (float)cy, (float)(cx + cw), (float)(cy + ch),
     };
+    image.rotation = st->dec.rotation;
 
     /* Display referred on purpose: what the file holds is the look on
      * screen, sRGB encoded, not the scene-linear numbers. */
@@ -2118,7 +2142,7 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
             .bits   = { .sample_depth = 16, .color_depth = 16 },
         },
         .color = pl_color_space_srgb,
-        .crop  = { 0, 0, (float)cw, (float)ch },
+        .crop  = { 0, 0, (float)tw, (float)th },
     };
 
     /* The Export section's tone mapping setting reaches the still as well as
