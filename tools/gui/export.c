@@ -49,6 +49,7 @@ void view_export_begin(struct view_state *st, int64_t frame, const char *path,
 
     e->frame = CRAW_MAX(frame, 0);
     e->active = true;
+    e->sought = false;
     snprintf(e->codec, sizeof(e->codec), "%s", codec ? codec : "");
     /* Whatever --enc was given at launch, which is as true of an export
      * from the panel as of one from the command line. */
@@ -84,8 +85,17 @@ int view_export_step(struct view_state *st)
      * a seek normally lands on it; decoding on is the fallback for a source
      * whose timestamps do not map to frame numbers exactly. */
     if (!st->have_frame || st->index != e->frame) {
-        if (!st->have_frame || st->index >= e->frame || st->index < e->frame - 8)
+        /* One seek per approach: a starved step comes back before the
+         * reader has queued the packet, and seeking again would throw that
+         * packet away and start over, a livelock on any medium slower than
+         * this loop (seen on the CFexpress card, 8.9 MB re-read every 2 ms
+         * for minutes). The seek is re-armed only once a picture has
+         * actually arrived and is the wrong one. */
+        if (!e->sought &&
+            (!st->have_frame || st->index >= e->frame || st->index < e->frame - 8)) {
             st->seek_to = e->frame;
+            e->sought = true;
+        }
 
         do {
             ret = view_step_frame(st);
@@ -101,8 +111,10 @@ int view_export_step(struct view_state *st)
             e->active = false;
             return 0;
         }
-        if (st->index != e->frame)
+        if (st->index != e->frame) {
+            e->sought = false;
             return 0;
+        }
     }
 
     /* The render target is the crop, or the whole frame when there is

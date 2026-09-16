@@ -485,6 +485,7 @@ struct view_awb {
 struct view_export {
     bool active;
     int64_t frame;
+    bool sought;                /* the seek towards `frame` has been issued */
     char path[VIEW_MAX_PATH];
     char codec[64];             /* empty: the muxer's own */
     char enc[256];              /* encoder options, from --enc */
