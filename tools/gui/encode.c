@@ -49,6 +49,7 @@
 
 #include "view.h"
 #include "encode.h"
+#include "presets.h"
 
 /* Frames in flight on the software path. Two is enough to keep the GPU
  * busy: one is being read back while the other is scaled and encoded. */
@@ -65,6 +66,12 @@ struct view_enc_slot {
 struct view_encode {
     struct view_gpu *g;
     bool verbose, report;
+
+    /* What was selected, copied at the start of the run so that fiddling
+     * with the panel while an export is going does not change the file. */
+    struct view_preset_sel sel;
+    const struct view_colour *col;
+    enum AVPixelFormat pin;     /* the preset's format, or NONE */
 
     AVFormatContext *oc;
     AVStream *vs;
@@ -342,19 +349,21 @@ static int view_enc_frames(struct view_encode *e, struct view_state *st,
 
 static void view_enc_colours(struct view_encode *e, enum AVPixelFormat fmt)
 {
-    /* What the export really is: libplacebo renders into a display referred
-     * sRGB target, so the samples are BT.709 primaries with the IEC
-     * 61966-2-1 transfer. An RGB encoder keeps them at full range, which is
-     * what the still writer does too and what makes a lossless video of one
-     * frame the same numbers as the still of it; a YCbCr one gets the
-     * BT.709 matrix and the studio swing every muxer and player assumes of
-     * a movie. */
+    /* What the export is, which is now a choice rather than a fact: the
+     * selected colour space says what libplacebo renders into and what the
+     * stream is tagged with, and the two are the same thing said twice.
+     *
+     * An RGB encoder keeps the samples at full range, which is what the
+     * still writer does too and what makes a lossless video of one frame
+     * the same numbers as the still of it; a YCbCr one gets the space's own
+     * matrix and the studio swing every muxer and player assumes of a
+     * movie. */
     if (view_enc_is_rgb(fmt)) {
         e->csp    = AVCOL_SPC_RGB;
         e->range  = AVCOL_RANGE_JPEG;
         e->chroma = AVCHROMA_LOC_UNSPECIFIED;
     } else {
-        e->csp    = AVCOL_SPC_BT709;
+        e->csp    = e->col->spc;
         e->range  = AVCOL_RANGE_MPEG;
         e->chroma = AVCHROMA_LOC_LEFT;
     }
@@ -364,8 +373,8 @@ static void view_enc_tag_frame(const struct view_encode *e, AVFrame *f)
 {
     f->color_range     = e->range;
     f->colorspace      = e->csp;
-    f->color_primaries = AVCOL_PRI_BT709;
-    f->color_trc       = AVCOL_TRC_IEC61966_2_1;
+    f->color_primaries = e->col->pri;
+    f->color_trc       = e->col->trc;
     /* Where the chroma samples sit. Left siting is what H.264, HEVC and
      * every muxer's default mean by 4:2:0 and 4:2:2, and saying so is not
      * cosmetic: libplacebo subsamples where it is told to, and a frame that
@@ -410,8 +419,8 @@ static int view_enc_try(struct view_encode *e, struct view_state *st,
     view_enc_colours(e, fmt);
     avc->color_range     = e->range;
     avc->colorspace      = e->csp;
-    avc->color_primaries = AVCOL_PRI_BT709;
-    avc->color_trc       = AVCOL_TRC_IEC61966_2_1;
+    avc->color_primaries = e->col->pri;
+    avc->color_trc       = e->col->trc;
     avc->chroma_sample_location = e->chroma;
 
     if (e->hw) {
@@ -430,14 +439,20 @@ static int view_enc_try(struct view_encode *e, struct view_state *st,
         avc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     /* Last, so that what was asked for wins over what we would have
-     * chosen. */
-    if (enc_opts && enc_opts[0]) {
-        ret = av_dict_parse_string(&opts, enc_opts, "=", ",", 0);
-        if (ret < 0) {
-            fprintf(stderr, "--enc: cannot parse `%s`\n", enc_opts);
-            ret = CRAW_ERROR(EINVAL);
-            goto fail;
-        }
+     * chosen: the preset table first, then --enc on top of it. The two are
+     * assembled together so that an --enc key replaces the table's rather
+     * than being appended after it and losing to it. */
+    ret = view_presets_dict(&e->sel, enc_opts, &opts);
+    if (ret < 0)
+        goto fail;
+
+    if (e->verbose) {
+        const AVDictionaryEntry *t = NULL;
+
+        fprintf(stderr, "%s options:", e->codec->name);
+        while ((t = av_dict_iterate(opts, t)))
+            fprintf(stderr, " %s=%s", t->key, t->value);
+        fprintf(stderr, "\n");
     }
 
     ret = avcodec_open2(avc, e->codec, &opts);
@@ -447,8 +462,13 @@ static int view_enc_try(struct view_encode *e, struct view_state *st,
                     av_get_pix_fmt_name(fmt), av_err2str(ret));
         goto fail;
     }
-    if (av_dict_count(opts))
-        fprintf(stderr, "the %s encoder ignored an option\n", e->codec->name);
+    if (av_dict_count(opts)) {
+        const AVDictionaryEntry *t = NULL;
+
+        while ((t = av_dict_iterate(opts, t)))
+            fprintf(stderr, "the %s encoder ignored %s=%s\n", e->codec->name,
+                    t->key, t->value);
+    }
 
     av_dict_free(&opts);
     e->avc    = avc;
@@ -677,6 +697,56 @@ static int view_enc_audio_pump(struct view_encode *e, double until)
     return 0;
 }
 
+/* ------------------------------------------------------------- the colour */
+
+/* libplacebo's side of the selected colour space: the target the renderer
+ * tone maps and gamut maps into, exactly as it does for the screen.
+ *
+ * Only the display-referred spaces are here. The three scene-referred ones
+ * are a selection the panel and the command line accept, but they are not
+ * a render target: linear light has to reach the encoder from libcraw's
+ * own output rather than through the display pipeline, and that path is
+ * not in yet, so an export that asks for one is refused before it starts.
+ * view_encode_begin() is where that happens. */
+static struct pl_color_space view_enc_target_csp(const struct view_encode *e)
+{
+    struct pl_color_space c = { 0 };
+
+    switch (e->sel.colour) {
+    case VIEW_COLOUR_2020_SDR:
+        c.primaries = PL_COLOR_PRIM_BT_2020;
+        c.transfer  = PL_COLOR_TRC_BT_1886;
+        break;
+    case VIEW_COLOUR_2020_PQ:
+        c.primaries = PL_COLOR_PRIM_BT_2020;
+        c.transfer  = PL_COLOR_TRC_PQ;
+        /* The peak the picture is mapped to, and the number the mastering
+         * display metadata on the stream says. */
+        c.hdr.min_luma = PL_COLOR_HDR_BLACK;
+        c.hdr.max_luma = (float)e->sel.hdr_peak;
+        break;
+    case VIEW_COLOUR_2020_HLG:
+        c.primaries = PL_COLOR_PRIM_BT_2020;
+        c.transfer  = PL_COLOR_TRC_HLG;
+        /* HLG's nominal peak is a property of the system, not a setting:
+         * 1000 nits at the reference white the standard fixes. */
+        c.hdr.min_luma = PL_COLOR_HDR_BLACK;
+        c.hdr.max_luma = 1000.0f;
+        break;
+    default:
+        /* BT.709, the display look. The video curve rather than sRGB: a
+         * still is looked at in an image viewer and a movie is played in a
+         * player, and the two decode a file differently. Measured against
+         * the sRGB still of the same frame this is 57.4 dB - the same
+         * picture with a different curve on it, not a different picture. */
+        c.primaries = PL_COLOR_PRIM_BT_709;
+        c.transfer  = PL_COLOR_TRC_BT_1886;
+        break;
+    }
+
+    return c;
+}
+
 /* ------------------------------------------------------------- the target */
 
 /* The software path's render target: the RGBA16 texture the still export
@@ -728,9 +798,10 @@ static int view_enc_render_sw(struct view_encode *e, struct view_state *st,
     if (ret < 0)
         return ret;
 
-    /* Display referred on purpose, exactly as the still export's target
-     * is: what the file holds is the look on screen, sRGB encoded, not the
-     * scene-linear numbers. */
+    /* The colour the export was asked for. The read-back texture is 16 bit
+     * unorm, so this path is display referred by construction - anything
+     * above 1.0 would be clipped on the way out - which is why the
+     * scene-referred spaces are offered on the Vulkan FFV1 family alone. */
     target = (struct pl_frame) {
         .num_planes = 1,
         .planes[0] = {
@@ -744,7 +815,7 @@ static int view_enc_render_sw(struct view_encode *e, struct view_state *st,
             .alpha  = PL_ALPHA_NONE,
             .bits   = { .sample_depth = 16, .color_depth = 16 },
         },
-        .color = pl_color_space_srgb,
+        .color = view_enc_target_csp(e),
         .crop  = { 0, 0, (float)e->w, (float)e->h },
     };
 
@@ -832,8 +903,8 @@ static int view_enc_scale(struct view_encode *e, AVFrame *f,
     src->height          = f->height;
     src->colorspace      = AVCOL_SPC_RGB;
     src->color_range     = AVCOL_RANGE_JPEG;
-    src->color_primaries = AVCOL_PRI_BT709;
-    src->color_trc       = AVCOL_TRC_IEC61966_2_1;
+    src->color_primaries = e->col->pri;
+    src->color_trc       = e->col->trc;
 
     /* The slot is an RGBA64 plane in host order already, so the scaler
      * reads it where it lies. */
@@ -917,6 +988,10 @@ static int view_enc_send_hw(struct view_encode *e, struct view_state *st,
     }
 
     target.crop = (pl_rect2df) { 0, 0, (float)e->w, (float)e->h };
+    /* The mapping reads the frame's tags, which say what the space is but
+     * not how bright it is; the peak an HDR target is mapped to comes from
+     * here. */
+    target.color = view_enc_target_csp(e);
 
     ret = view_gpu_render_target(e->g, st, &target);
     pl_unmap_avframe(e->g->gpu, &target);
@@ -987,8 +1062,8 @@ static int view_enc_send_sw(struct view_encode *e, struct view_enc_slot *s,
 /* ---------------------------------------------------------------- the run */
 
 void view_encode_default_path(const struct view_state *st, int64_t start,
-                              int64_t end, const char *codec,
-                              char *out, size_t size)
+                              int64_t end, const struct view_preset_sel *sel,
+                              const char *codec, char *out, size_t size)
 {
     const char *file = strrchr(st->cfg.input, '/');
     const char *dot, *ext = "mov";
@@ -1002,15 +1077,21 @@ void view_encode_default_path(const struct view_state *st, int64_t start,
     memcpy(base, file, n);
     base[n] = '\0';
 
-    /* QuickTime for the codecs a camera writes, Matroska for the archival
-     * ones it does not: a .mov with FFV1 in it is not a file anything else
-     * will open. */
-    if (codec && (strstr(codec, "ffv1") || strstr(codec, "x265") ||
-                  strstr(codec, "hevc") || strstr(codec, "vp9") ||
-                  strstr(codec, "huff")))
+    /* The family names its own container - QuickTime for the codecs a
+     * camera writes, Matroska for the archival ones it does not, MP4 for
+     * x264 - because a .mov with FFV1 in it is not a file anything else
+     * will open. A --codec that is not one of the families falls back to
+     * what its name says. */
+    if (sel && (!codec || !codec[0] ||
+                !strcmp(codec, view_presets_encoder(sel)))) {
+        ext = view_presets_container(sel);
+    } else if (codec && (strstr(codec, "ffv1") || strstr(codec, "x265") ||
+                         strstr(codec, "hevc") || strstr(codec, "vp9") ||
+                         strstr(codec, "huff"))) {
         ext = "mkv";
-    else if (codec && (strstr(codec, "av1") || strstr(codec, "apv")))
+    } else if (codec && (strstr(codec, "av1") || strstr(codec, "apv"))) {
         ext = "mp4";
+    }
 
     snprintf(out, size, "%s/%s-%05d-%05d.%s", view_clip_dir(st), base,
              (int)start, (int)end, ext);
@@ -1039,19 +1120,49 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     e->req_audio = o->audio;
     e->t0 = e->last_report = av_gettime_relative();
 
+    /* The whole selection, taken now: an export is a file, and moving a
+     * slider while one is running must not change half of it. */
+    if (o->sel)
+        e->sel = *o->sel;
+    else
+        view_presets_default(&e->sel);
+
+    if (e->sel.colour < 0 || e->sel.colour >= VIEW_NB_COLOURS)
+        e->sel.colour = VIEW_COLOUR_709;
+    e->col = &view_colours[e->sel.colour];
+    e->pin = view_presets_pix_fmt(&e->sel);
+
+    /* The scene-referred spaces are a selection, not yet an export. They
+     * have to reach the encoder from libcraw's own linear output rather
+     * than through the display pipeline - everything in that pipeline,
+     * from the tone curve to the grain, is display referred - and that
+     * path is not written yet. Refused here, with the reason on the panel
+     * rather than a file that quietly holds the wrong numbers. */
+    if (e->col->scene) {
+        fprintf(stderr, "%s is scene referred, and the direct path from the "
+                        "pipeline's linear output to the encoder is not in "
+                        "this build yet; nothing was written\n", e->col->name);
+        snprintf(v->status, sizeof(v->status),
+                 "%s: the direct linear path is not in yet", e->col->name);
+        view_encode_close(st);
+        return CRAW_ERROR(ENOSYS);
+    }
+
     v->start = e->start;
     v->end   = e->end;
     v->audio = o->audio;
     v->active = true;
     v->stop = false;
     v->progress = 0.0;
-    snprintf(v->codec, sizeof(v->codec), "%s", o->codec ? o->codec : "");
+    snprintf(v->codec, sizeof(v->codec), "%s",
+             o->codec && o->codec[0] ? o->codec
+                                     : view_presets_encoder(&e->sel));
     snprintf(v->enc, sizeof(v->enc), "%s", o->enc ? o->enc : "");
 
     if (o->path && o->path[0])
         snprintf(v->path, sizeof(v->path), "%s", o->path);
     else
-        view_encode_default_path(st, e->start, e->end,
+        view_encode_default_path(st, e->start, e->end, &e->sel,
                                  v->codec[0] ? v->codec : NULL,
                                  v->path, sizeof(v->path));
 
@@ -1124,6 +1235,18 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
 
     e->hw = view_enc_is_vulkan(e->codec);
 
+    /* A typed extension wins over the family's container, but only if the
+     * muxer will carry the codec: saying so here is a sentence, and
+     * finding out at the muxer is a half written file. */
+    if (avformat_query_codec(e->oc->oformat, e->codec->id,
+                             FF_COMPLIANCE_NORMAL) == 0) {
+        fprintf(stderr, "%s: the %s muxer does not carry %s; this family "
+                        "writes .%s\n", v->path, e->oc->oformat->name,
+                e->codec->name, view_presets_container(&e->sel));
+        ret = CRAW_ERROR(EINVAL);
+        goto fail;
+    }
+
     e->pkt  = av_packet_alloc();
     e->apkt = av_packet_alloc();
     e->vs   = avformat_new_stream(e->oc, NULL);
@@ -1141,7 +1264,21 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
             goto fail;
     }
 
-    if (e->hw) {
+    /* The preset's own format where it has one: a ProRes profile is a
+     * chroma format as much as a bitrate, and letting the engine pick the
+     * deepest format the encoder lists would write 4:4:4 under an HQ
+     * label. Only a preset with nothing to say falls back to the search. */
+    if (e->pin != AV_PIX_FMT_NONE) {
+        ret = view_enc_try(e, st, e->pin, v->enc);
+        if (ret < 0) {
+            fprintf(stderr, "%s: cannot open the %s encoder with %s, which is "
+                            "what this preset asks for: %s\n", v->path,
+                    e->codec->name, av_get_pix_fmt_name(e->pin),
+                    av_err2str(ret));
+            ret = CRAW_ERROR(EINVAL);
+            goto fail;
+        }
+    } else if (e->hw) {
         /* A Vulkan encoder reports nothing but AV_PIX_FMT_VULKAN, so what
          * it really takes is found by handing it a frames context of each
          * candidate in turn and seeing which one opens. */
@@ -1185,6 +1322,57 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
         goto fail;
     e->vs->time_base      = e->avc->time_base;
     e->vs->avg_frame_rate = e->fr;
+
+    /* H.273 has no code points for the ACES spaces, so a file written in
+     * one says so in words instead; anything reading it back has to be
+     * told, and a tag is the only place to tell it. */
+    if (e->col->tag)
+        av_dict_set(&e->vs->metadata, "COLOUR_SPACE", e->col->tag, 0);
+
+    /* An HDR file says what it was mastered for, which is the peak the
+     * renderer just tone mapped to. Written as stream side data, which is
+     * what Matroska and MP4 both carry. */
+    if (e->col->hdr) {
+        AVMasteringDisplayMetadata *m;
+        AVContentLightMetadata *c;
+        size_t size;
+        float peak = e->sel.colour == VIEW_COLOUR_2020_PQ
+                   ? (float)e->sel.hdr_peak : 1000.0f;
+
+        m = av_mastering_display_metadata_alloc_size(&size);
+        c = av_content_light_metadata_alloc(NULL);
+        if (m && c) {
+            const struct pl_raw_primaries *p =
+                pl_raw_primaries_get(PL_COLOR_PRIM_BT_2020);
+
+            m->display_primaries[0][0] = av_d2q(p->red.x, 50000);
+            m->display_primaries[0][1] = av_d2q(p->red.y, 50000);
+            m->display_primaries[1][0] = av_d2q(p->green.x, 50000);
+            m->display_primaries[1][1] = av_d2q(p->green.y, 50000);
+            m->display_primaries[2][0] = av_d2q(p->blue.x, 50000);
+            m->display_primaries[2][1] = av_d2q(p->blue.y, 50000);
+            m->white_point[0] = av_d2q(p->white.x, 50000);
+            m->white_point[1] = av_d2q(p->white.y, 50000);
+            m->has_primaries = 1;
+            m->max_luminance = av_d2q(peak, 10000);
+            m->min_luminance = av_d2q(PL_COLOR_HDR_BLACK, 1000000);
+            m->has_luminance = 1;
+            c->MaxCLL  = (unsigned)peak;
+            c->MaxFALL = (unsigned)(peak / 4.0f);
+
+            av_packet_side_data_add(&e->vs->codecpar->coded_side_data,
+                                    &e->vs->codecpar->nb_coded_side_data,
+                                    AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
+                                    m, size, 0);
+            av_packet_side_data_add(&e->vs->codecpar->coded_side_data,
+                                    &e->vs->codecpar->nb_coded_side_data,
+                                    AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
+                                    c, sizeof(*c), 0);
+        } else {
+            av_freep(&m);
+            av_freep(&c);
+        }
+    }
 
     if (!(e->oc->oformat->flags & AVFMT_NOFILE)) {
         ret = avio_open(&e->oc->pb, v->path, AVIO_FLAG_WRITE);

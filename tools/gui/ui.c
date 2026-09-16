@@ -259,11 +259,15 @@ static void view_adjust_cycle(struct view_state *st, bool focused, int *v, int n
         *v = (*v + adj + n) % n;
 }
 
-/* ------------------------------------------- the film simulation menu */
+/* ------------------------------------------------- the cascading menus */
 
-#if CINEVIEW_HAVE_LUTS
-
-/* nuklear has popups and groups but nothing cascading, and its windows
+/* Three rows use this: the film simulation, the video export's codec
+ * preset and the export's colour space. The geometry, the hover
+ * hysteresis, the keyboard and the drawing are one implementation; what
+ * differs is only what a column holds, which the five accessors below
+ * answer per kind.
+ *
+ * nuklear has popups and groups but nothing cascading, and its windows
  * hand input to whichever one the pointer last activated, which is not how
  * a menu behaves: every column has to keep reacting while the panel
  * underneath is still the window nuklear considers active. So the columns
@@ -274,6 +278,7 @@ static void view_adjust_cycle(struct view_state *st, bool focused, int *v, int n
  * columns in creation order, which is drawing order, so they always sit on
  * top of the panel built before them. */
 
+#if CINEVIEW_HAVE_LUTS
 /* The film whose renderings column 3 lists, or NULL when the path does not
  * reach that far. */
 static const ViewLutFilm *view_menu_film(const struct view_state *st)
@@ -289,21 +294,97 @@ static const ViewLutFilm *view_menu_film(const struct view_state *st)
 
     return view_lut_film(c->first_film + m->sel[2]);
 }
+#endif
 
-/* A leaf column's entries are renderings, so clicking one selects. */
+/* The colour spaces are grouped by their first column entry, so that the
+ * three BT.2020 transfers hang off one row. */
+static int view_menu_colour_groups(void)
+{
+    int n = 0;
+
+    for (int i = 0; i < VIEW_NB_COLOURS; i++)
+        if (!i || strcmp(view_colours[i].group, view_colours[i - 1].group))
+            n++;
+
+    return n;
+}
+
+/* The first and the count of the colours in group `g`. */
+static int view_menu_colour_group(int g, int *count)
+{
+    int seen = -1;
+
+    for (int i = 0; i < VIEW_NB_COLOURS; i++) {
+        if (!i || strcmp(view_colours[i].group, view_colours[i - 1].group))
+            seen++;
+        if (seen != g)
+            continue;
+
+        *count = 0;
+        for (int j = i; j < VIEW_NB_COLOURS &&
+                        !strcmp(view_colours[j].group, view_colours[i].group);
+             j++)
+            (*count)++;
+
+        return i;
+    }
+
+    *count = 0;
+
+    return -1;
+}
+
+/* A leaf column's entries select rather than opening another column. */
 static bool view_menu_leaf(const struct view_state *st, int col)
 {
-    return (st->menu.sel[0] == 1 && col == 2) ||
-           (st->menu.sel[0] == 0 && col == 3);
+    const struct view_lut_menu *m = &st->menu;
+    int first, n;
+
+    switch (m->kind) {
+    case VIEW_MENU_PRESET:
+        return col == 1;
+    case VIEW_MENU_COLOUR:
+        /* A group with one entry in it is its own leaf: BT.709 and the two
+         * ACES spaces are one row each, BT.2020 opens its transfers. */
+        if (col == 1)
+            return true;
+        first = m->sel[0] >= 0 ? view_menu_colour_group(m->sel[0], &n) : -1;
+        return first < 0 || n <= 1;
+    default:
+        return (m->sel[0] == 1 && col == 2) || (m->sel[0] == 0 && col == 3);
+    }
 }
 
 static int view_menu_count(const struct view_state *st, int col)
 {
     const struct view_lut_menu *m = &st->menu;
+#if CINEVIEW_HAVE_LUTS
     const ViewLutFilmCategory *fc;
     const ViewLutLookCategory *lc;
     const ViewLutFilm *f;
+#endif
+    int n;
 
+    if (m->kind == VIEW_MENU_PRESET) {
+        if (col == 0)
+            return view_nb_preset_families;
+        if (col == 1 && m->sel[0] >= 0 &&
+            m->sel[0] < view_nb_preset_families)
+            return view_preset_families[m->sel[0]].nb_presets;
+        return 0;
+    }
+
+    if (m->kind == VIEW_MENU_COLOUR) {
+        if (col == 0)
+            return view_menu_colour_groups();
+        if (col == 1 && m->sel[0] >= 0) {
+            view_menu_colour_group(m->sel[0], &n);
+            return n > 1 ? n : 0;
+        }
+        return 0;
+    }
+
+#if CINEVIEW_HAVE_LUTS
     switch (col) {
     case 0:
         return 2;
@@ -327,37 +408,113 @@ static int view_menu_count(const struct view_state *st, int col)
     default:
         return 0;
     }
+#else
+    (void)col;
+    return 0;
+#endif
 }
 
-/* The rendering an entry of a leaf column stands for, or -1. */
+/* What an entry of a leaf column stands for, or -1: a rendering for the
+ * film menu, a preset for the codec one, a colour space for the third. */
 static int view_menu_lut(const struct view_state *st, int col, int i)
 {
+    const struct view_lut_menu *m = &st->menu;
+#if CINEVIEW_HAVE_LUTS
     const ViewLutLookCategory *lc;
     const ViewLutFilm *f;
+#endif
+    int first, n;
 
     if (!view_menu_leaf(st, col) || i < 0 || i >= view_menu_count(st, col))
         return -1;
 
+    if (m->kind == VIEW_MENU_PRESET)
+        return i;
+
+    if (m->kind == VIEW_MENU_COLOUR) {
+        first = view_menu_colour_group(col == 0 ? i : m->sel[0], &n);
+        if (first < 0)
+            return -1;
+        return col == 0 ? first : first + i;
+    }
+
+#if CINEVIEW_HAVE_LUTS
     if (col == 2) {
-        lc = view_lut_look_category(st->menu.sel[1]);
+        lc = view_lut_look_category(m->sel[1]);
         return lc && lc->luts ? (int)lc->luts[i] : -1;
     }
 
     f = view_menu_film(st);
     return f ? f->first_lut + i : -1;
+#else
+    return -1;
+#endif
+}
+
+/* Why the entry cannot be chosen, or NULL. A greyed row still shows and
+ * still highlights: what it says is the point. */
+static const char *view_menu_why_not(const struct view_state *st, int col, int i)
+{
+    const struct view_lut_menu *m = &st->menu;
+    const struct view_preset_sel *s = &st->look.video_preset;
+    int ix;
+
+    if (m->kind == VIEW_MENU_PRESET)
+        return col == 0 ? view_presets_family_why_not(i)
+                        : view_presets_preset_why_not(m->sel[0], i);
+
+    if (m->kind == VIEW_MENU_COLOUR) {
+        ix = view_menu_lut(st, col, i);
+        if (ix < 0 && col == 0)
+            ix = view_menu_colour_group(i, &(int) { 0 });
+        return ix < 0 ? NULL
+                      : view_presets_colour_why_not(s->family, s->preset, ix);
+    }
+
+    return NULL;
 }
 
 static void view_menu_label(const struct view_state *st, int col, int i,
                             char *buf, size_t n)
 {
     const struct view_lut_menu *m = &st->menu;
+#if CINEVIEW_HAVE_LUTS
     const ViewLutFilmCategory *fc;
     const ViewLutLookCategory *lc;
     const ViewLutFilm *f;
     const ViewLut *l;
+#endif
+    int ix;
 
     buf[0] = '\0';
 
+    if (m->kind == VIEW_MENU_PRESET) {
+        if (col == 0 && i < view_nb_preset_families)
+            snprintf(buf, n, "%s", view_preset_families[i].name);
+        else if (col == 1 && m->sel[0] >= 0 &&
+                 m->sel[0] < view_nb_preset_families &&
+                 i < view_preset_families[m->sel[0]].nb_presets)
+            snprintf(buf, n, "%s",
+                     view_preset_families[m->sel[0]].presets[i].name);
+        return;
+    }
+
+    if (m->kind == VIEW_MENU_COLOUR) {
+        if (col == 0) {
+            int cnt;
+
+            ix = view_menu_colour_group(i, &cnt);
+            if (ix >= 0)
+                snprintf(buf, n, "%s", view_colours[ix].group);
+        } else {
+            ix = view_menu_lut(st, col, i);
+            if (ix >= 0)
+                snprintf(buf, n, "%s", view_colours[ix].name);
+        }
+        return;
+    }
+
+#if CINEVIEW_HAVE_LUTS
     switch (col) {
     case 0:
         snprintf(buf, n, "%s", i == 0 ? "Films" : "Looks");
@@ -401,6 +558,73 @@ static void view_menu_label(const struct view_state *st, int col, int i,
 
     default:
         return;
+    }
+#else
+    (void)col;
+#endif
+}
+
+/* What choosing entry `i` of leaf column `col` does. */
+static void view_menu_select(struct view_state *st, int col, int i)
+{
+    struct view_lut_menu *m = &st->menu;
+    struct view_preset_sel *s = &st->look.video_preset;
+    int ix = view_menu_lut(st, col, i);
+
+    if (ix < 0 || view_menu_why_not(st, col, i))
+        return;
+
+    switch (m->kind) {
+    case VIEW_MENU_PRESET:
+        s->family = m->sel[0];
+        s->preset = ix;
+        s->set = true;
+        view_presets_family_defaults(s);
+        break;
+    case VIEW_MENU_COLOUR:
+        s->colour = ix;
+        s->set = true;
+        break;
+    default:
+#if CINEVIEW_HAVE_LUTS
+        view_lut_select_film(st, ix);
+#endif
+        break;
+    }
+}
+
+/* The entry that is in use, for the mark the drawing puts behind it. */
+static int view_menu_current(const struct view_state *st, int col)
+{
+    const struct view_lut_menu *m = &st->menu;
+    const struct view_preset_sel *s = &st->look.video_preset;
+    int first, n;
+
+    switch (m->kind) {
+    case VIEW_MENU_PRESET:
+        return col == 0 ? s->family : (m->sel[0] == s->family ? s->preset : -1);
+    case VIEW_MENU_COLOUR:
+        if (col == 0) {
+            for (int g = 0; g < view_menu_colour_groups(); g++) {
+                first = view_menu_colour_group(g, &n);
+                if (first >= 0 && s->colour >= first && s->colour < first + n)
+                    return g;
+            }
+            return -1;
+        }
+        first = m->sel[0] >= 0 ? view_menu_colour_group(m->sel[0], &n) : -1;
+        return first >= 0 && s->colour >= first && s->colour < first + n
+             ? s->colour - first : -1;
+    default:
+        /* A rendering is only findable by walking the leaf column, since
+         * the index says nothing about which entry holds it. */
+        if (st->look.film_sim < 0 || !view_menu_leaf(st, col))
+            return -1;
+        n = view_menu_count(st, col);
+        for (int i = 0; i < n; i++)
+            if (view_menu_lut(st, col, i) == st->look.film_sim)
+                return i;
+        return -1;
     }
 }
 
@@ -529,6 +753,40 @@ static void view_menu_descend(struct view_state *st, int col, int i)
  * entry has to be rested on before its submenu opens, and for a moment
  * after one opens the siblings are ignored while the pointer is still
  * travelling towards it. */
+/* A click on a row that opens another column: the film menu just walks
+ * into it, but the export's two treat the parent as a choice of its own -
+ * clicking a family takes that family's default preset, clicking a colour
+ * group takes the first entry under it - which is what the row above the
+ * menu says it does. Returns true when that settled it. */
+static bool view_menu_click_parent(struct view_state *st, int col, int i)
+{
+    struct view_lut_menu *m = &st->menu;
+    struct view_preset_sel *s = &st->look.video_preset;
+    int first, n;
+
+    if (m->kind == VIEW_MENU_PRESET && col == 0) {
+        if (view_presets_family_why_not(i))
+            return true;            /* greyed: eat the click, change nothing */
+        s->family = i;
+        s->preset = view_preset_families[i].def;
+        s->set = true;
+        view_presets_family_defaults(s);
+        return true;
+    }
+
+    if (m->kind == VIEW_MENU_COLOUR && col == 0) {
+        first = view_menu_colour_group(i, &n);
+        if (first < 0 ||
+            view_presets_colour_why_not(s->family, s->preset, first))
+            return true;
+        s->colour = first;
+        s->set = true;
+        return true;
+    }
+
+    return false;
+}
+
 static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
                              bool *over)
 {
@@ -594,7 +852,10 @@ static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
              * hover timers were about to do. */
             m->kb = -1;
             if (leaf) {
-                pick = view_menu_lut(st, hit_col, hit_entry);
+                view_menu_select(st, hit_col, hit_entry);
+                pick = 1;
+            } else if (view_menu_click_parent(st, hit_col, hit_entry)) {
+                pick = 1;
             } else {
                 view_menu_descend(st, hit_col, hit_entry);
                 m->guard_col = hit_col;
@@ -651,20 +912,22 @@ static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
         }
         out = nk_window_get_canvas(ctx);
 
+        int cur = view_menu_current(st, c);
+
         for (int i = 0; i < n; i++) {
             struct nk_rect e = view_menu_entry(m, c, i);
             struct nk_rect t;
             char buf[192];
             bool on = m->sel[c] == i;
+            bool grey = view_menu_why_not(st, c, i) != NULL;
 
             if (e.y + e.h <= r.y || e.y >= r.y + r.h)
                 continue;           /* scrolled out of the column */
 
             view_menu_label(st, c, i, buf, sizeof(buf));
-            /* The rendering actually in use gets a mark of its own, so it
+            /* The entry actually in use gets a mark of its own, so it
              * stays findable while the highlight is off wandering. */
-            if (view_menu_lut(st, c, i) == st->look.film_sim &&
-                st->look.film_sim >= 0)
+            if (i == cur)
                 nk_fill_rect(out, e, 2.0f, nk_rgba(40, 62, 52, 255));
             if (on)
                 nk_fill_rect(out, e, 2.0f,
@@ -673,7 +936,9 @@ static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
 
             t = nk_rect(e.x + VIEW_MENU_XPAD, e.y, e.w - 2 * VIEW_MENU_XPAD, e.h);
             nk_draw_text(out, t, buf, (int)strlen(buf), font,
-                         nk_rgba(0, 0, 0, 0), nk_rgba(226, 226, 232, 255));
+                         nk_rgba(0, 0, 0, 0),
+                         grey ? nk_rgba(126, 126, 132, 255)
+                              : nk_rgba(226, 226, 232, 255));
 
             /* The mark that says this entry opens another column. Plain
              * ASCII: nuklear's built-in font atlas only bakes Latin-1, so
@@ -707,15 +972,19 @@ static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
     nk_style_pop_vec2(ctx);
 }
 
-void view_ui_menu_open(struct view_state *st)
+void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind)
 {
     struct view_lut_menu *m = &st->menu;
+#if CINEVIEW_HAVE_LUTS
     const ViewLut *l = view_lut_get(st->look.film_sim);
+#endif
 
     if (m->open)
         return;
 
     m->open = true;
+    m->kind = kind;
+    m->row = m->rows[kind];
     m->cols = 1;
     m->kb = 0;
     for (int c = 0; c < VIEW_MENU_COLS; c++) {
@@ -732,7 +1001,21 @@ void view_ui_menu_open(struct view_state *st)
     m->guard_until = 0;
 
     /* Open on what is already selected, so Enter then the arrows walks on
-     * from the current look rather than from the top of the list. */
+     * from the current setting rather than from the top of the list. */
+    if (kind == VIEW_MENU_PRESET) {
+        m->sel[0] = st->look.video_preset.family;
+        m->sel[1] = st->look.video_preset.preset;
+        m->kb = 1;
+        return;
+    }
+    if (kind == VIEW_MENU_COLOUR) {
+        m->sel[0] = view_menu_current(st, 0);
+        m->sel[1] = m->sel[0] >= 0 ? view_menu_current(st, 1) : -1;
+        m->kb = m->sel[1] >= 0 ? 1 : 0;
+        return;
+    }
+
+#if CINEVIEW_HAVE_LUTS
     if (l) {
         const ViewLutFilm *f = view_lut_film(l->film);
         const ViewLutFilmCategory *c = f ? view_lut_film_category(f->category) : NULL;
@@ -753,6 +1036,16 @@ void view_ui_menu_open(struct view_state *st)
             m->kb = 3;
         }
     }
+#endif
+}
+
+void view_ui_menu_open_row(struct view_state *st, int row)
+{
+    for (int k = 0; k < VIEW_MENU_KINDS; k++)
+        if (st->menu.rows[k] == row) {
+            view_ui_menu_open(st, (enum view_menu_kind)k);
+            return;
+        }
 }
 
 void view_ui_menu_close(struct view_state *st)
@@ -824,11 +1117,9 @@ bool view_ui_menu_key(struct view_state *st, int key)
         if (m->sel[c] < 0 && n > 0)
             view_menu_descend(st, c, 0);
         if (view_menu_leaf(st, c)) {
-            int ix = view_menu_lut(st, c, m->sel[c]);
-
             /* Right on a leaf has nowhere to go; only Enter selects. */
-            if (key != SDLK_RIGHT && ix >= 0) {
-                view_lut_select_film(st, ix);
+            if (key != SDLK_RIGHT) {
+                view_menu_select(st, c, m->sel[c]);
                 view_ui_menu_close(st);
             }
             return true;
@@ -861,6 +1152,9 @@ bool view_ui_menu_key(struct view_state *st, int key)
  * is one run of indices and a step is one index inside it. */
 static void view_menu_step(struct view_state *st, int adj)
 {
+#if !CINEVIEW_HAVE_LUTS
+    (void)st; (void)adj;
+#else
     int n = view_luts_count();
     int cur = st->look.film_sim;
     int lo = 0, hi = n - 1;
@@ -890,43 +1184,67 @@ static void view_menu_step(struct view_state *st, int adj)
     }
 
     view_lut_select_film(st, CRAW_CLAMP(cur + adj, lo, hi));
+#endif
 }
 
-/* The panel row. Clicking it toggles the menu; the menu itself is built
+/* One panel row that opens a cascade: a label, a button showing what is
+ * selected, and the anchor the columns hang off. The menu itself is built
  * after the panel so that it draws on top. */
-static void view_panel_film_sim(struct nk_context *ctx, struct view_state *st)
+static void view_menu_row(struct nk_context *ctx, struct view_state *st,
+                          enum view_menu_kind kind, const char *label,
+                          const char *value)
 {
     struct view_lut_menu *m = &st->menu;
     struct nk_rect content = nk_window_get_content_region(ctx);
     struct nk_rect b;
-    bool focused;
 
-    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    focused = view_row(st, ctx);
-    m->row = st->ui_row - 1;        /* view_row() has already stepped it */
-    view_menu_step(st, view_step(st, focused));
+    m->rows[kind] = st->ui_row - 1;  /* view_row() has already stepped it */
 
-    nk_label(ctx, "film simulation", NK_TEXT_LEFT);
+    nk_label(ctx, label, NK_TEXT_LEFT);
 
     b = nk_widget_bounds(ctx);
-    /* The menu hangs off the whole row rather than the button, so that it
-     * opens flush with the panel's edge instead of halfway across it. */
-    m->ax = content.x;
-    m->aw = content.w;
-    m->ay = b.y;
-    m->ah = b.h;
-    m->anchored = true;
 
     /* Click to toggle, never hover: a menu that dropped open whenever the
      * pointer crossed the row on its way somewhere else was the single
      * most irritating thing about it. */
-    if (nk_button_label(ctx, view_lut_film_name(st))) {
-        if (m->open)
+    if (nk_button_label(ctx, value)) {
+        if (m->open && m->kind == kind) {
             view_ui_menu_close(st);
-        else
-            view_ui_menu_open(st);
-        m->kb = -1;
+        } else {
+            view_ui_menu_close(st);
+            view_ui_menu_open(st, kind);
+            m->kb = -1;
+        }
     }
+
+    /* The anchor is the whole row rather than the button, so the cascade
+     * opens flush with the panel's edge instead of halfway across it. It
+     * is only written by whichever row owns the open menu, or two rows
+     * would fight over where the columns go. */
+    if (m->open && m->kind == kind) {
+        m->ax = content.x;
+        m->aw = content.w;
+        m->ay = b.y;
+        m->ah = b.h;
+        m->row = m->rows[kind];
+        m->anchored = true;
+    }
+}
+
+static void view_panel_film_sim(struct nk_context *ctx, struct view_state *st)
+{
+    bool focused;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    focused = view_row(st, ctx);
+    view_menu_step(st, view_step(st, focused));
+
+    view_menu_row(ctx, st, VIEW_MENU_FILM, "film simulation",
+#if CINEVIEW_HAVE_LUTS
+                  view_lut_film_name(st));
+#else
+                  "not built in");
+#endif
 }
 
 /* Runs the whole menu for this frame: pointer first so that the cascade
@@ -938,12 +1256,20 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
     bool over = false;
     int pick;
 
-    if (!m->open || !m->anchored)
+    if (!m->open)
         return;
 
+    /* The row the menu hangs off was not emitted this frame - its section
+     * has been collapsed under it - so there is nothing to hang off and
+     * nothing to draw. Closing rather than hiding, or the keyboard would
+     * go on being swallowed by a menu nobody can see. */
+    if (!m->anchored) {
+        view_ui_menu_close(st);
+        return;
+    }
+
     pick = view_menu_pointer(ctx, st, &over);
-    if (pick >= 0) {
-        view_lut_select_film(st, pick);
+    if (pick > 0) {
         view_ui_menu_close(st);
         return;
     }
@@ -964,32 +1290,6 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
     view_menu_draw(ctx, st);
 }
 
-#else /* !CINEVIEW_HAVE_LUTS */
-
-void view_ui_menu_open(struct view_state *st) { (void)st; }
-void view_ui_menu_close(struct view_state *st) { (void)st; }
-bool view_ui_menu_key(struct view_state *st, int key) { (void)st; (void)key; return false; }
-
-bool view_ui_menu_covers(const struct view_state *st, float x, float y)
-{
-    (void)st; (void)x; (void)y;
-    return false;
-}
-
-static void view_panel_film_sim(struct nk_context *ctx, struct view_state *st)
-{
-    (void)st;
-    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    nk_label(ctx, "film simulation", NK_TEXT_LEFT);
-    nk_label(ctx, "not built in", NK_TEXT_LEFT);
-}
-
-static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
-{
-    (void)ctx; (void)st;
-}
-
-#endif /* CINEVIEW_HAVE_LUTS */
 
 static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
 {
@@ -1392,15 +1692,18 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     nk_tree_pop(ctx);
 }
 
-/* The video exporter's corner of the Export section: a frame range, one
- * button, a progress bar and a way to stop. Everything else about the
- * encode - which encoder, which options, what size - is the command line's
- * for now; the preset system will give the panel the rest. */
+/* The video exporter's corner of the Export section: two cascades - the
+ * codec preset and the colour space - whatever knobs the chosen family
+ * declares, a frame range, one button, a progress bar and a way to stop.
+ * The selection itself lives in the look, so it survives the export and
+ * carries from clip to clip. */
 static void view_panel_export_video(struct nk_context *ctx, struct view_state *st)
 {
     struct view_video *v = &st->video;
-    char path[VIEW_MAX_PATH];
-    const char *codec;
+    struct view_preset_sel *sel = &st->look.video_preset;
+    const struct view_preset_family *fam;
+    char path[VIEW_MAX_PATH], label[128];
+    const char *codec, *why;
     bool busy = v->active;
 
     /* The range follows the picture until it has been set: a fresh panel
@@ -1411,16 +1714,102 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         v->end_ui = v->start_ui + 59;
     }
 
-    /* The encoder is whatever --codec said, or the best one this build has:
-     * lossless on the GPU where that exists, and the encoder everything can
-     * read where it does not. */
+    /* One family per frame until every one that needs a device answer has
+     * given it, so that a GPU with no AV1 engine greys that row rather
+     * than failing at export time - and so that opening the section never
+     * stalls on four encoder opens at once. */
+    view_presets_probe_step(st->dec.hw_device, st->cfg.verbose);
+
+    if (sel->family < 0 || sel->family >= view_nb_preset_families)
+        view_presets_default(sel);
+    fam = &view_preset_families[sel->family];
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    view_row(st, ctx);
+    view_menu_row(ctx, st, VIEW_MENU_PRESET, "video",
+                  view_presets_label(sel, label, sizeof(label)));
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    view_row(st, ctx);
+    view_menu_row(ctx, st, VIEW_MENU_COLOUR, "colour",
+                  view_colours[CRAW_CLAMP(sel->colour, 0,
+                                          VIEW_NB_COLOURS - 1)].name);
+
+    /* Why the selection cannot be used, said once and in full rather than
+     * left for the encoder to discover. */
+    why = view_presets_preset_why_not(sel->family, sel->preset);
+    if (!why)
+        why = view_presets_colour_why_not(sel->family, sel->preset,
+                                          sel->colour);
+    if (why) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        nk_labelf_wrap(ctx, "cannot export: %s", why);
+    } else if (view_colours[sel->colour].scene) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        nk_label_wrap(ctx, "scene referred: the direct path from the "
+                           "pipeline's linear output to the encoder is not "
+                           "in this build yet");
+    }
+
+    /* Only the rows the family declares. */
+    if (fam->ctrl & VIEW_CTRL_ASYNC) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        view_row(st, ctx);
+        nk_property_int(ctx, "#async depth", fam->async_min, &sel->async,
+                        fam->async_max, 1, 0.05f);
+    }
+    if (fam->ctrl & VIEW_CTRL_QP) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        view_row(st, ctx);
+        nk_property_int(ctx, "#qp", fam->qp_min, &sel->qp, fam->qp_max,
+                        1, 0.2f);
+    }
+    if (fam->ctrl & VIEW_CTRL_CPU) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        view_row(st, ctx);
+        nk_property_int(ctx, "#cpu preset", fam->cpu_min, &sel->cpu,
+                        fam->cpu_max, 1, 0.05f);
+    }
+    if (fam->ctrl & VIEW_CTRL_RC && fam->nb_rc > 0) {
+        const struct view_rc_spec *rc;
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, fam->nb_rc);
+        view_row(st, ctx);
+        for (int i = 0; i < fam->nb_rc; i++)
+            if (nk_option_label(ctx, fam->rc[i].label, sel->rc == i))
+                sel->rc = i;
+
+        rc = &fam->rc[CRAW_CLAMP(sel->rc, 0, fam->nb_rc - 1)];
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        view_row(st, ctx);
+        if (rc->bitrate) {
+            int mbit = CRAW_MAX(sel->kbit / 1000, 1);
+
+            /* Mbit/s on the panel, kbit/s underneath: a bitrate field that
+             * counted in kilobits would need five digits to say anything
+             * useful about a 5.8K export. */
+            nk_property_int(ctx, "#Mbit/s", 1, &mbit, 2000, 1, 0.5f);
+            sel->kbit = mbit * 1000;
+        } else {
+            char name[32];
+
+            snprintf(name, sizeof(name), "#%s", rc->label);
+            nk_property_int(ctx, name, rc->qmin, &sel->quant, rc->qmax,
+                            1, 0.2f);
+        }
+    }
+    if (view_colours[sel->colour].hdr &&
+        sel->colour == VIEW_COLOUR_2020_PQ) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        view_row(st, ctx);
+        nk_property_int(ctx, "#peak nits", 100, &sel->hdr_peak, 10000,
+                        50, 5.0f);
+    }
+
+    /* --codec still wins, for an encoder that is not one of the eight. */
     codec = st->cfg.export_codec;
     if (!codec || !codec[0])
-        codec = avcodec_find_encoder_by_name("ffv1_vulkan") ? "ffv1_vulkan"
-              : avcodec_find_encoder_by_name("libx264") ? "libx264" : "ffv1";
-
-    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-    nk_labelf(ctx, NK_TEXT_LEFT, "video: %s", codec);
+        codec = fam->encoder;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
     if (nk_property_int(ctx, "#start", 0, &v->start_ui, INT_MAX - 1, 1, 1.0f))
@@ -1432,16 +1821,17 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     if (nk_button_label(ctx, busy ? "stop" : "export video")) {
         if (busy) {
             view_encode_cancel(st);
-        } else {
+        } else if (!why) {
             struct view_encode_opts o = {
                 .start = v->start_ui,
                 .end   = v->end_ui,
+                .sel   = sel,
                 .codec = codec,
                 .enc   = st->cfg.export_enc,
                 .audio = st->cfg.video_audio,
             };
 
-            view_encode_default_path(st, o.start, o.end, codec,
+            view_encode_default_path(st, o.start, o.end, sel, codec,
                                      path, sizeof(path));
             o.path = path;
             v->range_set = true;
@@ -1795,6 +2185,11 @@ void view_ui_build(struct view_state *st)
     st->ui_row = 0;
     st->ui_edit_active = false;
     st->menu.anchored = false;
+    /* A row that is not emitted this frame - the export's two live inside a
+     * collapsed section most of the time - owns no cascade, or Enter on
+     * whatever row happens to have its old index would open one. */
+    for (int i = 0; i < VIEW_MENU_KINDS; i++)
+        st->menu.rows[i] = -1;
     if (st->ui_rows > 0)
         st->focus = (st->focus % st->ui_rows + st->ui_rows) % st->ui_rows;
 

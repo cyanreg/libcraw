@@ -47,6 +47,11 @@
  * write and the engine in encode.c reads. */
 #include "encode.h"
 
+/* The video export's preset table: the eight encoder families, what each
+ * preset means, and the colour spaces an export can be written in. Both the
+ * panel's cascade and --preset read it. */
+#include "presets.h"
+
 /* The panel sits on the right at a fixed width; the picture gets whatever
  * is left of the window. */
 #define VIEW_PANEL_WIDTH  360.0f
@@ -54,7 +59,9 @@
 
 /* Hooks handed to one pl_render_params: the non-raw path's exposure on the
  * LINEAR stage, then the film simulation LUT, vibrance, soft light and film
- * grain, all four at PL_HOOK_PRE_OUTPUT and in that order. */
+ * grain, all four at PL_HOOK_PRE_OUTPUT and in that order. The export uses
+ * the same chain as the display, so a frame of the movie and the still of
+ * it are graded and grained identically. */
 #define VIEW_MAX_HOOKS 5
 
 /* Zoom steps by a quarter octave per notch, stops at fit and at eight times
@@ -110,6 +117,12 @@ struct view_look {
      * the sensor clip the profile implies. */
     bool peak_detect;
     int peak_detect_flag;       /* nuklear's checkbox wants an int */
+
+    /* Which encoder, which preset, which knobs and which colour space the
+     * video export runs with. It lives here rather than beside the run in
+     * struct view_video because it is a setting: it survives a finished
+     * export and it carries from clip to clip, the way the grade does. */
+    struct view_preset_sel video_preset;
 };
 
 /* Everything the raw pipeline pass depends on, kept for the picture on
@@ -152,8 +165,20 @@ struct view_name_map {
  * that this header stays free of nuklear, which only ui.c includes. */
 #define VIEW_MENU_COLS 4
 
+/* Three panel rows hang a cascade off this one struct: the film
+ * simulation's, the video export's codec preset and the export's colour
+ * space. Only one is ever open, so the geometry, the highlight and the
+ * hover timers are shared and `kind` says what the columns mean. */
+enum view_menu_kind {
+    VIEW_MENU_FILM = 0,
+    VIEW_MENU_PRESET,
+    VIEW_MENU_COLOUR,
+    VIEW_MENU_KINDS,
+};
+
 struct view_lut_menu {
     bool open;
+    enum view_menu_kind kind;
     /* The highlighted entry of each column. Column 0 chooses the branch
      * (0 Films, 1 Looks) and the rest follow from it; -1 means nothing is
      * highlighted yet, which keeps every column to its right shut. */
@@ -168,10 +193,13 @@ struct view_lut_menu {
     float w[VIEW_MENU_COLS], h[VIEW_MENU_COLS];
 
     /* The panel row the menu hangs off, in window pixels, and its index in
-     * the focus ring so that Enter on it opens the menu. */
+     * the focus ring so that Enter on it opens the menu. `rows` is one per
+     * kind, filled as each row is emitted, so Enter on any of them knows
+     * which cascade it owns; `row` is the open one's. */
     float ax, ay, aw, ah;
     bool anchored;
     int row;
+    int rows[VIEW_MENU_KINDS];
 
     /* Hover hysteresis, so the cascade behaves like a real menu rather
      * than snapping to whatever the pointer crossed last. An entry has to
@@ -913,11 +941,15 @@ int  view_ui_resize(struct view_state *st, int w, int h);
  * been handed to the swapchain. */
 void view_ui_rotate(struct view_gpu *g);
 
-/* The film simulation menu. It owns its own hit testing rather than going
- * through nuklear's widgets, because a cascade is not a thing nuklear has
- * and the columns have to keep taking the pointer while the panel below
- * them is what nuklear considers active. */
-void view_ui_menu_open(struct view_state *st);
+/* The cascading menus - the film simulation's and the video export's two.
+ * They own their own hit testing rather than going through nuklear's
+ * widgets, because a cascade is not a thing nuklear has and the columns
+ * have to keep taking the pointer while the panel below them is what
+ * nuklear considers active. */
+void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind);
+/* Opens whichever cascade the focus ring's row `row` owns, if any: what
+ * Enter on a menu row does. */
+void view_ui_menu_open_row(struct view_state *st, int row);
 void view_ui_menu_close(struct view_state *st);
 /* Handles one key while the menu is open; true when it consumed it. */
 bool view_ui_menu_key(struct view_state *st, int key);

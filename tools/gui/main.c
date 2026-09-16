@@ -1422,7 +1422,19 @@ static void view_usage(FILE *f)
 "                      one the file name implies\n"
 "  --enc KEY=VALUE[,...]\n"
 "                      options for that encoder, e.g. cpu-used=8,threads=2\n"
-"                      for an AVIF or qmin=1 for a JPEG\n"
+"                      for an AVIF or qmin=1 for a JPEG. For a video these\n"
+"                      are applied on top of --preset's, and win over them\n"
+"  --preset FAMILY[/PRESET]\n"
+"                      the video export's encoder and settings, out of the\n"
+"                      same table the panel's menu shows, e.g.\n"
+"                      \"FFv1 (Vulkan)/L4 (experimental)\" or \"x264\".\n"
+"                      A family on its own takes its default preset\n"
+"  --colour NAME       the colour space the video is written in: bt709 (the\n"
+"                      display look, the default), bt2020-sdr, bt2020-pq,\n"
+"                      bt2020-hlg, or the scene referred aces, acescg and\n"
+"                      xyz, which bypass tone mapping and the grade\n"
+"  --list-presets      print every family, preset and colour space with the\n"
+"                      options each one means, and exit\n"
 "  --crop WxH+X+Y      export only that region of the source, in source\n"
 "                      pixels, with the edges snapped to even ones. The\n"
 "                      viewer shades everything outside it. A clip whose\n"
@@ -1468,6 +1480,9 @@ enum {
     VIEW_OPT_AUDIO,
     VIEW_OPT_CODEC,
     VIEW_OPT_ENC,
+    VIEW_OPT_PRESET,
+    VIEW_OPT_COLOUR,
+    VIEW_OPT_LIST_PRESETS,
     VIEW_OPT_CROP,
     VIEW_OPT_LOOPS,
     VIEW_OPT_NO_LOOP,
@@ -1510,6 +1525,10 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "audio",    required_argument, NULL, VIEW_OPT_AUDIO     },
         { "codec",    required_argument, NULL, VIEW_OPT_CODEC     },
         { "enc",      required_argument, NULL, VIEW_OPT_ENC       },
+        { "preset",   required_argument, NULL, VIEW_OPT_PRESET    },
+        { "colour",   required_argument, NULL, VIEW_OPT_COLOUR    },
+        { "color",    required_argument, NULL, VIEW_OPT_COLOUR    },
+        { "list-presets", no_argument,   NULL, VIEW_OPT_LIST_PRESETS },
         { "crop",     required_argument, NULL, VIEW_OPT_CROP      },
         { "loops",    required_argument, NULL, VIEW_OPT_LOOPS     },
         { "no-loop",  no_argument,       NULL, VIEW_OPT_NO_LOOP   },
@@ -1765,6 +1784,21 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         case VIEW_OPT_ENC:
             st->cfg.export_enc = optarg;
             break;
+        case VIEW_OPT_PRESET:
+            if ((ret = view_presets_parse(&st->look.video_preset, optarg)) < 0)
+                return ret;
+            break;
+        case VIEW_OPT_COLOUR:
+            if ((ret = view_presets_parse_colour(&st->look.video_preset,
+                                                 optarg)) < 0)
+                return ret;
+            break;
+        case VIEW_OPT_LIST_PRESETS:
+            /* The probe needs a device, which does not exist this early,
+             * so the list says what this build has and the panel says what
+             * this GPU can do with it. */
+            view_presets_list();
+            return 1;
         case VIEW_OPT_CROP:
             if ((ret = view_parse_crop(&st->crop, optarg)) < 0)
                 return ret;
@@ -2277,9 +2311,9 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
 
     case SDLK_RETURN:
     case SDLK_KP_ENTER:
-        /* Enter only means anything on the row that owns the menu. */
-        if (!repeat && st->focus == st->menu.row)
-            view_ui_menu_open(st);
+        /* Enter only means anything on a row that owns a menu. */
+        if (!repeat)
+            view_ui_menu_open_row(st, st->focus);
         break;
 
     case SDLK_TAB:
@@ -2781,6 +2815,7 @@ static int view_run_headless(struct view_state *st)
             .start  = st->cfg.video_start,
             .end    = st->cfg.video_end,
             .path   = st->cfg.video_path,
+            .sel    = &st->look.video_preset,
             .codec  = st->cfg.export_codec,
             .enc    = st->cfg.export_enc,
             .width  = st->cfg.video_w,
@@ -2836,9 +2871,13 @@ int main(int argc, char **argv)
         .peak_detect = true,
         .peak_detect_flag = 1,
     };
+    /* Before the arguments, so that --preset and --colour override it. */
+    view_presets_default(&st.look.video_preset);
     st.menu.kb = -1;
     for (int i = 0; i < VIEW_MENU_COLS; i++)
         st.menu.sel[i] = -1;
+    for (int i = 0; i < VIEW_MENU_KINDS; i++)
+        st.menu.rows[i] = -1;
     st.seek_to = -1;
     st.seek_target = -1;
     st.playing = true;
