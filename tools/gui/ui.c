@@ -1129,6 +1129,93 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
               view_total_gain(st) * exp2f(lk->exposure), view_peak_ceiling(st));
 }
 
+/* What the record says the lens is doing, in one word: the sign of the
+ * correction at the corner. Barrel distortion is corrected by pulling the
+ * corners in, pincushion by pushing them out. */
+static const char *view_lens_kind(const struct view_lens *ln)
+{
+    float g = ln->corner[1];
+
+    return g < -5.0f ? "barrel" : g > 5.0f ? "pincushion" : "near-neutral";
+}
+
+/* The "Lens" section: the geometric correction of DESIGN.md 16, driven by
+ * the record every frame of a Panasonic ProRes RAW clip carries in its own
+ * vendor metadata. The pipeline is always built with the pass (gpu.c), so
+ * the switch is live: it reaches the next frame while playing and puts the
+ * held picture through again while paused.
+ *
+ * The correction is the camera's, not the panel's. All this shows is what
+ * the frame on screen brought with it, because a clip whose frames carry no
+ * record cannot be corrected at all and the reason has to be visible rather
+ * than inferred from nothing happening. On a clip that zooms while
+ * recording the readout moves frame by frame, which is the record doing
+ * exactly what it is for. */
+static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_lens *ln = &st->lens;
+    bool have = ln->record.valid;
+    int on;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+
+    /* The row keeps its place on the focus ring either way, so the ring
+     * does not change shape when a clip without a record is opened; it just
+     * cannot be switched on. */
+    on = ln->on_flag;
+    if (have) {
+        view_adjust_cycle(st, view_row(st, ctx), &on, 2);
+    } else {
+        view_row(st, ctx);
+        view_step(st, false);
+    }
+    ln->on_flag = on;
+
+    if (have) {
+        nk_checkbox_label(ctx, "lens correction", &ln->on_flag);
+    } else {
+        /* Greyed: nuklear has no disabled widget, so the checkbox is drawn
+         * as a label that cannot be clicked. */
+        nk_label(ctx, "lens correction", NK_TEXT_LEFT);
+    }
+    ln->on = ln->on_flag != 0;
+
+    nk_labelf(ctx, NK_TEXT_LEFT, "%s",
+              !st->dec.raw       ? "not a raw clip"
+            : !have              ? "no lens record in this clip"
+            : ln->on             ? "on, after the colour stage"
+                                 : "off");
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+
+    if (have) {
+        nk_labelf(ctx, NK_TEXT_LEFT, "%s record: corner %+.0f px R, %+.0f px G, "
+                                     "%+.0f px B", view_lens_kind(ln),
+                  (double)ln->corner[0], (double)ln->corner[1],
+                  (double)ln->corner[2]);
+        nk_labelf(ctx, NK_TEXT_LEFT, "lateral CA R-B %+.2f px at the corner, "
+                                     "centre (%.3f, %.3f)",
+                  (double)(ln->corner[0] - ln->corner[2]),
+                  (double)ln->record.centre[0], (double)ln->record.centre[1]);
+    } else {
+        nk_label(ctx, "no lens record in this clip", NK_TEXT_LEFT);
+    }
+
+    /* Two smoothed averages of libcraw's own pass time, the way the Denoise
+     * section measures its own, so the cost shown is a measurement. */
+    if (st->cfg.verbose) {
+        if (ln->ms_on > 0.0 && ln->ms_off > 0.0) {
+            nk_labelf(ctx, NK_TEXT_LEFT, "libcraw %.2f ms on, %.2f off",
+                      ln->ms_on, ln->ms_off);
+            nk_labelf(ctx, NK_TEXT_LEFT, "the warp costs %.2f ms",
+                      ln->ms_on - ln->ms_off);
+        } else {
+            nk_labelf(ctx, NK_TEXT_LEFT, "libcraw %.2f ms; toggle to measure",
+                      st->gpu.last_gpu_ms);
+        }
+    }
+}
+
 /* The "Denoise" section: the raw domain stage of DESIGN.md 14, which runs
  * on the CFA planes before the debayer. The pipeline is always built with
  * the pass (gpu.c), so everything here is live: the strength reaches the
@@ -1374,6 +1461,11 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
     if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "Denoise", NK_MINIMIZED)) {
         view_panel_denoise(ctx, st);
+        nk_tree_pop(ctx);
+    }
+
+    if (st->dec.raw && nk_tree_push(ctx, NK_TREE_TAB, "Lens", NK_MINIMIZED)) {
+        view_panel_lens(ctx, st);
         nk_tree_pop(ctx);
     }
 

@@ -43,10 +43,18 @@ int craw_ref_debayer(const uint16_t *bayer, uint32_t width, uint32_t height,
 int craw_ref_color(float *rgb, uint32_t width, uint32_t height,
                    const CRAWFrameParams *fp, enum CRAWColorSpace out_space);
 
-/* Whole chain: [denoise,] debayer, colour. `out` receives width*height*4
- * floats. The denoise runs when `params` carries CRAW_PIPELINE_FLAG_DENOISE
- * and `fp->denoise_strength` is positive, which is the same condition
- * craw_pipeline_record() applies. */
+/* Lens correction, DESIGN.md 16: the per-channel radial warp of the linear
+ * output. `src` and `dst` are width*height*4 floats and must not be the
+ * same buffer. A correction with valid = false is a copy, which is what
+ * the pipeline's skipping the pass amounts to. */
+int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
+                  const CRAWLensCorrection *lc, float *dst);
+
+/* Whole chain: [denoise,] debayer, colour, [lens]. `out` receives
+ * width*height*4 floats. The denoise runs when `params` carries
+ * CRAW_PIPELINE_FLAG_DENOISE and `fp->denoise_strength` is positive, and
+ * the warp when it carries CRAW_PIPELINE_FLAG_LENS and `fp->lens` is
+ * valid; both are the conditions craw_pipeline_record() applies. */
 int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
                      size_t stride, const CRAWPipelineParams *params,
                      const CRAWFrameParams *fp, float *out);

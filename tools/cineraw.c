@@ -37,6 +37,7 @@
 #include <craw/pipeline.h>
 #include <craw/awb.h>
 #include <craw/noise.h>
+#include <craw/lens.h>
 
 #include "vkdev.h"
 #include "profiles.h"
@@ -63,6 +64,15 @@ enum tool_wb {
     TOOL_WB_AS_SHOT = 0,
     TOOL_WB_AUTO,
     TOOL_WB_FIXED,
+};
+
+/* Geometric lens correction. AUTO and ON both mean "apply the frame's own
+ * record"; they differ only in whether a clip that carries none is worth a
+ * warning, which it is when the user asked for the correction by name. */
+enum tool_lens {
+    TOOL_LENS_AUTO = 0,
+    TOOL_LENS_ON,
+    TOOL_LENS_OFF,
 };
 
 struct tool_cfg {
@@ -101,6 +111,8 @@ struct tool_cfg {
     CRAWNoiseModel noise;     /* a > 0 overrides the profile's table */
     bool noise_estimate;
 
+    enum tool_lens lens;
+
     const char *tables;
     const char *profile;
 };
@@ -126,6 +138,13 @@ static const struct tool_name_map tool_spaces[] = {
     { "ap0",    CRAW_CS_ACES_AP0_LINEAR },
     { "ap1",    CRAW_CS_ACES_AP1_LINEAR },
     { NULL,     0                       },
+};
+
+static const struct tool_name_map tool_lenses[] = {
+    { "auto", TOOL_LENS_AUTO },
+    { "on",   TOOL_LENS_ON   },
+    { "off",  TOOL_LENS_OFF  },
+    { NULL,   0              },
 };
 
 static const struct tool_name_map tool_encodes[] = {
@@ -234,6 +253,19 @@ static void tool_usage(FILE *f)
 "  --noise A,B         override the noise model: variance = A * u + B with u\n"
 "                      the signal above black over the sensor range. Print a\n"
 "                      clip's own pair with --noise-estimate\n"
+"  --lens on|off       geometric lens correction from the frame's own\n"
+"                      com.panasonic.Semi-Pro.optical_correction record: a\n"
+"                      per-channel radial warp after the colour stage that\n"
+"                      takes the distortion out and the lateral chromatic\n"
+"                      aberration with it. The default is on for every frame\n"
+"                      that carries a record and off for every frame that\n"
+"                      does not, so a clip from another camera is untouched;\n"
+"                      `on` says so explicitly and warns when a clip carries\n"
+"                      no record at all. With -v the corner correction per\n"
+"                      channel is printed for the first frame and again\n"
+"                      whenever it moves by more than half a pixel, which on\n"
+"                      a clip that zooms while recording is once per step of\n"
+"                      the zoom ring\n"
 "  --noise-estimate    fit A and B on every decoded frame and print them,\n"
 "                      then a summary; no GPU work and no output is written.\n"
 "                      Point it at a flat, evenly lit, unclipped field (a\n"
@@ -699,6 +731,7 @@ struct tool_gpu {
     CRAWTestImage src, dst;
     bool have_src, have_dst;
     uint32_t width, height;
+    bool lens;              /* the pipeline was built with the warp */
 };
 
 struct tool_record {
@@ -730,14 +763,14 @@ static void tool_gpu_drop_size(struct tool_gpu *g)
 /* Sized to the frame that actually came out of the decoder, cropping and
  * all, and rebuilt whenever that changes mid-clip. */
 static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
-                           uint32_t w, uint32_t h)
+                           uint32_t w, uint32_t h, bool lens)
 {
     VkFormat out_format = cfg->float32 ? VK_FORMAT_R32G32B32A32_SFLOAT
                                        : VK_FORMAT_R16G16B16A16_SFLOAT;
     CRAWPipelineParams pp;
     int ret;
 
-    if (g->pipe && g->width == w && g->height == h)
+    if (g->pipe && g->width == w && g->height == h && g->lens == lens)
         return 0;
 
     if (g->width)
@@ -770,6 +803,10 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
     pp.flags = cfg->wb == TOOL_WB_AUTO ? CRAW_PIPELINE_FLAG_AWB_HISTOGRAM : 0;
     if (cfg->denoise > 0.0f)
         pp.flags |= CRAW_PIPELINE_FLAG_DENOISE;
+    /* Only built once a frame has been seen to carry a record: a clip
+     * without one never pays for the extra image. */
+    if (lens)
+        pp.flags |= CRAW_PIPELINE_FLAG_LENS;
 
     ret = craw_pipeline_create(g->ctx, &pp, &g->pipe);
     if (ret < 0) {
@@ -779,6 +816,7 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
 
     g->width = w;
     g->height = h;
+    g->lens = lens;
 
     return 0;
 }
@@ -1179,13 +1217,72 @@ static const char *tool_detect_profile(AVFormatContext *fmt, int stream_index,
 
 /* -------------------------------------------------------------- decode */
 
+/* The lens record travels with the packet, not with the frame: it lives in
+ * the frame's vendor metadata, which the decoder does not expose, so it is
+ * read off the packet before the packet is handed over and matched back to
+ * the picture by presentation timestamp. ProRes RAW is all intra and never
+ * reorders, so in practice the match is always the oldest entry; matching
+ * by pts anyway costs nothing and stops a future reordering decoder from
+ * silently applying the wrong lens state to a frame. */
+#define TOOL_LENS_RING 8
+
+struct tool_lens_slot {
+    int64_t pts;
+    CRAWLensCorrection lc;
+    bool used;
+};
+
 struct tool_decoder {
     AVFormatContext *fmt;
     AVCodecContext *dec;
     AVPacket *pkt;
     int stream_index;
     bool draining;
+
+    /* Lens records of the packets in flight. */
+    struct tool_lens_slot lens[TOOL_LENS_RING];
+    uint64_t lens_pushed;
+    bool lens_scan;       /* look for records at all */
+    bool lens_any;        /* at least one packet carried one */
+    bool lens_none;       /* at least one packet did not */
 };
+
+/* Reads the record off a packet and files it under the packet's pts. */
+static void tool_lens_push(struct tool_decoder *d, const AVPacket *pkt)
+{
+    struct tool_lens_slot *sl;
+
+    if (!d->lens_scan)
+        return;
+
+    sl = &d->lens[d->lens_pushed++ % TOOL_LENS_RING];
+    sl->pts = pkt->pts;
+    sl->used = craw_lens_from_prores_raw(pkt->data, (size_t)pkt->size, &sl->lc) == 0;
+
+    if (sl->used)
+        d->lens_any = true;
+    else
+        d->lens_none = true;
+}
+
+/* The record filed under `pts`, or an invalid one when this frame had
+ * none. The slot is cleared so that a pts the container repeats cannot
+ * hand the same record out twice. */
+static void tool_lens_take(struct tool_decoder *d, int64_t pts,
+                           CRAWLensCorrection *out)
+{
+    *out = (CRAWLensCorrection) { 0 };
+
+    for (uint32_t i = 0; i < TOOL_LENS_RING; i++) {
+        struct tool_lens_slot *sl = &d->lens[i];
+
+        if (sl->used && sl->pts == pts) {
+            *out = sl->lc;
+            sl->used = false;
+            return;
+        }
+    }
+}
 
 static void tool_decoder_close(struct tool_decoder *d)
 {
@@ -1312,6 +1409,8 @@ static int tool_decoder_next(struct tool_decoder *d, AVFrame *frame)
             av_packet_unref(d->pkt);
             continue;
         }
+
+        tool_lens_push(d, d->pkt);
 
         ret = avcodec_send_packet(d->dec, d->pkt);
         av_packet_unref(d->pkt);
@@ -1511,6 +1610,7 @@ enum {
     TOOL_OPT_DENOISE,
     TOOL_OPT_NOISE,
     TOOL_OPT_NOISE_EST,
+    TOOL_OPT_LENS,
     TOOL_OPT_TABLES,
     TOOL_OPT_PROFILE,
 };
@@ -1536,6 +1636,7 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         { "denoise",        required_argument, NULL, TOOL_OPT_DENOISE   },
         { "noise",          required_argument, NULL, TOOL_OPT_NOISE     },
         { "noise-estimate", no_argument,       NULL, TOOL_OPT_NOISE_EST },
+        { "lens",           required_argument, NULL, TOOL_OPT_LENS      },
         { "tables",         required_argument, NULL, TOOL_OPT_TABLES    },
         { "profile",        required_argument, NULL, TOOL_OPT_PROFILE   },
         { "help",           no_argument,       NULL, 'h'                },
@@ -1656,6 +1757,11 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         case TOOL_OPT_NOISE_EST:
             cfg->noise_estimate = true;
             break;
+        case TOOL_OPT_LENS:
+            if ((ret = tool_lookup(tool_lenses, "--lens", optarg, &v)) < 0)
+                return ret;
+            cfg->lens = (enum tool_lens)v;
+            break;
         case TOOL_OPT_TABLES:
             cfg->tables = optarg;
             break;
@@ -1721,6 +1827,8 @@ int main(int argc, char **argv)
     AVFrame *frame = NULL;
     AVRational time_base = { 1, 1 };
     double gpu_ms_total = 0.0, decode_ms_total = 0.0, decode_ms_warm = 0.0;
+    float last_lens_dist = 0.0f;
+    bool have_lens_report = false, warned_no_lens = false;
     int64_t processed = 0;
     int ret;
 
@@ -1748,6 +1856,13 @@ int main(int argc, char **argv)
         goto fail;
 
     time_base = dec.fmt->streams[dec.stream_index]->time_base;
+
+    /* Reading the record is a few microseconds on a five megabyte packet
+     * and it decodes nothing, but there is no point doing it at all when
+     * the correction has been turned off. */
+    dec.lens_scan = cfg.lens != TOOL_LENS_OFF &&
+                    dec.fmt->streams[dec.stream_index]->codecpar->codec_id ==
+                        AV_CODEC_ID_PRORES_RAW;
 
     if (!cfg.profile) {
         const char *key = NULL;
@@ -1858,6 +1973,7 @@ have_device:
 
     while (cfg.frames < 0 || processed < cfg.frames) {
         CRAWFrameParams fp;
+        CRAWLensCorrection lens;
         struct tool_record rec;
         double pts_s, decode_ms, gpu_ms = 0.0;
         int64_t t0;
@@ -1985,7 +2101,42 @@ have_device:
             continue;
         }
 
-        ret = tool_gpu_resize(&gpu, &cfg, w, h);
+        /* The record was read off this frame's packet before the packet
+         * went into the decoder; the pts matches it back to the picture. */
+        tool_lens_take(&dec, frame->pts, &lens);
+
+        if (cfg.verbose && lens.valid) {
+            float dist[3], net[3];
+
+            craw_lens_corner_shift(&lens, w, h, true, dist);
+            craw_lens_corner_shift(&lens, w, h, false, net);
+
+            /* Once for the first frame, then only when the lens has
+             * actually moved: on a clip that zooms while recording this is
+             * one line per step of the ring, and on a static one it is one
+             * line for the whole clip. */
+            if (!have_lens_report || fabsf(dist[1] - last_lens_dist) > 0.5f) {
+                fprintf(stderr, "frame %5" PRId64 ": lens record, centre (%.4f, %.4f), "
+                        "corner %+.2f px R %+.2f G %+.2f B (net %+.2f/%+.2f/%+.2f, "
+                        "lateral CA R-B %+.2f px)\n", processed,
+                        (double)lens.centre[0], (double)lens.centre[1],
+                        (double)dist[0], (double)dist[1], (double)dist[2],
+                        (double)net[0], (double)net[1], (double)net[2],
+                        (double)(dist[0] - dist[2]));
+                last_lens_dist = dist[1];
+                have_lens_report = true;
+            }
+        }
+
+        if (cfg.lens == TOOL_LENS_ON && !lens.valid && !warned_no_lens) {
+            fprintf(stderr, "warning: --lens on, but this clip's frames carry no "
+                            "optical_correction record; nothing is corrected\n");
+            warned_no_lens = true;
+        }
+
+        /* The pass is only built once a frame has been seen to carry a
+         * record, so a clip without one never allocates the extra image. */
+        ret = tool_gpu_resize(&gpu, &cfg, w, h, dec.lens_any);
         if (ret < 0)
             goto fail;
 
@@ -1999,6 +2150,7 @@ have_device:
         fp.flags = cfg.clamp_negative ? CRAW_FRAME_FLAG_CLAMP_NEGATIVE : 0;
         fp.denoise_strength = cfg.denoise;
         fp.noise_override = cfg.noise;
+        fp.lens = lens;
 
         if (cfg.wb == TOOL_WB_FIXED) {
             fp.wb_mode = CRAW_WB_REBALANCE;

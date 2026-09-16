@@ -734,6 +734,438 @@ done:
 
 /* The configurations craw_pipeline_create() must refuse, plus the histogram
  * accessor on a pipeline that was never asked for one. */
+/* ----------------------------------------------------------------- lens */
+
+/* DESIGN.md 16. Three things are checked, and the geometry one is checked
+ * against arithmetic rather than against the other implementation:
+ *
+ *  - the GPU warp and craw_ref_lens() agree on the synthetic frame, and
+ *    the warped frame is far enough from the unwarped one that the
+ *    agreement means something;
+ *  - a correction marked invalid, on a pipeline built with the pass, gives
+ *    back exactly the bits a pipeline built without it does;
+ *  - a bright mark put through a polynomial whose inverse is worked out by
+ *    bisection lands where that inverse says, per channel, to a fraction of
+ *    a pixel.
+ */
+
+/* The warp is a weighted sum of sixteen fp16 samples whose weights sum to
+ * one but whose absolute values sum to as much as 1.25 per axis, so it
+ * carries at most 1.56 times the error of the image it reads into its own
+ * output. Against the 5e-3 DESIGN.md 11 allows the RCD intermediate that is
+ * 7.8e-3; the bound below is that rounded up. The geometry itself is fp32
+ * on both sides and agrees to a millionth of a pixel, so none of this is
+ * positional error. */
+#define TEST_LENS_TOL 8e-3
+
+/* The analytic test's frame. Bigger than the shared one so that a 3 pixel
+ * Gaussian near the corner has room on every side of it after being moved
+ * outwards by a tenth of the radius. */
+#define TEST_LENS_W 512
+#define TEST_LENS_H 320
+
+/* The mark is measured over a square this far either side of where it is
+ * expected; at 14 pixels a sigma 3 Gaussian is down by e^-10.9. */
+#define TEST_LENS_WIN 14
+
+/* P1000387.MOV frame 0, tools/prr_lens.md 5: the LUMIX S 24-60 at 60 mm,
+ * +81 px of pincushion corrected at the corner of a 5760x3040 frame. */
+static const CRAWLensCorrection test_lens_real = {
+    .k = {
+        { 0.9732558749542047f,  1.3826185943196782e-02f,  1.5989100451823418e-02f, -5.451906036893745e-03f },
+        { 0.9736971220864274f,  1.3698028399765133e-02f,  1.6482908551221100e-02f, -5.962137811706458e-03f },
+        { 0.9743091685055746f,  1.3363908702330294e-02f,  1.7107910468175024e-02f, -6.633721811149271e-03f },
+    },
+    .centre = { 0.5f, 0.5f },
+    .valid  = true,
+};
+
+/* A correction nobody's lens has: a tenth of the radius at the corner, two
+ * hundred times what the real record does on a frame this small, and a
+ * different coefficient per channel so that the three land visibly apart.
+ * Purely quadratic, so its inverse is a cubic that bisects in a dozen
+ * steps and the expected position is arithmetic, not a second
+ * implementation of the warp. */
+static const CRAWLensCorrection test_lens_synth = {
+    .k = {
+        { 1.0f, -0.090f, 0.0f, 0.0f },
+        { 1.0f, -0.100f, 0.0f, 0.0f },
+        { 1.0f, -0.110f, 0.0f, 0.0f },
+    },
+    .centre = { 0.5f, 0.5f },
+    .valid  = true,
+};
+
+/* Where the mark sits in the source, as a fraction of the half diagonal. */
+static const double test_lens_radii[] = { 0.35, 0.78 };
+
+static double test_lens_poly(const float k[4], double r)
+{
+    double r2 = r * r;
+
+    return k[0] + r2 * (k[1] + r2 * (k[2] + r2 * k[3]));
+}
+
+/* The destination radius whose source radius is `r_src`, i.e. the inverse
+ * of r * poly(r). Monotone over the range any real record covers, so plain
+ * bisection over [0, 2] converges to the last bit of a double in 60 steps. */
+static double test_lens_invert(const float k[4], double r_src)
+{
+    double lo = 0.0, hi = 2.0;
+
+    for (int i = 0; i < 80; i++) {
+        double mid = 0.5 * (lo + hi);
+
+        if (mid * test_lens_poly(k, mid) < r_src)
+            lo = mid;
+        else
+            hi = mid;
+    }
+
+    return 0.5 * (lo + hi);
+}
+
+/* A black frame with a Gaussian mark at each of `nb` positions, written in
+ * the prepped domain of DESIGN.md 4.1 and inverted to raw samples. No noise
+ * term: this frame is measured, not compared. */
+static void test_lens_gen_dots(uint16_t *m, uint32_t w, uint32_t h,
+                               const double (*dots)[2], int nb, double sigma,
+                               double peak)
+{
+    double inv2s2 = 1.0 / (2.0 * sigma * sigma);
+
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) {
+            int s = (int)((y & 1) * 2 + (x & 1));
+            int c = (s == 0) ? 0 : (s == 3) ? 2 : 1;
+            double v = 0.0;
+            double raw;
+            int iv;
+
+            for (int i = 0; i < nb; i++) {
+                double dx = (double)x + 0.5 - dots[i][0];
+                double dy = (double)y + 0.5 - dots[i][1];
+
+                v += peak * exp(-(dx * dx + dy * dy) * inv2s2);
+            }
+
+            raw = TEST_BLACK + (v / (double)test_wb[c]) * (TEST_WHITE - TEST_BLACK);
+            iv = (int)lrint(raw * 65535.0);
+            m[(size_t)y * w + x] = (uint16_t)(iv < 0 ? 0 : (iv > 65535 ? 65535 : iv));
+        }
+    }
+}
+
+/* First moment of one channel over a window, in the same pixel centre
+ * coordinates the warp uses. The Catmull-Rom undershoot around a bright
+ * mark is symmetric, so the samples go in signed rather than clamped:
+ * clamping them would be the thing that moved the answer. */
+static bool test_lens_centroid(const float *img, uint32_t w, uint32_t h, int c,
+                               double cx, double cy, double out[2])
+{
+    int x0 = (int)floor(cx) - TEST_LENS_WIN, x1 = (int)floor(cx) + TEST_LENS_WIN;
+    int y0 = (int)floor(cy) - TEST_LENS_WIN, y1 = (int)floor(cy) + TEST_LENS_WIN;
+    double sum = 0.0, sx = 0.0, sy = 0.0;
+
+    if (x0 < 0 || y0 < 0 || x1 >= (int)w || y1 >= (int)h)
+        return false;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            double v = img[((size_t)y * w + x) * 4 + c];
+
+            sum += v;
+            sx += v * ((double)x + 0.5);
+            sy += v * ((double)y + 0.5);
+        }
+    }
+
+    if (!(sum > 1e-3))
+        return false;
+
+    out[0] = sx / sum;
+    out[1] = sy / sum;
+
+    return true;
+}
+
+/* The geometry check. `off` and `on` are the same frame developed without
+ * and with the warp; for each mark and each channel the measured
+ * displacement is compared against the inverse of that channel's
+ * polynomial. Measuring the mark twice rather than trusting where it was
+ * put means the debayer's own reconstruction of a Bayer sampled Gaussian
+ * cancels out and what is left is the warp. */
+static int test_lens_geometry(const char *what, const float *off, const float *on,
+                              uint32_t w, uint32_t h, const CRAWLensCorrection *lc,
+                              const double (*dots)[2], int nb, double tol)
+{
+    double cx = lc->centre[0] * (double)w;
+    double cy = lc->centre[1] * (double)h;
+    double hx = (double)CRAW_MAX(lc->centre[0], 1.0f - lc->centre[0]) * (double)w;
+    double hy = (double)CRAW_MAX(lc->centre[1], 1.0f - lc->centre[1]) * (double)h;
+    double half_diag = sqrt(hx * hx + hy * hy);
+    double worst = 0.0;
+    int fails = 0;
+
+    for (int i = 0; i < nb; i++) {
+        for (int c = 0; c < 3; c++) {
+            double src[2], got[2], want[2];
+            double r_src, r_dst, scale, err;
+
+            if (!test_lens_centroid(off, w, h, c, dots[i][0], dots[i][1], src)) {
+                fprintf(stderr, "%s: mark %d channel %c was not found in the "
+                        "uncorrected frame\n", what, i, "RGB"[c]);
+                return -1;
+            }
+
+            /* Where the warp has to put what sits at `src`. */
+            r_src = hypot(src[0] - cx, src[1] - cy) / half_diag;
+            r_dst = test_lens_invert(lc->k[c], r_src);
+            scale = r_dst / r_src;
+            want[0] = cx + (src[0] - cx) * scale;
+            want[1] = cy + (src[1] - cy) * scale;
+
+            if (!test_lens_centroid(on, w, h, c, want[0], want[1], got)) {
+                fprintf(stderr, "%s: mark %d channel %c was not found near "
+                        "(%.2f, %.2f) in the corrected frame\n", what, i,
+                        "RGB"[c], want[0], want[1]);
+                return -1;
+            }
+
+            err = hypot(got[0] - want[0], got[1] - want[1]);
+            worst = CRAW_MAX(worst, err);
+
+            printf("    %s mark %d %c: r_src %.4f -> r_dst %.4f, moved %.2f px, "
+                   "landed %.3f px from where the polynomial says\n", what, i,
+                   "RGB"[c], r_src, r_dst,
+                   hypot(want[0] - src[0], want[1] - src[1]), err);
+
+            if (!(err <= tol)) {
+                fprintf(stderr, "%s: mark %d channel %c landed at (%.3f, %.3f), "
+                        "the polynomial says (%.3f, %.3f), %.3f px off, "
+                        "tolerance %.2f\n", what, i, "RGB"[c], got[0], got[1],
+                        want[0], want[1], err, tol);
+                fails++;
+            }
+        }
+    }
+
+    printf("  %s: worst placement error %.3f px (tol %.2f px)\n", what, worst, tol);
+
+    return fails ? -1 : 0;
+}
+
+static int test_lens_analytic(CRAWTestDevice *td, CRAWContext *ctx,
+                              const CRAWProfile *identity)
+{
+    const size_t npix = (size_t)TEST_LENS_W * TEST_LENS_H;
+    const int nb_dots = (int)(sizeof(test_lens_radii) / sizeof(test_lens_radii[0]));
+    /* Along the diagonal towards the bottom right corner, which is where a
+     * radial correction has the most to do. */
+    const double half_diag = sqrt((double)(TEST_LENS_W * TEST_LENS_W +
+                                           TEST_LENS_H * TEST_LENS_H)) * 0.5;
+    const double ux = (TEST_LENS_W * 0.5) / half_diag;
+    const double uy = (TEST_LENS_H * 0.5) / half_diag;
+    double dots[8][2];
+    CRAWTestImage src = { 0 }, dst = { 0 };
+    bool have_src = false, have_dst = false;
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    uint16_t *mosaic = NULL;
+    float *off = NULL, *on = NULL;
+    double ms = 0.0;
+    int ret;
+
+    for (int i = 0; i < nb_dots; i++) {
+        dots[i][0] = TEST_LENS_W * 0.5 + ux * test_lens_radii[i] * half_diag;
+        dots[i][1] = TEST_LENS_H * 0.5 + uy * test_lens_radii[i] * half_diag;
+    }
+
+    mosaic = malloc(npix * sizeof(*mosaic));
+    off = malloc(npix * 4 * sizeof(*off));
+    on = malloc(npix * 4 * sizeof(*on));
+    if (!mosaic || !off || !on) {
+        ret = CRAW_ERROR(ENOMEM);
+        goto done;
+    }
+
+    test_lens_gen_dots(mosaic, TEST_LENS_W, TEST_LENS_H, dots, nb_dots, 3.0, 0.40);
+
+    ret = craw_testdev_image_create(td, &src, TEST_LENS_W, TEST_LENS_H, VK_FORMAT_R16_UNORM);
+    if (ret < 0)
+        goto done;
+    have_src = true;
+    ret = craw_testdev_image_create(td, &dst, TEST_LENS_W, TEST_LENS_H,
+                                    VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (ret < 0)
+        goto done;
+    have_dst = true;
+    ret = craw_testdev_image_upload(td, &src, mosaic, npix * sizeof(*mosaic));
+    if (ret < 0)
+        goto done;
+
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_LENS_W;
+    pp.height = TEST_LENS_H;
+    pp.debayer = CRAW_DEBAYER_RCD;
+    pp.out_space = CRAW_CS_XYZ_D65;
+    pp.flags = CRAW_PIPELINE_FLAG_LENS;
+
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+
+    /* Uncorrected: the pass is built but this frame has no record. */
+    ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, off, NULL, NULL, &ms);
+    if (ret < 0)
+        goto done;
+
+    fp.lens = test_lens_synth;
+    ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, on, NULL, NULL, &ms);
+    if (ret < 0)
+        goto done;
+
+    ret = test_lens_geometry("gpu", off, on, TEST_LENS_W, TEST_LENS_H,
+                             &test_lens_synth, dots, nb_dots, 0.25);
+    if (ret < 0)
+        goto done;
+
+    /* The same two frames from the CPU reference, so that the definition is
+     * held to the arithmetic too and not only the shader. */
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+    ret = craw_ref_process(mosaic, TEST_LENS_W, TEST_LENS_H, TEST_LENS_W, &pp, &fp, off);
+    if (ret < 0)
+        goto done;
+    fp.lens = test_lens_synth;
+    ret = craw_ref_process(mosaic, TEST_LENS_W, TEST_LENS_H, TEST_LENS_W, &pp, &fp, on);
+    if (ret < 0)
+        goto done;
+
+    ret = test_lens_geometry("ref", off, on, TEST_LENS_W, TEST_LENS_H,
+                             &test_lens_synth, dots, nb_dots, 0.25);
+
+done:
+    if (ret < 0)
+        fprintf(stderr, "the analytic lens check failed: %d\n", ret);
+    if (have_dst)
+        craw_testdev_image_free(td, &dst);
+    if (have_src)
+        craw_testdev_image_free(td, &src);
+    free(on);
+    free(off);
+    free(mosaic);
+
+    return ret;
+}
+
+static int test_lens(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                     const uint16_t *mosaic, CRAWTestImage *src, CRAWTestImage *dst,
+                     float *gpu, float *ref)
+{
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    float *plain = NULL;
+    double ms_off = 0.0, ms_on = 0.0, ms_skip = 0.0, err, cross;
+    int ret;
+
+    plain = malloc(npix * 4 * sizeof(*plain));
+    if (!plain)
+        return CRAW_ERROR(ENOMEM);
+
+    /* 1. The chain with no lens pass at all, kept as the thing every "off"
+     *    case has to reproduce. */
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_W;
+    pp.height = TEST_H;
+    pp.debayer = CRAW_DEBAYER_RCD;
+    pp.out_space = CRAW_CS_XYZ_D65;
+
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+
+    ret = test_run_config(td, ctx, src, dst, &pp, &fp, plain, NULL, NULL, &ms_off);
+    if (ret < 0)
+        goto done;
+
+    /* 2. The pass built, this frame without a record: the warp drops out
+     *    and the colour stage writes the caller's image as it always did,
+     *    so the two frames have to be equal bit for bit. */
+    pp.flags = CRAW_PIPELINE_FLAG_LENS;
+    ret = test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms_skip);
+    if (ret < 0)
+        goto done;
+
+    if (memcmp(gpu, plain, npix * 4 * sizeof(*gpu))) {
+        size_t bad = 0;
+
+        for (size_t i = 0; i < npix * 4; i++)
+            if (gpu[i] != plain[i])
+                bad++;
+        fprintf(stderr, "an invalid correction changed %zu of %zu samples; it has to "
+                "leave the frame exactly alone\n", bad, npix * 4);
+        ret = -1;
+        goto done;
+    }
+
+    ret = craw_ref_process(mosaic, TEST_W, TEST_H, TEST_W, &pp, &fp, ref);
+    if (ret < 0)
+        goto done;
+    err = test_max_abs(gpu, ref, npix);
+    printf("  lens off (no record): identical to the plain chain, %.3e against the "
+           "reference, %.3f ms against %.3f without the pass\n", err, ms_skip, ms_off);
+    if (!(err <= TEST_LENS_TOL)) {
+        fprintf(stderr, "the skipped warp differs from the reference by %.3e\n", err);
+        ret = -1;
+        goto done;
+    }
+
+    /* 3. The warp running, against the reference, and far enough from the
+     *    unwarped frame that the agreement is worth something. */
+    for (int real = 0; real < 2; real++) {
+        const CRAWLensCorrection *lc = real ? &test_lens_real : &test_lens_synth;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.lens = *lc;
+
+        ret = test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms_on);
+        if (ret < 0)
+            goto done;
+
+        cross = test_max_abs(gpu, plain, npix);
+
+        ret = craw_ref_process(mosaic, TEST_W, TEST_H, TEST_W, &pp, &fp, ref);
+        if (ret < 0)
+            goto done;
+
+        err = test_max_abs(gpu, ref, npix);
+        printf("  lens on (%s record): max abs %.3e (tol %.1e), %.3e against the "
+               "uncorrected frame, %.3f ms\n", real ? "real" : "synthetic", err,
+               TEST_LENS_TOL, cross, ms_on);
+
+        if (!(err <= TEST_LENS_TOL)) {
+            fprintf(stderr, "the GPU warp differs from the reference by %.3e, "
+                    "tolerance %.1e\n", err, TEST_LENS_TOL);
+            ret = -1;
+            goto done;
+        }
+        if (!(cross > 5.0 * err)) {
+            fprintf(stderr, "the corrected frame is only %.3e from the uncorrected "
+                    "one; the warp cannot have run\n", cross);
+            ret = -1;
+            goto done;
+        }
+    }
+
+    ret = test_lens_analytic(td, ctx, identity);
+
+done:
+    free(plain);
+
+    return ret;
+}
+
 static int test_validation(CRAWContext *ctx)
 {
     CRAWAwbHistogram hist;
@@ -1135,6 +1567,9 @@ int main(void)
     }
 
     if (test_denoise(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
+
+    if (test_lens(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
         goto done;
 
     if (test_real_frame(&td, ctx, &profile) < 0)

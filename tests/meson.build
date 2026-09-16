@@ -40,6 +40,29 @@ foreach t : [ 'test_profile', 'test_ref_debayer', 'test_awb' ]
     test(t, exe, timeout: 120)
 endforeach
 
+# The ProRes RAW lens record parser. CPU only, and its frame comes from
+# tests/data, so it always runs. libavformat is asked for again here rather
+# than reused from tools/ because meson walks tests/ first; with it, and
+# with CRAW_TEST_CLIP pointing at a clip, the test also parses a packet
+# straight out of a real file.
+lens_lavf = dependency('libavformat', required: false)
+lens_lavc = dependency('libavcodec', required: false)
+lens_lavu = dependency('libavutil', required: false)
+lens_deps = [ craw_static_dep, cc.find_library('m', required: false) ]
+lens_args = [ '-DTEST_SOURCE_DIR="' + meson.current_source_dir() + '"' ]
+if lens_lavf.found() and lens_lavc.found() and lens_lavu.found()
+    lens_args += '-DCRAW_TEST_HAVE_LAVF=1'
+    lens_deps += [ lens_lavf, lens_lavc, lens_lavu ]
+else
+    lens_args += '-DCRAW_TEST_HAVE_LAVF=0'
+endif
+
+exe = executable('test_lens', 'test_lens.c',
+    dependencies: lens_deps,
+    link_language: 'cpp',
+    c_args: lens_args)
+test('test_lens', exe, timeout: 120)
+
 # GPU tests: exit with 77 (skipped) when no suitable device exists.
 foreach t : [ 'test_pipeline' ]
     exe = executable(t, t + '.c',

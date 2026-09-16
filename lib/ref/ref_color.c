@@ -124,6 +124,24 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
     }
 
     ret = craw_ref_color(out, width, height, fp, params->out_space);
+    if (ret < 0)
+        goto done;
+
+    /* The warp cannot run in place, so the coloured frame is moved aside
+     * and the result written back over `out`. */
+    if ((params->flags & CRAW_PIPELINE_FLAG_LENS) && fp->lens.valid) {
+        size_t n = (size_t)width * height * 4;
+        float *linear = malloc(n * sizeof(*linear));
+
+        if (!linear) {
+            ret = CRAW_ERROR(ENOMEM);
+            goto done;
+        }
+
+        memcpy(linear, out, n * sizeof(*linear));
+        ret = craw_ref_lens(linear, width, height, &fp->lens, out);
+        free(linear);
+    }
 
 done:
     free(clean);

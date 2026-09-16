@@ -192,6 +192,15 @@ float view_denoise_strength(const struct view_state *st)
     return st->denoise.strength;
 }
 
+/* The warp runs when the switch is on and the picture on screen carried a
+ * record. A clip whose frames have none - every ProRes RAW clip that is not
+ * from this camera - can never turn it on, which is why the panel's row
+ * greys out rather than lying. */
+bool view_lens_active(const struct view_state *st)
+{
+    return st->dec.raw && st->lens.on && st->lens.record.valid;
+}
+
 void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
 {
     craw_frame_params_init(fp);
@@ -202,6 +211,11 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
      * so craw_pipeline_record() evaluates the table at the frame's own
      * as-shot index. */
     fp->denoise_strength = view_denoise_strength(st);
+    /* By value: the record is this frame's own and the next frame's will be
+     * different, so the parameters must not point at anything the panel
+     * owns. An invalid one is the documented "leave this frame alone". */
+    if (view_lens_active(st))
+        fp->lens = st->lens.record;
 
     if (st->look.wb == VIEW_WB_MANUAL && st->prof.nb_wb_knots) {
         fp->wb_mode = CRAW_WB_REBALANCE;
@@ -224,6 +238,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .ambience   = st->awb.params.ambience,
         .debayer    = st->look.debayer,
         .denoise    = view_denoise_strength(st),
+        .lens       = view_lens_active(st),
     };
 }
 
@@ -238,7 +253,7 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->illum.cct == b->illum.cct && a->illum.tint == b->illum.tint &&
            a->ei == b->ei && a->exposure == b->exposure &&
            a->ambience == b->ambience && a->debayer == b->debayer &&
-           a->denoise == b->denoise;
+           a->denoise == b->denoise && a->lens == b->lens;
 }
 
 const char *view_clip_dir(const struct view_state *st)
@@ -992,6 +1007,10 @@ static int view_process_frame(struct view_state *st)
 
         *acc = *acc > 0.0 ? *acc * 0.9 + st->gpu.last_gpu_ms * 0.1
                           : st->gpu.last_gpu_ms;
+
+        acc = st->gpu.last_gpu_lens ? &st->lens.ms_on : &st->lens.ms_off;
+        *acc = *acc > 0.0 ? *acc * 0.9 + st->gpu.last_gpu_ms * 0.1
+                          : st->gpu.last_gpu_ms;
     }
 
     /* The histogram describes the frame that was just processed; what comes
@@ -1084,6 +1103,14 @@ int view_step_frame(struct view_state *st)
     st->timing.frames++;
     if (ret)
         return ret;
+
+    /* The lens record belongs to this picture and is taken exactly once,
+     * here: view_process_frame() runs again whenever a paused frame is
+     * replayed, and the ring hands each record out only the first time. */
+    view_decoder_lens(&st->dec, st->frame->pts, &st->lens.record);
+    if (st->lens.record.valid)
+        craw_lens_corner_shift(&st->lens.record, (uint32_t)st->frame->width,
+                               (uint32_t)st->frame->height, true, st->lens.corner);
 
     start = vs->start_time != AV_NOPTS_VALUE ? vs->start_time : 0;
     pts = st->frame->pts != AV_NOPTS_VALUE ? st->frame->pts : 0;
@@ -1263,6 +1290,13 @@ static void view_usage(FILE *f)
 "                      0.25 to 3.0, 0 (the default) leaves it off. Needs a\n"
 "                      noise model for the clip's ISO; the Denoise section\n"
 "                      says which one it found\n"
+"  --lens on|off       geometric lens correction from each frame's own\n"
+"                      optical_correction record: a per-channel radial warp\n"
+"                      after the colour stage that takes the distortion out\n"
+"                      and the lateral chromatic aberration with it. On by\n"
+"                      default for a clip whose frames carry a record, and a\n"
+"                      no-op for one that does not; the Lens section says\n"
+"                      which it is and what the record does at the corner\n"
 "  --tone-map NAME     bt.2390, spline, reinhard or clip (default: bt.2390)\n"
 "  --gamut-map NAME    perceptual, softclip, relative, clip or desaturate\n"
 "  --lut NAME          a .cube LUT applied by the renderer: a file, or the\n"
@@ -1356,6 +1390,7 @@ enum {
     VIEW_OPT_LIST_LUTS,
     VIEW_OPT_GRAIN,
     VIEW_OPT_DENOISE,
+    VIEW_OPT_LENS,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
 };
@@ -1391,6 +1426,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "zoom",     required_argument, NULL, VIEW_OPT_ZOOM      },
         { "grain",    required_argument, NULL, VIEW_OPT_GRAIN     },
         { "denoise",  required_argument, NULL, VIEW_OPT_DENOISE   },
+        { "lens",     required_argument, NULL, VIEW_OPT_LENS      },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
         { "help",     no_argument,       NULL, 'h'                },
@@ -1455,6 +1491,18 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             if ((ret = view_grain_parse(&st->grain, optarg)) < 0)
                 return ret;
             break;
+        case VIEW_OPT_LENS:
+            if (!strcmp(optarg, "on")) {
+                st->lens.on = true;
+            } else if (!strcmp(optarg, "off")) {
+                st->lens.on = false;
+            } else {
+                fprintf(stderr, "--lens: expected on or off, got `%s`\n", optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            st->lens.on_flag = st->lens.on ? 1 : 0;
+            break;
+
         case VIEW_OPT_DENOISE: {
             float v2 = strtof(optarg, &end);
 
@@ -2331,6 +2379,11 @@ int main(int argc, char **argv)
      * defaults. The strength is set even though the stage is off, so that
      * the panel's switch turns it on at something sensible. */
     st.denoise.strength = 1.0f;
+    /* On by default: a frame that carries a record is a frame the camera
+     * expects to be corrected, and one that does not is untouched either
+     * way. --lens off turns it off. */
+    st.lens.on = true;
+    st.lens.on_flag = 1;
     view_grain_defaults(&st.grain);
     view_adjust_defaults(&st.adjustments);
 

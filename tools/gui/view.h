@@ -39,6 +39,7 @@
 #include <craw/pipeline.h>
 #include <craw/profile.h>
 #include <craw/awb.h>
+#include <craw/lens.h>
 
 #define VIEW_MAX_PATH 1024
 
@@ -118,6 +119,10 @@ struct view_pipeline_look {
     /* The strength the pass actually ran at, 0 when it did not: a toggle
      * while paused has to put the frame through again. */
     float denoise;
+    /* Whether the lens warp ran, for the same reason. The record itself is
+     * the frame's own and changes with it, so a replay of the *same* frame
+     * only has to notice the switch. */
+    bool lens;
 };
 
 struct view_name_map {
@@ -204,8 +209,18 @@ struct view_reader {
     SDL_Condition *ready;            /* the main loop waits here for a seek */
 
     AVPacket *q[VIEW_PKTQ_MAX];
+    /* The lens record of each queued packet, read by the reader thread as
+     * it queues it: the record lives in the frame's vendor metadata, which
+     * the decoder does not expose, so it has to come off the packet, and
+     * the reader thread is where the packet already is. Invalid for a
+     * packet that carries none. */
+    CRAWLensCorrection lens[VIEW_PKTQ_MAX];
     int head, count;
     size_t bytes;
+
+    /* Whether to look for records at all. Written once before the thread
+     * starts and read-only afterwards. */
+    bool scan;
 
     bool eof;                   /* the file is exhausted */
     bool quit;
@@ -234,6 +249,25 @@ struct view_decoder {
 
     struct view_reader reader;
     bool pkt_held;              /* d->pkt holds one the decoder refused */
+    CRAWLensCorrection pkt_lens;  /* and its record */
+
+    /* Records of the packets in flight, matched back to the picture that
+     * comes out by presentation timestamp. ProRes RAW is all intra and
+     * never reorders, so the match is always the oldest entry; going by
+     * pts anyway costs nothing and keeps a reordering decoder from ever
+     * putting one frame's lens state on another's picture. */
+    struct {
+        int64_t pts;
+        CRAWLensCorrection lc;
+        bool used;
+    } lens_ring[8];
+    uint64_t lens_pushed;
+
+    /* What the clip turned out to carry, decided as pictures come out:
+     * `lens_any` is what makes the panel's row live and the pass get
+     * built. */
+    bool lens_any;
+    bool lens_none;
     /* Set when the codec context was rebuilt: its frame pool is new, so
      * every VkImageView cached for the old images is now dangling. */
     bool frames_reset;
@@ -339,6 +373,9 @@ struct view_gpu {
      * the right one of the panel's two averages. */
     bool slot_denoise[VIEW_SLOTS];
     bool last_gpu_denoise;
+    /* The same for the lens warp. */
+    bool slot_lens[VIEW_SLOTS];
+    bool last_gpu_lens;
 
     /* The pipeline's output: one libplacebo texture per slot, held for the
      * duration of libcraw's submission into it. */
@@ -554,6 +591,31 @@ struct view_denoise {
     double ms_on, ms_off;
 };
 
+/* Geometric lens correction, as the panel holds it. The correction itself
+ * is the frame's own - it changes every frame while the lens zooms or
+ * focuses - so the panel holds only the switch and what the picture on
+ * screen carried, for the readout. See DESIGN.md 16.
+ *
+ * `on` is what the user asked for; the pass only runs when the frame also
+ * has a record, which view_lens_active() is the single answer to. */
+struct view_lens {
+    bool on;
+    int on_flag;                /* nuklear's checkbox wants an int */
+
+    /* The record of the picture on screen, copied out of the packet it came
+     * from. Invalid when that frame carried none. */
+    CRAWLensCorrection record;
+
+    /* The corner correction of that record, per channel, in pixels, with
+     * the crop divided out: what the lens actually does. Only meaningful
+     * while `record.valid`. */
+    float corner[3];
+
+    /* libcraw's own pass time with and without the warp, smoothed
+     * separately, the way the Denoise section measures its own. */
+    double ms_on, ms_off;
+};
+
 /* Film grain, as the panel holds it. grain.c turns this into the parameters
  * libplacebo's grain shaders take and grain_ui.c does the turning; nothing
  * here reaches the raw pipeline, because the grain is applied at
@@ -595,6 +657,7 @@ struct view_state {
     struct view_crop crop;
     struct view_grain grain;
     struct view_denoise denoise;
+    struct view_lens lens;
     struct view_adjust adjustments;
 
     /* Keyboard focus through the panel's adjustable rows. `row` counts them
@@ -737,6 +800,12 @@ double view_decoder_queued(struct view_decoder *d);
 /* Fills `p` from the frame's AV_FRAME_DATA_RAW_COLOR_PARAMS side data. */
 int  view_profile_from_frame(CRAWProfile *p, const AVFrame *frame);
 
+/* The lens record of the picture with this presentation timestamp, read off
+ * the packet it was decoded from. `out` is left invalid when that frame
+ * carried none. */
+void view_decoder_lens(struct view_decoder *d, int64_t pts,
+                       CRAWLensCorrection *out);
+
 /* ----------------------------------------------------------- export.c */
 
 /* Starts writing one frame to one file. An empty `path` means the default
@@ -827,6 +896,12 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp);
  * as-shot exposure index, and false when there is none. Either pointer may
  * be NULL. */
 bool view_denoise_model(const struct view_state *st, CRAWNoiseModel *nm, float *iso);
+
+/* Whether the lens warp will run on the frame on screen: the switch is on
+ * and that frame carried a record. Everything that has to agree on whether
+ * the stage ran - the frame parameters, the look the picture was processed
+ * with, the panel - asks this. */
+bool view_lens_active(const struct view_state *st);
 
 /* The strength the denoise stage will actually run at: zero unless the
  * switch is on, the strength is positive and a model exists. */

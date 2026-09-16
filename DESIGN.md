@@ -26,33 +26,22 @@ In:
   including a sensor noise model by exposure index.
 - Raw domain denoising: non-local means on the four CFA planes in a
   variance stabilised domain, optional, per-frame strength. Section 14.
+- Geometric lens correction: a per-channel radial resampling warp on the
+  linear output, driven per frame by the camera's own
+  `com.panasonic.Semi-Pro.optical_correction` record, which the library
+  also parses (`<craw/lens.h>`). Optional, per-frame, and a no-op on a
+  frame that carries no record. Section 16.
 - CPU reference of every stage, tests comparing it against the GPU.
 
 Out, deliberately, with a slot reserved: temporal denoising (section 14.7
 says how it attaches), a second chroma-only denoise stage (14.4 says why
 not yet), scaling, learned debayer, highlight reconstruction beyond the
-clip, OCIO-generated transforms, LUTs, other CFA phases, ARRIRAW and BRAW
-profiles, and lens correction. (The GUI, cineview, exists under tools/gui as a consumer of
-the library: it is not part of the library's scope.) On the last one: Panasonic ProRes RAW frames carry a
-per-frame `com.panasonic.Semi-Pro.optical_correction` record in the
-vendor metadata after the last tile, framed as a `psim` record (be32 size
-counting itself and the fourcc, then the fourcc, a Pascal-string key, and
-the payload) in the list that `eomd` terminates. Payload: a be32 version,
-3 in every frame seen, then 20 big-endian doubles, per channel R, G, B a
-radial polynomial k0..k3 plus two zero pads, then the optical centre in
-normalized frame coordinates, always exactly (0.5, 0.5). The coefficients
-follow zoom and focus frame by frame and encode distortion with lateral
-chromatic aberration in the destination-to-source convention,
-`r_src = r_dst * (k0 + k1 r^2 + k2 r^4 + k3 r^6)` per channel, with r
-normalized by the coded frame's half diagonal so r = 1 is the corner, and
-k0 below 1.0 acting as the crop that keeps a pincushion correction inside
-the frame. Vignetting is not in the record. The layout, the direction and
-the normalization are confirmed against Panasonic's own in-camera
-distortion block in RW2 stills of the same lens at the same focal length;
-`tools/prr_lens.py` extracts the record and `tools/prr_lens.md` is the
-derivation. A lens stage would be a per-channel resampling warp after the
-debayer and before any scaling, fed through the profile or per-frame
-params.
+clip, OCIO-generated transforms, LUTs, other CFA phases, and ARRIRAW and
+BRAW profiles. Vignetting is out too, and unlike distortion it is out for
+good on this camera: the optical_correction record carries no shading
+term, because Panasonic applies shading correction in the camera before the
+sensels are written. (The GUI, cineview, exists under tools/gui as a
+consumer of the library: it is not part of the library's scope.)
 
 ## 2. Conventions
 
@@ -94,6 +83,10 @@ denoise stage and read by the debayer in its place. Section 14.1.
 
 Intermediate image (internal): `VK_FORMAT_R16G16B16A16_SFLOAT`, camera RGB
 after prep and debayer, alpha unused.
+
+Linear image (internal, only with `CRAW_PIPELINE_FLAG_LENS`): the output
+format, holding what the colour stage produced before the lens warp reads
+it. Section 16.3.
 
 Output image: `VK_FORMAT_R16G16B16A16_SFLOAT` or `R32G32B32A32_SFLOAT`,
 linear light in the requested colour space, alpha 1.0.
@@ -180,6 +173,14 @@ bin; at 1/8 resolution that needs a flat neutral covering a quarter of an
 BINS = 128, LOG_MIN = -2.5, LOG_MAX = 1.0 (see `craw/awb.h`). The buffers
 are zeroed by the pipeline at the start of each recording (vkCmdFillBuffer)
 and copied to a host-visible readback buffer at the end.
+
+### 4.5 Lens correction (optional, last)
+
+A per-channel radial resampling warp of the linear output, in the
+destination-to-source convention, driven by the frame's own record. Defined
+in section 16; nothing else in this section changes when it runs, and the
+auto white balance histogram of 4.4 is two stages ahead of it and is not
+affected at all.
 
 ## 5. Debayer definitions
 
@@ -474,8 +475,11 @@ for containers without them.
   readback buffer is host visible and cached.
 - The pipeline records, per frame: barrier src to GENERAL/compute read,
   [fill histogram buffers], [denoise pass], debayer passes, [awb
-  histogram], colour pass, [copy histogram to readback], and a final
-  barrier that returns dst to the caller's stated layout. The denoise pass
+  histogram], colour pass, [lens pass], [copy histogram to readback], and a
+  final barrier that returns dst to the caller's stated layout. With the
+  lens pass the colour pass writes the internal linear image and the lens
+  pass writes dst; without it, or on a frame whose correction is invalid,
+  the colour pass writes dst and no lens pass is recorded at all. The denoise pass
   dispatches one workgroup slice per CFA plane over a half resolution grid
   (`gl_WorkGroupID.z` selects the plane) and the debayer then reads its
   output image instead of the caller's source.
@@ -492,13 +496,19 @@ for containers without them.
   bilinear and MHC reproduce a linear ramp exactly away from borders; all
   three methods reproduce a constant colour exactly; borders never NaN.
 - `test_awb`: estimator and smoother on synthetic histograms/tracks.
+- `test_lens`: the ProRes RAW record parser, on real camera bytes stored in
+  `tests/data/prr_lens_frame0.bin`, plus a real packet through libavformat
+  when `CRAW_TEST_CLIP` names a clip. Section 16.5.
 - `test_pipeline`: GPU vs CPU reference on a synthetic 256x160 mosaic and,
   when `TEST_SOURCE_DIR/../samples` or `CRAW_TEST_FRAME` provides one, on a
   real frame dump. Tolerances: bilinear/MHC 2e-3 absolute per channel on
   the camera RGB intermediate (fp16), 1e-2 relative on the colour output;
   RCD 5e-3 / 1.5e-2. The denoise stage is held to the same bounds, plus the
   checks of section 14.6 that it ran, that it removed noise and that it
-  kept detail. lavapipe is acceptable for these tests; it exposes
+  kept detail. The lens stage is held to 8e-3 absolute plus the checks of
+  section 16.5 that it ran, that switching it off reproduces the plain
+  chain bit for bit, and that a mark lands within 0.25 px of where the
+  polynomial's inverse says it should. lavapipe is acceptable for these tests; it exposes
   everything required.
 
 ## 11b. Known API limitations to revisit
@@ -525,10 +535,12 @@ Contract files, owned by the integrator: everything under `include/`,
   `lib/vk_image.c`, `lib/vk_shader.c`, `lib/vma/vma.cpp`, `tests/vkdev.c`.
 - Shaders and pipeline: `lib/shaders/*.glsl`, `lib/shaders/meson.build`,
   `lib/pipeline.c`, `tests/test_pipeline.c`.
-- Colour science, noise, reference, CPU tests: `lib/profile.c`,
-  `lib/colorspace.c`, `lib/awb.c`, `lib/awb_smoother.c`, `lib/noise.c`,
-  `lib/ref/ref_debayer.c`, `lib/ref/ref_color.c`, `lib/ref/ref_denoise.c`,
-  `tests/test_profile.c`, `tests/test_ref_debayer.c`, `tests/test_awb.c`.
+- Colour science, noise, lens records, reference, CPU tests:
+  `lib/profile.c`, `lib/colorspace.c`, `lib/awb.c`, `lib/awb_smoother.c`,
+  `lib/noise.c`, `lib/lens.c`, `lib/ref/ref_debayer.c`,
+  `lib/ref/ref_color.c`, `lib/ref/ref_denoise.c`, `lib/ref/ref_lens.c`,
+  `tests/test_profile.c`, `tests/test_ref_debayer.c`, `tests/test_awb.c`,
+  `tests/test_lens.c`.
 
 Anyone needing a change to a contract file reports it instead of editing.
 
@@ -1800,3 +1812,313 @@ on. The difference is negative both times, i.e. the loop is decode-bound on
 shader work, and the added instructions fit entirely in the slack. The
 run-to-run spread, with other GPU work on the machine, is larger than
 anything the hooks could cost.
+
+## 16. Lens correction
+
+Panasonic's cameras write a geometric lens correction into every ProRes RAW
+frame, in the vendor metadata after the last tile, and it changes frame by
+frame as the lens zooms and focuses. `tools/prr_lens.md` is the derivation
+of the record from the bytes of real clips, from Apple's decoder and from
+Panasonic's own in-camera block in RW2 stills; this section is what libcraw
+does with it. Nothing below re-derives any of it.
+
+### 16.1 The record, and where it is read
+
+Frame layout, as `libavcodec/prores_raw.c` walks it: a be32 size, `prrf`, a
+be16 header length, the header body, `nb_tiles` be16 tile sizes, the tile
+data, and then a list of vendor metadata records that `eomd` ends. Each
+record is a be32 size counting itself and its fourcc, the fourcc, and for a
+`psim` record a Pascal-string key and the payload. The one that matters has
+the key `com.panasonic.Semi-Pro.optical_correction` and a payload of a be32
+version — 3 in every frame seen — followed by twenty big-endian doubles:
+three channel blocks of six in the order R, G, B, each `k0 k1 k2 k3` and
+two slots that are exactly +0.0 everywhere, then the optical centre, which
+is exactly (0.5, 0.5) on every frame of every clip.
+
+`craw_lens_from_prores_raw()` in `lib/lens.c` does that walk on a demuxed
+packet and fills a `CRAWLensCorrection`. It derives the trailer's offset
+from the header and the tile table rather than searching the frame for the
+key string, because a search would also find those bytes inside a tile and
+would say nothing about whether what follows them is a record. Every read
+is bounds checked against the frame's own size field, which is itself
+checked against the packet. No tile is decoded and no pixel is read; on a
+5 MB frame it is a few microseconds.
+
+It lives in the library rather than in either tool because both tools need
+it, and it is the only part of libcraw that looks at a bitstream at all —
+it is a metadata walk, not a decoder, and it is kept to that: it never
+touches Vulkan and never allocates.
+
+Three answers come back. A record found and decoded is 0. `ENOENT` is a
+frame that carries no such record, which covers both a clip from another
+camera whose metadata list simply lacks one and a frame with no list at
+all: an FX6 recorded to an Atomos Ninja V ends its frames with a few dozen
+bytes that are neither records nor zero and contain no `eomd` anywhere, and
+"this frame has no record" is the useful answer there. `EINVAL` is kept for
+a packet that is not a walkable ProRes RAW frame, and for an
+optical_correction record that is present but the wrong shape — an unknown
+version, a payload that is not 164 bytes, a coefficient that is not finite,
+a centre outside the frame. On every failure the output is zeroed, i.e.
+left invalid, so a caller that only wants "correct it if you can" can
+ignore the return value entirely.
+
+The record's doubles are narrowed to float in `CRAWLensCorrection`. At
+r <= 1 with these magnitudes that is under a thousandth of a pixel on a
+5.8K frame, and both the shader and the CPU reference evaluate in fp32
+anyway, so carrying doubles would only move the rounding somewhere less
+visible.
+
+### 16.2 The model, and the coordinate conventions
+
+Destination to source, per channel, about the optical centre:
+
+    r_src = r_dst * (k0 + k1 r_dst^2 + k2 r_dst^4 + k3 r_dst^6)
+
+For an output pixel at normalized radius `r_dst` from the centre, the
+source is sampled on the same ray at `r_src`. The three channels share the
+ray and differ only in the polynomial; that difference is the lens's
+lateral chromatic aberration, and it runs to about two pixels at the corner
+on the 24-60.
+
+The conventions, spelled out because everything in the stage depends on
+them:
+
+- **The frame is the coded frame.** The pipeline develops the whole readout
+  — the decoder is told not to crop (`apply_cropping = 0` in both tools),
+  the debayer starts at sensel (0, 0), and the picture the frame header
+  marks inside the readout is a *view* of the result, applied after the
+  pipeline by `--crop`. The record normalizes against the frame the camera
+  read out, so the stage does too: a `CRAWPipeline` created for
+  `width x height` uses exactly that. If a future caller ever hands the
+  pipeline a pre-cropped frame, the record would have to be re-normalized
+  first, and that is the caller's problem, not the stage's: the stage has
+  one frame and it is the one the pipeline was created for.
+- **The centre is in normalized frame coordinates**, so in pixels it is
+  `(cx * W, cy * H)` in a continuous coordinate system where integer pixel
+  `p` sits at `p + 0.5`. With the camera's (0.5, 0.5) that is `(W/2, H/2)`,
+  the exact geometric centre, and the geometry is symmetric about it.
+- **r = 1 is the frame corner** as seen from that centre, i.e. the radius
+  is normalized by `hypot(max(cx, 1-cx) * W, max(cy, 1-cy) * H)`. For a
+  centred optic on 5760x3040 that is 3256.5 px. Both the shader and
+  `craw_lens_corner_shift()` take the farther side on each axis, so an
+  off-centre record would still put r = 1 at the corner that is actually
+  farthest away.
+- **The centre and that radius are computed on the host**, once per frame,
+  and reach the shader as pixels and a reciprocal. A shader that recomputed
+  them would be doing the same divide seventeen million times.
+
+`k0` is not distortion; it is the crop. A pincushion correction pushes the
+corners outward and would sample off the sensor, so the camera scales the
+whole frame down by just enough to stop that: `k0` falls to 0.967 at the
+long end of the 24-60 and sits at 0.999 at the wide end, where a barrel
+correction samples inward anyway and no crop is needed. Two numbers follow
+from the polynomial and `craw_lens_corner_shift()` returns either:
+`poly(1) - 1` times the half diagonal is the *net* corner shift, a handful
+of pixels, and `poly(1)/poly(0) - 1` times the half diagonal is the
+distortion that is actually being corrected — -207 px at 24 mm, +100 px at
+60 mm, +110 px on the Sigma 135. The second is the one to show a person.
+
+Because `poly(1)` lands just below 1.0 on every frame measured, the source
+position never leaves the frame; the border rule below exists for the
+kernel's footprint, not for the sampling position.
+
+### 16.3 Where the stage sits
+
+After the colour pass, on the linear output image, and last. Section 1
+originally reserved it as "a per-channel resampling warp after the debayer
+and before any scaling", and after the colour pass is the earliest point
+that is true of: the warp needs the three channels in the same image, which
+is anything after the debayer, and it must not run on the mosaic, where
+resampling a CFA would be meaningless. Running it after the colour pass
+rather than on the camera RGB intermediate also means it resamples the
+values the caller is going to look at — one interpolation, in the space the
+picture is finally in, instead of one before a matrix that would spread its
+error across channels.
+
+With `CRAW_PIPELINE_FLAG_LENS` the colour pass writes an internal image and
+the warp writes the caller's destination; without the flag nothing changes
+and the colour pass writes the destination as it always did. The internal
+image is created in the pipeline's own `out_format`, so RGBA16F by default
+and RGBA32F when the caller asked for 32-bit output: a caller who asked for
+32 bits asked for them all the way, and an internal image is no place to
+quantize them away.
+
+The auto white balance histogram is not affected. It reads the *camera RGB*
+intermediate (section 4.4), two stages ahead of the warp, so it describes
+the frame the camera saw and not the frame the lens correction produced.
+That is the right way round: the estimator's locus is the camera's, and a
+geometric resample of the picture does not change what illuminant lit it.
+
+`CRAWFrameParams` carries a `CRAWLensCorrection` **by value**, not by
+pointer. The record is different on every frame of a clip that is zooming,
+and a player with several frames in flight must be able to keep each
+frame's parameters self-contained; a pointer would mean the parameters
+outliving whatever the panel or the decoder owned. A correction with
+`valid` false means "leave this frame alone", and it is not a cheap copy
+but no pass at all: the warp drops out of the recording and the colour pass
+writes the caller's destination, so the frame is **bit for bit** what a
+pipeline built without the flag produces. That is what makes the switch a
+live control and what makes a clip with no record cost nothing.
+
+### 16.4 Sampling
+
+Sixteen tap Catmull-Rom bicubic, per channel, at the channel's own source
+position. Catmull-Rom is the Mitchell-Netravali family at B = 0, C = 1/2:
+it interpolates, it is C1, and its weights sum to one for every fractional
+offset, so a flat field comes through flat.
+
+The warp is within a few percent of the identity everywhere — a couple of
+pixels of displacement over most of the frame, a couple of hundred at the
+corner of a 24 mm frame — and that is exactly why the interpolator has to
+be good. At a displacement of a fraction of a pixel a bilinear resample is
+a low pass filter applied to the whole picture, and it would take out the
+detail RCD was chosen to keep.
+
+Measured, on the fresnel rings of the lamp in P1000387.MOV frame 0, which
+is where the finest structure in that frame sits: a 512x512 crop at
+(2750, 1850), local scale 0.9742, warped by the frame's own record twice,
+once with these sixteen taps and once with plain bilinear. High-pass
+energy, the squared 3x3 Laplacian of green summed over the crop:
+
+    unwarped source   2.140e4
+    bicubic warped    1.717e4     80.3% of the source
+    bilinear warped   1.324e4     61.9% of the source
+
+So bilinear throws away **22.9%** of the detail the bicubic keeps. Between
+the two warped crops that is a 0.92% RMS difference, with the worst sample
+6.4% of the crop's peak and 7.5% of samples differing by more than 1% of
+it — all of it concentrated on the ring edges, which is exactly where it
+shows. Side by side at 3x it is not subtle: the dark rings come out wider
+and lower in contrast, and the finer secondary rings wash out. (Both
+numbers being under 100% is the warp's own 2.6% shrink at that radius,
+which no interpolator can undo; the comparison between the two is the
+point.) Bicubic costs three times the taps, and the whole pass is 0.8 ms
+(16.6), so it is worth paying for.
+
+Borders follow the mirror of section 3, `i < 0 -> -i` and
+`i >= n -> 2n - 2 - i`, one reflection. Only the outer ring of the 4x4
+footprint can ever reach past an edge, because the sampling position itself
+stays inside the frame (16.2), so the rule is there to keep the shader
+total rather than to shape the picture.
+
+Alpha is **not** warped: it is read from the output pixel's own position.
+The colour stage writes 1.0 and it stays exactly 1.0, rather than becoming
+the sum of sixteen weights that agree to the last bit only in exact
+arithmetic.
+
+The geometry is evaluated once per pixel and the polynomial three times:
+
+    d   = (p + 0.5) - centre_px
+    r2  = dot(d, d) * inv_half_diag^2
+    f_c = k0 + r2 * (k1 + r2 * (k2 + r2 * k3))          per channel
+    s_c = centre_px + d * f_c - 0.5                     pixel index space
+
+`r2` rather than `r` because nothing in the model needs the square root.
+
+### 16.5 The CPU reference and the tests
+
+`craw_ref_lens()` in `lib/ref/ref_lens.c` is the same arithmetic in the
+same order, in fp32, with the same border rule; `craw_ref_process()` runs
+it when the pipeline parameters carry the flag and the frame's correction
+is valid, which is the condition `craw_pipeline_record()` applies.
+
+`test_lens` (CPU only, always runs) parses the record. Its frame,
+`tests/data/prr_lens_frame0.bin`, is frame 0 of P1000387.MOV with the tile
+*payload* removed: the first 8836 bytes verbatim — the size field, `prrf`,
+the 88 byte header and all 4370 be16 tile sizes — followed by the 232 byte
+trailer verbatim, 9068 bytes instead of 5133984. The test puts
+`sum(tile sizes)` zero bytes back where the tiles were, so every byte the
+parser reads is the camera's own and the whole walk runs on it. It checks
+the twelve coefficients against `prr_lens.md` section 5 bit for bit, the
+corner shifts to 0.01 px, that every prefix of the frame is refused rather
+than read past, and each way of breaking the frame. With libavformat
+available and `CRAW_TEST_CLIP` set it parses a real packet too.
+
+`test_pipeline` covers the stage three ways.
+
+- GPU against `craw_ref_lens()` on the synthetic frame, with the real
+  P1000387 record and with an exaggerated one, tolerance 8e-3 absolute. The
+  warp is a weighted sum of sixteen fp16 samples whose weights sum to one
+  but whose absolute values sum to as much as 1.25 per axis, so it carries
+  at most 1.56 times the error of the image it reads; against the 5e-3
+  section 11 allows the RCD intermediate that is 7.8e-3. Measured:
+  **1.9e-3** and **2.0e-3**. As with the denoise stage the comparison is
+  also shown to be sensitive: the corrected frame must be more than five
+  times that from the *uncorrected* one, and it is 1.1 and 1.0.
+- That "off" is off, exactly. A pipeline built with the flag and handed an
+  invalid correction must reproduce a pipeline built without it **bit for
+  bit**, and the test compares the downloaded frames with `memcmp`.
+- Geometry against arithmetic rather than against the other
+  implementation. A black 512x320 frame carries two Gaussian marks on the
+  corner diagonal, at 0.35 and 0.78 of the half diagonal. The frame is
+  developed twice, once without the warp and once with a correction whose
+  three channels differ (`1 - 0.090 r^2`, `1 - 0.100 r^2`,
+  `1 - 0.110 r^2`), and each mark's centroid is measured in both. Where it
+  has to land is the inverse of `r * poly(r)`, found by bisection, so the
+  expected position is arithmetic and not a second warp; measuring the mark
+  in both frames rather than trusting where it was drawn cancels the
+  debayer's own reconstruction of a Bayer-sampled Gaussian. Tolerance
+  0.25 px. Measured: the outer mark moves 15.64 px in R, 17.83 in G and
+  20.16 in B — four and a half pixels of deliberate lateral aberration,
+  each channel following its own polynomial — and the worst placement error
+  is **0.071 px** on the GPU and 0.070 px in the reference.
+
+### 16.6 Cost
+
+`cineraw --bench` on the RX 6900 XT, RCD, 5760x3040, alternating runs on
+P1000387.MOV: **5.212 / 5.107 / 5.078 / 5.161 ms** per frame for the whole
+pipeline with `--lens off` against **5.943 / 5.960 / 5.947 / 5.932 ms**
+with the stage running, so the pass is **0.73 to 0.87 ms**, call it 0.8.
+The target was under 1.5 and the frame budget at 30p is 33. In cineview,
+which measures libcraw's own timestamps rather than the whole submission,
+the same frames read 5.3 to 6.2 ms with the stage on.
+
+That is 49 image loads per pixel — sixteen taps for each of three channels
+plus one for alpha — on 17.5 million pixels, which only fits in 0.8 ms
+because neighbouring output pixels read overlapping footprints and the
+cache absorbs almost all of it: the traffic that actually reaches memory is
+one read and one write of an RGBA16F frame, 280 MB, about 0.55 ms at this
+card's bandwidth. There is a shared-memory tiling to be had here if the
+budget ever gets tight — the source footprint of a 16x16 output tile is a
+16x16 source tile plus a three pixel halo, wherever the warp has moved it —
+but at 0.8 ms it would be optimizing the wrong stage.
+
+A frame with no record costs nothing at all, because the pass is not
+recorded: measured at **0.037 ms** difference on the 256x160 test frame,
+i.e. inside the noise of the measurement.
+
+### 16.7 Channels after the colour stage, and what is not verified
+
+Two things about the lateral chromatic aberration are worth stating plainly,
+because neither is settled by anything here.
+
+**The record's channels are the camera's; the warp's channels are the output
+space's.** The stage runs after the colour pass (16.3), so it applies the R
+polynomial to the output image's R, which is a linear combination of the
+camera's R, G and B. For the radial distortion this is exact: the common
+part of the three polynomials is the same for every channel, so warping a
+mixture is warping each part by the same amount. For the *difference*
+between the channels it is not: correcting the camera's aberration properly
+would mean warping the camera channels and then applying the matrix.
+Whether that matters in practice depends on how diagonal the combined
+matrix is, and this version does not attempt to find out; the stage is
+where section 1 reserved it and where the distortion wants it.
+
+**The aberration correction is not verified on a real frame.** On the
+synthetic frame it is exact: `test_pipeline` puts three deliberately
+different polynomials on the three channels, the outer mark moves 15.64 px
+in R, 17.83 in G and 20.16 in B, and each lands within 0.071 px of the
+inverse of its own polynomial (16.5). On a real one it is below the noise
+of any estimator tried. On the long window mullion of P1000352.MOV frame
+29, where the record separates R from B by 0.46 px along the scan, the
+measured R minus B is -0.128 px before the warp and -0.132 px after, on
+camera RGB, from cross-correlating the two channels' profiles over 2721
+scan lines. That estimator was calibrated by amplifying the record's
+per-channel deviation: a nominal 4.56 px change reads 2.63 px, 2.28 px
+reads 0.75, 1.37 px reads 0.25, and 0.46 px reads 0.00. It has a dead zone
+right where the real effect is, on a defocused edge in a scene with its own
+colour fringing. So: the machinery demonstrably applies a different
+polynomial per channel, and whether the camera's numbers are the right ones
+for a real lens remains open — as does the channel ordering, which
+`tools/prr_lens.md` section 8 already lists as inferred rather than
+established.

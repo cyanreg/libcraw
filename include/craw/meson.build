@@ -43,6 +43,7 @@ lib_headers = [
     'noise.h',
     'pipeline.h',
     'awb.h',
+    'lens.h',
 
     version_h_target,
 ]

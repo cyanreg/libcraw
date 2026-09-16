@@ -467,6 +467,11 @@ int view_decoder_open(struct view_decoder *d, const char *path,
     if (!d->pkt)
         return CRAW_ERROR(ENOMEM);
 
+    /* Only a Bayer clip has a lens record to find, and only the pipeline
+     * that develops one can use it. Set before the reader starts, which is
+     * what makes the flag safe to read from that thread without the lock. */
+    d->reader.scan = d->raw;
+
     ret = view_reader_start(d);
     if (ret < 0)
         return ret;
@@ -534,6 +539,7 @@ static int view_reader_thread(void *opaque)
     struct view_decoder *d = opaque;
     struct view_reader *r = &d->reader;
     AVPacket *pkt = av_packet_alloc();
+    CRAWLensCorrection lens = { 0 };
 
     if (!pkt)
         return -1;
@@ -570,6 +576,12 @@ static int view_reader_thread(void *opaque)
 
         SDL_UnlockMutex(r->lock);
         ret = av_read_frame(d->fmt, pkt);
+        /* Off the lock, because it is a walk of a five megabyte packet -
+         * microseconds, but the render loop can be waiting on this mutex.
+         * `scan` is set before the thread starts and never written again. */
+        lens = (CRAWLensCorrection) { 0 };
+        if (ret >= 0 && r->scan && pkt->stream_index == d->stream_index)
+            craw_lens_from_prores_raw(pkt->data, (size_t)pkt->size, &lens);
         SDL_LockMutex(r->lock);
 
         if (ret == AVERROR_EOF) {
@@ -591,6 +603,7 @@ static int view_reader_thread(void *opaque)
         }
 
         av_packet_move_ref(r->q[(r->head + r->count) % VIEW_PKTQ_MAX], pkt);
+        r->lens[(r->head + r->count) % VIEW_PKTQ_MAX] = lens;
         r->bytes += (size_t)r->q[(r->head + r->count) % VIEW_PKTQ_MAX]->size;
         r->count++;
         r->depth_sum += r->count;
@@ -657,6 +670,7 @@ static void view_reader_stop(struct view_decoder *d)
         SDL_DestroyMutex(r->lock);
 
     *r = (struct view_reader) { 0 };
+    r->scan = d->raw;
 }
 
 double view_decoder_queued(struct view_decoder *d)
@@ -674,15 +688,19 @@ double view_decoder_queued(struct view_decoder *d)
 
 /* 0: `pkt` now holds a packet, 1: end of file, EAGAIN: the medium has not
  * kept up and the caller must not block on it. */
-static int view_reader_get(struct view_decoder *d, AVPacket *pkt)
+static int view_reader_get(struct view_decoder *d, AVPacket *pkt,
+                           CRAWLensCorrection *lens)
 {
     struct view_reader *r = &d->reader;
     int ret;
+
+    *lens = (CRAWLensCorrection) { 0 };
 
     SDL_LockMutex(r->lock);
 
     if (r->count) {
         av_packet_move_ref(pkt, r->q[r->head]);
+        *lens = r->lens[r->head];
         r->bytes -= (size_t)pkt->size;
         r->head = (r->head + 1) % VIEW_PKTQ_MAX;
         r->count--;
@@ -709,7 +727,7 @@ static int view_decoder_feed(struct view_decoder *d, int budget)
         /* A packet the decoder would not take is kept, not thrown away:
          * dropping it here would silently lose a picture. */
         if (!d->pkt_held) {
-            ret = view_reader_get(d, d->pkt);
+            ret = view_reader_get(d, d->pkt, &d->pkt_lens);
 
             if (ret == CRAW_ERROR(EAGAIN))
                 break;
@@ -730,6 +748,15 @@ static int view_decoder_feed(struct view_decoder *d, int budget)
         ret = avcodec_send_packet(d->dec, d->pkt);
         if (ret == AVERROR(EAGAIN))
             break;              /* the decoder is full, which is the point */
+
+        if (d->reader.scan) {
+            size_t n = CRAW_ARRAY_ELEMS(d->lens_ring);
+
+            d->lens_ring[d->lens_pushed % n].pts = d->pkt->pts;
+            d->lens_ring[d->lens_pushed % n].lc = d->pkt_lens;
+            d->lens_ring[d->lens_pushed % n].used = d->pkt_lens.valid;
+            d->lens_pushed++;
+        }
 
         av_packet_unref(d->pkt);
         d->pkt_held = false;
@@ -790,6 +817,30 @@ int view_decoder_next(struct view_decoder *d, AVFrame *frame)
     }
 }
 
+void view_decoder_lens(struct view_decoder *d, int64_t pts,
+                       CRAWLensCorrection *out)
+{
+    *out = (CRAWLensCorrection) { 0 };
+
+    if (!d->reader.scan)
+        return;
+
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(d->lens_ring); i++) {
+        if (d->lens_ring[i].used && d->lens_ring[i].pts == pts) {
+            *out = d->lens_ring[i].lc;
+            d->lens_ring[i].used = false;
+            break;
+        }
+    }
+
+    /* Decided as pictures come out rather than as packets go in, so that
+     * what the panel says matches what the pipeline was handed. */
+    if (out->valid)
+        d->lens_any = true;
+    else
+        d->lens_none = true;
+}
+
 int view_decoder_seek(struct view_decoder *d, int64_t frame_index)
 {
     struct view_reader *r = &d->reader;
@@ -822,6 +873,8 @@ int view_decoder_seek(struct view_decoder *d, int64_t frame_index)
         av_packet_unref(d->pkt);
         d->pkt_held = false;
     }
+    d->pkt_lens = (CRAWLensCorrection) { 0 };
+    memset(d->lens_ring, 0, sizeof(d->lens_ring));
 
     if (d->eof || d->draining) {
         int ret = view_decoder_codec_open(d);

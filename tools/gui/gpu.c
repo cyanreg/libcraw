@@ -729,11 +729,14 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
     pp.debayer    = debayer;
     pp.out_space  = CRAW_CS_BT2020_LINEAR;
     pp.out_format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    /* Both always built: the panel can switch to auto white balance or to
-     * denoising at any time and a pipeline rebuild mid-clip would drop a
-     * frame. A denoise pass that is built but left at strength 0 costs
-     * nothing measurable, which is what makes it a live control. */
-    pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE;
+    /* All three always built: the panel can switch to auto white balance,
+     * to denoising or to lens correction at any time and a pipeline rebuild
+     * mid-clip would drop a frame. A denoise pass that is built but left at
+     * strength 0 costs nothing measurable, and a lens pass handed a frame
+     * with no record drops out entirely, which is what makes both live
+     * controls. */
+    pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE |
+                    CRAW_PIPELINE_FLAG_LENS;
     /* Enough copies that the previous frame's histogram is still readable
      * while the current one is in flight, which is what lets the auto white
      * balance run without a per-frame stall. */
@@ -840,6 +843,7 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
              * timestamps came from; it is overwritten below for the one
              * about to be recorded. */
             g->last_gpu_denoise = g->slot_denoise[g->slot];
+            g->last_gpu_lens = g->slot_lens[g->slot];
         }
     }
 
@@ -884,6 +888,7 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
     /* Charged to this slot's timestamps, which are read back the next time
      * the slot comes round. */
     g->slot_denoise[g->slot] = fp->denoise_strength > 0.0f;
+    g->slot_lens[g->slot] = fp->lens.valid;
 
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,

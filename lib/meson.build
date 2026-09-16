@@ -41,6 +41,9 @@ craw_sources = files(
     'awb_smoother.c',
     'noise.c',
 
+    # Vendor lens correction records (CPU, no Vulkan)
+    'lens.c',
+
     # GPU pipeline
     'pipeline.c',
 
@@ -48,6 +51,7 @@ craw_sources = files(
     'ref/ref_debayer.c',
     'ref/ref_color.c',
     'ref/ref_denoise.c',
+    'ref/ref_lens.c',
 )
 
 # Generate local configure file

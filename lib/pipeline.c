@@ -22,6 +22,7 @@
 #include "color.spv.h"
 #include "awb_hist.spv.h"
 #include "denoise_nlm.spv.h"
+#include "lens.spv.h"
 
 /* Every debayer pass shares this block; it mirrors CRAWPrepPushBuf in
  * lib/shaders/common.glsl field for field. Scalar layout gives every member
@@ -88,6 +89,24 @@ static_assert(offsetof(CRAWColorPush, matrix) == 8, "CRAWColorPush layout");
 static_assert(offsetof(CRAWColorPush, wb_ratio) == 44, "CRAWColorPush layout");
 static_assert(offsetof(CRAWColorPush, flags) == 56, "CRAWColorPush layout");
 
+/* Mirrors CRAWLensPushBuf in lib/shaders/lens.comp.glsl. The centre and
+ * the normalizing radius are turned into pixels on the host, because they
+ * depend only on the frame size and the record's own centre and a shader
+ * that recomputed them per invocation would be doing the same divide
+ * seventeen million times. Scalar layout gives the vec4 array a stride of
+ * 16, matching float[3][4]. */
+typedef struct CRAWLensPush {
+    int32_t size[2];
+    float   centre[2];      /* optical centre in pixels, pixel centre origin */
+    float   inv_half_diag;  /* 1 / the corner distance from `centre` */
+    float   k[3][4];        /* k0..k3 per channel, R G B */
+} CRAWLensPush;
+
+static_assert(sizeof(CRAWLensPush) == 68, "CRAWLensPush layout");
+static_assert(offsetof(CRAWLensPush, centre) == 8, "CRAWLensPush layout");
+static_assert(offsetof(CRAWLensPush, inv_half_diag) == 16, "CRAWLensPush layout");
+static_assert(offsetof(CRAWLensPush, k) == 20, "CRAWLensPush layout");
+
 /* Mirrors CRAWAwbPushBuf in lib/shaders/awb_hist.comp.glsl. */
 typedef struct CRAWAwbPush {
     int32_t blocks[2];
@@ -144,6 +163,7 @@ struct CRAWPipeline {
     bool rcd;
     bool awb;
     bool has_denoise;
+    bool has_lens;
 
     /* One of `debayer` or the three RCD passes is created, never both.
      * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
@@ -154,11 +174,13 @@ struct CRAWPipeline {
     CRAWVkShader color;
     CRAWVkShader awb_hist;
     CRAWVkShader denoise;
+    CRAWVkShader lens;
 
     CRAWVkImage inter;   /* camera RGB, RGBA16F */
     CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
     CRAWVkImage green;   /* RCD: pass B green plane, R16F */
     CRAWVkImage clean;   /* denoise: the filtered mosaic, R16_UNORM */
+    CRAWVkImage linear;  /* lens: the colour stage's output, out_format */
 
     CRAWVkBuffer hist_count;
     CRAWVkBuffer hist_weight;
@@ -308,6 +330,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     p->rcd = params->debayer == CRAW_DEBAYER_RCD;
     p->awb = !!(params->flags & CRAW_PIPELINE_FLAG_AWB_HISTOGRAM);
     p->has_denoise = !!(params->flags & CRAW_PIPELINE_FLAG_DENOISE);
+    p->has_lens = !!(params->flags & CRAW_PIPELINE_FLAG_LENS);
     p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
     p->blocks[1] = (int32_t)(params->height / CRAW_AWB_BLOCK);
 
@@ -408,6 +431,25 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     if (ret < 0)
         goto fail;
 
+    if (p->has_lens) {
+        /* The warp reads what the colour stage wrote, so with the stage
+         * built the colour stage writes here instead of the caller's
+         * destination. The format follows the pipeline's output rather
+         * than being fixed at RGBA16F: a caller who asked for RGBA32F did
+         * so to keep 32 bits all the way, and an internal image is no
+         * place to quantize them away. With the default output this is
+         * exactly the RGBA16F intermediate DESIGN.md 16 describes. */
+        ret = craw_vk_image_create(ctx, &p->linear, params->width, params->height,
+                                   params->out_format, VK_IMAGE_USAGE_STORAGE_BIT);
+        if (ret < 0)
+            goto fail;
+
+        ret = craw_pipeline_shader(p, &p->lens, "lens", craw_lens_spv_data, craw_lens_spv_len,
+                                   craw_bind_images, 2, sizeof(CRAWLensPush), wg2d, NULL, 0);
+        if (ret < 0)
+            goto fail;
+    }
+
     if (p->awb) {
         ret = craw_pipeline_shader(p, &p->awb_hist, "awb_hist",
                                    craw_awb_hist_spv_data, craw_awb_hist_spv_len,
@@ -451,10 +493,11 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
-    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s\n",
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s\n",
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
              p->awb ? ", awb histogram" : "",
-             p->has_denoise ? ", denoise" : "");
+             p->has_denoise ? ", denoise" : "",
+             p->has_lens ? ", lens" : "");
 
     *pipe = p;
     return 0;
@@ -490,6 +533,8 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->awb_hist);
     if (p->denoise.pipeline)
         craw_vk_shader_free(ctx, &p->denoise);
+    if (p->lens.pipeline)
+        craw_vk_shader_free(ctx, &p->lens);
 
     if (p->inter.image)
         craw_vk_image_free(ctx, &p->inter);
@@ -499,6 +544,8 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_image_free(ctx, &p->green);
     if (p->clean.image)
         craw_vk_image_free(ctx, &p->clean);
+    if (p->linear.image)
+        craw_vk_image_free(ctx, &p->linear);
 
     if (p->hist_count.buf)
         craw_vk_buffer_free(ctx, &p->hist_count);
@@ -607,6 +654,43 @@ static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
     return 0;
 }
 
+/* Turns the frame's correction into the warp's push constants, DESIGN.md
+ * 16. The record states the centre in normalized frame coordinates and
+ * normalizes its radius by the corner distance, so both become pixels here
+ * against the pipeline's own frame size: the pipeline develops the whole
+ * coded frame, which is the frame the camera normalized against. */
+static int craw_pipeline_lens_push(CRAWPipeline *p, const CRAWLensCorrection *lc,
+                                   CRAWLensPush *lp)
+{
+    float hx, hy, half_diag;
+
+    if (lc->centre[0] < 0.0f || lc->centre[0] > 1.0f ||
+        lc->centre[1] < 0.0f || lc->centre[1] > 1.0f) {
+        craw_log(p->ctx, CRAW_LOG_ERROR, "Lens centre (%g, %g) is outside the frame\n",
+                 (double)lc->centre[0], (double)lc->centre[1]);
+        return CRAW_ERROR(EINVAL);
+    }
+
+    *lp = (CRAWLensPush) {
+        .size   = { (int32_t)p->params.width, (int32_t)p->params.height },
+        .centre = { lc->centre[0] * (float)p->params.width,
+                    lc->centre[1] * (float)p->params.height },
+    };
+
+    /* r = 1 is the frame corner as seen from the stated centre, i.e. the
+     * farther of the two sides on each axis. */
+    hx = CRAW_MAX(lc->centre[0], 1.0f - lc->centre[0]) * (float)p->params.width;
+    hy = CRAW_MAX(lc->centre[1], 1.0f - lc->centre[1]) * (float)p->params.height;
+    half_diag = sqrtf(hx * hx + hy * hy);
+    if (!(half_diag > 0.0f))
+        return CRAW_ERROR(EINVAL);
+
+    lp->inv_half_diag = 1.0f / half_diag;
+    memcpy(lp->k, lc->k, sizeof(lp->k));
+
+    return 0;
+}
+
 /* `gz` is 1 for every pass but the denoise, which puts the CFA plane index
  * there and dispatches all four at once. */
 static void craw_pipeline_dispatch(CRAWPipeline *p, VkCommandBuffer cmd, const CRAWVkShader *sh,
@@ -626,14 +710,15 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
 {
     CRAWContext *ctx;
     CRAWVkImage src_img, dst_img;
-    CRAWVkImage *mosaic;
+    CRAWVkImage *mosaic, *color_dst;
     CRAWVkDescWrite writes[4];
     CRAWColorParams frame;
     CRAWPrepPush pp;
     CRAWColorPush cp;
     CRAWAwbPush ap;
     CRAWDenoisePush dp;
-    bool denoise;
+    CRAWLensPush lp;
+    bool denoise, lens;
     float m_out[3][3], scale;
     uint32_t w, h;
     int ret;
@@ -685,6 +770,17 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     denoise = p->has_denoise && fp->denoise_strength > 0.0f;
     if (denoise) {
         ret = craw_pipeline_denoise_push(p, fp->profile, fp, &dp);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* A correction marked invalid is the documented way to leave one frame
+     * alone, so the whole warp drops out: the colour stage writes the
+     * caller's destination as it would without the pass and the result is
+     * bit for bit the uncorrected one. */
+    lens = p->has_lens && fp->lens.valid;
+    if (lens) {
+        ret = craw_pipeline_lens_push(p, &fp->lens, &lp);
         if (ret < 0)
             return ret;
     }
@@ -821,12 +917,29 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                                (uint32_t)p->blocks[0], (uint32_t)p->blocks[1], 1);
     }
 
-    craw_vk_image_barrier(ctx, cmd, &dst_img, VK_IMAGE_LAYOUT_GENERAL,
+    /* With the warp running, the colour stage lands in the intermediate the
+     * warp reads and the warp writes the caller's destination; without it,
+     * the colour stage is the last pass, exactly as before. */
+    color_dst = lens ? &p->linear : &dst_img;
+
+    craw_vk_image_barrier(ctx, cmd, color_dst, VK_IMAGE_LAYOUT_GENERAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     craw_vk_desc_image(&writes[0], 0, &p->inter);
-    craw_vk_desc_image(&writes[1], 1, &dst_img);
+    craw_vk_desc_image(&writes[1], 1, color_dst);
     craw_pipeline_dispatch(p, cmd, &p->color, writes, 2, &cp, sizeof(cp), w, h, 1);
+
+    if (lens) {
+        craw_vk_image_barrier(ctx, cmd, &p->linear, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        craw_vk_image_barrier(ctx, cmd, &dst_img, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        craw_vk_desc_image(&writes[0], 0, &p->linear);
+        craw_vk_desc_image(&writes[1], 1, &dst_img);
+        craw_pipeline_dispatch(p, cmd, &p->lens, writes, 2, &lp, sizeof(lp), w, h, 1);
+    }
 
     if (p->awb) {
         VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = CRAW_AWB_HIST_BYTES };

@@ -29,6 +29,7 @@
 #include <craw/vulkan.h>
 #include <craw/profile.h>
 #include <craw/awb.h>
+#include <craw/lens.h>
 
 typedef struct CRAWPipeline CRAWPipeline;
 
@@ -51,6 +52,15 @@ enum CRAWDebayer {
  * with CRAWFrameParams.denoise_strength, which costs nothing when zero.
  * See DESIGN.md 14. */
 #define CRAW_PIPELINE_FLAG_DENOISE (1 << 1)
+
+/* Build the lens correction pass. It costs an extra full resolution image
+ * in the pipeline's output format, because the colour stage then writes
+ * that instead of the caller's destination and the warp reads it. Once
+ * created it is switched per frame with CRAWFrameParams.lens: a correction
+ * with valid = false skips the warp entirely and the colour stage writes
+ * the caller's destination as it always did, so such a frame is bit for
+ * bit what a pipeline built without the flag produces. See DESIGN.md 16. */
+#define CRAW_PIPELINE_FLAG_LENS (1 << 2)
 
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
@@ -113,8 +123,17 @@ typedef struct CRAWFrameParams {
      * denoise_strength is positive. */
     CRAWNoiseModel noise_override;
 
+    /* Geometric lens correction for this frame, by value rather than by
+     * pointer: the record changes every frame while the lens zooms or
+     * focuses, and a frame's parameters have to stay self-contained when a
+     * player keeps several frames in flight. `valid` false means "leave
+     * this frame alone", which is the default and is what a clip without a
+     * record gets. Ignored unless the pipeline was created with
+     * CRAW_PIPELINE_FLAG_LENS. See <craw/lens.h> and DESIGN.md 16. */
+    CRAWLensCorrection lens;
+
     /* Padding to allow for future options. Must always be set to 0. */
-    uint8_t padding[256 - 4*4 - 8 - 12];
+    uint8_t padding[256 - 4*4 - 8 - 12 - 64];
 } CRAWFrameParams;
 
 /* Fills `p` with defaults: RGGB, RCD, XYZ D65 output, RGBA16F, no flags.
@@ -122,8 +141,8 @@ typedef struct CRAWFrameParams {
 CRAW_API void craw_pipeline_params_init(CRAWPipelineParams *p);
 
 /* Fills `fp` with defaults: as-shot white balance, no exposure change, no
- * denoising, no noise model override. The profile pointer is left NULL and
- * must be set by the caller. */
+ * denoising, no noise model override, no lens correction. The profile
+ * pointer is left NULL and must be set by the caller. */
 CRAW_API void craw_frame_params_init(CRAWFrameParams *fp);
 
 /* Allocates the pipeline's intermediate images and histogram buffers for
@@ -143,6 +162,7 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
  *     -> [auto white balance histogram]
  *     -> white balance re-balance, camera matrix, gain and exposure
  *     -> XYZ to out_space
+ *     -> [per-channel lens correction warp, on the linear output]
  *   dst (out_format, same size)
  *
  * src and dst must not alias. Both must already be in their stated layouts
