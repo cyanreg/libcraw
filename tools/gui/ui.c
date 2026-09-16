@@ -10,6 +10,7 @@
  * submission is done is what libplacebo waits on again. */
 
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1391,6 +1392,80 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     nk_tree_pop(ctx);
 }
 
+/* The video exporter's corner of the Export section: a frame range, one
+ * button, a progress bar and a way to stop. Everything else about the
+ * encode - which encoder, which options, what size - is the command line's
+ * for now; the preset system will give the panel the rest. */
+static void view_panel_export_video(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_video *v = &st->video;
+    char path[VIEW_MAX_PATH];
+    const char *codec;
+    bool busy = v->active;
+
+    /* The range follows the picture until it has been set: a fresh panel
+     * offers the second from the frame on screen, which is the range
+     * someone pressing the button once was going to draw anyway. */
+    if (!v->range_set && !busy) {
+        v->start_ui = (int)st->index;
+        v->end_ui = v->start_ui + 59;
+    }
+
+    /* The encoder is whatever --codec said, or the best one this build has:
+     * lossless on the GPU where that exists, and the encoder everything can
+     * read where it does not. */
+    codec = st->cfg.export_codec;
+    if (!codec || !codec[0])
+        codec = avcodec_find_encoder_by_name("ffv1_vulkan") ? "ffv1_vulkan"
+              : avcodec_find_encoder_by_name("libx264") ? "libx264" : "ffv1";
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    nk_labelf(ctx, NK_TEXT_LEFT, "video: %s", codec);
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    if (nk_property_int(ctx, "#start", 0, &v->start_ui, INT_MAX - 1, 1, 1.0f))
+        v->range_set = true;
+    if (nk_property_int(ctx, "#end", v->start_ui, &v->end_ui, INT_MAX, 1, 1.0f))
+        v->range_set = true;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    if (nk_button_label(ctx, busy ? "stop" : "export video")) {
+        if (busy) {
+            view_encode_cancel(st);
+        } else {
+            struct view_encode_opts o = {
+                .start = v->start_ui,
+                .end   = v->end_ui,
+                .codec = codec,
+                .enc   = st->cfg.export_enc,
+                .audio = st->cfg.video_audio,
+            };
+
+            view_encode_default_path(st, o.start, o.end, codec,
+                                     path, sizeof(path));
+            o.path = path;
+            v->range_set = true;
+            view_encode_begin(st, &o);
+        }
+    }
+    {
+        nk_size cur = (nk_size)(v->progress * 1000.0);
+
+        nk_progress(ctx, &cur, 1000, nk_false);
+    }
+
+    if (v->status[0]) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%s", v->status);
+    }
+    if (v->path[0]) {
+        const char *name = strrchr(v->path, '/');
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%.46s", name ? name + 1 : v->path);
+    }
+}
+
 static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
 {
     int x, y, w, h;
@@ -1625,6 +1700,9 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
             nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
             nk_labelf(ctx, NK_TEXT_LEFT, "%s", st->exp.status);
         }
+
+        view_panel_export_video(ctx, st);
+
         nk_tree_pop(ctx);
     }
 }

@@ -43,6 +43,10 @@
 
 #define VIEW_MAX_PATH 1024
 
+/* The video exporter's own state, which the panel and the command line both
+ * write and the engine in encode.c reads. */
+#include "encode.h"
+
 /* The panel sits on the right at a fixed width; the picture gets whatever
  * is left of the window. */
 #define VIEW_PANEL_WIDTH  360.0f
@@ -63,9 +67,11 @@
  * allocates its frames with VK_SHARING_MODE_CONCURRENT: with a single
  * family it tracks an exclusive owner and then emits barriers that release
  * ownership to VK_QUEUE_FAMILY_IGNORED, which is not a legal transfer. The
- * video decode one is what lets FFmpeg's Vulkan HEVC hwaccel start at all. */
+ * video decode one is what lets FFmpeg's Vulkan HEVC hwaccel start at all,
+ * and the encode one is what the video export's Vulkan encoders need. */
 #define VIEW_EXTRA_QUEUES (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT | \
-                           VK_QUEUE_VIDEO_DECODE_BIT_KHR)
+                           VK_QUEUE_VIDEO_DECODE_BIT_KHR | \
+                           VK_QUEUE_VIDEO_ENCODE_BIT_KHR)
 
 /* ------------------------------------------------------------- the look */
 
@@ -454,6 +460,15 @@ struct view_cfg {
     char export_path[VIEW_MAX_PATH];
     const char *export_codec;   /* --codec, NULL: the muxer's own */
     const char *export_enc;     /* --enc KEY=VALUE,... for the encoder */
+
+    /* --export-video START END OUT, the same headless run for a range of
+     * frames. `video_w` and `video_h` are --size, zero for the crop's own
+     * size. */
+    bool export_video;
+    int64_t video_start, video_end;
+    char video_path[VIEW_MAX_PATH];
+    int video_w, video_h;
+    bool video_audio;           /* --audio copy, which is the default */
 };
 
 struct view_awb {
@@ -663,6 +678,7 @@ struct view_state {
     struct view_audio audio;
     struct view_awb awb;
     struct view_export exp;
+    struct view_video video;
     struct view_sync sync;
     struct view_timing timing;
     struct view_zoom view;
@@ -784,6 +800,13 @@ int  view_gpu_display(struct view_gpu *g, struct view_state *st);
 /* Renders to an offscreen sRGB texture and downloads it as 16 bit RGB. */
 int  view_gpu_render_export(struct view_gpu *g, struct view_state *st,
                             uint16_t *rgba);
+
+/* The same render into a target the caller owns, for the video export: the
+ * export renderer, the export's own hook state and the crop rectangle as
+ * the source, with everything about the destination - its planes, its
+ * colour and its size - left to `target`. */
+int  view_gpu_render_target(struct view_gpu *g, struct view_state *st,
+                            struct pl_frame *target);
 
 /* The overlay texture nuklear draws into. On a resize the previous texture
  * and view are kept until view_gpu_ui_drop_old(), which must be called once

@@ -114,6 +114,7 @@ if craw_tools_ffmpeg
             'gui/audio.c',
             'gui/export.c',
             'gui/still.c',
+            'gui/encode.c',
             'gui/grain.c',
             'gui/grain_ui.c',
             'gui/adjust.c',

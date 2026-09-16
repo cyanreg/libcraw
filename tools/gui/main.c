@@ -1367,6 +1367,22 @@ static void view_usage(FILE *f)
 "                      libavformat: .png and .tif hold sixteen bits, .jpg,\n"
 "                      .webp and .avif whatever their encoder takes. The\n"
 "                      file holds the displayed look, sRGB encoded.\n"
+"  --export-video START END OUT\n"
+"                      encode frames START to END, inclusive, into the file\n"
+"                      OUT and exit, without opening a window. The name\n"
+"                      picks the muxer, --codec the encoder; a Vulkan\n"
+"                      encoder (h264_vulkan, hevc_vulkan, ffv1_vulkan,\n"
+"                      apv_vulkan, prores_ks_vulkan) is fed on the GPU\n"
+"                      without a read-back, anything else through\n"
+"                      libswscale. The picture is what --export writes.\n"
+"  --list-encoders     print every video encoder this FFmpeg has, marking\n"
+"                      the ones that take Vulkan frames, and exit\n"
+"  --size WxH          scale the exported video to that size; the default is\n"
+"                      the crop rectangle's own, which is the source's\n"
+"  --audio copy|none   copy the clip's audio into the exported video, which\n"
+"                      is the default. The stream is the one playback uses,\n"
+"                      and a four channel stream is copied whole rather than\n"
+"                      cut down to the pair the speakers get\n"
 "  --codec NAME        encode the still with this encoder rather than the\n"
 "                      one the file name implies\n"
 "  --enc KEY=VALUE[,...]\n"
@@ -1410,6 +1426,10 @@ enum {
     VIEW_OPT_PROFILE,
     VIEW_OPT_TABLES,
     VIEW_OPT_EXPORT,
+    VIEW_OPT_EXPORT_VIDEO,
+    VIEW_OPT_LIST_ENCODERS,
+    VIEW_OPT_SIZE,
+    VIEW_OPT_AUDIO,
     VIEW_OPT_CODEC,
     VIEW_OPT_ENC,
     VIEW_OPT_CROP,
@@ -1448,6 +1468,10 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "profile",  required_argument, NULL, VIEW_OPT_PROFILE   },
         { "tables",   required_argument, NULL, VIEW_OPT_TABLES    },
         { "export",   required_argument, NULL, VIEW_OPT_EXPORT    },
+        { "export-video", required_argument, NULL, VIEW_OPT_EXPORT_VIDEO },
+        { "list-encoders", no_argument,  NULL, VIEW_OPT_LIST_ENCODERS },
+        { "size",     required_argument, NULL, VIEW_OPT_SIZE      },
+        { "audio",    required_argument, NULL, VIEW_OPT_AUDIO     },
         { "codec",    required_argument, NULL, VIEW_OPT_CODEC     },
         { "enc",      required_argument, NULL, VIEW_OPT_ENC       },
         { "crop",     required_argument, NULL, VIEW_OPT_CROP      },
@@ -1650,6 +1674,54 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                      argv[optind]);
             optind += 1;
             st->cfg.headless = true;
+            break;
+        case VIEW_OPT_EXPORT_VIDEO:
+            /* Three arguments, of which getopt can only express the first:
+             * the other two come off the tail the way --export's do. */
+            if (optind + 1 >= argc) {
+                fprintf(stderr, "--export-video takes START END OUT\n");
+                return CRAW_ERROR(EINVAL);
+            }
+            st->cfg.video_start = strtoll(optarg, &end, 10);
+            if (end == optarg || *end || st->cfg.video_start < 0) {
+                fprintf(stderr, "--export-video: `%s` is not a frame number\n",
+                        optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            st->cfg.video_end = strtoll(argv[optind], &end, 10);
+            if (end == argv[optind] || *end ||
+                st->cfg.video_end < st->cfg.video_start) {
+                fprintf(stderr, "--export-video: `%s` is not a frame number at "
+                                "or after %" PRId64 "\n",
+                        argv[optind], st->cfg.video_start);
+                return CRAW_ERROR(EINVAL);
+            }
+            snprintf(st->cfg.video_path, sizeof(st->cfg.video_path), "%s",
+                     argv[optind + 1]);
+            optind += 2;
+            st->cfg.export_video = true;
+            st->cfg.headless = true;
+            break;
+        case VIEW_OPT_LIST_ENCODERS:
+            view_encode_list();
+            return 1;
+        case VIEW_OPT_SIZE:
+            if (sscanf(optarg, "%dx%d", &st->cfg.video_w, &st->cfg.video_h) != 2 ||
+                st->cfg.video_w <= 0 || st->cfg.video_h <= 0) {
+                fprintf(stderr, "--size: expected WxH, got `%s`\n", optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            break;
+        case VIEW_OPT_AUDIO:
+            if (!strcmp(optarg, "copy")) {
+                st->cfg.video_audio = true;
+            } else if (!strcmp(optarg, "none")) {
+                st->cfg.video_audio = false;
+            } else {
+                fprintf(stderr, "--audio: expected copy or none, got `%s`\n",
+                        optarg);
+                return CRAW_ERROR(EINVAL);
+            }
             break;
         case VIEW_OPT_CODEC:
             st->cfg.export_codec = optarg;
@@ -2120,11 +2192,16 @@ static int view_run_window(struct view_state *st)
         }
         view_ui_input_end();
 
-        /* Keeps the audio ring topped up whatever the picture is doing. */
-        if (!st->exp.active && view_audio_pump(&st->audio) < 0)
+        /* Keeps the audio ring topped up whatever the picture is doing.
+         * An export owns the decoder while it runs, so the clock and the
+         * ring are left alone until it is done. */
+        if (!st->exp.active && !st->video.active &&
+            view_audio_pump(&st->audio) < 0)
             break;
 
-        if (st->exp.active) {
+        if (st->video.active) {
+            view_encode_step(st);
+        } else if (st->exp.active) {
             if (view_export_step(st) < 0)
                 st->exp.active = false;
         } else if (st->need_frame || !st->have_frame ||
@@ -2323,6 +2400,8 @@ static int view_run_window(struct view_state *st)
  * view_gpu_close), and only then the window it belongs to. */
 static void view_close(struct view_state *st)
 {
+    /* Before the pl_gpu: the video exporter holds textures on it. */
+    view_encode_close(st);
     free(st->exp.rgba);
     pl_lut_free(&st->lut);
     av_frame_free(&st->frame);
@@ -2381,6 +2460,34 @@ static int view_run_headless(struct view_state *st)
     }
     t0 = view_phase(st, t0, "profile and LUT");
 
+    if (st->cfg.export_video) {
+        struct view_encode_opts o = {
+            .start  = st->cfg.video_start,
+            .end    = st->cfg.video_end,
+            .path   = st->cfg.video_path,
+            .codec  = st->cfg.export_codec,
+            .enc    = st->cfg.export_enc,
+            .width  = st->cfg.video_w,
+            .height = st->cfg.video_h,
+            .audio  = st->cfg.video_audio,
+        };
+
+        ret = view_encode_begin(st, &o);
+        if (ret < 0)
+            return ret;
+
+        while (st->video.active) {
+            ret = view_encode_step(st);
+            if (ret < 0)
+                return ret;
+        }
+
+        view_phase(st, t0, "seek, decode, render and encode");
+        fprintf(stderr, "%s\n", st->video.status);
+
+        return 0;
+    }
+
     view_export_begin(st, st->cfg.export_frame, st->cfg.export_path,
                       st->cfg.export_codec);
 
@@ -2420,6 +2527,10 @@ int main(int argc, char **argv)
     st.seek_target = -1;
     st.playing = true;
     st.cfg.loop = true;
+    /* The exported video carries the clip's own audio unless --audio none
+     * says otherwise: a range of a take without its sound is rarely what
+     * anyone wanted. */
+    st.cfg.video_audio = true;
     st.view.fit = true;
     st.volume = 1.0f;
     /* Before the arguments, so that --grain and --denoise override the

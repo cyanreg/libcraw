@@ -407,6 +407,41 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
     rq.required_features_11.uniformAndStorageBuffer16BitAccess = VK_TRUE;
     rq.required_features_14.shaderExpectAssume = VK_TRUE;
 
+    /* The same again for the compute encoders the video export can use.
+     * FFV1, APV and ProRes on Vulkan are ordinary compute shaders, and they
+     * declare rather more than the decoders do: a runtime descriptor array
+     * above all. This driver takes the modules anyway, but a validated
+     * device refuses them, the pipeline comes back null, and the encode
+     * writes a file with nothing in it - so the declaration has to be true
+     * whether or not anyone is checking. What the device does not have,
+     * libplacebo drops. The list is the one libavutil enables when it
+     * creates a device of its own. */
+    rq.required_features.shaderInt64 = VK_TRUE;
+    rq.required_features.shaderStorageImageReadWithoutFormat  = VK_TRUE;
+    rq.required_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    rq.required_features.shaderImageGatherExtended = VK_TRUE;
+    rq.required_features_11.storageBuffer16BitAccess = VK_TRUE;
+    rq.required_features_11.storagePushConstant16    = VK_TRUE;
+    rq.required_features_11.samplerYcbcrConversion   = VK_TRUE;
+    rq.required_features_12.runtimeDescriptorArray   = VK_TRUE;
+    rq.required_features_12.shaderSampledImageArrayNonUniformIndexing  = VK_TRUE;
+    rq.required_features_12.shaderStorageImageArrayNonUniformIndexing  = VK_TRUE;
+    rq.required_features_12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+    rq.required_features_12.shaderUniformBufferArrayNonUniformIndexing = VK_TRUE;
+    rq.required_features_12.shaderInt8                   = VK_TRUE;
+    rq.required_features_12.storageBuffer8BitAccess      = VK_TRUE;
+    rq.required_features_12.uniformAndStorageBuffer8BitAccess = VK_TRUE;
+    rq.required_features_12.storagePushConstant8         = VK_TRUE;
+    rq.required_features_12.shaderFloat16                = VK_TRUE;
+    rq.required_features_12.shaderBufferInt64Atomics     = VK_TRUE;
+    rq.required_features_12.shaderSharedInt64Atomics     = VK_TRUE;
+    rq.required_features_12.shaderSubgroupExtendedTypes  = VK_TRUE;
+    rq.required_features_12.vulkanMemoryModel            = VK_TRUE;
+    rq.required_features_12.vulkanMemoryModelDeviceScope = VK_TRUE;
+    rq.required_features_13.computeFullSubgroups              = VK_TRUE;
+    rq.required_features_13.subgroupSizeControl               = VK_TRUE;
+    rq.required_features_13.shaderZeroInitializeWorkgroupMemory = VK_TRUE;
+
     VkPhysicalDeviceFeatures2 feats = {
         .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
         .pNext    = &rq.required_features_11,
@@ -420,13 +455,61 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
      * alone, because each of those extensions does have a feature FFmpeg
      * would normally turn on when it creates the device itself, and
      * enabling e.g. VK_EXT_shader_object without `shaderObject` makes the
-     * decoder take a path the device then rejects. */
+     * decoder take a path the device then rejects.
+     *
+     * The encode half of the list is the same story for the video export:
+     * FFmpeg's Vulkan encoders refuse to start without the encode queue
+     * extension and VK_KHR_video_maintenance1, and the latter does have a
+     * feature, which is why it is chained below as well. */
     static const char *const video_exts[] = {
         VK_KHR_VIDEO_QUEUE_EXTENSION_NAME,
         VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME,
         VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME,
         VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME,
+        VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME,
+        VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME,
+        VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME,
+#ifdef VK_KHR_video_encode_av1
+        VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME,
+#endif
+        VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME,
+#ifdef VK_KHR_video_maintenance2
+        VK_KHR_VIDEO_MAINTENANCE_2_EXTENSION_NAME,
+#endif
+        /* Push descriptors became core in Vulkan 1.4, so libplacebo uses
+         * them without asking for the extension - but FFmpeg decides which
+         * descriptor path its compute shaders take by looking at the
+         * enabled extension *names*. It has no feature of its own. */
+        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+        /* The compute encoders' shaders declare SPV_KHR_maximal_reconvergence
+         * and SPV_KHR_subgroup_rotate. Without the matching extensions and
+         * their features a validated device refuses the modules, and
+         * prores_ks_vulkan then writes a file of ninety kilobytes with
+         * nothing in it. */
+        VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME,
+        VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME,
+#ifdef VK_KHR_shader_relaxed_extended_instruction
+        VK_KHR_SHADER_RELAXED_EXTENDED_INSTRUCTION_EXTENSION_NAME,
+#endif
     };
+
+    VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR shader_mr = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR,
+        .pNext = &rq.required_features_11,
+        .shaderMaximalReconvergence = VK_TRUE,
+    };
+    VkPhysicalDeviceVideoMaintenance1FeaturesKHR video_m1 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR,
+        .pNext = &shader_mr,
+        .videoMaintenance1 = VK_TRUE,
+    };
+
+    /* Promoted to Vulkan 1.4, so it goes in the core struct rather than in
+     * one of its own; the extension above is only there for FFmpeg to see. */
+    rq.required_features_14.shaderSubgroupRotate = VK_TRUE;
+
+    feats.pNext = &video_m1;
+
     const char *opt_exts[CRAW_ARRAY_ELEMS(video_exts) + 8];
     int nb_opt_exts = 0;
 
@@ -1436,6 +1519,43 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
     pl_swapchain_swap_buffers(g->sw);
 
     st->timing.present += (double)(av_gettime_relative() - t0) / 1000.0;
+
+    return 0;
+}
+
+/* The video export's render. Everything about the source - the renderer,
+ * the hooks, the peak detection track, the crop rectangle - is the still
+ * export's, so that a frame of a movie and the same frame written on its
+ * own are the same picture; everything about the destination belongs to the
+ * caller, which is what lets encode.c render straight into an encoder's own
+ * Vulkan image or into a texture it reads back. */
+int view_gpu_render_target(struct view_gpu *g, struct view_state *st,
+                           struct pl_frame *target)
+{
+    struct pl_render_params rp;
+    struct pl_color_map_params cmp;
+    struct pl_peak_detect_params pdp;
+    struct pl_color_adjustment adj;
+    const struct pl_hook *hook[VIEW_MAX_HOOKS];
+    struct pl_frame image;
+    int cx, cy, cw, ch;
+
+    view_crop_rect(st, &cx, &cy, &cw, &ch);
+
+    if (st->dec.raw)
+        view_gpu_image(g, &image, view_peak_ceiling(st));
+    else
+        image = g->mapped;
+    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, true);
+
+    image.crop = (pl_rect2df) {
+        (float)cx, (float)cy, (float)(cx + cw), (float)(cy + ch),
+    };
+
+    if (!pl_render_image(g->rr_export, &image, target, &rp)) {
+        fprintf(stderr, "pl_render_image failed while encoding\n");
+        return CRAW_ERROR(EIO);
+    }
 
     return 0;
 }
