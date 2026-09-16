@@ -603,8 +603,9 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
     }
 
     g->rr = pl_renderer_create(g->log, g->gpu);
+    g->rr_compose = pl_renderer_create(g->log, g->gpu);
     g->rr_export = pl_renderer_create(g->log, g->gpu);
-    if (!g->rr || !g->rr_export)
+    if (!g->rr || !g->rr_compose || !g->rr_export)
         return CRAW_ERROR(ENOMEM);
 
     /* Our own command buffer: libcraw records into it, we submit it. */
@@ -706,6 +707,7 @@ void view_gpu_close(struct view_gpu *g)
             pl_tex_destroy(g->gpu, &g->ui_tex[i]);
         }
         pl_tex_destroy(g->gpu, &g->export_tex);
+        pl_tex_destroy(g->gpu, &g->pic_tex);
         pl_vulkan_sem_destroy(g->gpu, &g->out_sem);
     }
 
@@ -722,6 +724,7 @@ void view_gpu_close(struct view_gpu *g)
     }
 
     pl_renderer_destroy(&g->rr_export);
+    pl_renderer_destroy(&g->rr_compose);
     pl_renderer_destroy(&g->rr);
     pl_swapchain_destroy(&g->sw);
     pl_vulkan_destroy(&g->vk);
@@ -1005,6 +1008,8 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
             return CRAW_ERROR(EIO);
 
         tm->fence += (double)(av_gettime_relative() - tw) / 1000.0;
+        if (g->rec)
+            g->rec->fence_ms += (double)(av_gettime_relative() - tw) / 1000.0;
         sl->busy = false;
 
         if (vkGetQueryPoolResults(g->vk->device, g->queries, (uint32_t)(2 * g->slot),
@@ -1174,6 +1179,8 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
         sl->busy = true;
 
     tm->submit += (double)(av_gettime_relative() - t0) / 1000.0;
+    if (g->rec)
+        g->rec->t_submit = av_gettime_relative();
 
     /* The contract the hwcontext documents: the value we signalled becomes
      * the value the next user has to wait on, and the layout is whatever we
@@ -1206,6 +1213,7 @@ release:
     g->display_slot = g->slot;
     g->slot = (g->slot + 1) % VIEW_SLOTS;
     g->submitted++;
+    g->pic_serial++;
 
     return 0;
 }
@@ -1222,10 +1230,28 @@ int view_gpu_wait_prev(struct view_gpu *g, struct view_timing *tm)
     if (vkWaitForFences(g->vk->device, 1, &sl->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
         return CRAW_ERROR(EIO);
     tm->fence += (double)(av_gettime_relative() - t0) / 1000.0;
+    if (g->rec)
+        g->rec->fence_ms += (double)(av_gettime_relative() - t0) / 1000.0;
 
     sl->busy = false;
 
     return 0;
+}
+
+/* Asks, without blocking, whether the picture just submitted has finished
+ * on the GPU, and records the first iteration at which it had. Only --trace
+ * calls it, and only so that the file can say whether libcraw's work was
+ * done before the render that needed it was submitted; the resolution is
+ * therefore one iteration of the run loop. */
+void view_gpu_poll_fence(struct view_gpu *g)
+{
+    struct view_slot *sl = &g->slots[g->display_slot];
+
+    if (!g->rec || g->rec->t_fence || !g->submitted || !sl->busy)
+        return;
+
+    if (vkGetFenceStatus(g->vk->device, sl->fence) == VK_SUCCESS)
+        g->rec->t_fence = av_gettime_relative();
 }
 
 /* ------------------------------------------------------- the video path */
@@ -1289,6 +1315,7 @@ int view_gpu_map(struct view_gpu *g, AVFrame *frame, AVStream *stream,
     g->have_mapped = true;
     g->width = (uint32_t)frame->width;
     g->height = (uint32_t)frame->height;
+    g->pic_serial++;
     tm->map += (double)(av_gettime_relative() - t0) / 1000.0;
 
     return 0;
@@ -1445,12 +1472,28 @@ static craw_adjust *view_adjust_state(struct view_state *st, bool export_path)
     return *slot;
 }
 
+/* FNV-1a. What it is hashing is the display path's inputs, so that the
+ * window can tell whether the picture it already has is still the right
+ * one; nothing is stored or compared across runs. */
+static uint64_t view_hash(uint64_t h, const void *p, size_t n)
+{
+    const unsigned char *b = p;
+
+    while (n--) {
+        h ^= *b++;
+        h *= 0x100000001b3ULL;
+    }
+
+    return h;
+}
+
 static void view_render_params(struct view_state *st,
                                struct pl_render_params *rp,
                                struct pl_color_map_params *cmp,
                                struct pl_peak_detect_params *pdp,
                                struct pl_color_adjustment *adj,
-                               const struct pl_hook **hook, bool export_path)
+                               const struct pl_hook **hook, bool export_path,
+                               uint64_t *sig)
 {
     const struct view_preset_sel *sel = &st->look.video_preset;
     /* The look is bypassed entirely while a scene-referred export space is
@@ -1490,8 +1533,19 @@ static void view_render_params(struct view_state *st,
      * defaults for the smoothing window, the scene cut thresholds and the
      * percentile are kept: nothing measured here argues with them, and the
      * window keeps them whatever the export was set to. */
-    if (export_path)
+    if (export_path) {
         rp->peak_detect_params = sel->peak ? pdp : NULL;
+    } else {
+        /* The window lets the measurement arrive a frame late. Without this
+         * libplacebo reads the peak back inside pl_render_image and has to
+         * wait for the GPU to get there, which on one queue means waiting
+         * for the decoder's and libcraw's work as well: a full round trip
+         * per displayed frame, measured at ten milliseconds on this
+         * machine. An export reads its peak the way it always did - nothing
+         * about a written file may depend on when the CPU asked. */
+        pdp->allow_delayed = true;
+        rp->peak_detect_params = pdp;
+    }
     /* A user .cube goes on the image as asked; a film simulation never
      * does: it is a display-referred sRGB look and belongs after tone
      * mapping, in the output's own encoding. It used to ride on the target
@@ -1569,6 +1623,33 @@ static void view_render_params(struct view_state *st,
         rp->hooks = hook;
         rp->num_hooks = nb_hooks;
     }
+
+    if (!sig)
+        return;
+
+    /* Everything resolved above, in one number. The display path renders
+     * only when this changes, so a look parameter added to this function
+     * has to be added here too or a paused picture will not follow it: the
+     * hooks are cached objects whose address does not move when their
+     * parameters do, which is why the parameters themselves are hashed and
+     * not just the pointers. Each of the three structs is hashed up to its
+     * trailing GPU state, which is not a look. */
+    *sig = view_hash(0xcbf29ce484222325ULL, cmp, sizeof(*cmp));
+    *sig = view_hash(*sig, pdp, sizeof(*pdp));
+    *sig = view_hash(*sig, adj, sizeof(*adj));
+    *sig = view_hash(*sig, &rp->lut, sizeof(rp->lut));
+    *sig = view_hash(*sig, &rp->lut_type, sizeof(rp->lut_type));
+    *sig = view_hash(*sig, &nb_hooks, sizeof(nb_hooks));
+    *sig = view_hash(*sig, hook, (size_t)nb_hooks * sizeof(hook[0]));
+    *sig = view_hash(*sig, &st->look, offsetof(struct view_look, video_preset));
+    *sig = view_hash(*sig, &st->look.video_preset,
+                     sizeof(st->look.video_preset));
+    *sig = view_hash(*sig, &st->adjustments,
+                     offsetof(struct view_adjust, state));
+    *sig = view_hash(*sig, &st->grain, offsetof(struct view_grain, hook));
+    *sig = view_hash(*sig, &st->gpu.exposure_hook_gain,
+                     sizeof(st->gpu.exposure_hook_gain));
+    *sig = view_hash(*sig, &scene, sizeof(scene));
 }
 
 void view_gpu_reset_peak(struct view_gpu *g, bool export_renderer)
@@ -1577,35 +1658,101 @@ void view_gpu_reset_peak(struct view_gpu *g, bool export_renderer)
      * cache) between frames; a cut in the source has to clear it or the
      * first frames after it are tone mapped against the old scene. */
     pl_renderer_flush_cache(export_renderer ? g->rr_export : g->rr);
-    if (!export_renderer)
+    if (!export_renderer) {
         g->measured_peak = 0.0;
+        /* The kept picture was tone mapped against the track that has just
+         * been thrown away, so it is no longer what this frame looks like. */
+        g->pic_valid = false;
+    }
 }
 
-int view_gpu_display(struct view_gpu *g, struct view_state *st)
+/* The texture the window's picture is kept in between renders: the size of
+ * the swapchain image and floating point, so that the picture pass does no
+ * quantisation of its own and the compose below is the only place the
+ * display's bit depth is met. False when there is no such format or no
+ * memory, which makes the caller render straight to the swapchain the way
+ * it always did. */
+static bool view_gpu_pic_tex(struct view_gpu *g, int w, int h)
 {
-    int64_t t0 = av_gettime_relative();
-    struct pl_swapchain_frame sw_frame;
+    pl_fmt fmt;
+
+    if (g->pic_tex && g->pic_w == w && g->pic_h == h)
+        return true;
+
+    pl_tex_destroy(g->gpu, &g->pic_tex);
+    g->pic_valid = false;
+    g->pic_w = g->pic_h = 0;
+
+    fmt = pl_find_fmt(g->gpu, PL_FMT_FLOAT, 4, 16, 0,
+                      PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE |
+                      PL_FMT_CAP_LINEAR);
+    if (!fmt)
+        return false;
+
+    /* Blittable and storable where the format allows it: libplacebo picks
+     * a blit or a compute pass over a render pass when the work is a plain
+     * copy, which both of the passes either side of this texture often are,
+     * and a texture that cannot take one makes it log the refusal on every
+     * frame. */
+    g->pic_tex = pl_tex_create(g->gpu, pl_tex_params(
+        .w          = w,
+        .h          = h,
+        .format     = fmt,
+        .renderable = true,
+        .sampleable = true,
+        .storable   = !!(fmt->caps & PL_FMT_CAP_STORABLE),
+        .blit_src   = !!(fmt->caps & PL_FMT_CAP_BLITTABLE),
+        .blit_dst   = !!(fmt->caps & PL_FMT_CAP_BLITTABLE),
+    ));
+    if (!g->pic_tex)
+        return false;
+
+    g->pic_w = w;
+    g->pic_h = h;
+
+    return true;
+}
+
+/* The picture pass: everything the window shows except the panel, rendered
+ * into pic_tex against the description the swapchain last carried. Returns
+ * true when it actually rendered; false means the texture already holds
+ * exactly this picture and nothing was done.
+ *
+ * It is split out from the present so that it can be run the moment a
+ * picture has been developed rather than at the moment the picture is due:
+ * pl_render_image blocks for five to twenty-five milliseconds here - the
+ * CPU waiting its turn on the one queue the decoder, libcraw and the
+ * renderer all share - and on the present path every one of those
+ * milliseconds lands in the interval between one picture and the next. */
+static bool view_gpu_pic_pass(struct view_gpu *g, struct view_state *st,
+                              const struct pl_color_repr *trepr,
+                              const struct pl_color_space *tcolor,
+                              int tw, int th)
+{
     struct pl_render_params rp;
     struct pl_color_map_params cmp;
     struct pl_peak_detect_params pdp;
     struct pl_color_adjustment adj;
     struct pl_hdr_metadata measured;
     const struct pl_hook *hook[VIEW_MAX_HOOKS];
-    struct pl_frame image, target;
-    struct pl_overlay overlay;
-    struct pl_overlay_part part;
+    struct pl_frame image, pic;
+    pl_rect2df dst = { 0, 0, (float)tw, (float)th };
+    uint64_t sig;
+    float ceiling;
 
-    if (!pl_swapchain_start_frame(g->sw, &sw_frame))
-        return CRAW_ERROR(EAGAIN);
+    if (!view_gpu_pic_tex(g, tw, th))
+        return false;
 
-    pl_frame_from_swapchain(&target, &sw_frame);
-    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, false);
+    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, false, &sig);
+    if (st->trace.on)
+        rp.info_callback = view_trace_pass;
 
+    ceiling = st->have_frame ? view_peak_ceiling(st) : 0.0f;
     if (st->have_frame) {
-        pl_rect2df src, dst;
+        pl_rect2df src;
 
         if (st->dec.raw)
-            view_gpu_image(g, &image, view_peak_ceiling(st));
+            view_gpu_image(g, &image, ceiling);
         else
             image = g->mapped;
 
@@ -1616,8 +1763,111 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
          * twice. */
         view_zoom_rects(st, &src, &dst);
         image.crop = src;
-        target.crop = dst;
+        sig = view_hash(sig, &src, sizeof(src));
+        sig = view_hash(sig, &dst, sizeof(dst));
     }
+
+    sig = view_hash(sig, &g->pic_serial, sizeof(g->pic_serial));
+    sig = view_hash(sig, &st->have_frame, sizeof(st->have_frame));
+    sig = view_hash(sig, &ceiling, sizeof(ceiling));
+    sig = view_hash(sig, trepr, sizeof(*trepr));
+    sig = view_hash(sig, tcolor, sizeof(*tcolor));
+    sig = view_hash(sig, &tw, sizeof(tw));
+    sig = view_hash(sig, &th, sizeof(th));
+
+    /* The picture is kept and reused until something about it moves. The
+     * measured peak is part of that: libplacebo's detector converges over a
+     * few passes after a cut, and a paused window has to keep rendering
+     * until it has, or the picture would be frozen part-way through the
+     * tone mapper settling. The threshold is what makes that terminate. */
+    if (g->pic_valid && g->pic_sig == sig &&
+        fabs(g->measured_peak - g->pic_peak) <=
+        0.002 * CRAW_MAX(g->pic_peak, 1.0))
+        return false;
+
+    /* The swapchain's own colour, but none of its bit depth: dithering
+     * belongs in the compose, which is the pass that meets the display. */
+    pic = (struct pl_frame) {
+        .num_planes = 1,
+        .planes[0] = {
+            .texture           = g->pic_tex,
+            .components        = 4,
+            .component_mapping = { 0, 1, 2, 3 },
+        },
+        .repr  = *trepr,
+        .color = *tcolor,
+        .crop  = dst,
+    };
+    pic.repr.bits = (struct pl_bit_encoding) { 0 };
+
+    if (!pl_render_image(g->rr, st->have_frame ? &image : NULL, &pic, &rp)) {
+        fprintf(stderr, "pl_render_image failed\n");
+        g->pic_valid = false;
+        return false;
+    }
+
+    /* Whatever the detector settled on for the frame just rendered - the
+     * window's own, which libplacebo runs by default and nothing here turns
+     * off any more. It is reported in PQ, so it comes back through the same
+     * rescale libplacebo uses internally. */
+    if (pl_renderer_get_hdr_metadata(g->rr, &measured))
+        g->measured_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, measured.max_pq_y);
+    else
+        g->measured_peak = 0.0;
+
+    g->pic_sig = sig;
+    g->pic_peak = g->measured_peak;
+    g->pic_valid = true;
+    g->pic_redrew = true;
+    /* Charged to whichever iteration ran the pass, which is normally the
+     * one that decoded the picture and not the one that presents it. */
+    if (g->rec)
+        g->rec->rendered = true;
+
+    return true;
+}
+
+/* Runs the picture pass early, off the present path, against the
+ * description the last swapchain frame carried. Does nothing before the
+ * first present, when there is no such description yet. */
+void view_gpu_prepare(struct view_gpu *g, struct view_state *st)
+{
+    if (!g->sw || !g->pic_have_target)
+        return;
+
+    view_gpu_pic_pass(g, st, &g->pic_repr, &g->pic_color, g->pic_tw, g->pic_th);
+}
+
+int view_gpu_display(struct view_gpu *g, struct view_state *st)
+{
+    int64_t t0 = av_gettime_relative();
+    if (g->rec)
+        g->rec->t_disp = t0;
+    struct pl_swapchain_frame sw_frame;
+    struct pl_frame target;
+    struct pl_overlay overlay;
+    struct pl_overlay_part part;
+    int tw, th;
+
+    g->pic_redrew = false;
+
+    if (!pl_swapchain_start_frame(g->sw, &sw_frame))
+        return CRAW_ERROR(EAGAIN);
+    if (g->rec)
+        g->rec->t_start = av_gettime_relative();
+
+    pl_frame_from_swapchain(&target, &sw_frame);
+    tw = sw_frame.fbo->params.w;
+    th = sw_frame.fbo->params.h;
+
+    /* Remembered for view_gpu_prepare(), which has no swapchain frame of
+     * its own to ask. Only a resize or a format change moves any of it, and
+     * both are in the picture pass's signature. */
+    g->pic_repr = target.repr;
+    g->pic_color = target.color;
+    g->pic_tw = tw;
+    g->pic_th = th;
+    g->pic_have_target = true;
 
     if (g->ui_tex[g->ui_slot]) {
         part = (struct pl_overlay_part) {
@@ -1644,29 +1894,103 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
         target.num_overlays = 1;
     }
 
-    if (!pl_render_image(g->rr, st->have_frame ? &image : NULL, &target, &rp)) {
-        fprintf(stderr, "pl_render_image failed\n");
-        return CRAW_ERROR(EIO);
-    }
+    /* Normally a no-op: view_gpu_prepare() has already put this picture in
+     * the texture, off the present path. It still has to be asked, because
+     * the first frame, a resize and a look the panel changed a moment ago
+     * all reach here with nothing rendered. */
+    view_gpu_pic_pass(g, st, &target.repr, &target.color, tw, th);
 
-    /* Whatever the detector settled on for the frame just rendered - the
-     * window's own, which libplacebo runs by default and nothing here turns
-     * off any more. It is reported in PQ, so it comes back through the same
-     * rescale libplacebo uses internally. */
-    if (pl_renderer_get_hdr_metadata(g->rr, &measured))
-        g->measured_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, measured.max_pq_y);
-    else
-        g->measured_peak = 0.0;
+    if (g->pic_tex && g->pic_valid) {
+        /* The compose: source and target are the same size and carry the
+         * same colour, so libplacebo has nothing to do here but sample one
+         * texel per pixel, blend the overlay and dither into the
+         * swapchain's depth. */
+        struct pl_render_params crp = pl_render_default_params;
+        struct pl_frame src_frame = {
+            .num_planes = 1,
+            .planes[0] = {
+                .texture           = g->pic_tex,
+                .components        = 4,
+                .component_mapping = { 0, 1, 2, 3 },
+            },
+            .repr  = target.repr,
+            .color = target.color,
+            .crop  = { 0, 0, (float)tw, (float)th },
+        };
+
+        src_frame.repr.bits = (struct pl_bit_encoding) { 0 };
+        crp.peak_detect_params = NULL;
+        crp.color_adjustment = &pl_color_adjustment_neutral;
+        crp.upscaler = crp.downscaler = NULL;
+        crp.skip_anti_aliasing = true;
+        crp.info_callback = st->trace.on ? view_trace_pass : NULL;
+        target.crop = (pl_rect2df) { 0, 0, (float)tw, (float)th };
+
+        if (!pl_render_image(g->rr_compose, &src_frame, &target, &crp)) {
+            fprintf(stderr, "composing the window failed\n");
+            return CRAW_ERROR(EIO);
+        }
+    } else {
+        /* No texture to keep the picture in - no floating point format, or
+         * no memory. Straight to the swapchain, the way this always
+         * worked. */
+        struct pl_render_params rp;
+        struct pl_color_map_params cmp;
+        struct pl_peak_detect_params pdp;
+        struct pl_color_adjustment adj;
+        struct pl_hdr_metadata measured;
+        const struct pl_hook *hook[VIEW_MAX_HOOKS];
+        struct pl_frame image;
+
+        view_render_params(st, &rp, &cmp, &pdp, &adj, hook, false, NULL);
+        if (st->trace.on)
+            rp.info_callback = view_trace_pass;
+
+        if (st->have_frame) {
+            pl_rect2df src, dst;
+
+            if (st->dec.raw)
+                view_gpu_image(g, &image, view_peak_ceiling(st));
+            else
+                image = g->mapped;
+            view_zoom_rects(st, &src, &dst);
+            image.crop = src;
+            target.crop = dst;
+        }
+
+        if (!pl_render_image(g->rr, st->have_frame ? &image : NULL,
+                             &target, &rp)) {
+            fprintf(stderr, "pl_render_image failed\n");
+            return CRAW_ERROR(EIO);
+        }
+        g->pic_redrew = true;
+        if (g->rec)
+            g->rec->rendered = st->have_frame;
+
+        if (pl_renderer_get_hdr_metadata(g->rr, &measured))
+            g->measured_peak = pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS,
+                                              measured.max_pq_y);
+        else
+            g->measured_peak = 0.0;
+    }
+    if (g->rec)
+        g->rec->t_image = av_gettime_relative();
+    if (g->rec)
+        g->rec->t_hdr = av_gettime_relative();
 
     if (!pl_swapchain_submit_frame(g->sw))
         return CRAW_ERROR(EIO);
 
     st->timing.render += (double)(av_gettime_relative() - t0) / 1000.0;
     t0 = av_gettime_relative();
+    if (g->rec)
+        g->rec->t_render = t0;
 
     pl_swapchain_swap_buffers(g->sw);
 
     st->timing.present += (double)(av_gettime_relative() - t0) / 1000.0;
+    if (g->rec)
+        g->rec->t_present = av_gettime_relative();
 
     return 0;
 }
@@ -1694,7 +2018,7 @@ int view_gpu_render_target(struct view_gpu *g, struct view_state *st,
         view_gpu_image(g, &image, view_peak_ceiling(st));
     else
         image = g->mapped;
-    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, true);
+    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, true, NULL);
 
     image.crop = (pl_rect2df) {
         (float)cx, (float)cy, (float)(cx + cw), (float)(cy + ch),
@@ -1755,7 +2079,7 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
         view_gpu_image(g, &image, view_peak_ceiling(st));
     else
         image = g->mapped;
-    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, true);
+    view_render_params(st, &rp, &cmp, &pdp, &adj, hook, true, NULL);
 
     /* The crop is nothing but this rectangle, the same way zoom and pan are
      * nothing but the pair of them on the display path. */

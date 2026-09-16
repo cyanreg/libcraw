@@ -609,6 +609,7 @@ static int view_reader_thread(void *opaque)
 
         av_packet_move_ref(r->q[(r->head + r->count) % VIEW_PKTQ_MAX], pkt);
         r->lens[(r->head + r->count) % VIEW_PKTQ_MAX] = lens;
+        r->arrive[(r->head + r->count) % VIEW_PKTQ_MAX] = av_gettime_relative();
         r->bytes += (size_t)r->q[(r->head + r->count) % VIEW_PKTQ_MAX]->size;
         r->count++;
         r->depth_sum += r->count;
@@ -700,12 +701,14 @@ static int view_reader_get(struct view_decoder *d, AVPacket *pkt,
     int ret;
 
     *lens = (CRAWLensCorrection) { 0 };
+    d->pkt_arrive = 0;
 
     SDL_LockMutex(r->lock);
 
     if (r->count) {
         av_packet_move_ref(pkt, r->q[r->head]);
         *lens = r->lens[r->head];
+        d->pkt_arrive = r->arrive[r->head];
         r->bytes -= (size_t)pkt->size;
         r->head = (r->head + 1) % VIEW_PKTQ_MAX;
         r->count--;
@@ -754,6 +757,14 @@ static int view_decoder_feed(struct view_decoder *d, int budget)
         if (ret == AVERROR(EAGAIN))
             break;              /* the decoder is full, which is the point */
 
+        {
+            size_t n = CRAW_ARRAY_ELEMS(d->arrive_ring);
+
+            d->arrive_ring[d->arrive_pushed % n].pts = d->pkt->pts;
+            d->arrive_ring[d->arrive_pushed % n].t = d->pkt_arrive;
+            d->arrive_pushed++;
+        }
+
         if (d->reader.scan) {
             size_t n = CRAW_ARRAY_ELEMS(d->lens_ring);
 
@@ -791,6 +802,14 @@ int view_decoder_next(struct view_decoder *d, AVFrame *frame)
                     fprintf(stderr, "decoding %s: %s\n", d->codec_name,
                             d->hwaccel ? "Vulkan hwaccel, frames stay on the GPU"
                                        : "software, frames uploaded per picture");
+            }
+
+            d->frame_arrive = 0;
+            for (size_t i = 0; i < CRAW_ARRAY_ELEMS(d->arrive_ring); i++) {
+                if (d->arrive_ring[i].t && d->arrive_ring[i].pts == frame->pts) {
+                    d->frame_arrive = d->arrive_ring[i].t;
+                    break;
+                }
             }
 
             /* Keep the decoder fed while it will take more, so the next
@@ -880,6 +899,9 @@ int view_decoder_seek(struct view_decoder *d, int64_t frame_index)
     }
     d->pkt_lens = (CRAWLensCorrection) { 0 };
     memset(d->lens_ring, 0, sizeof(d->lens_ring));
+    /* Presentation timestamps repeat after a loop point, so a stale entry
+     * here would put an old packet's arrival on a new picture. */
+    memset(d->arrive_ring, 0, sizeof(d->arrive_ring));
 
     if (d->eof || d->draining) {
         int ret = view_decoder_codec_open(d);

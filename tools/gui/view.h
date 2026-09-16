@@ -256,6 +256,10 @@ struct view_reader {
      * the reader thread is where the packet already is. Invalid for a
      * packet that carries none. */
     CRAWLensCorrection lens[VIEW_PKTQ_MAX];
+    /* When the reader put each packet in the queue, so that --trace can say
+     * whether a late picture was late because the medium was slow or
+     * because everything after the medium was. */
+    int64_t arrive[VIEW_PKTQ_MAX];
     int head, count;
     size_t bytes;
 
@@ -291,6 +295,17 @@ struct view_decoder {
     struct view_reader reader;
     bool pkt_held;              /* d->pkt holds one the decoder refused */
     CRAWLensCorrection pkt_lens;  /* and its record */
+    int64_t pkt_arrive;           /* and when the reader queued it */
+
+    /* The queue time of the packets in flight, matched to the picture that
+     * comes out by presentation timestamp, the way lens_ring below is -
+     * except that this one is kept for every clip and never consumed, since
+     * two pictures may legitimately want to read the same entry. */
+    struct {
+        int64_t pts, t;
+    } arrive_ring[16];
+    uint64_t arrive_pushed;
+    int64_t frame_arrive;       /* of the picture view_decoder_next() returned */
 
     /* Records of the packets in flight, matched back to the picture that
      * comes out by presentation timestamp. ProRes RAW is all intra and
@@ -392,6 +407,32 @@ struct view_gpu {
     pl_gpu gpu;
     pl_swapchain sw;
     pl_renderer rr;
+    /* The window's picture is rendered into a texture of its own and only
+     * when something about it changes; every swapchain frame then composes
+     * that texture and the panel overlay, which is a copy and a blend
+     * rather than a second pass over seventeen million source pixels. Its
+     * own renderer, because alternating two unrelated renders on one
+     * pl_renderer throws away the state it keeps between frames - the peak
+     * detection track above all. */
+    pl_renderer rr_compose;
+    pl_tex pic_tex;
+    int pic_w, pic_h;
+    /* Bumped by every new developed or mapped picture; part of the
+     * signature below, which is what decides that the texture is stale. */
+    uint64_t pic_serial;
+    uint64_t pic_sig;
+    double pic_peak;            /* what the detector had settled on then */
+    /* What the last swapchain frame described itself as, so that the
+     * picture pass can run without one. */
+    struct pl_color_repr pic_repr;
+    struct pl_color_space pic_color;
+    int pic_tw, pic_th;
+    bool pic_have_target;
+    bool pic_valid;
+    /* Whether the last display actually ran the picture pass. The peak
+     * detector converges over a few passes, so one redraw is a reason to
+     * come back and look again. */
+    bool pic_redrew;
 
     /* The single queue family everything runs on: libplacebo's async
      * transfer and compute are turned off so that graphics, compute and
@@ -489,7 +530,70 @@ struct view_gpu {
     /* What libplacebo's peak detection measured for the last displayed
      * frame, in nits; 0 when it has nothing to report. */
     double measured_peak;
+
+    /* Where --trace's current record lives, or NULL. gpu.c writes the
+     * moments only it knows - when libcraw's submit returned, when its
+     * fence was first seen signalled, when the swapchain took the frame -
+     * straight into it rather than through another accumulator. */
+    struct view_trace_rec *rec;
 };
+
+/* ---------------------------------------------------------- trace.c */
+
+/* One record per iteration of the run loop that reached the swapchain. The
+ * whole run is kept in memory and written out at exit: a file write inside
+ * the loop would measure the writing rather than the playback, and what is
+ * being asked of the trace is precisely where the milliseconds go. */
+struct view_trace_rec {
+    int64_t t_iter;         /* the iteration began */
+    int64_t t_step;         /* view_step_frame returned */
+    int64_t t_pkt;          /* the packet reached the reader's queue, 0: none */
+    int64_t t_submit;       /* libcraw's vkQueueSubmit2 returned */
+    int64_t t_fence;        /* that submission's fence was first seen signalled */
+    int64_t t_disp;         /* view_gpu_display() began */
+    int64_t t_start;        /* pl_swapchain_start_frame returned */
+    int64_t t_image;        /* pl_render_image returned */
+    int64_t t_hdr;          /* pl_renderer_get_hdr_metadata returned */
+    int64_t t_render;       /* pl_swapchain_submit_frame returned */
+    int64_t t_present;      /* the swap returned */
+    int64_t index;          /* the picture this iteration showed, -1: none */
+    double pts, clock;
+    double craw_gpu_ms;     /* libcraw's own timestamps, filled in two frames late */
+    double fence_ms;        /* blocked on a libcraw fence during this iteration */
+    double ui_ms;
+    bool stepped;           /* a new picture was decoded and developed */
+    bool rendered;          /* the picture pass ran rather than being reused */
+};
+
+struct view_trace {
+    struct view_trace_rec *recs;
+    int nb, max;
+    int64_t t0;
+    /* The output's refresh, as SDL reports it. The summary counts how long
+     * each picture was left on screen in refreshes, and that is the number
+     * a person sees as judder; without it the same figures can only be
+     * given in milliseconds. */
+    double refresh_hz;
+    /* The record being filled. Copied into recs[nb] at the end of the
+     * iteration, so that a run longer than `max` still gets a summary. */
+    struct view_trace_rec cur;
+    bool on;
+};
+
+/* Allocates the ring; `path` is where view_trace_close() writes, and
+ * `refresh_hz` is the output's own rate, 0 when it is not known. */
+int  view_trace_open(struct view_state *st, const char *path, double refresh_hz);
+/* Starts a record for this iteration. */
+void view_trace_iter(struct view_state *st, int64_t now);
+/* Ends it, at the moment the swap returned. */
+void view_trace_push(struct view_state *st);
+/* Writes the per-frame lines and the summary, and frees the ring. */
+void view_trace_close(struct view_state *st);
+/* Handed to pl_render_params.info_callback while tracing: totals the GPU
+ * time of every pass libplacebo dispatches for the window, so that the
+ * summary can say what the scaler, the peak detector, each hook and the
+ * overlay blend each cost. */
+void view_trace_pass(void *priv, const struct pl_render_info *info);
 
 /* --------------------------------------------------------- program state */
 
@@ -505,6 +609,7 @@ struct view_cfg {
     bool verbose;
     bool debug;                 /* validation layer */
     bool bench;                 /* decode as fast as the GPU allows */
+    const char *trace;          /* --trace FILE: one line per present */
 
     const char *profile;        /* built-in per-CCT table set */
     const char *tables;         /* per-CCT tables from a text file */
@@ -812,6 +917,7 @@ struct view_state {
     struct view_video video;
     struct view_sync sync;
     struct view_timing timing;
+    struct view_trace trace;
     struct view_zoom view;
     struct view_crop crop;
     struct view_grain grain;
@@ -879,6 +985,10 @@ struct view_state {
     /* The wall clock that stands in for the audio clock on a silent clip. */
     double wall_pts;
     int64_t wall_t0;
+    /* The master clock's smoother: see view_clock(). */
+    double clk_t;
+    int64_t clk_wall;
+    bool clk_have;
     /* The first picture pays for the pipeline's shaders and libplacebo's;
      * the audio only starts once that is behind us, or the clock would run
      * away and the first second would be spent dropping frames. */
@@ -893,6 +1003,16 @@ struct view_state {
     double proc_fps;            /* pictures pushed through the pipeline */
     double loop_period;         /* smoothed wall time between iterations */
     double step_cost;           /* smoothed decode plus pipeline time */
+
+    /* The window is only drawn and presented when something on it would be
+     * different: a new picture, a replayed one, any input at all, a picture
+     * pass that has not settled yet, or the idle tick that keeps the
+     * panel's own readouts alive. In between, the loop waits instead of
+     * drawing the same frame again - which on a 60 Hz output used to be a
+     * second full pass over seventeen million source pixels per picture,
+     * and a second copy of the window back over the Thunderbolt link. */
+    bool present_due;
+    int64_t last_present;
 };
 
 /* ----------------------------------------------------------- gpu.c */
@@ -926,6 +1046,9 @@ int  view_gpu_process(struct view_gpu *g, const AVFrame *frame,
  * white balance histogram of the previous frame needs. Normally returns at
  * once: that frame has had a whole frame period to retire. */
 int  view_gpu_wait_prev(struct view_gpu *g, struct view_timing *tm);
+/* Non-blocking: notes in --trace's record when the last submission's fence
+ * was first seen signalled. */
+void view_gpu_poll_fence(struct view_gpu *g);
 
 /* The non-raw path: hands the decoded frame to libplacebo. Takes its own
  * reference, so the caller may unref immediately. `vlog` replaces the two
@@ -955,6 +1078,11 @@ void view_gpu_reset_peak(struct view_gpu *g, bool export_renderer);
 
 /* Renders to the swapchain, with `ui` composited on top when non-NULL. */
 int  view_gpu_display(struct view_gpu *g, struct view_state *st);
+/* Renders the window's picture into its own texture, off the present path,
+ * so that presenting it later is a copy and a blend. Safe to call as often
+ * as the loop likes: it does nothing when the texture already holds exactly
+ * this picture. */
+void view_gpu_prepare(struct view_gpu *g, struct view_state *st);
 
 /* Renders to an offscreen sRGB texture and downloads it as 16 bit RGB. */
 int  view_gpu_render_export(struct view_gpu *g, struct view_state *st,

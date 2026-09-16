@@ -39,6 +39,14 @@
 #define VIEW_WINDOW_W 1600
 #define VIEW_WINDOW_H 900
 
+/* How long the window may go without being drawn when nothing on it would
+ * change, and how long the loop is ever allowed to sleep at a stretch. The
+ * first keeps the panel's frame rate averages moving while paused; the
+ * second keeps the audio ring topped up and the next picture's due time
+ * from being overshot. */
+#define VIEW_IDLE_PRESENT 200000        /* microseconds */
+#define VIEW_IDLE_WAIT_MS 4
+
 /* BT.2408 diffuse white, which is what a pipeline value of 1.0 means. */
 #define VIEW_REF_WHITE_NITS 203.0f
 
@@ -555,23 +563,66 @@ fail:
 
 /* ------------------------------------------------------------- the clock */
 
+/* How fast the smoother below closes on the audio device's own cursor, and
+ * how far that cursor may move in one step before the move is taken for a
+ * real one rather than for noise. */
+#define VIEW_CLOCK_TAU  0.30            /* seconds */
+#define VIEW_CLOCK_JUMP 0.10
+
 double view_clock(struct view_state *st)
 {
+    double raw, dt, err;
+    int64_t now;
+
     if (st->audio.available)
-        return view_audio_clock(&st->audio);
+        raw = view_audio_clock(&st->audio);
+    else if (!st->playing)
+        raw = st->wall_pts;             /* a silent clip, stopped */
+    else
+        raw = st->wall_pts +
+              (double)(av_gettime_relative() - st->wall_t0) / 1.0e6;
 
-    /* A silent clip gets the same pacing from wall time, anchored at the
-     * last start or seek. */
-    if (!st->playing)
-        return st->wall_pts;
+    now = av_gettime_relative();
 
-    return st->wall_pts + (double)(av_gettime_relative() - st->wall_t0) / 1.0e6;
+    /* Stopped, or not yet running: the cursor is the answer and there is
+     * nothing to smooth across. */
+    if (!st->clk_have || !st->playing || !st->warm) {
+        st->clk_t = raw;
+        st->clk_wall = now;
+        st->clk_have = true;
+        return raw;
+    }
+
+    /* The audio cursor is read through two quantised numbers - what SDL
+     * still has queued, and when we last handed it frames - and it wanders
+     * about five milliseconds either side of wall time. Read once a picture
+     * that did not matter; deciding when to present from it puts every one
+     * of those milliseconds into the interval between one picture and the
+     * next, and that interval is what the eye sees as judder. So the clock
+     * runs on wall time and is pulled towards the cursor over a third of a
+     * second: still locked to the sound, no longer shaking. A jump - a
+     * seek, a loop point, the first frames of a run - is not noise and is
+     * taken whole. */
+    dt = (double)(now - st->clk_wall) / 1.0e6;
+    st->clk_wall = now;
+    st->clk_t += dt;
+
+    err = raw - st->clk_t;
+    if (fabs(err) > VIEW_CLOCK_JUMP)
+        st->clk_t = raw;
+    else
+        st->clk_t += err * (1.0 - exp(-dt / VIEW_CLOCK_TAU));
+
+    return st->clk_t;
 }
 
 static void view_wall_restart(struct view_state *st, double pts)
 {
     st->wall_pts = pts;
     st->wall_t0 = av_gettime_relative();
+    /* The clock has been moved on purpose; the smoother starts again from
+     * where it was put rather than sliding there. */
+    st->clk_have = false;
 }
 
 static double view_frame_duration(const struct view_state *st)
@@ -579,29 +630,21 @@ static double view_frame_duration(const struct view_state *st)
     return st->dec.frame_rate.num ? 1.0 / av_q2d(st->dec.frame_rate) : 1.0 / 29.97;
 }
 
-/* Audio is the master clock and is never made to wait for the picture: a
- * frame is stepped only once the one on screen has had its turn, and the
- * lead accounts for what it costs to get the next one there - the decode
- * and pipeline time, plus half a display interval of presentation jitter.
- * Without that the picture would sit a consistent half-refresh late. */
+/* Audio is the master clock and is never made to wait for the picture. The
+ * next picture is started the moment the one on screen has been presented,
+ * not a decode's length before it is due: the window holds what it is
+ * showing in a texture of its own, so the slot, the frame and the renderer
+ * are all free again, and the next picture then has a whole frame period to
+ * be decoded, developed and rendered in. What it is actually shown at is
+ * decided by the clock alone (the hold in the run loop), so nothing that
+ * varies about a decode - six to twenty-five milliseconds at 5.8K - reaches
+ * the interval between one picture and the next, which is what judder is.
+ *
+ * One picture in flight, never two: `present_due` is false only between a
+ * present and the step that follows it. */
 static bool view_frame_due(struct view_state *st)
 {
-    double dur, lead;
-
-    if (st->cfg.bench || !st->have_frame)
-        return true;
-
-    dur = view_frame_duration(st);
-    lead = st->step_cost + st->loop_period * 0.5;
-
-    /* Never launch more than half a frame early. Without the clamp the
-     * first step's one-time cost - mapping textures, starting a hwaccel,
-     * compiling shaders - seeds the estimate at a few hundred milliseconds
-     * and the picture sprints that far ahead of the audio before the
-     * average decays. */
-    lead = CRAW_MIN(lead, dur * 0.5);
-
-    return view_clock(st) + lead >= st->pts + dur;
+    return st->cfg.bench || !st->have_frame || !st->present_due;
 }
 
 /* Fills the ring before the device is unpaused, so that a run never starts
@@ -1439,6 +1482,9 @@ static void view_usage(FILE *f)
 "  --debug             turn the Vulkan validation layer on\n"
 "  --bench             play as fast as the pipeline allows instead of at the\n"
 "                      clip's own frame rate\n"
+"  --trace FILE        write one line per present - when the packet arrived,\n"
+"                      when it was decoded, developed and rendered, and the\n"
+"                      interval to the last present - and a cadence summary\n"
 "  --no-loop           stop at the end of the clip instead of starting over\n"
 "  --loops N           play the clip N times and quit, printing the A/V\n"
 "                      statistics (default: loop for ever)\n"
@@ -1608,6 +1654,7 @@ enum {
     VIEW_OPT_DEVICE = 0x100,
     VIEW_OPT_DEBUG,
     VIEW_OPT_BENCH,
+    VIEW_OPT_TRACE,
     VIEW_OPT_WB,
     VIEW_OPT_EI,
     VIEW_OPT_EXPOSURE,
@@ -1654,6 +1701,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "device",   required_argument, NULL, VIEW_OPT_DEVICE    },
         { "debug",    no_argument,       NULL, VIEW_OPT_DEBUG     },
         { "bench",    no_argument,       NULL, VIEW_OPT_BENCH     },
+        { "trace",    required_argument, NULL, VIEW_OPT_TRACE     },
         { "wb",       required_argument, NULL, VIEW_OPT_WB        },
         { "ei",       required_argument, NULL, VIEW_OPT_EI        },
         { "exposure", required_argument, NULL, VIEW_OPT_EXPOSURE  },
@@ -1716,6 +1764,9 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             break;
         case VIEW_OPT_BENCH:
             st->cfg.bench = true;
+            break;
+        case VIEW_OPT_TRACE:
+            st->cfg.trace = optarg;
             break;
         case VIEW_OPT_NO_LOOP:
             st->cfg.loop = false;
@@ -2575,6 +2626,10 @@ static int view_run_window(struct view_state *st)
     bool running = true;
     int64_t fps_t0, iter_t0;
     int fps_frames = 0, proc_frames = 0;
+    /* A picture that has been developed but not yet drawn: the a/v figures
+     * belong to the moment it reached the screen, which need not be the
+     * iteration that decoded it. */
+    bool stepped_pending = false;
     int w = VIEW_WINDOW_W, h = VIEW_WINDOW_H;
     int ret;
 
@@ -2630,6 +2685,16 @@ static int view_run_window(struct view_state *st)
     if (ret < 0)
         return ret;
 
+    if (st->cfg.trace) {
+        const SDL_DisplayMode *mode =
+            SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(win));
+
+        ret = view_trace_open(st, st->cfg.trace,
+                              mode ? (double)mode->refresh_rate : 0.0);
+        if (ret < 0)
+            return ret;
+    }
+
     fps_t0 = av_gettime_relative();
     iter_t0 = fps_t0;
     ret = 0;
@@ -2637,12 +2702,22 @@ static int view_run_window(struct view_state *st)
     while (running) {
         bool was_playing = st->playing;
         bool stepped = false;
+        bool events_seen = false;
+        bool presented = false;
+        double hold;
         SDL_Event e;
         int64_t now;
+
+        view_trace_iter(st, av_gettime_relative());
 
         view_ui_input_begin();
         while (SDL_PollEvent(&e)) {
             bool to_nuklear = true;
+
+            /* Any event at all is a reason to draw: a key or a drag can
+             * move the picture, the look or the panel, and chasing down
+             * which ones do would only be a list to get wrong. */
+            events_seen = true;
 
             switch (e.type) {
             case SDL_EVENT_QUIT:
@@ -2803,6 +2878,10 @@ static int view_run_window(struct view_state *st)
 
                 stepped = true;
                 proc_frames++;
+                if (st->trace.on) {
+                    st->trace.cur.t_step = av_gettime_relative();
+                    st->trace.cur.t_pkt = st->dec.frame_arrive;
+                }
                 /* The first picture of a run pays for everything that is
                  * set up once, so it is no guide to what the next one will
                  * cost. */
@@ -2828,21 +2907,15 @@ static int view_run_window(struct view_state *st)
             }
         }
 
-        view_ui_build(st);
-
-        /* A grade change while paused replays the picture on screen; while
-         * playing the next frame simply uses the current look, and so does
-         * a decode that is already pending. */
-        if (!st->playing && !st->exp.active && st->have_frame &&
-            !st->need_frame && st->seek_to < 0) {
-            struct view_pipeline_look look = view_pipeline_look(st);
-
-            if (!view_pipeline_look_equal(&look, &st->processed)) {
-                ret = view_replay_frame(st);
-                if (ret < 0)
-                    break;
-            }
-        }
+        now = av_gettime_relative();
+        /* What would make the window look different from what is on it.
+         * The panel's own readouts move with the picture, so they need no
+         * test of their own; the idle tick is what keeps the ones that move
+         * with nothing - the frame rate averages - alive while paused. */
+        if (stepped || events_seen || !st->warm || st->gpu.pic_redrew ||
+            st->exp.active || st->video.active || st->need_frame ||
+            st->seek_to >= 0 || now - st->last_present >= VIEW_IDLE_PRESENT)
+            st->present_due = true;
 
         /* The transport drives the audio, never the other way round. */
         if (st->playing != was_playing) {
@@ -2861,38 +2934,108 @@ static int view_run_window(struct view_state *st)
                 view_audio_pause(&st->audio);
         }
 
-        if (stepped) {
-            double clock = view_clock(st);
-            double diff = clock - st->pts;
-            double mag = fabs(diff);
+        if (stepped)
+            stepped_pending = true;
 
-            st->sync.diff = diff;
-            st->sync.presented++;
-            st->sync.max_abs = CRAW_MAX(st->sync.max_abs, mag);
-            /* The first frames of a run are ahead of the audio by up to one
-             * device buffer, because nothing has been heard yet, and the
-             * very first of them also pay for compiling shaders. */
-            if (st->sync.run_frames > 10)
-                st->sync.max_abs_settled = CRAW_MAX(st->sync.max_abs_settled, mag);
+        /* The picture pass runs here rather than inside the present: it is
+         * where the milliseconds are, and on the present path they would
+         * land in the interval between one picture and the next. By the
+         * time the picture is due, the texture already holds it and the
+         * present is a copy, a panel blend and a swap. */
+        if (st->present_due && !st->exp.active && !st->video.active)
+            view_gpu_prepare(&st->gpu, st);
 
-            view_log(st, "frame %5" PRId64 " pts %7.3f s  clock %7.3f s  "
-                         "a/v %+7.2f ms  peak %6.0f / %6.0f nits\n",
-                     st->index, st->pts, clock, diff * 1000.0,
-                     st->gpu.measured_peak, view_peak_ceiling(st));
+        /* A developed picture is held until its own time on the clip's
+         * timeline. Presenting it the moment it finished developing puts
+         * the decode's own variation - two to sixteen milliseconds at 5.8K
+         * - straight into the interval between one picture and the next,
+         * and that interval is what judder is. Everything else the window
+         * draws is wanted at once. */
+        hold = st->present_due && stepped_pending && st->playing && st->warm &&
+               !st->cfg.bench && !st->exp.active && !st->video.active
+             ? st->pts - view_clock(st) : 0.0;
+
+        if (st->present_due && hold <= 0.0) {
+            view_ui_build(st);
+
+            /* A grade change while paused replays the picture on screen;
+             * while playing the next frame simply uses the current look,
+             * and so does a decode that is already pending. */
+            if (!st->playing && !st->exp.active && st->have_frame &&
+                !st->need_frame && st->seek_to < 0) {
+                struct view_pipeline_look look = view_pipeline_look(st);
+
+                if (!view_pipeline_look_equal(&look, &st->processed)) {
+                    ret = view_replay_frame(st);
+                    if (ret < 0)
+                        break;
+                }
+            }
+
+            ret = view_ui_render(st);
+            if (ret < 0)
+                break;
+
+            if (st->trace.on) {
+                view_gpu_poll_fence(&st->gpu);
+                st->trace.cur.index = st->index;
+                st->trace.cur.pts = st->pts;
+                st->trace.cur.clock = view_clock(st);
+                st->trace.cur.stepped = stepped_pending;
+            }
+
+            ret = view_gpu_display(&st->gpu, st);
+            view_ui_rotate(&st->gpu);
+            if (ret == CRAW_ERROR(EAGAIN)) {
+                SDL_Delay(10);
+                continue;
+            }
+            if (ret < 0)
+                break;
+
+            /* A picture's place against the clock is where it was when it
+             * reached the screen, not where it was when it was decoded: the
+             * decode now runs a whole frame ahead of the present. */
+            if (stepped_pending) {
+                double clock = view_clock(st);
+                double diff = clock - st->pts;
+                double mag = fabs(diff);
+
+                st->sync.diff = diff;
+                st->sync.presented++;
+                st->sync.max_abs = CRAW_MAX(st->sync.max_abs, mag);
+                /* The first frames of a run are ahead of the audio by up to
+                 * one device buffer, because nothing has been heard yet,
+                 * and the very first of them also pay for compiling
+                 * shaders. */
+                if (st->sync.run_frames > 10)
+                    st->sync.max_abs_settled = CRAW_MAX(st->sync.max_abs_settled,
+                                                        mag);
+
+                view_log(st, "frame %5" PRId64 " pts %7.3f s  clock %7.3f s  "
+                             "a/v %+7.2f ms  peak %6.0f / %6.0f nits\n",
+                         st->index, st->pts, clock, diff * 1000.0,
+                         st->gpu.measured_peak, view_peak_ceiling(st));
+            }
+
+            view_trace_push(st);
+            st->present_due = false;
+            st->last_present = av_gettime_relative();
+            presented = true;
+            stepped_pending = false;
+        } else {
+            /* Nothing would be different yet, so the loop waits rather than
+             * drawing the same picture again. The wait ends early on any
+             * input and never runs past the moment something is wanted:
+             * either the held picture's own time, or the point at which the
+             * next one has to start being decoded. The cap keeps the audio
+             * ring topped up whatever the clip's frame rate is. */
+            int ms = hold > 0.0 ? (int)(hold * 1000.0) : VIEW_IDLE_WAIT_MS;
+
+            ms = CRAW_MIN(ms, VIEW_IDLE_WAIT_MS);
+            if (ms > 0)
+                SDL_WaitEventTimeout(NULL, ms);
         }
-
-        ret = view_ui_render(st);
-        if (ret < 0)
-            break;
-
-        ret = view_gpu_display(&st->gpu, st);
-        view_ui_rotate(&st->gpu);
-        if (ret == CRAW_ERROR(EAGAIN)) {
-            SDL_Delay(10);
-            continue;
-        }
-        if (ret < 0)
-            break;
 
         if (!st->view.cx && !st->view.cy && st->gpu.width) {
             st->view.cx = (float)st->gpu.width * 0.5f;
@@ -2907,7 +3050,8 @@ static int view_run_window(struct view_state *st)
             st->sync.run_frames = 0;
         }
 
-        fps_frames++;
+        if (presented)
+            fps_frames++;
         now = av_gettime_relative();
         {
             double period = (double)(now - iter_t0) / 1.0e6;
@@ -2940,6 +3084,8 @@ static int view_run_window(struct view_state *st)
             }
         }
     }
+
+    view_trace_close(st);
 
     if (st->cfg.verbose || st->cfg.loops)
         fprintf(stderr, "%" PRId64 " passes: %" PRId64 " frames presented, "

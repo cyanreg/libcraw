@@ -108,6 +108,7 @@ if craw_tools_ffmpeg
     if craw_tools_gui
         executable('cineview',
             'gui/main.c',
+            'gui/trace.c',
             'gui/gpu.c',
             'gui/decode.c',
             'gui/ui.c',
