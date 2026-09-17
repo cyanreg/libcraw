@@ -23,8 +23,6 @@
 
 #include <libplacebo/gpu.h>
 #include <libplacebo/swapchain.h>
-#include <libplacebo/tone_mapping.h>
-#include <libplacebo/gamut_mapping.h>
 #include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/shaders/custom.h>
 /* Header-only in C, and it needs the Vulkan header first for AVVkFrame
@@ -40,43 +38,6 @@
 #define VIEW_REF_WHITE_NITS 203.0f
 
 /* --------------------------------------------------------------- tables */
-
-/* Both lists start with "off", which is the export's own setting and not a
- * libplacebo function: NULL for the tone map, so nothing is attached and the
- * target carries the source's own luminance range; libplacebo's `clip` for
- * the gamut map, whose map callback is literally a no-op that
- * pl_gamut_map_params_noop() recognises, so the conversion is the primaries
- * matrix and nothing else. */
-static const struct pl_tone_map_function *const view_tone_map_fns[] = {
-    NULL,
-    &pl_tone_map_bt2390,
-    &pl_tone_map_spline,
-    &pl_tone_map_reinhard,
-    &pl_tone_map_clip,
-};
-
-const char *const view_tone_map_names[] = {
-    "off", "bt.2390", "spline", "reinhard", "clip",
-};
-
-const int view_nb_tone_maps = (int)(sizeof(view_tone_map_fns) / sizeof(view_tone_map_fns[0]));
-
-static const struct pl_gamut_map_function *const view_gamut_map_fns[] = {
-    &pl_gamut_map_clip,
-    &pl_gamut_map_perceptual,
-    &pl_gamut_map_softclip,
-    &pl_gamut_map_relative,
-    &pl_gamut_map_desaturate,
-};
-
-/* One word each: the same strings name the choice in the panel and on the
- * command line. libplacebo's "clip" is not a mode of its own here because it
- * is the absence of one, which is what "off" says. */
-const char *const view_gamut_map_names[] = {
-    "off", "perceptual", "softclip", "relative", "desaturate",
-};
-
-const int view_nb_gamut_maps = (int)(sizeof(view_gamut_map_fns) / sizeof(view_gamut_map_fns[0]));
 
 /* What a .cube LUT expects at its input. Anything but the first entry makes
  * the LUT a PL_LUT_CONVERSION from that space to a BT.709 display, which is
@@ -126,16 +87,6 @@ void view_lut_apply_space(struct pl_custom_lut *lut, int space)
         .sys    = PL_COLOR_SYSTEM_RGB,
         .levels = PL_COLOR_LEVELS_PC,
     };
-}
-
-const struct pl_tone_map_function *view_tone_map(int idx)
-{
-    return view_tone_map_fns[CRAW_CLAMP(idx, 0, view_nb_tone_maps - 1)];
-}
-
-const struct pl_gamut_map_function *view_gamut_map(int idx)
-{
-    return view_gamut_map_fns[CRAW_CLAMP(idx, 0, view_nb_gamut_maps - 1)];
 }
 
 /* --------------------------------------------------------------- device */
@@ -551,6 +502,13 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
         return CRAW_ERROR(ENOTSUP);
     }
     g->gpu = g->vk->gpu;
+
+    /* Which video encode engines this device has, for the export's preset
+     * table: an engine is an extension, and libplacebo has just enabled
+     * every one of the optional ones the device offers. A GPU without
+     * VK_KHR_video_encode_av1 has no AV1 encoder, and the table greys the
+     * family with that rather than finding out by opening one. */
+    view_presets_device_exts(g->vk->extensions, g->vk->num_extensions);
 
     g->qf = g->vk->queue_compute.index;
     g->queue_flags = g->vk->queue_compute.flags;
@@ -1446,33 +1404,6 @@ void view_gpu_image(const struct view_gpu *g, struct pl_frame *out,
     };
 }
 
-/* "Tone mapping off" is not a clip and not a function: it is the target
- * carrying the source's own luminance range, which is exactly the condition
- * pl_tone_map_params_noop() tests, so libplacebo attaches no tone curve at
- * all and every value passes through into the target's encoding. Left alone
- * when tone mapping is on, and when it is the target's own peak that says
- * what the picture is mapped to. */
-void view_export_tone_off(struct view_state *st, struct pl_color_space *c)
-{
-    struct pl_color_space src;
-
-    if (st->look.video_preset.tone_map != 0)
-        return;
-
-    if (st->dec.raw) {
-        c->hdr.min_luma = PL_COLOR_HDR_BLACK;
-        c->hdr.max_luma = view_peak_ceiling(st);
-        return;
-    }
-
-    /* A developed clip's range is the stream's own, once libplacebo has
-     * filled in whatever the tags left out. */
-    src = st->gpu.mapped.color;
-    pl_color_space_infer(&src);
-    c->hdr.min_luma = src.hdr.min_luma;
-    c->hdr.max_luma = src.hdr.max_luma;
-}
-
 /* The hook state for one of the two renderers, made on first use the way
  * the grain's is: the pl_gpu has to exist first, and a viewer that never
  * exports never builds the export one. */
@@ -1510,7 +1441,6 @@ static void view_render_params(struct view_state *st,
                                const struct pl_hook **hook, bool export_path,
                                uint64_t *sig)
 {
-    const struct view_preset_sel *sel = &st->look.video_preset;
     /* The look is bypassed entirely while a scene-referred export space is
      * selected, on screen as well as in the file: what that export holds is
      * the pipeline's own linear light, so the window has to show the same
@@ -1518,16 +1448,16 @@ static void view_render_params(struct view_state *st,
      * something nobody is going to get. */
     bool scene = view_export_is_scene(st);
 
+    /* One mapping for the window and the file: libplacebo's own defaults -
+     * the spline tone map, the perceptual gamut map - into whatever the
+     * target is, which for the window is what the compositor negotiated
+     * and for an export is the colour space that was chosen. The export
+     * used to have a mapping of its own, bt.2390 by default, and a file
+     * that came out thirteen per cent brighter in the mid-tones than the
+     * frame on screen is what that bought; a display-referred export is
+     * the picture as the viewer shows it, and this is what makes it so. */
     *cmp = pl_color_map_default_params;
     *pdp = pl_peak_detect_default_params;
-
-    /* The window's mapping is the compositor's business: libplacebo knows
-     * what the swapchain negotiated and its defaults are for exactly that.
-     * Only the export chooses, and only into a display-referred target. */
-    if (export_path) {
-        cmp->tone_mapping_function = view_tone_map(sel->tone_map);
-        cmp->gamut_mapping = view_gamut_map(sel->gamut_map);
-    }
 
     /* The raw path's texture is tagged scRGB, whose 1.0 is 80 nits, while
      * the pipeline's 1.0 is diffuse white at 203. Scaling the samples by
@@ -1546,11 +1476,9 @@ static void view_render_params(struct view_state *st,
      * measuring the real peak stops an ordinary frame from being tone
      * mapped as though it were full of blown highlights. libplacebo's
      * defaults for the smoothing window, the scene cut thresholds and the
-     * percentile are kept: nothing measured here argues with them, and the
-     * window keeps them whatever the export was set to. */
-    if (export_path) {
-        rp->peak_detect_params = sel->peak ? pdp : NULL;
-    } else {
+     * percentile are kept: nothing measured here argues with them. */
+    rp->peak_detect_params = pdp;
+    if (!export_path) {
         /* The window lets the measurement arrive a frame late. Without this
          * libplacebo reads the peak back inside pl_render_image and has to
          * wait for the GPU to get there, which on one queue means waiting
@@ -1559,7 +1487,6 @@ static void view_render_params(struct view_state *st,
          * machine. An export reads its peak the way it always did - nothing
          * about a written file may depend on when the CPU asked. */
         pdp->allow_delayed = true;
-        rp->peak_detect_params = pdp;
     }
     /* A user .cube goes on the image as asked; a film simulation never
      * does: it is a display-referred sRGB look and belongs after tone
@@ -2144,12 +2071,6 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
         .color = pl_color_space_srgb,
         .crop  = { 0, 0, (float)tw, (float)th },
     };
-
-    /* The Export section's tone mapping setting reaches the still as well as
-     * the movie: they are one export with one set of settings, and a still
-     * that tone mapped while the video beside it did not would be a
-     * different picture of the same frame. */
-    view_export_tone_off(st, &target.color);
 
     /* The export has its own renderer so that the peak detection track it
      * walks through depends only on the exported frames: the same frame

@@ -25,9 +25,15 @@
  * next frame is already in flight while the scaler and the encoder work on
  * this one.
  *
- * Audio is remuxed rather than re-encoded: the clip's own packets, cut to
- * the exported range on a sample boundary where the codec is PCM, which is
- * what every camera here records. */
+ * Audio goes with the picture as the selection says. `copy` remuxes the
+ * clip's own packets, cut to the exported range on a sample boundary where
+ * the codec is PCM, which is what every camera here records. The four
+ * encoding modes decode the same packets, take them through libswresample
+ * only where the encoder wants another sample format or rate, cut them to
+ * the same range, and hand them to opus, aac, flac or PCM in frames of the
+ * encoder's own size; the packets are interleaved with the video as they
+ * come out. A QuickTime or MP4 file always gets its moov atom in front of
+ * the media, so it plays before it has finished downloading. */
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -36,11 +42,16 @@
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/audio_fifo.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/samplefmt.h>
 #include <libavutil/time.h>
+#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
 /* After <vulkan/vulkan.h>, which view.h has already pulled in: that is what
@@ -113,7 +124,6 @@ struct view_encode {
      * written upright and carries no matrix of its own, so `w` and `h`
      * above are the turned ones and the crop rectangle is not. */
     pl_rotation rotation;
-    bool req_audio;
     AVRational fr;
     int64_t start, end, next;
     int64_t encoded;
@@ -126,38 +136,46 @@ struct view_encode {
     enum AVColorSpace csp;
     enum AVChromaLocation chroma;
 
-    /* Audio, remuxed. `pcm_bytes` is the size of one sample frame, which is
-     * what lets the range be cut on a sample; zero for a codec with no such
-     * thing, where the cut is a packet boundary instead. */
+    /* The sound: the clip opened a second time for it, and one entry per
+     * stream on its way into the file. */
     AVFormatContext *aic;
     AVPacket *apkt;
     int nb_audio;
-    int a_in[2], a_out[2];
-    int pcm_bytes[2];
-    int rate[2];
-    int64_t a_first[2], a_want[2], a_written[2];
+    struct view_enc_audio {
+        int in, out;            /* the clip's stream index and the file's */
+        int src_rate;           /* the clip's sample rate */
+        int rate;               /* the file's, which is the stream's time base */
+        /* Copy: the size of one sample frame, which is what lets the range
+         * be cut on a sample; zero for a codec with no such thing, where
+         * the cut is a packet boundary instead. */
+        int pcm_bytes;
+        /* The range in the clip's own samples, how much of it has been
+         * taken, and the same range and count in the file's samples. */
+        int64_t first, want, taken;
+        int64_t out_want, written;
+
+        /* The encoding modes: a decoder, the converter where the encoder
+         * wants another format or rate, a queue that turns the decoder's
+         * frames into the encoder's, and the encoder. */
+        AVCodecContext *dec, *enc;
+        struct SwrContext *swr;
+        AVAudioFifo *fifo;
+        AVFrame *df, *cf, *ef;  /* decoded, converted, and the encoder's */
+        int64_t pts;            /* the next encoder frame's first sample */
+        int64_t src_pos;        /* where the next decoded sample falls */
+        bool flushed;
+    } a[2];
     bool audio_eof;
+
+    /* What the video encoder's thread_count came out as after the open,
+     * for the status line: some encoders clamp what they were asked for. */
+    int threads;
 
     int64_t t0, last_report;
     double fps;
 };
 
 /* ------------------------------------------------------- the encoder list */
-
-static bool view_enc_is_vulkan(const AVCodec *c)
-{
-    const AVCodecHWConfig *hw;
-
-    for (int i = 0; (hw = avcodec_get_hw_config(c, i)); i++)
-        if (hw->device_type == AV_HWDEVICE_TYPE_VULKAN ||
-            hw->pix_fmt == AV_PIX_FMT_VULKAN)
-            return true;
-
-    /* A name is not evidence on its own, but an encoder that calls itself
-     * Vulkan and reports nothing is not one we would drive by uploading
-     * system memory into it either. */
-    return strstr(c->name, "_vulkan") != NULL;
-}
 
 void view_encode_list(void)
 {
@@ -175,7 +193,7 @@ void view_encode_list(void)
         if (!av_codec_is_encoder(c) || c->type != AVMEDIA_TYPE_VIDEO)
             continue;
 
-        if (view_enc_is_vulkan(c))
+        if (view_presets_codec_is_vulkan(c))
             kind = 'V';
         else if (c->capabilities & AV_CODEC_CAP_HARDWARE)
             kind = 'H';
@@ -460,6 +478,10 @@ static int view_enc_try(struct view_encode *e, struct view_state *st,
         }
     } else {
         avc->pix_fmt = fmt;
+        /* The threads row, which only a software encoder has any use for:
+         * 0 is FFmpeg's own auto, and what the encoder makes of the number
+         * is read back after the open, since some clamp it. */
+        avc->thread_count = CRAW_MAX(e->sel.threads, 0);
     }
 
     if (e->oc->oformat->flags & AVFMT_GLOBALHEADER)
@@ -498,9 +520,10 @@ static int view_enc_try(struct view_encode *e, struct view_state *st,
     }
 
     av_dict_free(&opts);
-    e->avc    = avc;
-    e->frames = frames;
-    e->sw_fmt = fmt;
+    e->avc     = avc;
+    e->frames  = frames;
+    e->sw_fmt  = fmt;
+    e->threads = avc->thread_count;
 
     return 0;
 
@@ -518,14 +541,15 @@ fail:
  * stereo stream is the whole of it, and four mono tracks means the last two
  * are the stereo pair. A single four channel stream is copied whole -
  * playback picks channels 3 and 4 out of it, but an export that dropped the
- * other two would be throwing away a recording. */
-static void view_enc_audio_pick(struct view_encode *e)
+ * other two would be throwing away a recording. Returns how many, at most
+ * `max`, with their stream indices in `in`. */
+static int view_enc_audio_pick(const AVFormatContext *fc, int *in, int max)
 {
     int audio[64], nb_audio = 0;
     int mono = 0, quad = -1;
 
-    for (unsigned i = 0; i < e->aic->nb_streams && nb_audio < 64; i++) {
-        AVCodecParameters *cp = e->aic->streams[i]->codecpar;
+    for (unsigned i = 0; i < fc->nb_streams && nb_audio < 64; i++) {
+        const AVCodecParameters *cp = fc->streams[i]->codecpar;
 
         if (cp->codec_type != AVMEDIA_TYPE_AUDIO)
             continue;
@@ -536,28 +560,528 @@ static void view_enc_audio_pick(struct view_encode *e)
         audio[nb_audio++] = (int)i;
     }
 
-    if (!nb_audio)
+    if (!nb_audio || max < 1)
+        return 0;
+
+    if (nb_audio >= 4 && mono >= 4 && max >= 2) {
+        in[0] = audio[nb_audio - 2];
+        in[1] = audio[nb_audio - 1];
+        return 2;
+    }
+
+    in[0] = audio[quad >= 0 ? quad : 0];
+
+    return 1;
+}
+
+/* The depth of a source, for the PCM mode's choice of encoder: what the
+ * stream says its samples are, or what its codec's name says. */
+static int view_enc_audio_bits(const AVCodecParameters *cp)
+{
+    int bits = cp->bits_per_raw_sample;
+
+    if (!bits)
+        bits = av_get_bits_per_sample(cp->codec_id);
+
+    return bits;
+}
+
+/* The encoder a mode means for a source like `cp`: pcm_s24le, or pcm_s16le
+ * for a sixteen bit source, for the PCM mode, and the table's encoder for
+ * the rest. */
+static const AVCodec *view_enc_audio_codec(int mode, const AVCodecParameters *cp)
+{
+    if (mode == VIEW_AUDIO_WAV)
+        return avcodec_find_encoder_by_name(view_enc_audio_bits(cp) == 16
+                                            ? "pcm_s16le" : "pcm_s24le");
+    if (mode < 0 || mode >= VIEW_NB_AUDIO_MODES ||
+        !view_audio_modes[mode].encoder)
+        return NULL;
+
+    return avcodec_find_encoder_by_name(view_audio_modes[mode].encoder);
+}
+
+/* Opens the encoder for a source that decodes to `dec_fmt` at the source's
+ * own rate and layout. The sample format is the decoder's own where the
+ * encoder takes it - so that flac and PCM are the source's samples and not
+ * a conversion of them - and otherwise the nearest thing to float the
+ * encoder lists; the rate is the source's where the encoder takes it, and
+ * otherwise the lowest one above it. `q` is the mode's number: a bitrate in
+ * kbit/s or flac's compression level. */
+static int view_enc_audio_encoder(int mode, int q, const AVCodecParameters *cp,
+                                  enum AVSampleFormat dec_fmt, bool global,
+                                  bool verbose, AVCodecContext **out)
+{
+    static const enum AVSampleFormat prefer[] = {
+        AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_S32P,
+        AV_SAMPLE_FMT_S32,  AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_S16,
+        AV_SAMPLE_FMT_DBLP, AV_SAMPLE_FMT_DBL,
+    };
+    const AVCodec *codec = view_enc_audio_codec(mode, cp);
+    const enum AVSampleFormat *fmts = NULL;
+    const int *rates = NULL;
+    AVCodecContext *enc;
+    AVDictionary *opts = NULL;
+    int nb_fmts = 0, nb_rates = 0;
+    int ret;
+
+    *out = NULL;
+    if (!codec) {
+        fprintf(stderr, "this FFmpeg has no %s encoder\n",
+                view_audio_modes[CRAW_CLAMP(mode, 0, VIEW_NB_AUDIO_MODES - 1)].encoder
+                    ? view_audio_modes[mode].encoder : "PCM");
+        return CRAW_ERROR(ENOSYS);
+    }
+
+    enc = avcodec_alloc_context3(codec);
+    if (!enc)
+        return CRAW_ERROR(ENOMEM);
+
+    /* An encoder that lists nothing takes anything, so the source's own
+     * format and rate go straight through. */
+    if (avcodec_get_supported_config(NULL, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT,
+                                     0, (const void **)&fmts, &nb_fmts) < 0)
+        fmts = NULL;
+    enc->sample_fmt = fmts ? AV_SAMPLE_FMT_NONE : dec_fmt;
+    for (int i = 0; fmts && i < nb_fmts; i++)
+        if (fmts[i] == dec_fmt)
+            enc->sample_fmt = dec_fmt;
+    for (size_t k = 0; enc->sample_fmt == AV_SAMPLE_FMT_NONE &&
+                       k < CRAW_ARRAY_ELEMS(prefer); k++)
+        for (int i = 0; i < nb_fmts; i++)
+            if (fmts[i] == prefer[k])
+                enc->sample_fmt = prefer[k];
+    if (enc->sample_fmt == AV_SAMPLE_FMT_NONE && nb_fmts > 0)
+        enc->sample_fmt = fmts[0];
+
+    if (avcodec_get_supported_config(NULL, codec, AV_CODEC_CONFIG_SAMPLE_RATE,
+                                     0, (const void **)&rates, &nb_rates) < 0)
+        rates = NULL;
+    enc->sample_rate = rates ? 0 : cp->sample_rate;
+    for (int i = 0; rates && i < nb_rates; i++) {
+        if (rates[i] == cp->sample_rate)
+            enc->sample_rate = rates[i];
+        else if (enc->sample_rate != cp->sample_rate &&
+                 rates[i] > cp->sample_rate &&
+                 (!enc->sample_rate || rates[i] < enc->sample_rate))
+            enc->sample_rate = rates[i];
+    }
+    if (!enc->sample_rate && nb_rates > 0)
+        enc->sample_rate = rates[nb_rates - 1];
+
+    /* A camera writes LPCM with no channel layout at all; the default
+     * layout for that many channels is what the file means anyway, and the
+     * one thing every encoder here insists on being told. */
+    if (cp->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
+        av_channel_layout_default(&enc->ch_layout, cp->ch_layout.nb_channels);
+    else
+        av_channel_layout_copy(&enc->ch_layout, &cp->ch_layout);
+
+    enc->time_base = (AVRational) { 1, enc->sample_rate };
+    if (global)
+        enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+    switch (mode) {
+    case VIEW_AUDIO_OPUS:
+        enc->bit_rate = (int64_t)q * 1000;
+        /* 120 ms frames: the longest Opus has, and the fewest packets and
+         * the least overhead for a recording that is not being streamed. */
+        av_dict_set(&opts, "frame_duration", "120", 0);
+        break;
+    case VIEW_AUDIO_AAC:
+        enc->bit_rate = (int64_t)q * 1000;
+        break;
+    case VIEW_AUDIO_FLAC:
+        enc->compression_level = q;
+        /* The source's depth, so that a 24 bit clip is written as 24 bits
+         * and not as the 32 the sample format is carried in. */
+        enc->bits_per_raw_sample = view_enc_audio_bits(cp);
+        break;
+    default:
+        break;
+    }
+
+    ret = avcodec_open2(enc, codec, &opts);
+    if (ret < 0) {
+        fprintf(stderr, "cannot open the %s encoder for %d Hz %d channel %s: %s\n",
+                codec->name, enc->sample_rate, enc->ch_layout.nb_channels,
+                av_get_sample_fmt_name(enc->sample_fmt), av_err2str(ret));
+        av_dict_free(&opts);
+        avcodec_free_context(&enc);
+        return ret;
+    }
+    if (av_dict_count(opts)) {
+        const AVDictionaryEntry *t = NULL;
+
+        while ((t = av_dict_iterate(opts, t)))
+            fprintf(stderr, "the %s encoder ignored %s=%s\n", codec->name,
+                    t->key, t->value);
+    }
+    av_dict_free(&opts);
+
+    if (verbose)
+        fprintf(stderr, "audio encoder %s: %d Hz, %d channels, %s, %s%d %s, "
+                        "%d samples a frame\n",
+                codec->name, enc->sample_rate, enc->ch_layout.nb_channels,
+                av_get_sample_fmt_name(enc->sample_fmt),
+                mode == VIEW_AUDIO_FLAC ? "level " : "",
+                mode == VIEW_AUDIO_FLAC ? q
+                    : mode == VIEW_AUDIO_WAV ? view_enc_audio_bits(cp) : q,
+                mode == VIEW_AUDIO_FLAC ? "" : mode == VIEW_AUDIO_WAV ? "bit"
+                                                                     : "kbit/s",
+                enc->frame_size);
+
+    *out = enc;
+
+    return 0;
+}
+
+/* ------------------------------------------------ what a container carries */
+
+/* The muxer is asked the only way that gets a true answer: a header is
+ * written into memory with the stream the mode would add. A table of
+ * codec tags says the QuickTime muxer takes opus and flac, and its
+ * initialisation then refuses both with "only supported in MP4"; the
+ * refusal is the answer that matters, and its words are the reason the
+ * panel shows. Cached per muxer, mode and source, since the panel asks for
+ * every mode on every frame. */
+struct view_enc_carry {
+    const AVOutputFormat *of;
+    int mode;
+    enum AVCodecID src;
+    int rate, channels, bits;
+    char why[160];              /* empty: carried */
+};
+
+static struct view_enc_carry view_carry[32];
+static int view_nb_carry;
+
+/* Where the muxer's own words land while a probe runs: the last error it
+ * logged, which is the one that explains the refusal. Nothing else in this
+ * program installs a log callback, so the default is what goes back. */
+static char view_probe_msg[160];
+
+static void view_probe_log(void *avcl, int level, const char *fmt, va_list vl)
+{
+    size_t n;
+
+    (void)avcl;
+    if (level > AV_LOG_ERROR)
         return;
 
-    if (nb_audio >= 4 && mono >= 4) {
-        e->a_in[0] = audio[nb_audio - 2];
-        e->a_in[1] = audio[nb_audio - 1];
-        e->nb_audio = 2;
-    } else if (quad >= 0) {
-        e->a_in[0] = audio[quad];
-        e->nb_audio = 1;
-    } else {
-        e->a_in[0] = audio[0];
-        e->nb_audio = 1;
+    vsnprintf(view_probe_msg, sizeof(view_probe_msg), fmt, vl);
+    n = strlen(view_probe_msg);
+    while (n && (view_probe_msg[n - 1] == '\n' || view_probe_msg[n - 1] == '.'))
+        view_probe_msg[--n] = '\0';
+}
+
+static const char *view_enc_audio_probe(const AVOutputFormat *of, int mode,
+                                        const AVCodecParameters *cp, int q)
+{
+    struct view_enc_carry *c;
+    AVFormatContext *oc = NULL;
+    AVCodecContext *dec = NULL, *enc = NULL;
+    const AVCodec *codec;
+    AVStream *os;
+    uint8_t *buf = NULL;
+    int bits = view_enc_audio_bits(cp);
+    int ret;
+
+    for (int i = 0; i < view_nb_carry; i++) {
+        c = &view_carry[i];
+        if (c->of == of && c->mode == mode && c->src == cp->codec_id &&
+            c->rate == cp->sample_rate &&
+            c->channels == cp->ch_layout.nb_channels && c->bits == bits)
+            return c->why[0] ? c->why : NULL;
     }
+
+    /* The next slot, round robin: a session that walks more than thirty
+     * two combinations has long since stopped caring about the cost. */
+    c = &view_carry[view_nb_carry % (int)CRAW_ARRAY_ELEMS(view_carry)];
+    view_nb_carry++;
+    *c = (struct view_enc_carry) {
+        .of = of, .mode = mode, .src = cp->codec_id, .rate = cp->sample_rate,
+        .channels = cp->ch_layout.nb_channels, .bits = bits,
+    };
+
+    ret = avformat_alloc_output_context2(&oc, of, NULL, NULL);
+    if (ret < 0 || !oc) {
+        snprintf(c->why, sizeof(c->why), "no %s muxer", of->name);
+        return c->why;
+    }
+
+    os = avformat_new_stream(oc, NULL);
+    if (!os) {
+        ret = AVERROR(ENOMEM);
+        goto out;
+    }
+
+    if (mode == VIEW_AUDIO_COPY) {
+        ret = avcodec_parameters_copy(os->codecpar, cp);
+        if (ret < 0)
+            goto out;
+        os->codecpar->codec_tag = 0;
+        if (os->codecpar->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
+            av_channel_layout_default(&os->codecpar->ch_layout,
+                                      cp->ch_layout.nb_channels);
+    } else {
+        /* The real encoder, opened the way the run opens it, because the
+         * muxer reads its extradata: an Opus header is nineteen bytes the
+         * MP4 muxer refuses to write without. */
+        codec = avcodec_find_decoder(cp->codec_id);
+        dec = codec ? avcodec_alloc_context3(codec) : NULL;
+        if (!dec) {
+            snprintf(c->why, sizeof(c->why), "no decoder for %s",
+                     avcodec_get_name(cp->codec_id));
+            goto done;
+        }
+        ret = avcodec_parameters_to_context(dec, cp);
+        if (ret >= 0)
+            ret = avcodec_open2(dec, codec, NULL);
+        if (ret < 0)
+            goto out;
+
+        ret = view_enc_audio_encoder(mode, q, cp, dec->sample_fmt,
+                                     !!(of->flags & AVFMT_GLOBALHEADER),
+                                     false, &enc);
+        if (ret < 0)
+            goto out;
+        ret = avcodec_parameters_from_context(os->codecpar, enc);
+        if (ret < 0)
+            goto out;
+    }
+    os->time_base = (AVRational) { 1, os->codecpar->sample_rate };
+
+    ret = avio_open_dyn_buf(&oc->pb);
+    if (ret < 0)
+        goto out;
+
+    view_probe_msg[0] = '\0';
+    av_log_set_callback(view_probe_log);
+    ret = avformat_write_header(oc, NULL);
+    av_log_set_callback(av_log_default_callback);
+
+    avio_close_dyn_buf(oc->pb, &buf);
+    oc->pb = NULL;
+    av_free(buf);
+
+out:
+    if (ret < 0) {
+        const char *what = mode == VIEW_AUDIO_COPY
+                         ? avcodec_get_name(cp->codec_id)
+                         : enc ? enc->codec->name
+                         : view_audio_modes[mode].encoder
+                         ? view_audio_modes[mode].encoder : "PCM";
+
+        if (view_probe_msg[0])
+            snprintf(c->why, sizeof(c->why), "%s: %s", of->name, view_probe_msg);
+        else
+            snprintf(c->why, sizeof(c->why), "the %s muxer refuses %s: %s",
+                     of->name, what, av_err2str(ret));
+    }
+
+done:
+    avcodec_free_context(&dec);
+    avcodec_free_context(&enc);
+    avformat_free_context(oc);
+
+    return c->why[0] ? c->why : NULL;
+}
+
+/* The muxer a file name picks, or NULL. */
+static const AVOutputFormat *view_enc_muxer(const char *path)
+{
+    if (!path || !path[0])
+        return NULL;
+
+    return av_guess_format(NULL, path, NULL);
+}
+
+bool view_encode_has_audio(const struct view_state *st)
+{
+    int in[2];
+
+    return st->dec.fmt && view_enc_audio_pick(st->dec.fmt, in, 2) > 0;
+}
+
+const char *view_encode_audio_why_not(const struct view_state *st,
+                                      const char *path, int mode)
+{
+    const AVOutputFormat *of = view_enc_muxer(path);
+    const AVCodecParameters *cp;
+    int in[2];
+
+    if (mode <= VIEW_AUDIO_NONE || mode >= VIEW_NB_AUDIO_MODES)
+        return NULL;
+    if (!of)
+        return "no muxer for this file name";
+    if (!st->dec.fmt || !view_enc_audio_pick(st->dec.fmt, in, 2))
+        return "the clip has no sound";
+
+    cp = st->dec.fmt->streams[in[0]]->codecpar;
+    if (cp->sample_rate <= 0 || cp->ch_layout.nb_channels <= 0)
+        return "the clip's sound has no rate or no channels";
+
+    return view_enc_audio_probe(of, mode, cp,
+                                st->look.video_preset.audio_q[mode]);
+}
+
+const char *view_encode_video_why_not(const struct view_state *st,
+                                      const char *path,
+                                      const struct view_preset_sel *sel,
+                                      const char *codec)
+{
+    static char why[192];
+    const AVOutputFormat *of = view_enc_muxer(path);
+    const AVCodec *c;
+    enum AVCodecID id;
+
+    (void)st;
+    if (!of)
+        return "no muxer for this file name";
+
+    /* The name picks the codec as well as the muxer, the way it does for a
+     * still: only av_guess_codec() looks at the extension. */
+    if (codec && codec[0]) {
+        c = avcodec_find_encoder_by_name(codec);
+        if (!c) {
+            snprintf(why, sizeof(why), "this FFmpeg has no %s encoder", codec);
+            return why;
+        }
+    } else if (sel) {
+        c = avcodec_find_encoder_by_name(view_presets_encoder(sel));
+        if (!c) {
+            snprintf(why, sizeof(why), "this FFmpeg has no %s encoder",
+                     view_presets_encoder(sel));
+            return why;
+        }
+    } else {
+        id = av_guess_codec(of, NULL, path, NULL, AVMEDIA_TYPE_VIDEO);
+        c = avcodec_find_encoder(id);
+        if (!c) {
+            snprintf(why, sizeof(why), "no video encoder for a .%s",
+                     strrchr(path, '.') ? strrchr(path, '.') + 1 : "?");
+            return why;
+        }
+    }
+    if (c->type != AVMEDIA_TYPE_VIDEO) {
+        snprintf(why, sizeof(why), "%s is not a video encoder", c->name);
+        return why;
+    }
+    /* A --codec h264_vulkan on a GPU with no H.264 engine, said here the
+     * way the preset table says it for its AV1 family. */
+    if (view_presets_engine_why_not(c))
+        return view_presets_engine_why_not(c);
+
+    /* A typed extension wins over the family's container, but only if the
+     * muxer will carry the codec: saying so here is a sentence, and
+     * finding out at the muxer is a half written file. */
+    if (avformat_query_codec(of, c->id, FF_COMPLIANCE_NORMAL) == 0) {
+        snprintf(why, sizeof(why), "the %s muxer does not carry %s; this "
+                                   "family writes .%s", of->name, c->name,
+                 sel ? view_presets_container(sel) : "mkv");
+        return why;
+    }
+
+    return NULL;
+}
+
+/* -------------------------------------------------------- the audio streams */
+
+/* One stream's encoding path: its decoder, its encoder, the converter
+ * between them where one is needed, and the queue. */
+static int view_enc_audio_open_enc(struct view_encode *e, struct view_enc_audio *a,
+                                   const AVStream *is, AVStream *os)
+{
+    const AVCodecParameters *cp = is->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(cp->codec_id);
+    AVChannelLayout in_layout = { 0 };
+    int mode = e->sel.audio_mode;
+    int ret;
+
+    if (!codec) {
+        fprintf(stderr, "no decoder for %s audio\n", avcodec_get_name(cp->codec_id));
+        return CRAW_ERROR(ENOSYS);
+    }
+
+    a->dec = avcodec_alloc_context3(codec);
+    if (!a->dec)
+        return CRAW_ERROR(ENOMEM);
+    ret = avcodec_parameters_to_context(a->dec, cp);
+    if (ret < 0)
+        return ret;
+    ret = avcodec_open2(a->dec, codec, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "cannot open the %s decoder: %s\n", codec->name,
+                av_err2str(ret));
+        return ret;
+    }
+
+    ret = view_enc_audio_encoder(mode, e->sel.audio_q[mode], cp,
+                                 a->dec->sample_fmt,
+                                 !!(e->oc->oformat->flags & AVFMT_GLOBALHEADER),
+                                 e->verbose, &a->enc);
+    if (ret < 0)
+        return ret;
+
+    /* The converter, only where the encoder wants another sample format or
+     * rate: flac and PCM take the decoder's samples as they are, opus wants
+     * packed float and aac planar float. The layout is the encoder's, which
+     * is the source's or the default for its channel count; the channels
+     * themselves never change. */
+    if (a->dec->sample_fmt != a->enc->sample_fmt ||
+        a->dec->sample_rate != a->enc->sample_rate) {
+        av_channel_layout_copy(&in_layout, &a->enc->ch_layout);
+        ret = swr_alloc_set_opts2(&a->swr, &a->enc->ch_layout, a->enc->sample_fmt,
+                                  a->enc->sample_rate, &in_layout,
+                                  a->dec->sample_fmt, a->dec->sample_rate,
+                                  0, NULL);
+        av_channel_layout_uninit(&in_layout);
+        if (ret >= 0)
+            ret = swr_init(a->swr);
+        if (ret < 0) {
+            fprintf(stderr, "cannot convert %s %d Hz to %s %d Hz: %s\n",
+                    av_get_sample_fmt_name(a->dec->sample_fmt), a->dec->sample_rate,
+                    av_get_sample_fmt_name(a->enc->sample_fmt), a->enc->sample_rate,
+                    av_err2str(ret));
+            return ret;
+        }
+        if (e->verbose)
+            fprintf(stderr, "audio converted from %s %d Hz to %s %d Hz\n",
+                    av_get_sample_fmt_name(a->dec->sample_fmt), a->dec->sample_rate,
+                    av_get_sample_fmt_name(a->enc->sample_fmt), a->enc->sample_rate);
+    }
+
+    a->fifo = av_audio_fifo_alloc(a->enc->sample_fmt, a->enc->ch_layout.nb_channels,
+                                  4096);
+    a->df = av_frame_alloc();
+    a->cf = av_frame_alloc();
+    a->ef = av_frame_alloc();
+    if (!a->fifo || !a->df || !a->cf || !a->ef)
+        return CRAW_ERROR(ENOMEM);
+
+    ret = avcodec_parameters_from_context(os->codecpar, a->enc);
+    if (ret < 0)
+        return ret;
+    os->time_base = (AVRational) { 1, a->enc->sample_rate };
+    a->rate = a->enc->sample_rate;
+
+    return 0;
 }
 
 /* Opens the clip a second time for its audio and adds the streams to the
- * output. A container that will not carry the codec is not an error: the
- * video is still worth writing, so the audio is dropped with a word. */
+ * output. A clip with no sound is not an error: the video is still worth
+ * writing, and the mode is greyed in the panel for the same reason. A
+ * container that will not carry the mode's codec has already been refused
+ * by view_encode_begin(); this is where the muxer gets the last word. */
 static int view_enc_audio_open(struct view_encode *e, struct view_state *st)
 {
+    int mode = e->sel.audio_mode;
+    int in[2], nb;
     int ret;
+
+    if (mode == VIEW_AUDIO_NONE)
+        return 0;
 
     ret = avformat_open_input(&e->aic, st->cfg.input, NULL, NULL);
     if (ret < 0)
@@ -565,68 +1089,83 @@ static int view_enc_audio_open(struct view_encode *e, struct view_state *st)
     if (avformat_find_stream_info(e->aic, NULL) < 0)
         goto drop;
 
-    view_enc_audio_pick(e);
-    if (!e->nb_audio)
+    nb = view_enc_audio_pick(e->aic, in, 2);
+    if (!nb)
         goto drop;
 
-    for (int i = 0; i < e->nb_audio; i++) {
-        AVStream *is = e->aic->streams[e->a_in[i]];
+    for (int i = 0; i < nb; i++) {
+        struct view_enc_audio *a = &e->a[i];
+        AVStream *is = e->aic->streams[in[i]];
         AVCodecParameters *cp = is->codecpar;
         AVStream *os;
         int bits;
 
         if (cp->sample_rate <= 0)
             goto drop;
-        if (avformat_query_codec(e->oc->oformat, cp->codec_id,
-                                 FF_COMPLIANCE_NORMAL) <= 0) {
-            fprintf(stderr, "%s cannot carry %s audio; writing video only\n",
-                    e->oc->oformat->name, avcodec_get_name(cp->codec_id));
-            goto drop;
-        }
 
         os = avformat_new_stream(e->oc, NULL);
         if (!os)
             goto drop;
-        ret = avcodec_parameters_copy(os->codecpar, cp);
-        if (ret < 0)
-            goto drop;
-        os->codecpar->codec_tag = 0;
-        os->time_base = (AVRational) { 1, cp->sample_rate };
 
-        /* A camera writes LPCM with no channel layout at all, which the
-         * QuickTime muxer merely grumbles about and the MP4 one refuses to
-         * write a 'chan' box for at trailer time. The default layout for
-         * that many channels is what the file means anyway. */
-        if (os->codecpar->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
-            av_channel_layout_default(&os->codecpar->ch_layout,
-                                      cp->ch_layout.nb_channels);
+        a->in  = in[i];
+        a->out = os->index;
+        a->src_rate = cp->sample_rate;
+        e->nb_audio = i + 1;
 
-        e->a_out[i] = os->index;
-        e->rate[i]  = cp->sample_rate;
+        if (mode == VIEW_AUDIO_COPY) {
+            if (avformat_query_codec(e->oc->oformat, cp->codec_id,
+                                     FF_COMPLIANCE_NORMAL) == 0) {
+                fprintf(stderr, "%s cannot carry %s audio\n",
+                        e->oc->oformat->name, avcodec_get_name(cp->codec_id));
+                return CRAW_ERROR(EINVAL);
+            }
+            ret = avcodec_parameters_copy(os->codecpar, cp);
+            if (ret < 0)
+                goto drop;
+            os->codecpar->codec_tag = 0;
+            os->time_base = (AVRational) { 1, cp->sample_rate };
+            a->rate = cp->sample_rate;
 
-        /* PCM, which is what every camera here records, has a sample frame
-         * of a known size, so the range can be cut on a sample rather than
-         * on a packet and the audio lines up with the picture exactly. */
-        bits = av_get_bits_per_sample(cp->codec_id);
-        e->pcm_bytes[i] = bits && !(bits % 8)
-                        ? bits / 8 * cp->ch_layout.nb_channels : 0;
+            /* A camera writes LPCM with no channel layout at all, which the
+             * QuickTime muxer merely grumbles about and the MP4 one refuses
+             * to write a 'chan' box for at trailer time. The default layout
+             * for that many channels is what the file means anyway. */
+            if (os->codecpar->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
+                av_channel_layout_default(&os->codecpar->ch_layout,
+                                          cp->ch_layout.nb_channels);
+
+            /* PCM, which is what every camera here records, has a sample
+             * frame of a known size, so the range can be cut on a sample
+             * rather than on a packet and the audio lines up with the
+             * picture exactly. */
+            bits = av_get_bits_per_sample(cp->codec_id);
+            a->pcm_bytes = bits && !(bits % 8)
+                         ? bits / 8 * cp->ch_layout.nb_channels : 0;
+        } else {
+            ret = view_enc_audio_open_enc(e, a, is, os);
+            if (ret < 0)
+                return ret;
+        }
 
         /* The first sample of the range and how many of them it holds, in
-         * the stream's own sample rate. Integer arithmetic throughout: at
-         * 48 kHz these come out exact for every frame rate a camera
-         * writes, 29.97 included. */
-        e->a_first[i] = av_rescale(e->start * e->fr.den, cp->sample_rate, e->fr.num);
-        e->a_want[i]  = av_rescale((e->end - e->start + 1) * e->fr.den,
-                                   cp->sample_rate, e->fr.num);
+         * the clip's own sample rate and in the file's. Integer arithmetic
+         * throughout: at 48 kHz these come out exact for every frame rate
+         * a camera writes, 29.97 included. */
+        a->first = av_rescale(e->start * e->fr.den, a->src_rate, e->fr.num);
+        a->want  = av_rescale((e->end - e->start + 1) * e->fr.den,
+                              a->src_rate, e->fr.num);
+        a->out_want = av_rescale((e->end - e->start + 1) * e->fr.den,
+                                 a->rate, e->fr.num);
     }
 
     /* Start reading near the range rather than from the top of the file. */
     if (e->start > 0) {
-        AVStream *is = e->aic->streams[e->a_in[0]];
-        int64_t ts = av_rescale_q(e->a_first[0], (AVRational) { 1, e->rate[0] },
+        AVStream *is = e->aic->streams[e->a[0].in];
+        int64_t ts = av_rescale_q(e->a[0].first,
+                                  (AVRational) { 1, e->a[0].src_rate },
                                   is->time_base);
 
-        av_seek_frame(e->aic, e->a_in[0], ts, AVSEEK_FLAG_BACKWARD);
+        av_seek_frame(e->aic, e->a[0].in, ts, AVSEEK_FLAG_BACKWARD);
     }
 
     return 0;
@@ -641,6 +1180,213 @@ drop:
     return 0;
 }
 
+/* Cuts every stream's range to `frames` frames of the picture: what a run
+ * stopped early has to do, or the sound would run on past the last picture
+ * that was written. */
+static void view_enc_audio_cut(struct view_encode *e, int64_t frames)
+{
+    for (int i = 0; i < e->nb_audio; i++) {
+        struct view_enc_audio *a = &e->a[i];
+
+        a->want = CRAW_MIN(a->want, av_rescale(frames * e->fr.den, a->src_rate,
+                                               e->fr.num));
+        a->out_want = CRAW_MIN(a->out_want,
+                               av_rescale(frames * e->fr.den, a->rate, e->fr.num));
+    }
+}
+
+/* Writes whatever packets the encoder has ready. */
+static int view_enc_audio_drain(struct view_encode *e, struct view_enc_audio *a)
+{
+    AVStream *os = e->oc->streams[a->out];
+    int ret;
+
+    while (1) {
+        ret = avcodec_receive_packet(a->enc, e->apkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            return 0;
+        if (ret < 0) {
+            fprintf(stderr, "%s: avcodec_receive_packet: %s\n",
+                    a->enc->codec->name, av_err2str(ret));
+            return CRAW_ERROR(EIO);
+        }
+
+        /* The duration is in the encoder's time base, which is samples. */
+        a->written += e->apkt->duration;
+        e->apkt->stream_index = a->out;
+        av_packet_rescale_ts(e->apkt, a->enc->time_base, os->time_base);
+
+        ret = av_interleaved_write_frame(e->oc, e->apkt);
+        av_packet_unref(e->apkt);
+        if (ret < 0) {
+            fprintf(stderr, "cannot write the audio packet: %s\n", av_err2str(ret));
+            return CRAW_ERROR(EIO);
+        }
+    }
+}
+
+/* Hands the queue to the encoder in frames of its own size. Only a full
+ * frame goes while the run is on; `flush` sends whatever is left as the
+ * short last frame every encoder accepts, and then the end of stream. */
+static int view_enc_audio_encode(struct view_encode *e, struct view_enc_audio *a,
+                                 bool flush)
+{
+    AVFrame *f = a->ef;
+    int fs = a->enc->frame_size;
+    bool any = !fs || (a->enc->codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE);
+    int ret;
+
+    while (1) {
+        int have = av_audio_fifo_size(a->fifo);
+        int n = any ? CRAW_MIN(have, 4096) : fs;
+
+        if (have <= 0 || (have < n && !flush))
+            break;
+        n = CRAW_MIN(n, have);
+        /* The resampler may owe or overrun by a sample; the file's count is
+         * the one that has to come out exactly. */
+        if (a->pts + n > a->out_want) {
+            n = (int)(a->out_want - a->pts);
+            if (n <= 0) {
+                av_audio_fifo_drain(a->fifo, have);
+                break;
+            }
+        }
+
+        av_frame_unref(f);
+        f->format      = a->enc->sample_fmt;
+        f->sample_rate = a->enc->sample_rate;
+        f->nb_samples  = n;
+        ret = av_channel_layout_copy(&f->ch_layout, &a->enc->ch_layout);
+        if (ret >= 0)
+            ret = av_frame_get_buffer(f, 0);
+        if (ret < 0)
+            return CRAW_ERROR(ENOMEM);
+        if (av_audio_fifo_read(a->fifo, (void **)f->extended_data, n) < n)
+            return CRAW_ERROR(EIO);
+        f->pts = a->pts;
+        a->pts += n;
+
+        ret = avcodec_send_frame(a->enc, f);
+        if (ret < 0) {
+            fprintf(stderr, "%s: avcodec_send_frame: %s\n", a->enc->codec->name,
+                    av_err2str(ret));
+            return CRAW_ERROR(EIO);
+        }
+        ret = view_enc_audio_drain(e, a);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (flush && !a->flushed) {
+        a->flushed = true;
+        avcodec_send_frame(a->enc, NULL);
+        return view_enc_audio_drain(e, a);
+    }
+
+    return 0;
+}
+
+/* Queues `n` decoded samples starting at plane offset `skip`, converted
+ * where the encoder wants another format or rate. */
+static int view_enc_audio_queue(struct view_enc_audio *a, const AVFrame *df,
+                                int skip, int n)
+{
+    const uint8_t *in[64];
+    int nb_ch = a->dec->ch_layout.nb_channels;
+    int planar = av_sample_fmt_is_planar(a->dec->sample_fmt);
+    int bps = av_get_bytes_per_sample(a->dec->sample_fmt);
+    int planes = planar ? nb_ch : 1;
+    int ret, got;
+
+    if (planes > (int)CRAW_ARRAY_ELEMS(in))
+        return CRAW_ERROR(ENOTSUP);
+    for (int p = 0; p < planes; p++)
+        in[p] = df->extended_data[p] + (ptrdiff_t)skip * bps * (planar ? 1 : nb_ch);
+
+    if (!a->swr) {
+        if (av_audio_fifo_write(a->fifo, (void **)in, n) < n)
+            return CRAW_ERROR(ENOMEM);
+        return 0;
+    }
+
+    av_frame_unref(a->cf);
+    a->cf->format      = a->enc->sample_fmt;
+    a->cf->sample_rate = a->enc->sample_rate;
+    a->cf->nb_samples  = (int)swr_get_out_samples(a->swr, n);
+    ret = av_channel_layout_copy(&a->cf->ch_layout, &a->enc->ch_layout);
+    if (ret >= 0)
+        ret = av_frame_get_buffer(a->cf, 0);
+    if (ret < 0)
+        return CRAW_ERROR(ENOMEM);
+
+    got = swr_convert(a->swr, a->cf->extended_data, a->cf->nb_samples, in, n);
+    if (got < 0) {
+        fprintf(stderr, "swr_convert: %s\n", av_err2str(got));
+        return CRAW_ERROR(EIO);
+    }
+    if (got > 0 && av_audio_fifo_write(a->fifo, (void **)a->cf->extended_data, got) < got)
+        return CRAW_ERROR(ENOMEM);
+
+    return 0;
+}
+
+/* One packet of the clip's audio through the decoder, cut to the range,
+ * into the queue and on to the encoder. */
+static int view_enc_audio_feed(struct view_encode *e, struct view_enc_audio *a,
+                               const AVStream *is, AVPacket *pkt)
+{
+    AVRational sr = { 1, a->src_rate };
+    int ret;
+
+    ret = avcodec_send_packet(a->dec, pkt);
+    if (ret < 0) {
+        fprintf(stderr, "%s: avcodec_send_packet: %s\n", a->dec->codec->name,
+                av_err2str(ret));
+        return CRAW_ERROR(EIO);
+    }
+
+    while (1) {
+        int64_t s0, keep;
+        int n, skip;
+
+        ret = avcodec_receive_frame(a->dec, a->df);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+            return 0;
+        if (ret < 0) {
+            fprintf(stderr, "%s: avcodec_receive_frame: %s\n",
+                    a->dec->codec->name, av_err2str(ret));
+            return CRAW_ERROR(EIO);
+        }
+
+        /* Where this frame's samples fall, in the clip's own samples: from
+         * its timestamp, which for PCM is exact, and by counting on from
+         * the last one where a frame carries none. */
+        n  = a->df->nb_samples;
+        s0 = a->df->pts != AV_NOPTS_VALUE
+           ? av_rescale_q(a->df->pts, is->time_base, sr) : a->src_pos;
+        a->src_pos = s0 + n;
+
+        skip = (int)CRAW_CLAMP(a->first - s0, 0, n);
+        keep = CRAW_MIN((int64_t)(n - skip), a->want - a->taken);
+        /* Before the range, or all of it already taken. */
+        if (keep <= 0 || s0 + skip >= a->first + a->want) {
+            av_frame_unref(a->df);
+            continue;
+        }
+
+        ret = view_enc_audio_queue(a, a->df, skip, (int)keep);
+        av_frame_unref(a->df);
+        if (ret < 0)
+            return ret;
+        a->taken += keep;
+
+        ret = view_enc_audio_encode(e, a, false);
+        if (ret < 0)
+            return ret;
+    }
+}
+
 /* Writes the audio of the range up to `until` seconds into it, so the
  * interleaver never has to hold more than a frame's worth. */
 static int view_enc_audio_pump(struct view_encode *e, double until)
@@ -648,14 +1394,15 @@ static int view_enc_audio_pump(struct view_encode *e, double until)
     int ret;
 
     while (e->nb_audio && !e->audio_eof) {
+        struct view_enc_audio *a = NULL;
         AVStream *is;
         AVRational sr;
-        int slot = -1;
         int64_t first, n, s0, s1, keep0, keep1;
         bool all_done = true;
 
         for (int i = 0; i < e->nb_audio; i++)
-            if (e->a_written[i] < e->a_want[i])
+            if (e->a[i].enc ? e->a[i].taken < e->a[i].want
+                            : e->a[i].written < e->a[i].want)
                 all_done = false;
         if (all_done) {
             e->audio_eof = true;
@@ -669,66 +1416,130 @@ static int view_enc_audio_pump(struct view_encode *e, double until)
         }
 
         for (int i = 0; i < e->nb_audio; i++)
-            if (e->apkt->stream_index == e->a_in[i])
-                slot = i;
-        if (slot < 0 || e->apkt->pts == AV_NOPTS_VALUE) {
+            if (e->apkt->stream_index == e->a[i].in)
+                a = &e->a[i];
+        if (!a || e->apkt->pts == AV_NOPTS_VALUE) {
             av_packet_unref(e->apkt);
             continue;
         }
 
-        is = e->aic->streams[e->a_in[slot]];
-        sr = (AVRational) { 1, e->rate[slot] };
-        first = e->a_first[slot];
+        is = e->aic->streams[a->in];
+
+        if (a->enc) {
+            ret = view_enc_audio_feed(e, a, is, e->apkt);
+            av_packet_unref(e->apkt);
+            if (ret < 0)
+                return ret;
+            if ((double)a->written / a->rate >= until)
+                break;
+            continue;
+        }
+
+        sr = (AVRational) { 1, a->src_rate };
+        first = a->first;
 
         /* Everything in sample units of this stream, which is also the
          * output stream's time base. */
         s0 = av_rescale_q(e->apkt->pts, is->time_base, sr);
-        n  = e->pcm_bytes[slot] ? e->apkt->size / e->pcm_bytes[slot]
-                                : av_rescale_q(e->apkt->duration, is->time_base, sr);
+        n  = a->pcm_bytes ? e->apkt->size / a->pcm_bytes
+                          : av_rescale_q(e->apkt->duration, is->time_base, sr);
         s1 = s0 + (n > 0 ? n : 1);
 
-        if (s1 <= first || s0 >= first + e->a_want[slot]) {
+        if (s1 <= first || s0 >= first + a->want) {
             av_packet_unref(e->apkt);
             continue;
         }
 
         keep0 = CRAW_MAX(s0, first);
-        keep1 = CRAW_MIN(s1, first + e->a_want[slot]);
+        keep1 = CRAW_MIN(s1, first + a->want);
 
-        if (e->pcm_bytes[slot] && (keep0 != s0 || keep1 != s1)) {
+        if (a->pcm_bytes && (keep0 != s0 || keep1 != s1)) {
             /* Cut to the sample. The packet is not made writable: moving
              * the data pointer and trimming the size is all a copy of it
              * into the muxer needs. */
-            e->apkt->data += (keep0 - s0) * e->pcm_bytes[slot];
-            e->apkt->size  = (int)((keep1 - keep0) * e->pcm_bytes[slot]);
+            e->apkt->data += (keep0 - s0) * a->pcm_bytes;
+            e->apkt->size  = (int)((keep1 - keep0) * a->pcm_bytes);
         }
 
-        e->apkt->stream_index = e->a_out[slot];
+        e->apkt->stream_index = a->out;
         e->apkt->pts = e->apkt->dts = keep0 - first;
         e->apkt->duration = keep1 - keep0;
         e->apkt->pos = -1;
-        av_packet_rescale_ts(e->apkt, sr,
-                             e->oc->streams[e->a_out[slot]]->time_base);
+        av_packet_rescale_ts(e->apkt, sr, e->oc->streams[a->out]->time_base);
 
-        e->a_written[slot] += keep1 - keep0;
+        a->written += keep1 - keep0;
 
         ret = av_interleaved_write_frame(e->oc, e->apkt);
         av_packet_unref(e->apkt);
         if (ret < 0)
             return ret;
 
-        if ((double)(keep1 - first) / e->rate[slot] >= until)
+        if ((double)(keep1 - first) / a->src_rate >= until)
             break;
     }
 
     return 0;
 }
 
+/* The end of the sound: whatever the converter still holds, whatever the
+ * queue still holds as the short last frame, and the encoder's own tail. */
+static int view_enc_audio_finish(struct view_encode *e)
+{
+    int ret;
+
+    for (int i = 0; i < e->nb_audio; i++) {
+        struct view_enc_audio *a = &e->a[i];
+
+        if (!a->enc)
+            continue;
+
+        if (a->swr) {
+            av_frame_unref(a->cf);
+            a->cf->format      = a->enc->sample_fmt;
+            a->cf->sample_rate = a->enc->sample_rate;
+            a->cf->nb_samples  = (int)CRAW_MAX(swr_get_out_samples(a->swr, 0), 1);
+            ret = av_channel_layout_copy(&a->cf->ch_layout, &a->enc->ch_layout);
+            if (ret >= 0)
+                ret = av_frame_get_buffer(a->cf, 0);
+            if (ret < 0)
+                return CRAW_ERROR(ENOMEM);
+            ret = swr_convert(a->swr, a->cf->extended_data, a->cf->nb_samples,
+                              NULL, 0);
+            if (ret > 0 &&
+                av_audio_fifo_write(a->fifo, (void **)a->cf->extended_data, ret) < ret)
+                return CRAW_ERROR(ENOMEM);
+        }
+
+        ret = view_enc_audio_encode(e, a, true);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+static void view_enc_audio_close(struct view_encode *e)
+{
+    for (int i = 0; i < (int)CRAW_ARRAY_ELEMS(e->a); i++) {
+        struct view_enc_audio *a = &e->a[i];
+
+        avcodec_free_context(&a->dec);
+        avcodec_free_context(&a->enc);
+        swr_free(&a->swr);
+        av_audio_fifo_free(a->fifo);
+        a->fifo = NULL;
+        av_frame_free(&a->df);
+        av_frame_free(&a->cf);
+        av_frame_free(&a->ef);
+    }
+    avformat_close_input(&e->aic);
+}
+
 /* ------------------------------------------------------------- the colour */
 
 /* libplacebo's side of the selected colour space: the target the renderer
- * tone maps and gamut maps into, with the Export section's own settings for
- * both.
+ * tone maps and gamut maps into, with its own defaults for both, the way it
+ * maps the window into whatever the compositor negotiated.
  *
  * Only the display-referred spaces are here, and only they ever reach a
  * renderer at all: the three scene-referred ones are written by the direct
@@ -848,7 +1659,6 @@ static int view_enc_render_sw(struct view_encode *e, struct view_state *st,
         .color = view_enc_target_csp(e),
         .crop  = { 0, 0, (float)e->w, (float)e->h },
     };
-    view_export_tone_off(st, &target.color);
 
     ret = view_gpu_render_target(e->g, st, &target);
     if (ret < 0)
@@ -1023,7 +1833,6 @@ static int view_enc_send_hw(struct view_encode *e, struct view_state *st,
      * not how bright it is; the peak an HDR target is mapped to comes from
      * here. */
     target.color = view_enc_target_csp(e);
-    view_export_tone_off(st, &target.color);
 
     ret = view_gpu_render_target(e->g, st, &target);
     pl_unmap_avframe(e->g->gpu, &target);
@@ -1314,7 +2123,6 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     e->start = CRAW_MAX(o->start, 0);
     e->end   = CRAW_MAX(o->end, e->start);
     e->next  = e->start;
-    e->req_audio = o->audio;
     e->t0 = e->last_report = av_gettime_relative();
 
     /* The whole selection, taken now: an export is a file, and moving a
@@ -1397,12 +2205,6 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
         }
     }
 
-    v->start = e->start;
-    v->end   = e->end;
-    v->audio = o->audio;
-    v->active = true;
-    v->stop = false;
-    v->progress = 0.0;
     snprintf(v->codec, sizeof(v->codec), "%s",
              o->codec && o->codec[0] ? o->codec
                                      : view_presets_encoder(&e->sel));
@@ -1414,6 +2216,38 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
         view_encode_default_path(st, e->start, e->end, &e->sel,
                                  v->codec[0] ? v->codec : NULL,
                                  v->path, sizeof(v->path));
+
+    /* Everything the name decides, decided now: the muxer, whether it
+     * carries the encoder, and whether it carries the sound the selection
+     * asks for. A refusal here is a sentence on the status line; the same
+     * refusal from the muxer would come after the first frame had been
+     * decoded and with a file already open. */
+    {
+        const char *why = view_encode_video_why_not(st, v->path, &e->sel,
+                                                    o->codec);
+
+        /* A clip with no sound is not a reason to refuse the picture. */
+        if (!why && view_encode_has_audio(st))
+            why = view_encode_audio_why_not(st, v->path, e->sel.audio_mode);
+        if (why) {
+            fprintf(stderr, "%s: %s\n", v->path, why);
+            snprintf(v->status, sizeof(v->status), "%.*s",
+                     (int)sizeof(v->status) - 1, why);
+            view_encode_close(st);
+            return CRAW_ERROR(EINVAL);
+        }
+    }
+
+    v->start = e->start;
+    v->end   = e->end;
+    v->active = true;
+    v->stop = false;
+    v->progress = 0.0;
+
+    /* Where the picture was, so that it can go back there when the run has
+     * walked the decoder somewhere else. */
+    v->resume = st->have_frame;
+    v->resume_index = st->index;
 
     /* A clean peak detection track, so that a range exported twice gives
      * the same file twice. The rest waits for the first frame: the clip's
@@ -1436,6 +2270,7 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     const enum AVPixelFormat *want = NULL;
     enum AVCodecID id = AV_CODEC_ID_NONE;
     size_t nwant = 0;
+    char label[64];
     int x, y, cw, ch;
     int ret;
 
@@ -1487,6 +2322,15 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
         goto fail;
     }
 
+    /* A QuickTime or MP4 file gets its moov atom in front of the media,
+     * always: the muxer writes it at the end, where it is cheapest, and
+     * then rewrites the file with it at the front, and a file whose index
+     * is at the end cannot start playing until all of it has arrived. Set
+     * on every muxer that has the flag - mov, mp4 and the rest of that
+     * family share one option table - and nothing else has it. */
+    if (av_opt_find(e->oc->priv_data, "movflags", NULL, 0, 0))
+        av_opt_set(e->oc->priv_data, "movflags", "+faststart", 0);
+
     /* The name picks the codec as well as the muxer, the way it does for a
      * still: only av_guess_codec() looks at the extension. */
     if (v->codec[0]) {
@@ -1504,11 +2348,10 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
         goto fail;
     }
 
-    e->hw = view_enc_is_vulkan(e->codec);
+    e->hw = view_presets_codec_is_vulkan(e->codec);
 
-    /* A typed extension wins over the family's container, but only if the
-     * muxer will carry the codec: saying so here is a sentence, and
-     * finding out at the muxer is a half written file. */
+    /* view_encode_begin() has asked this already; asked again here of the
+     * context that is about to be written, so the two can never disagree. */
     if (avformat_query_codec(e->oc->oformat, e->codec->id,
                              FF_COMPLIANCE_NORMAL) == 0) {
         fprintf(stderr, "%s: the %s muxer does not carry %s; this family "
@@ -1529,11 +2372,9 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     /* The audio streams are added after the video one, so the picture stays
      * stream 0, and before the header, which is the only time a stream can
      * be added at all. */
-    if (e->req_audio) {
-        ret = view_enc_audio_open(e, st);
-        if (ret < 0)
-            goto fail;
-    }
+    ret = view_enc_audio_open(e, st);
+    if (ret < 0)
+        goto fail;
 
     /* A scene-referred export has exactly one format, whatever the preset
      * pins: float samples, which for FFV1 is gbrpf32 at version 4. The
@@ -1722,16 +2563,31 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
 
     e->opened = true;
 
-    snprintf(v->status, sizeof(v->status), "%s %dx%d %s, %" PRId64 " frames",
-             e->codec->name, e->w, e->h, av_get_pix_fmt_name(e->sw_fmt),
-             e->end - e->start + 1);
-    view_log(st, "encoding frames %" PRId64 " to %" PRId64 " into %s: %s %s "
-                 "%dx%d %s, %d/%d fps%s%s\n",
-             e->start, e->end, v->path, e->oc->oformat->name, e->codec->name,
-             e->w, e->h, av_get_pix_fmt_name(e->sw_fmt), e->fr.num, e->fr.den,
-             e->hw ? ", Vulkan frames" : "",
-             e->direct ? ", straight from the pipeline"
-                       : e->nb_audio ? ", audio copied" : "");
+    /* The threads the encoder ended up with, in the status line and the
+     * log, because what was asked for is not always what it took. */
+    {
+        char threads[32] = "", audio[64] = "";
+
+        if (!e->hw)
+            snprintf(threads, sizeof(threads), ", %s%d thread%s",
+                     e->threads ? "" : "auto: ", e->threads,
+                     e->threads == 1 ? "" : "s");
+        if (e->nb_audio)
+            snprintf(audio, sizeof(audio), ", audio %s",
+                     view_presets_audio_label(&e->sel, label, sizeof(label)));
+
+        snprintf(v->status, sizeof(v->status), "%s %dx%d %s, %" PRId64
+                 " frames%s%s", e->codec->name, e->w, e->h,
+                 av_get_pix_fmt_name(e->sw_fmt), e->end - e->start + 1,
+                 threads, audio);
+        view_log(st, "encoding frames %" PRId64 " to %" PRId64 " into %s: %s %s "
+                     "%dx%d %s, %d/%d fps%s%s%s%s\n",
+                 e->start, e->end, v->path, e->oc->oformat->name,
+                 e->codec->name, e->w, e->h, av_get_pix_fmt_name(e->sw_fmt),
+                 e->fr.num, e->fr.den, e->hw ? ", Vulkan frames" : "",
+                 e->direct ? ", straight from the pipeline" : "",
+                 threads, e->nb_audio ? audio : ", no audio");
+    }
 
     return 0;
 
@@ -1786,8 +2642,8 @@ static void view_enc_progress(struct view_encode *e, struct view_state *st)
     left = e->fps > 0.0 ? (double)(total - e->encoded) / e->fps : 0.0;
 
     snprintf(v->status, sizeof(v->status),
-             "%" PRId64 "/%" PRId64 " frames, %.1f fps, %.0f s left",
-             e->encoded, total, e->fps, left);
+             "exporting: %" PRId64 " of %" PRId64 " frames, %.1f fps, "
+             "%.0f s left", e->encoded, total, e->fps, left);
 
     if (e->report && now - e->last_report >= 1000000) {
         e->last_report = now;
@@ -1810,8 +2666,14 @@ static int view_enc_finish(struct view_encode *e, struct view_state *st)
     if (ret < 0)
         return ret;
 
-    /* Whatever audio the range still owes, now that the video is done. */
+    /* Whatever audio the range still owes, now that the video is done - cut
+     * to the frames that were actually written, so that a run stopped early
+     * does not leave the sound running on past its last picture. */
+    view_enc_audio_cut(e, e->encoded);
     ret = view_enc_audio_pump(e, 1.0e9);
+    if (ret < 0)
+        return ret;
+    ret = view_enc_audio_finish(e);
     if (ret < 0)
         return ret;
 
@@ -2021,7 +2883,7 @@ void view_encode_close(struct view_state *st)
     av_packet_free(&e->apkt);
     avcodec_free_context(&e->avc);
     av_buffer_unref(&e->frames);
-    avformat_close_input(&e->aic);
+    view_enc_audio_close(e);
 
     /* The second pipeline and its RGBA32F texture are most of a gigabyte of
      * device memory, and a viewer that is done exporting has no use for
@@ -2038,4 +2900,15 @@ void view_encode_close(struct view_state *st)
 
     free(e);
     st->video.e = NULL;
+
+    /* The run walked the decoder; the window gets its picture back. A
+     * headless run has no picture to get back and no loop left to fetch
+     * it, and a run that never got as far as a frame moved nothing. */
+    if (st->win && st->video.resume) {
+        st->video.resume = false;
+        if (st->have_frame && st->index != st->video.resume_index) {
+            st->seek_to = st->video.resume_index;
+            st->need_frame = true;
+        }
+    }
 }

@@ -23,6 +23,10 @@
  *    The read-back is double buffered so that the GPU renders the next
  *    frame while the scaler and the encoder chew on this one.
  *
+ * The clip's sound goes with the picture as the selection says: remuxed
+ * and cut to the sample, or decoded and encoded again with opus, aac, flac
+ * or PCM, cut to the same range and interleaved with the video.
+ *
  * Everything is stepped: one call is at most one frame, so the caller can
  * draw a progress bar, pump its event loop, and stop.
  *
@@ -36,8 +40,8 @@ struct view_state;
 struct view_encode;
 struct view_preset_sel;
 
-/* What one run is asked for. The size is the selection's, which is an
- * export setting like the rest of them. */
+/* What one run is asked for. The size, the sound and the threads are the
+ * selection's, which are export settings like the rest of them. */
 struct view_encode_opts {
     int64_t start, end;         /* inclusive frame range */
     const char *path;
@@ -48,7 +52,6 @@ struct view_encode_opts {
     const struct view_preset_sel *sel;
     const char *codec;          /* encoder name, NULL: the preset's */
     const char *enc;            /* KEY=VALUE,... on top of the preset's */
-    bool audio;                 /* remux the clip's own audio */
 };
 
 /* The panel's and the command line's side of a run: what was asked for,
@@ -65,7 +68,19 @@ struct view_video {
     char codec[64];
     char enc[256];
     int out_w, out_h;
-    bool audio;
+
+    /* The panel's file field and the default it was last given. The field
+     * follows the default - the clip's name, the range and the family's
+     * container - until it differs from it, after which it is the user's
+     * and is left alone, across clips too. */
+    char field[1024];
+    char field_def[1024];
+
+    /* The frame that was on screen when the run started, and whether there
+     * was one: the export walks the decoder, and when it is done the
+     * picture goes back to where it was. */
+    int64_t resume_index;
+    bool resume;
 
     bool stop;                  /* the panel's stop button */
     char status[192];
@@ -86,7 +101,32 @@ void view_encode_default_path(const struct view_state *st, int64_t start,
                               int64_t end, const struct view_preset_sel *sel,
                               const char *codec, char *out, size_t size);
 
-/* Starts a run. An empty `path` means the default one above. */
+/* Whether the open clip has a sound track the export could carry at all,
+ * by the same rule that picks it. A clip without one is exported without
+ * one, whatever the mode says; it is not a reason to refuse the picture. */
+bool view_encode_has_audio(const struct view_state *st);
+
+/* Why the sound cannot be written this way into the file `path` names, or
+ * NULL when it can: the container the name picks will not carry the
+ * codec the mode means, or the clip has no sound to carry. Asked of the
+ * muxer by writing a header into memory once per container and mode, so
+ * the answer is this FFmpeg's own and not a table's. The panel greys the
+ * mode with it; view_encode_begin() refuses with it. */
+const char *view_encode_audio_why_not(const struct view_state *st,
+                                      const char *path, int mode);
+
+/* Why the file `path` names cannot hold the selection's video, or NULL:
+ * no muxer for the name, or a muxer that does not carry the encoder.
+ * `codec` is the --codec override or NULL. */
+const char *view_encode_video_why_not(const struct view_state *st,
+                                      const char *path,
+                                      const struct view_preset_sel *sel,
+                                      const char *codec);
+
+/* Starts a run. An empty `path` means the default one above. Nothing about
+ * the file is written here - the size is not known until a frame has been
+ * decoded - but everything the name decides is checked, so a refusal is a
+ * sentence in `st->video.status` rather than a half written file. */
 int  view_encode_begin(struct view_state *st, const struct view_encode_opts *o);
 
 /* One iteration: decodes, renders and encodes at most one frame, and

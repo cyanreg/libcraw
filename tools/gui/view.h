@@ -110,17 +110,17 @@ struct view_look {
      * conversion from that space to a BT.709 display. */
     int lut_space;
 
-    /* Which encoder, which preset, which knobs, which colour space and how
-     * the picture is mapped into it: everything the export decides. It
-     * lives here rather than beside the run in struct view_video because it
-     * is a setting - it survives a finished export and it carries from clip
-     * to clip, the way the grade does.
+    /* Which encoder, which preset, which knobs, which colour space, what
+     * happens to the sound: everything the export decides. It lives here
+     * rather than beside the run in struct view_video because it is a
+     * setting - it survives a finished export and it carries from clip to
+     * clip, the way the grade does.
      *
-     * Tone mapping, peak detection and gamut mapping are in here and not
-     * above because they are not a look. What the window shows is whatever
-     * the compositor negotiated for it, mapped with libplacebo's own
-     * defaults for that display; what a file holds is a decision, and a
-     * decision that only means anything for a display-referred target. */
+     * How the picture is mapped into the target is not in here, because it
+     * is not a decision the export gets to make: a display-referred export
+     * is the picture as the window shows it, mapped with libplacebo's own
+     * defaults into the chosen space, the way the window is mapped into
+     * whatever the compositor negotiated. */
     struct view_preset_sel video_preset;
 };
 
@@ -223,16 +223,6 @@ extern const int view_nb_iso;
 extern const char *const view_debayer_names[];
 extern const char *const view_lut_space_names[];
 extern const int view_nb_lut_spaces;
-extern const char *const view_tone_map_names[];
-extern const char *const view_gamut_map_names[];
-extern const int view_nb_tone_maps;
-extern const int view_nb_gamut_maps;
-
-/* Index 0 of both name lists is "off", for which these return NULL: no tone
- * map function at all, and libplacebo's own `clip`, whose map callback is
- * the no-op its gamut mapper skips entirely. */
-const struct pl_tone_map_function *view_tone_map(int idx);
-const struct pl_gamut_map_function *view_gamut_map(int idx);
 
 /* ------------------------------------------------------------- decoding */
 
@@ -643,7 +633,9 @@ struct view_cfg {
     bool export_video;
     int64_t video_start, video_end;
     char video_path[VIEW_MAX_PATH];
-    bool video_audio;           /* --audio copy, which is the default */
+
+    /* --list-presets: after the arguments and with the device open. */
+    bool list_presets;
 };
 
 struct view_awb {
@@ -676,6 +668,12 @@ struct view_export {
     char codec[64];             /* empty: the muxer's own */
     char enc[256];              /* encoder options, from --enc */
     char status[128];
+
+    /* The panel's file field and the default it was last given: the field
+     * follows the frame on screen until it differs from that default, after
+     * which it is the user's and is kept, across clips too. */
+    char field[VIEW_MAX_PATH];
+    char field_def[VIEW_MAX_PATH];
 
     /* One RGBA16 frame, grown once and kept. */
     uint16_t *rgba;
@@ -951,6 +949,11 @@ struct view_state {
     struct view_lut_menu menu;
     struct view_sections sections;
 
+    /* `q` during a video export: the run is cancelled and the program
+     * quits once the file has its trailer, rather than leaving a file
+     * nothing can play. */
+    bool quit_pending;
+
     CRAWProfile base;           /* tables, no per-frame data */
     CRAWProfile prof;           /* base plus the current frame's side data */
     bool have_prof;
@@ -1106,12 +1109,6 @@ int  view_gpu_render_export(struct view_gpu *g, struct view_state *st,
 int  view_gpu_render_target(struct view_gpu *g, struct view_state *st,
                             struct pl_frame *target);
 
-/* An export target's colour space carries the source's own luminance range
- * when the export's tone mapping is off: libplacebo's tone mapping is a
- * no-op exactly when the two ends of the range agree, so this is what turns
- * the map off rather than clipping with it. A no-op when it is on. */
-void view_export_tone_off(struct view_state *st, struct pl_color_space *c);
-
 /* ------------------------------------------------ the direct export path */
 
 /* The second pipeline and the RGBA32F texture a scene-referred export
@@ -1182,6 +1179,12 @@ int  view_ui_open(struct view_state *st, void *sdl_window);
 void view_ui_close(struct view_state *st);
 /* True while nuklear owns the keyboard (a text field has focus). */
 bool view_ui_wants_keys(const struct view_state *st);
+/* True while a video export runs, which locks the whole panel and every
+ * key, wheel and drag but the export's own stop button and `q`: the
+ * engine owns the decoder and has copied the settings, and a slider that
+ * moved would be changing a picture nobody is looking at and a file that
+ * is half written. */
+bool view_ui_locked(const struct view_state *st);
 /* Feeds one SDL_Event; returns true when nuklear consumed it. */
 bool view_ui_event(void *sdl_event);
 void view_ui_input_begin(void);

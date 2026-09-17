@@ -105,10 +105,6 @@ struct view_preset_family {
     int rc_def;                 /* the mode the switch starts in */
     int kbit_def;               /* the bitrate field's default, kbit/s */
 
-    /* True when the family may be missing an engine on this particular
-     * device rather than from this build: the answer needs the encoder to
-     * be opened once, which view_presets_probe_step() does. */
-    bool probe;
 
     /* The pixel formats the encoder takes, fixed in presets.c: a Vulkan
      * encoder cannot be asked short of opening it with each candidate,
@@ -127,8 +123,9 @@ extern const int view_nb_preset_families;
  *
  * The display-referred entries are render targets: the export renderer
  * tone maps and gamut maps into them exactly as it does for the screen,
- * with the Export section's own tone mapping, peak detection and gamut
- * mapping settings.
+ * with libplacebo's own defaults, so the file is the picture as the window
+ * shows it. PQ's target peak is the one parameter of that mapping the
+ * selection holds, because it is part of what the target is.
  *
  * The scene-referred three never touch the renderer at all. The pipeline is
  * run a second time for the frame with CRAWFrameParams.out_space set to the
@@ -195,17 +192,10 @@ struct view_preset_sel {
     int quant;                  /* the QP or CRF field */
 
     int colour;                 /* enum view_colour_id */
-    int hdr_peak;               /* PQ's target peak in nits */
-
-    /* How the picture is mapped into a display-referred target. These are
-     * export settings and not look settings: what the window shows is
-     * whatever the compositor negotiated, mapped with libplacebo's own
-     * defaults for it, and what a file holds is a decision. Index 0 of
-     * view_tone_map_names[] and view_gamut_map_names[] is "off"; a
-     * scene-referred colour ignores all three. */
-    int tone_map;
-    int gamut_map;
-    int peak;                   /* nuklear's checkbox wants an int */
+    /* PQ's target peak in nits: the one mapping parameter that stays,
+     * because it is part of what the target *is*. How the picture is
+     * mapped into it is libplacebo's defaults, the same as the window's. */
+    int hdr_peak;
 
     int size;                   /* enum view_size_id */
     int size_w, size_h;         /* VIEW_SIZE_TYPED's own, in pixels */
@@ -224,13 +214,71 @@ struct view_preset_sel {
     int pix_fmt;
     int pix_fmt_family;
 
+    /* What the export does with the clip's sound, enum view_audio_mode,
+     * and the one number each encoding mode takes - a bitrate in kbit/s
+     * for opus and aac, a compression level for flac - kept per mode so
+     * that switching the combo back and forth never lands a bitrate in a
+     * level field. The two modes with no number leave their entry alone. */
+    int audio_mode;
+    int audio_q[6];
+
+    /* AVCodecContext.thread_count for a software encoder: 0 is auto, which
+     * is what FFmpeg's own `-threads 0` means, and the panel's range runs
+     * to the machine's core count. The Vulkan encoders have no threads and
+     * ignore it. */
+    int threads;
+
     bool set;                   /* false until something chose: use the defaults */
 };
 
-/* The first real entry of each list, which is what the Look section used to
- * start on and what an untouched Export section still does. */
-#define VIEW_TONE_MAP_DEF  1    /* bt.2390 */
-#define VIEW_GAMUT_MAP_DEF 1    /* perceptual */
+/* -------------------------------------------------------------- the audio */
+
+/* What the video export does with the clip's sound. `copy` is the source
+ * track remuxed and cut to the sample; the four encoders take the decoded
+ * samples, through libswresample only where the encoder wants another
+ * sample format or rate, and cut them to the same range. `wav` is PCM in
+ * whatever container the file is: 24 bit little endian, or 16 bit when the
+ * source is 16 bit. */
+enum view_audio_mode {
+    VIEW_AUDIO_NONE = 0,
+    VIEW_AUDIO_COPY,
+    VIEW_AUDIO_OPUS,
+    VIEW_AUDIO_AAC,
+    VIEW_AUDIO_FLAC,
+    VIEW_AUDIO_WAV,
+    VIEW_NB_AUDIO_MODES,
+};
+
+struct view_audio_spec {
+    const char *name;           /* "opus": --audio's word and the combo's */
+    const char *encoder;        /* libavcodec's encoder, NULL where none */
+    /* What the numeric field beside the combo is - "kbit/s" or "level" -
+     * and NULL for a mode that takes no number. */
+    const char *field;
+    int min, max, def;
+};
+
+extern const struct view_audio_spec view_audio_modes[VIEW_NB_AUDIO_MODES];
+
+/* `--audio none|copy|opus[:KBPS]|aac[:KBPS]|flac[:LEVEL]|wav`. */
+int view_presets_parse_audio(struct view_preset_sel *s, const char *arg);
+
+/* "opus 160 kbit/s", "flac level 5", "copy": the mode and its number in one
+ * string, for the panel's status and the log. Returns `buf`. */
+const char *view_presets_audio_label(const struct view_preset_sel *s,
+                                     char *buf, size_t n);
+
+/* ------------------------------------------------------------ the threads */
+
+/* The top of the threads row's range: the machine's core count, which is
+ * what FFmpeg resolves `-threads 0` to. */
+int view_presets_max_threads(void);
+
+/* Whether a codec takes Vulkan frames, which is the one thing that decides
+ * whether the threads row means anything: a Vulkan encoder has no threads
+ * to set. The family form asks about the family's own encoder. */
+bool view_presets_codec_is_vulkan(const AVCodec *c);
+bool view_presets_family_is_vulkan(int family);
 
 /* --------------------------------------------------------------- the size */
 
@@ -333,22 +381,26 @@ int view_presets_dict(const struct view_preset_sel *s, const char *extra,
                       AVDictionary **out);
 
 /* Why a family or one of its presets cannot be used here, or NULL when it
- * can. The family form needs the probe below to have run for the families
- * that declare it; until it has, it answers only from this build. */
+ * can. The family form answers for the GPU as well once
+ * view_presets_device_exts() has been told what it has; until then it
+ * answers only from this build. */
 const char *view_presets_family_why_not(int family);
 const char *view_presets_preset_why_not(int family, int preset);
 /* And with a colour space in hand, since three of them need 16 bit RGB. */
 const char *view_presets_colour_why_not(int family, int preset, int colour);
 
-/* Asks the device one question about one family that declares `probe`:
- * whether its encoder has an engine here at all, so that a GPU with none
- * greys the row rather than failing at export time. One open per call, the
- * family `want` (the selected one, or -1) first; the video-queue encoders
- * answer in microseconds. Returns true while a family is still unasked.
- * The pixel formats are not asked for: each family carries its list.
- *
- * `hw_device` is the viewer's AVHWDeviceContext, or NULL. */
-bool view_presets_probe_step(struct AVBufferRef *hw_device, int want,
-                             bool verbose);
+/* The device extensions the viewer's VkDevice was created with, told once
+ * at device open. A Vulkan H.264, HEVC or AV1 encoder is a hardware engine
+ * and the engine is an extension - VK_KHR_video_encode_h264, _h265, _av1 -
+ * so whether this GPU has one is whether the extension is among them,
+ * which is all a GPU has to say about it. The compute-shader encoders
+ * (FFV1, ProRes, APV) run wherever the shaders do and need no check. */
+void view_presets_device_exts(const char *const *exts, int n);
+
+/* Why this encoder has no engine on this GPU, or NULL: for a Vulkan codec
+ * whose engine is an extension the device was not created with. Answers
+ * NULL for everything else, and for every codec until the device has been
+ * told about. */
+const char *view_presets_engine_why_not(const AVCodec *c);
 
 #endif /* CINEVIEW_PRESETS_H */

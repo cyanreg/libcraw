@@ -159,6 +159,11 @@ bool view_ui_wants_keys(const struct view_state *st)
     return st->ui_edit_active;
 }
 
+bool view_ui_locked(const struct view_state *st)
+{
+    return st->video.active;
+}
+
 int view_ui_resize(struct view_state *st, int w, int h)
 {
     int ret = view_gpu_ui_resize(&st->gpu, w, h);
@@ -278,6 +283,33 @@ static void view_adjust_cycle(struct view_state *st, bool focused, int *v, int n
  *
  * The section's own tree tab is deliberately left alive, because a section
  * you cannot open is a section that cannot tell you why it is greyed. */
+/* nk_widget_disable_begin() and _end() for a stretch of the panel, with
+ * one rule on top: while the whole panel is locked by a running video
+ * export, the end of an inner stretch is not an end. nuklear's pair does
+ * not nest - the end re-enables everything - and a section that greyed
+ * three rows for its own reasons would otherwise unlock the rest of the
+ * panel behind it. `rows` says whether the stretch's rows leave the focus
+ * ring as well, which the greyed sections' do and a greyed switch's do
+ * not. */
+static void view_disable_begin(struct view_state *st, struct nk_context *ctx,
+                               bool rows)
+{
+    nk_widget_disable_begin(ctx);
+    if (rows)
+        st->ui_greyed = true;
+}
+
+static void view_disable_end(struct view_state *st, struct nk_context *ctx,
+                             bool rows)
+{
+    if (view_ui_locked(st))
+        return;
+
+    nk_widget_disable_end(ctx);
+    if (rows)
+        st->ui_greyed = false;
+}
+
 static bool view_grey_begin(struct view_state *st, struct nk_context *ctx,
                             const char *why)
 {
@@ -293,8 +325,7 @@ static bool view_grey_begin(struct view_state *st, struct nk_context *ctx,
         nk_label_wrap(ctx, why);
     }
 
-    nk_widget_disable_begin(ctx);
-    st->ui_greyed = true;
+    view_disable_begin(st, ctx, true);
 
     return true;
 }
@@ -304,8 +335,7 @@ static void view_grey_end(struct view_state *st, struct nk_context *ctx, bool on
     if (!on)
         return;
 
-    nk_widget_disable_end(ctx);
-    st->ui_greyed = false;
+    view_disable_end(st, ctx, true);
 }
 
 /* ------------------------------------------------- the section headers */
@@ -394,14 +424,14 @@ static bool view_section_header(struct nk_context *ctx, struct view_state *st,
                 bs.disabled_factor;
 
         if (disabled)
-            nk_widget_disable_begin(ctx);
+            view_disable_begin(st, ctx, false);
         /* A disabled widget takes no input at all, so the click below
          * cannot happen while the section is greyed. */
         if (nk_button_symbol_styled(ctx, &bs, *on ? NK_SYMBOL_CIRCLE_SOLID
                                                   : NK_SYMBOL_CIRCLE_OUTLINE))
             *on = !*on;
         if (disabled)
-            nk_widget_disable_end(ctx);
+            view_disable_end(st, ctx, false);
     } else {
         nk_spacing(ctx, 1);
     }
@@ -1259,8 +1289,11 @@ void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind)
 
     /* The film simulation is one of the three things a scene-referred
      * export takes away, and a cascade that opened over a greyed row would
-     * be offering a choice that changes neither the file nor the screen. */
+     * be offering a choice that changes neither the file nor the screen.
+     * A locked panel has no rows a cascade could change anything from. */
     if (kind == VIEW_MENU_FILM && view_export_is_scene(st))
+        return;
+    if (view_ui_locked(st))
         return;
 
     m->open = true;
@@ -1551,8 +1584,10 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
     /* The row the menu hangs off was not emitted this frame - its section
      * has been collapsed under it - so there is nothing to hang off and
      * nothing to draw. Closing rather than hiding, or the keyboard would
-     * go on being swallowed by a menu nobody can see. */
-    if (!m->anchored) {
+     * go on being swallowed by a menu nobody can see. A locked panel closes
+     * it for the same reason: the columns do their own hit testing, and a
+     * choice made in one would land on a setting the run has copied. */
+    if (!m->anchored || view_ui_locked(st)) {
         view_ui_menu_close(st);
         return;
     }
@@ -1976,20 +2011,111 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     view_grey_end(st, ctx, grey);
 }
 
-/* The video exporter's corner of the Export section: two cascades - the
- * codec preset and the colour space - whatever knobs the chosen family
- * declares, a frame range, one button, a progress bar and a way to stop.
- * The selection itself lives in the look, so it survives the export and
- * carries from clip to clip. */
+/* The panel's numeric field for one export setting, on the focus ring:
+ * Left and Right step it by `step`, the pointer drags or types it. */
+static void view_int_row(struct view_state *st, struct nk_context *ctx,
+                         const char *name, int *v, int lo, int hi, int step)
+{
+    int adj = view_step(st, view_row(st, ctx));
+
+    if (adj)
+        *v = CRAW_CLAMP(*v + adj * step, lo, hi);
+    nk_property_int(ctx, name, lo, v, hi, step, (float)step * 0.2f);
+}
+
+/* The sound row of the Video block: a combo of the six modes, with the
+ * ones the file's container will not carry greyed and labelled with the
+ * muxer's own reason, and under it the one number the mode takes. What the
+ * container is comes from the file field, so typing `.mov` into it greys
+ * opus and flac right there. */
+static void view_panel_export_audio(struct nk_context *ctx, struct view_state *st,
+                                    const char *path, const char *why)
+{
+    struct view_preset_sel *sel = &st->look.video_preset;
+    const struct view_audio_spec *m;
+    char label[160];
+    int mode = CRAW_CLAMP(sel->audio_mode, 0, VIEW_NB_AUDIO_MODES - 1);
+    int adj;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    adj = view_step(st, view_row(st, ctx));
+    if (adj)
+        mode = (mode + adj + VIEW_NB_AUDIO_MODES) % VIEW_NB_AUDIO_MODES;
+    nk_label(ctx, "audio", NK_TEXT_LEFT);
+
+    m = &view_audio_modes[mode];
+    if (m->field)
+        snprintf(label, sizeof(label), "%s %d %s", m->name, sel->audio_q[mode],
+                 m->field);
+    else
+        snprintf(label, sizeof(label), "%s", m->name);
+
+    /* Wide enough for a refusal: the popup may run past the combo's own
+     * width, and "mov: opus only supported in MP4" is what it has to say. */
+    if (nk_combo_begin_label(ctx, label, nk_vec2(330, 200))) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        for (int i = 0; i < VIEW_NB_AUDIO_MODES; i++) {
+            const char *no = view_encode_audio_why_not(st, path, i);
+
+            if (no) {
+                snprintf(label, sizeof(label), "%s: %s",
+                         view_audio_modes[i].name, no);
+                view_disable_begin(st, ctx, false);
+                nk_combo_item_label(ctx, label, NK_TEXT_LEFT);
+                view_disable_end(st, ctx, false);
+            } else if (nk_combo_item_label(ctx, view_audio_modes[i].name,
+                                           NK_TEXT_LEFT)) {
+                mode = i;
+            }
+        }
+        nk_combo_end(ctx);
+    }
+    sel->audio_mode = mode;
+    m = &view_audio_modes[mode];
+
+    /* The number the mode takes, or what the mode is instead of one. */
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    if (m->field) {
+        snprintf(label, sizeof(label), "#%s", m->field);
+        view_int_row(st, ctx, label, &sel->audio_q[mode], m->min, m->max,
+                     !strcmp(m->field, "level") ? 1 : 16);
+        nk_label(ctx, mode == VIEW_AUDIO_OPUS ? "120 ms frames" : "", NK_TEXT_LEFT);
+    } else {
+        /* The second column is simply left empty: nk_spacing() over the
+         * last column of a row opens a whole new row, which is a blank
+         * line in the panel. */
+        view_row(st, ctx);
+        view_step(st, false);
+        nk_label(ctx, mode == VIEW_AUDIO_COPY ? "the clip's own track"
+               : mode == VIEW_AUDIO_WAV  ? "PCM at the clip's depth"
+               : "no sound", NK_TEXT_LEFT);
+    }
+
+    /* Why the selected mode cannot go into this file, in full: the popup
+     * says it beside the entry, but the entry that is selected is the one
+     * that has to say it out loud. */
+    if (why) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW * 2.0f, 1);
+        nk_labelf_wrap(ctx, "no audio: %s", why);
+    }
+}
+
+/* The Video block of the Export section: the codec preset and the colour
+ * space cascades, the pixel format, the size, whatever knobs the chosen
+ * family declares, the sound, the threads, a frame range, the file, one
+ * button, a progress bar and a way to stop. The selection itself lives in
+ * the look, so it survives the export and carries from clip to clip; the
+ * file field follows its default until it is typed into, and then it is
+ * the user's and carries too. */
 static void view_panel_export_video(struct nk_context *ctx, struct view_state *st)
 {
     struct view_video *v = &st->video;
     struct view_preset_sel *sel = &st->look.video_preset;
     const struct view_preset_family *fam;
-    char path[VIEW_MAX_PATH], label[128];
-    const char *codec, *why;
+    char want[VIEW_MAX_PATH], label[128];
+    const char *codec, *why, *audio_why = NULL;
     bool busy = v->active;
-    bool scene;
+    bool scene, vulkan;
 
     /* The whole clip until a range has been set: Ctrl+1 and Ctrl+2 mark
      * the start and the end at the frame on screen, and the two fields
@@ -2001,17 +2127,30 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
                                           : INT_MAX - 1;
     }
 
-    /* One question of the device per frame, and never more than one
-     * encoder open: which families have an engine here, so that a GPU with
-     * no AV1 one greys that row rather than failing at export time, and
-     * which pixel formats each encoder opens with. The selected family is
-     * asked first, so the format row below fills in before the lists
-     * nobody is looking at, and opening the section never stalls. */
     if (sel->family < 0 || sel->family >= view_nb_preset_families)
         view_presets_default(sel);
-    view_presets_probe_step(st->dec.hw_device, sel->family, st->cfg.verbose);
 
     fam = &view_preset_families[sel->family];
+    vulkan = view_presets_family_is_vulkan(sel->family);
+
+    /* --codec still wins, for an encoder that is not one of the eight. */
+    codec = st->cfg.export_codec;
+    if (!codec || !codec[0])
+        codec = fam->encoder;
+
+    /* The file field follows its default - the clip's name, the range and
+     * the family's container, next to the clip - until it differs from the
+     * default it was last given: once it does, it is the user's and is
+     * left alone, on this clip and the next. Not while a run is on: the
+     * name the run is writing is the one to show. */
+    if (!busy) {
+        view_encode_default_path(st, v->start_ui, v->end_ui, sel, codec,
+                                 want, sizeof(want));
+        if (!v->field[0] || !strcmp(v->field, v->field_def)) {
+            snprintf(v->field, sizeof(v->field), "%s", want);
+            snprintf(v->field_def, sizeof(v->field_def), "%s", want);
+        }
+    }
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
     view_row(st, ctx);
@@ -2069,6 +2208,14 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     if (!why && scene && !st->dec.raw)
         why = "a scene-referred export comes out of the raw pipeline, and "
               "this clip is already developed";
+    /* The file's own say: a typed extension picks the container, and a
+     * container that does not carry the encoder is refused here, in a
+     * sentence, rather than at the muxer with a file already open. The
+     * sound's refusal is shown on its own row below. */
+    if (!why && !busy)
+        why = view_encode_video_why_not(st, v->field, sel, st->cfg.export_codec);
+    if (!busy && view_encode_has_audio(st))
+        audio_why = view_encode_audio_why_not(st, v->field, sel->audio_mode);
     /* Three rows of height for both: a wrapped label clips at the bottom of
      * the rectangle it is given, and a refusal that ends mid-sentence is
      * not a refusal anybody can act on. */
@@ -2109,46 +2256,17 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
                   view_presets_size_label(sel, cw, ch, label, sizeof(label)));
     }
 
-    /* How the picture is mapped into the target, which only means anything
-     * for a display-referred one: the direct path has no renderer to map
-     * with. Greyed rather than hidden, so that switching the colour space
-     * does not make three rows appear and disappear under the pointer. */
-    {
-        bool grey = scene;
-
-        if (grey) {
-            nk_widget_disable_begin(ctx);
-            st->ui_greyed = true;
-        }
-
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        view_adjust_cycle(st, view_row(st, ctx), &sel->tone_map,
-                          view_nb_tone_maps);
-        nk_label(ctx, "tone map", NK_TEXT_LEFT);
-        sel->tone_map = nk_combo(ctx, view_tone_map_names, view_nb_tone_maps,
-                                 CRAW_CLAMP(sel->tone_map, 0, view_nb_tone_maps - 1),
-                                 20, nk_vec2(160, 180));
-
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        view_adjust_cycle(st, view_row(st, ctx), &sel->gamut_map,
-                          view_nb_gamut_maps);
-        nk_label(ctx, "gamut map", NK_TEXT_LEFT);
-        sel->gamut_map = nk_combo(ctx, view_gamut_map_names, view_nb_gamut_maps,
-                                  CRAW_CLAMP(sel->gamut_map, 0, view_nb_gamut_maps - 1),
-                                  20, nk_vec2(160, 180));
-
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        if (view_step(st, view_row(st, ctx)))
-            sel->peak = !sel->peak;
-        nk_checkbox_label(ctx, "peak detection", &sel->peak);
-        nk_label(ctx, sel->tone_map ? (sel->peak ? "per-frame peak"
-                                                 : "the profile's clip")
-                                    : "nothing to map", NK_TEXT_LEFT);
-
-        if (grey) {
-            nk_widget_disable_end(ctx);
-            st->ui_greyed = false;
-        }
+    /* The target peak of a PQ export, which is part of what the target is.
+     * How the picture is mapped into it is not a row here any more: a
+     * display-referred export is mapped exactly as the window is, with
+     * libplacebo's own defaults, so what the file holds is what is on
+     * screen. */
+    if (view_colours[sel->colour].hdr &&
+        sel->colour == VIEW_COLOUR_2020_PQ) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        view_row(st, ctx);
+        nk_property_int(ctx, "#peak nits", 100, &sel->hdr_peak, 10000,
+                        50, 5.0f);
     }
 
     /* Only the rows the family declares. */
@@ -2198,18 +2316,23 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
                             1, 0.2f);
         }
     }
-    if (view_colours[sel->colour].hdr &&
-        sel->colour == VIEW_COLOUR_2020_PQ) {
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        view_row(st, ctx);
-        nk_property_int(ctx, "#peak nits", 100, &sel->hdr_peak, 10000,
-                        50, 5.0f);
+
+    /* The threads, which only a software encoder has: greyed, and off the
+     * ring, under a Vulkan family, with the note saying why. */
+    {
+        int max = view_presets_max_threads();
+
+        if (vulkan)
+            view_disable_begin(st, ctx, true);
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        view_int_row(st, ctx, "#threads", &sel->threads, 0, max, 1);
+        nk_label(ctx, vulkan ? "none: a Vulkan encoder"
+                             : sel->threads ? "" : "0: FFmpeg's auto", NK_TEXT_LEFT);
+        if (vulkan)
+            view_disable_end(st, ctx, true);
     }
 
-    /* --codec still wins, for an encoder that is not one of the eight. */
-    codec = st->cfg.export_codec;
-    if (!codec || !codec[0])
-        codec = fam->encoder;
+    view_panel_export_audio(ctx, st, v->field, audio_why);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
     if (nk_property_int(ctx, "#start", 0, &v->start_ui, INT_MAX - 1, 1, 1.0f))
@@ -2217,23 +2340,33 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     if (nk_property_int(ctx, "#end", v->start_ui, &v->end_ui, INT_MAX, 1, 1.0f))
         v->range_set = true;
 
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    nk_label(ctx, "file (the extension picks the container)", NK_TEXT_LEFT);
+    if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, v->field,
+                                       sizeof(v->field),
+                                       nk_filter_default) & NK_EDIT_ACTIVE)
+        st->ui_edit_active = true;
+
+    /* The one stretch of a locked panel that stays live: the stop button,
+     * the progress bar and the status under them. Everything else is
+     * disabled from the top of the panel down while the run is on. */
+    if (busy)
+        nk_widget_disable_end(ctx);
+
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
     if (nk_button_label(ctx, busy ? "stop" : "export video")) {
         if (busy) {
             view_encode_cancel(st);
-        } else if (!why) {
+        } else if (!why && !audio_why) {
             struct view_encode_opts o = {
                 .start = v->start_ui,
                 .end   = v->end_ui,
+                .path  = v->field,
                 .sel   = sel,
                 .codec = codec,
                 .enc   = st->cfg.export_enc,
-                .audio = st->cfg.video_audio,
             };
 
-            view_encode_default_path(st, o.start, o.end, sel, codec,
-                                     path, sizeof(path));
-            o.path = path;
             v->range_set = true;
             view_encode_begin(st, &o);
         }
@@ -2254,6 +2387,66 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
         nk_labelf(ctx, NK_TEXT_LEFT, "%.46s", name ? name + 1 : v->path);
     }
+
+    if (busy)
+        nk_widget_disable_begin(ctx);
+}
+
+/* The Still block of the Export section: the frame on screen, one image,
+ * the format picked by the file field's extension. The field follows the
+ * frame on screen until it is typed into: once it differs from the default
+ * that was last put there, it is the user's and is left alone, on this
+ * clip and the next. */
+static void view_panel_export_still(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_export *e = &st->exp;
+    char want[VIEW_MAX_PATH];
+    int x, y, w, h;
+
+    view_export_default_path(st, st->index, want, sizeof(want));
+    if (!e->field[0] || !strcmp(e->field, e->field_def)) {
+        snprintf(e->field, sizeof(e->field), "%s", want);
+        snprintf(e->field_def, sizeof(e->field_def), "%s", want);
+    }
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    nk_label(ctx, "file (the extension picks the format)", NK_TEXT_LEFT);
+    if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, e->field,
+                                       sizeof(e->field),
+                                       nk_filter_default) & NK_EDIT_ACTIVE)
+        st->ui_edit_active = true;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    if (nk_button_label(ctx, "export still") && !e->active) {
+        /* The current frame, and nothing but it: a range of stills is a
+         * video encode, which this is not. The encoder is the one the
+         * name implies; there is no codec box, the extension is the
+         * choice. */
+        st->playing = false;
+        view_export_begin(st, st->index, e->field, NULL);
+    }
+    /* What the file will be, which is the rotated size: the still is
+     * written upright like everything else. */
+    if (view_crop_disp_rect(st, &x, &y, &w, &h))
+        nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d cropped", w, h);
+    else
+        nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d full", w, h);
+
+    if (e->status[0]) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%s", e->status);
+    }
+}
+
+/* A block's title inside the Export section, with a rule over it so that
+ * the two blocks read as two things: the still and the video are two
+ * exports with two files, and neither field names the other. */
+static void view_panel_block(struct nk_context *ctx, const char *title)
+{
+    nk_layout_row_dynamic(ctx, 6.0f, 1);
+    nk_rule_horizontal(ctx, nk_rgba(80, 80, 92, 255), nk_false);
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    nk_label(ctx, title, NK_TEXT_LEFT);
 }
 
 /* The "Crop" section: what a left drag has drawn and a way to take it back.
@@ -2289,9 +2482,22 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 {
     struct view_look *lk = &st->look;
     const char *file = strrchr(st->cfg.input, '/');
+    bool locked = view_ui_locked(st);
     int sel;
 
     file = file ? file + 1 : st->cfg.input;
+
+    /* A running video export locks the panel from here to the end: every
+     * row is drawn and none takes input, by mouse, wheel or key, and none
+     * is on the focus ring. The engine owns the decoder - it seeks it and
+     * steps it - and has copied the settings, so a slider that moved would
+     * be changing a picture nobody is looking at and nothing about the
+     * file. The Video block's stop button, progress bar and status are the
+     * one stretch left live, which view_panel_export_video() re-enables
+     * for exactly those three. The pair does not nest, which is what the
+     * lock-aware view_disable_end() is for. */
+    if (locked)
+        view_disable_begin(st, ctx, true);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     {
@@ -2502,58 +2708,21 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
     }
 
     if (view_section_header(ctx, st, VIEW_SEC_EXPORT, "Export", NULL, false)) {
-        /* The field follows the frame on screen until it is typed into:
-         * once it differs from the default that was last put there, it is
-         * the user's and is left alone. */
-        static char path[VIEW_MAX_PATH], def[VIEW_MAX_PATH];
-        static char codec[64];
-        char want[VIEW_MAX_PATH];
+        /* Two exports, two blocks, two files: the still of the frame on
+         * screen, and the video of the range. Neither field names the
+         * other's file. */
+        view_panel_block(ctx, "Still");
+        view_panel_export_still(ctx, st);
 
-        view_export_default_path(st, st->index, want, sizeof(want));
-        if (!path[0] || !strcmp(path, def)) {
-            snprintf(path, sizeof(path), "%s", want);
-            snprintf(def, sizeof(def), "%s", want);
-        }
-
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        nk_label(ctx, "file (the extension picks the format)", NK_TEXT_LEFT);
-        if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, path, sizeof(path),
-                                           nk_filter_default) & NK_EDIT_ACTIVE)
-            st->ui_edit_active = true;
-
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        nk_label(ctx, "codec (empty: by name)", NK_TEXT_LEFT);
-        if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, codec, sizeof(codec),
-                                           nk_filter_default) & NK_EDIT_ACTIVE)
-            st->ui_edit_active = true;
-
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        if (nk_button_label(ctx, "Export") && !st->exp.active) {
-            /* The current frame, and nothing but it: a range of stills is
-             * a video encode, which this is not. */
-            st->playing = false;
-            view_export_begin(st, st->index, path, codec);
-        }
-        {
-            /* What the file will be, which is the rotated size: the still
-             * is written upright like everything else. */
-            int x, y, w, h;
-
-            if (view_crop_disp_rect(st, &x, &y, &w, &h))
-                nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d cropped", w, h);
-            else
-                nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d full", w, h);
-        }
-
-        if (st->exp.status[0]) {
-            nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-            nk_labelf(ctx, NK_TEXT_LEFT, "%s", st->exp.status);
-        }
-
+        view_panel_block(ctx, "Video");
         view_panel_export_video(ctx, st);
 
         view_section_end(ctx);
     }
+
+    /* The end of the lock, for the same reason as its start below. */
+    if (locked)
+        view_disable_end(st, ctx, true);
 }
 
 /* ------------------------------------------------------- the crop shade */

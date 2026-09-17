@@ -61,14 +61,8 @@
 #include <string.h>
 #include <strings.h>
 
-#include <libavutil/buffer.h>
-#include <libavutil/hwcontext.h>
-/* For the frames context the format probe builds, which has to carry the
- * same image usage the exporter's does or it would answer a different
- * question from the one that matters. Pulls in <vulkan/vulkan.h> itself. */
-#include <libavutil/hwcontext_vulkan.h>
+#include <libavutil/cpu.h>
 #include <libavutil/opt.h>
-#include <libavutil/time.h>
 #include <libavutil/pixdesc.h>
 
 #include "craw/craw.h"
@@ -352,7 +346,6 @@ const struct view_preset_family view_preset_families[] = {
             { "CQP", false, 0, 255, 100 },
         },
         .nb_rc = 3, .rc_def = 0, .kbit_def = 40000,
-        .probe = true,
     },
 };
 
@@ -423,6 +416,122 @@ const struct view_colour view_colours[VIEW_NB_COLOURS] = {
     },
 };
 
+/* ----------------------------------------------------------- the audio */
+
+/* The bitrate modes start at 160 kbit/s, which is where both codecs are
+ * transparent for a stereo location recording; flac's level 5 is the
+ * encoder's own default. `wav` names no encoder because the depth is the
+ * source's: pcm_s24le, or pcm_s16le for a 16 bit clip, decided by the
+ * engine when it has the stream in hand. */
+const struct view_audio_spec view_audio_modes[VIEW_NB_AUDIO_MODES] = {
+    [VIEW_AUDIO_NONE] = { "none" },
+    [VIEW_AUDIO_COPY] = { "copy" },
+    [VIEW_AUDIO_OPUS] = { "opus", "libopus", "kbit/s", 6, 512, 160 },
+    [VIEW_AUDIO_AAC]  = { "aac",  "aac",     "kbit/s", 8, 512, 160 },
+    [VIEW_AUDIO_FLAC] = { "flac", "flac",    "level",  0, 12, 5 },
+    [VIEW_AUDIO_WAV]  = { "wav" },
+};
+
+int view_presets_parse_audio(struct view_preset_sel *s, const char *arg)
+{
+    const char *colon = arg ? strchr(arg, ':') : NULL;
+    size_t n;
+
+    if (!arg || !arg[0]) {
+        fprintf(stderr, "--audio: expected none, copy, opus[:KBPS], aac[:KBPS], "
+                        "flac[:LEVEL] or wav\n");
+        return CRAW_ERROR(EINVAL);
+    }
+
+    n = colon ? (size_t)(colon - arg) : strlen(arg);
+
+    for (int i = 0; i < VIEW_NB_AUDIO_MODES; i++) {
+        const struct view_audio_spec *m = &view_audio_modes[i];
+        char *end;
+        long v;
+
+        if (strlen(m->name) != n || strncasecmp(m->name, arg, n))
+            continue;
+
+        s->audio_mode = i;
+        if (!colon)
+            return 0;
+
+        /* A number on a mode that takes none is a typo worth stopping
+         * on: `wav:24` is not a depth this program chooses. */
+        if (!m->field) {
+            fprintf(stderr, "--audio: %s takes no number\n", m->name);
+            return CRAW_ERROR(EINVAL);
+        }
+
+        v = strtol(colon + 1, &end, 10);
+        if (end == colon + 1 || *end || v < m->min || v > m->max) {
+            fprintf(stderr, "--audio: %s takes a %s from %d to %d, got `%s`\n",
+                    m->name, m->field, m->min, m->max, colon + 1);
+            return CRAW_ERROR(EINVAL);
+        }
+        s->audio_q[i] = (int)v;
+
+        return 0;
+    }
+
+    fprintf(stderr, "--audio: no mode called `%.*s`. There are none, copy, "
+                    "opus[:KBPS], aac[:KBPS], flac[:LEVEL] and wav\n",
+            (int)n, arg);
+
+    return CRAW_ERROR(EINVAL);
+}
+
+const char *view_presets_audio_label(const struct view_preset_sel *s,
+                                     char *buf, size_t n)
+{
+    int mode = CRAW_CLAMP(s->audio_mode, 0, VIEW_NB_AUDIO_MODES - 1);
+    const struct view_audio_spec *m = &view_audio_modes[mode];
+
+    if (!m->field)
+        snprintf(buf, n, "%s", m->name);
+    else if (!strcmp(m->field, "level"))
+        snprintf(buf, n, "%s level %d", m->name, s->audio_q[mode]);
+    else
+        snprintf(buf, n, "%s %d %s", m->name, s->audio_q[mode], m->field);
+
+    return buf;
+}
+
+/* --------------------------------------------------------- the threads */
+
+int view_presets_max_threads(void)
+{
+    return CRAW_MAX(av_cpu_count(), 1);
+}
+
+bool view_presets_codec_is_vulkan(const AVCodec *c)
+{
+    const AVCodecHWConfig *hw;
+
+    if (!c)
+        return false;
+
+    for (int i = 0; (hw = avcodec_get_hw_config(c, i)); i++)
+        if (hw->device_type == AV_HWDEVICE_TYPE_VULKAN ||
+            hw->pix_fmt == AV_PIX_FMT_VULKAN)
+            return true;
+
+    /* A name is not evidence on its own, but an encoder that calls itself
+     * Vulkan and reports nothing is not one we would drive by uploading
+     * system memory into it either. */
+    return strstr(c->name, "_vulkan") != NULL;
+}
+
+bool view_presets_family_is_vulkan(int family)
+{
+    if (family < 0 || family >= view_nb_preset_families)
+        return false;
+
+    return view_presets_codec_is_vulkan(
+        avcodec_find_encoder_by_name(view_preset_families[family].encoder));
+}
+
 /* ---------------------------------------------------------- selections */
 
 static const struct view_preset_family *view_family(int i)
@@ -478,10 +587,15 @@ void view_presets_default(struct view_preset_sel *s)
      * field AV_PIX_FMT_YUV420P. */
     s->pix_fmt = AV_PIX_FMT_NONE;
     s->pix_fmt_family = -1;
-    s->tone_map = VIEW_TONE_MAP_DEF;
-    s->gamut_map = VIEW_GAMUT_MAP_DEF;
-    s->peak = 1;
     s->size = VIEW_SIZE_FULL;
+    /* The clip's own sound, remuxed: a range of a take without its sound
+     * is rarely what anyone wanted. Every encoding mode's number starts on
+     * its own default, so the field is right the moment the combo lands on
+     * it. */
+    s->audio_mode = VIEW_AUDIO_COPY;
+    for (int i = 0; i < VIEW_NB_AUDIO_MODES; i++)
+        s->audio_q[i] = view_audio_modes[i].def;
+    s->threads = 0;
     view_presets_family_defaults(s);
 }
 
@@ -843,17 +957,52 @@ int view_presets_parse_fmt(struct view_preset_sel *s, const char *arg)
 
 /* --------------------------------------------------------- availability */
 
-/* One entry per family: whether its encoder has an engine here, once
- * asked, and why not. */
-static struct {
-    bool done;
-    char why[192];
-} view_probe[16];
+/* The three hardware engines a Vulkan encoder can be, each an extension of
+ * the device, and whether this device has them once view_presets_device_exts()
+ * has said. Everything else a Vulkan encoder can be is compute shaders. */
+static const struct {
+    enum AVCodecID id;
+    const char *ext;
+    const char *name;
+} view_engines[] = {
+    { AV_CODEC_ID_H264, "VK_KHR_video_encode_h264", "H.264" },
+    { AV_CODEC_ID_HEVC, "VK_KHR_video_encode_h265", "HEVC" },
+    { AV_CODEC_ID_AV1,  "VK_KHR_video_encode_av1",  "AV1" },
+};
 
-static int view_nb_probe(void)
+static struct {
+    bool known;
+    bool have[CRAW_ARRAY_ELEMS(view_engines)];
+} view_dev;
+
+void view_presets_device_exts(const char *const *exts, int n)
 {
-    return CRAW_MIN(view_nb_preset_families,
-                    (int)CRAW_ARRAY_ELEMS(view_probe));
+    view_dev.known = true;
+
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_engines); i++) {
+        view_dev.have[i] = false;
+        for (int j = 0; j < n; j++)
+            if (exts[j] && !strcmp(exts[j], view_engines[i].ext))
+                view_dev.have[i] = true;
+    }
+}
+
+const char *view_presets_engine_why_not(const AVCodec *c)
+{
+    static char buf[160];
+
+    if (!c || !view_dev.known || !view_presets_codec_is_vulkan(c))
+        return NULL;
+
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_engines); i++) {
+        if (view_engines[i].id != c->id || view_dev.have[i])
+            continue;
+        snprintf(buf, sizeof(buf), "this GPU has no %s encode engine (no %s)",
+                 view_engines[i].name, view_engines[i].ext);
+        return buf;
+    }
+
+    return NULL;
 }
 
 static const char *view_presets_build_why_not(const struct view_preset_family *f)
@@ -880,11 +1029,7 @@ const char *view_presets_family_why_not(int family)
     if (why)
         return why;
 
-    if (family < (int)CRAW_ARRAY_ELEMS(view_probe) &&
-        view_probe[family].done && view_probe[family].why[0])
-        return view_probe[family].why;
-
-    return NULL;
+    return view_presets_engine_why_not(avcodec_find_encoder_by_name(f->encoder));
 }
 
 const char *view_presets_preset_why_not(int family, int preset)
@@ -926,99 +1071,6 @@ const char *view_presets_colour_why_not(int family, int preset, int colour)
     return NULL;
 }
 
-/* Opens one family's encoder once, so that a device with no engine for it
- * greys the row rather than failing at export time. */
-static void view_probe_family(int idx, AVBufferRef *hw_device, bool verbose)
-{
-    const struct view_preset_family *f = &view_preset_families[idx];
-    const AVCodec *codec;
-    AVCodecContext *avc = NULL;
-    AVBufferRef *frames = NULL;
-    AVHWFramesContext *fc;
-    AVDictionary *opts = NULL;
-    struct view_preset_sel sel = { 0 };
-    char buf[512];
-    int ret;
-    int64_t t0;
-
-    /* No device, no answer; say so rather than claiming the family works. */
-    codec = avcodec_find_encoder_by_name(f->encoder);
-    if (!codec) {
-        view_probe[idx].done = true;        /* the build check says it */
-        return;
-    }
-    if (!hw_device) {
-        snprintf(view_probe[idx].why, sizeof(view_probe[idx].why),
-                 "%s needs a Vulkan device and there is none", f->encoder);
-        view_probe[idx].done = true;
-        return;
-    }
-
-    t0 = av_gettime_relative();
-
-    frames = av_hwframe_ctx_alloc(hw_device);
-    if (!frames) {
-        view_probe[idx].done = true;
-        return;
-    }
-    fc = (AVHWFramesContext *)frames->data;
-    fc->format    = AV_PIX_FMT_VULKAN;
-    fc->sw_format = AV_PIX_FMT_YUV420P10;
-    fc->width     = 1920;
-    fc->height    = 1080;
-    fc->initial_pool_size = 0;
-
-    ret = av_hwframe_ctx_init(frames);
-    if (ret < 0)
-        goto out;
-
-    avc = avcodec_alloc_context3(codec);
-    if (!avc) {
-        ret = AVERROR(ENOMEM);
-        goto out;
-    }
-    avc->width     = fc->width;
-    avc->height    = fc->height;
-    avc->pix_fmt   = AV_PIX_FMT_VULKAN;
-    avc->sw_pix_fmt = fc->sw_format;
-    avc->time_base = (AVRational) { 1, 25 };
-    avc->framerate = (AVRational) { 25, 1 };
-    avc->hw_frames_ctx = av_buffer_ref(frames);
-    if (!avc->hw_frames_ctx) {
-        ret = AVERROR(ENOMEM);
-        goto out;
-    }
-
-    /* The family's own default preset, so that the probe answers the
-     * question the menu is about to ask. */
-    sel.family = idx;
-    sel.preset = f->def;
-    sel.pix_fmt = AV_PIX_FMT_NONE;
-    view_presets_family_defaults(&sel);
-    view_presets_opts(&sel, buf, sizeof(buf));
-    if (buf[0])
-        av_dict_parse_string(&opts, buf, "=", ",", 0);
-
-    ret = avcodec_open2(avc, codec, &opts);
-
-out:
-    if (ret < 0)
-        snprintf(view_probe[idx].why, sizeof(view_probe[idx].why),
-                 "%s: %s", f->encoder,
-                 ret == AVERROR(ENOSYS) || ret == AVERROR(EINVAL)
-                 ? "this GPU has no encode engine for it" : av_err2str(ret));
-    view_probe[idx].done = true;
-
-    if (verbose)
-        fprintf(stderr, "probed %s in %.0f ms: %s\n", f->encoder,
-                (double)(av_gettime_relative() - t0) / 1000.0,
-                view_probe[idx].why[0] ? view_probe[idx].why : "usable");
-
-    av_dict_free(&opts);
-    avcodec_free_context(&avc);
-    av_buffer_unref(&frames);
-}
-
 /* ------------------------------------------------------ the formats */
 
 int view_presets_fmts(int family, const enum AVPixelFormat **out)
@@ -1033,24 +1085,6 @@ int view_presets_fmts(int family, const enum AVPixelFormat **out)
     *out = f->fmts;
 
     return f->nb_fmts;
-}
-
-bool view_presets_probe_step(AVBufferRef *hw_device, int want, bool verbose)
-{
-    /* The selected family first: it is the row on screen. */
-    if (want >= 0 && want < view_nb_probe() &&
-        view_preset_families[want].probe && !view_probe[want].done) {
-        view_probe_family(want, hw_device, verbose);
-        return true;
-    }
-
-    for (int i = 0; i < view_nb_probe(); i++)
-        if (view_preset_families[i].probe && !view_probe[i].done) {
-            view_probe_family(i, hw_device, verbose);
-            return true;
-        }
-
-    return false;
 }
 
 /* ------------------------------------------------------- the names */

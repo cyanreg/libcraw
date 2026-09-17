@@ -90,7 +90,9 @@ wheel zooms about the pointer and a left drag pans; `r` and `t` go to the
 previous and the next file; Ctrl+1 and Ctrl+2 mark the start and the end of
 the video export at the frame on screen, the whole clip being the default;
 `m` mutes; `q`, or Escape with no menu open, quits. Zoom and pan only touch
-the view, never the export.
+the view, never the export. While a video export runs the whole panel and
+every key but `q` are locked, the picture is the export's; `q` then stops
+the export, finishes the file and quits.
 
 The panel is a column of sections — White balance, Exposure, Debayer,
 Denoise, Lens, Look, Adjustments, Film grain, Crop, Export — each behind a
@@ -127,8 +129,9 @@ line reads `3/7 P1000347.MOV [hevc video, gpu]`. The clips need not match —
 ProRes RAW and already developed, different sizes, stereo or four-channel or
 no audio at all — and a switch keeps every setting exactly as it was: the
 white balance mode and a manual CCT, the exposure index and bias, debayer,
-denoise, lens correction and its fit, the export's colour space, size, tone
-and gamut mapping, the film
+denoise, lens correction and its fit, the export's colour space, size,
+pixel format, audio mode and threads, the two export file paths once typed,
+the film
 simulation, the adjustments, the grain, every section's switch and the
 zoom. A setting a clip's kind
 cannot use is kept rather than dropped, so the white balance a raw clip was
@@ -191,18 +194,48 @@ was drawn and the file holds exactly that region, upright. `--crop WxH+X+Y`
 sets the same rectangle from the command line, in source pixels — which on a
 rotated clip is the readout's rectangle turned back.
 
-`--export FRAME OUT` writes one frame to one file and exits without opening
-a window, upright and at the crop rectangle's own size; the Export panel does the same for the frame on screen. The file
-name picks the format through libavformat, which knows both the muxer and
-the codec an extension implies: `.png` and `.tif` take the sixteen bit RGB
-the frame is rendered as, `.jpg`, `.webp` and `.avif` whatever their encoder
-supports, deepest first, through libswscale where that is not RGB;
-`--codec` overrides the encoder and `--enc KEY=VALUE,...` passes it options
-(`cpu-used=8,threads=2` for an AVIF). PNG is written at zlib level 1 (a
-fifth of the time of the default level for a per cent of the size) and
-TIFF uncompressed. The stream is tagged as what the export really is: full
-range, BT.709 primaries, sRGB transfer, display referred. A sequence of
-stills is deliberately not offered — that is a video encode.
+The Export section holds two exports, laid out as two separate blocks and
+independent of each other: a **Still** of the frame on screen, one image,
+and a **Video** of a range. Each has its own file field, its own button and
+its own status line, and neither field names the other's file. Each field
+follows its own default name until it is typed into — the still's the clip
+and the frame, the video's the clip and the range in the clip's directory —
+and once a path is typed it is the user's and is kept, across clips too. A
+typed path always wins; the video path's extension picks the container as
+long as the muxer carries the encoder, and is refused with the reason
+otherwise.
+
+`--export FRAME OUT` is the still from the command line: it writes one frame
+to one file and exits without opening a window, upright and at the crop
+rectangle's own size. The file name picks the format through libavformat,
+which knows both the muxer and the codec an extension implies: `.png` and
+`.tif` take the sixteen bit RGB the frame is rendered as, `.jpg`, `.webp`
+and `.avif` whatever their encoder supports, deepest first, through
+libswscale where that is not RGB; `--codec` overrides the encoder and `--enc
+KEY=VALUE,...` passes it options (`cpu-used=8,threads=2` for an AVIF). PNG is
+written at zlib level 1 (a fifth of the time of the default level for a per
+cent of the size) and TIFF uncompressed. The stream is tagged as what the
+export really is: full range, BT.709 primaries, sRGB transfer, display
+referred. A sequence of stills is deliberately not offered — that is a video
+encode. `--export-video START END OUT` is the video export headless. The
+still panel has no codec box: the extension is the choice.
+
+Every video export into an `.mp4` or `.mov` is written with `movflags
++faststart`, always: the `moov` atom is moved ahead of the media so the file
+plays before it has finished downloading. There is no option to turn it off.
+
+The **Video** block also carries the sound (see below), the number of
+encoder **threads** — 0 for FFmpeg's own auto, 1 to the machine's core
+count, applied to the software encoders and greyed for a Vulkan one, which
+has none; `--threads N` sets it and `-v` prints the count the encoder
+settled on since some clamp it — and, while a run is going, an *exporting: N
+of M frames* line, a progress bar and a stop button. From the moment the
+export starts until it ends or is stopped, every panel section and every row
+but the stop button is disabled: nothing can be scrubbed, seeked or changed
+by mouse, wheel or keyboard, the scrub bar takes no input, and the key
+handler ignores everything but `q` (which stops the export cleanly and then
+quits) and Escape closing a menu. When the export ends everything unlocks
+and the picture returns to where it was.
 
 ### Two kinds of export
 
@@ -210,22 +243,18 @@ There are two, and they are not two settings of one thing.
 
 A **display-referred** export — BT.709, BT.2020 SDR, BT.2020 PQ, BT.2020
 HLG — is the picture as the viewer shows it. libplacebo renders it into the
-target the way it renders the window: tone mapped, gamut mapped, with the
-film simulation, the adjustments and the grain on it, and encoded with the
-target's own transfer. The Export section chooses how that mapping is done:
-a tone mapping function (`off`, bt.2390, spline, reinhard, clip) with PQ's
-target peak beside it, peak detection on or off, and a gamut mapping mode
-(`off`, perceptual, softclip, relative, desaturate). `off` for tone mapping
-is not a clip: the target is given the source's own luminance range, which
-is exactly when libplacebo attaches no tone curve at all, so every value
-passes through into the target's encoding. `off` for gamut mapping is
-libplacebo's own `clip`, whose mapping step is a no-op, so the conversion is
-the primaries matrix and nothing else.
-
-None of those three are look settings and none of them touch the window.
-What the window shows is mapped with libplacebo's defaults for whatever the
-compositor negotiated for it, which is the only thing that can be right on a
-display this program knows nothing about.
+target exactly the way it renders the window: the same tone mapping, the
+same gamut mapping and the same per-frame peak detection — libplacebo's own
+defaults — with the film simulation, the adjustments and the grain on it,
+encoded with the target's own transfer. There is no tone-map, gamut-map or
+peak-detection choice, because the export does not get to decide how the
+picture is mapped any more than the window does: the mapping is the
+display's, so the file is the frame on screen. The one mapping parameter the
+selection still holds is PQ's target peak in nits, because that is part of
+what the HDR target *is* rather than a choice about the picture. (An export
+used to default to a bt.2390 map with peak detection off, and a file that
+came out thirteen per cent brighter in the mid-tones than the frame on
+screen is what that bought.)
 
 A **scene-referred** export — ACEScg, ACES2065-1, CIE XYZ D65 — never goes
 near the renderer. The frame is put through the pipeline a second time with
@@ -266,6 +295,26 @@ software encoder at 5.8K wants three and a half gigabytes. The row and its
 quarter turn `1/2` of a 5760x3040 frame is 1520x2880 and `1920 wide` is 1920
 across the turned frame — and a Vulkan H.264 or HEVC encoder meets its 4096
 limit on what is now the height.
+
+### The audio
+
+The video export optionally carries the clip's sound, chosen by the Video
+block's audio row and `--audio MODE`: `none`; `copy` (the default), the
+source track remuxed and cut to the exported range on a sample boundary;
+`opus:KBPS` (libopus, 160 by default, in 120 ms frames); `aac:KBPS` (160);
+`flac:LEVEL` (0 to 12, 5); or `wav`, PCM at the source's own depth — 24 bit
+little endian, or 16 bit for a 16 bit clip. The four encoders decode the
+source (it is PCM in these MOVs), take it through libswresample only where
+the encoder wants another sample format or rate — opus wants 48 kHz float,
+aac planar float, while flac and PCM take the samples as they are — encode
+it cut to the same range as `copy`, and interleave the packets with the
+picture. One numeric field beside the mode is its bitrate or its level as
+the mode needs. Which container carries which codec is asked of the muxer
+itself, so a mode the file cannot hold is greyed with the muxer's own
+reason: this FFmpeg's QuickTime muxer takes neither Opus nor FLAC (*only
+supported in MP4*), while `.mp4` and `.mkv` carry all of aac, opus, flac and
+PCM. The four-mono-track rule holds — the last two of four are the stereo
+pair — and a single four-channel stream is taken whole.
 
 ### The pixel format
 

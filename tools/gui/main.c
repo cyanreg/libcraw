@@ -1680,18 +1680,24 @@ static void view_usage(FILE *f)
 "  --tables FILE       load the per-CCT tables from a text file\n"
 "\n"
 "  --export FRAME OUT  write frame FRAME to the file OUT and exit, without\n"
-"                      opening a window. The name picks the format through\n"
-"                      libavformat: .png and .tif hold sixteen bits, .jpg,\n"
-"                      .webp and .avif whatever their encoder takes. The\n"
-"                      file holds the displayed look, sRGB encoded.\n"
+"                      opening a window: one image, the still export. The\n"
+"                      name picks the format through libavformat: .png and\n"
+"                      .tif hold sixteen bits, .jpg, .webp and .avif\n"
+"                      whatever their encoder takes. The file holds the\n"
+"                      displayed look, sRGB encoded, mapped as the window\n"
+"                      is.\n"
 "  --export-video START END OUT\n"
 "                      encode frames START to END, inclusive, into the file\n"
-"                      OUT and exit, without opening a window. The name\n"
-"                      picks the muxer, --codec the encoder; a Vulkan\n"
-"                      encoder (h264_vulkan, hevc_vulkan, ffv1_vulkan,\n"
-"                      apv_vulkan, prores_ks_vulkan) is fed on the GPU\n"
-"                      without a read-back, anything else through\n"
-"                      libswscale. The picture is what --export writes.\n"
+"                      OUT and exit, without opening a window: the video\n"
+"                      export, independent of the still one. The name picks\n"
+"                      the container and --preset the encoder (--codec\n"
+"                      overrides it); a Vulkan encoder (h264_vulkan,\n"
+"                      hevc_vulkan, ffv1_vulkan, apv_vulkan,\n"
+"                      prores_ks_vulkan) is fed on the GPU without a\n"
+"                      read-back, anything else through libswscale. The\n"
+"                      picture is what --export writes. A .mp4 or .mov is\n"
+"                      always written with movflags +faststart, its moov\n"
+"                      atom ahead of the media.\n"
 "  --list-encoders     print every video encoder this FFmpeg has, marking\n"
 "                      the ones that take Vulkan frames, and exit\n"
 "  --size SIZE         how large the export is written: full (the default,\n"
@@ -1703,24 +1709,27 @@ static void view_usage(FILE *f)
 "                      native resolution or not at all. On a clip the camera\n"
 "                      rotated this is the picture as it is written, upright:\n"
 "                      1/2 of a 5760x3040 frame turned a quarter is 1520x2880\n"
-"  --tone-map NAME     how the export maps the picture into a display\n"
-"                      referred space: off, bt.2390 (the default), spline,\n"
-"                      reinhard or clip. Off means the target carries the\n"
-"                      source's own luminance range, so nothing is mapped\n"
-"                      and nothing is clipped. The window is not affected:\n"
-"                      it is mapped with libplacebo's defaults for whatever\n"
-"                      the compositor negotiated\n"
-"  --gamut-map NAME    the export's gamut mapping: off, perceptual (the\n"
-"                      default), softclip, relative or desaturate\n"
-"  --no-peak-detect    the export tone maps against the profile's sensor\n"
-"                      clip instead of the peak libplacebo measures per\n"
-"                      frame\n"
-"  --audio copy|none   copy the clip's audio into the exported video, which\n"
-"                      is the default. The stream is the one playback uses,\n"
-"                      and a four channel stream is copied whole rather than\n"
-"                      cut down to the pair the speakers get\n"
-"  --codec NAME        encode the still with this encoder rather than the\n"
-"                      one the file name implies\n"
+"  --audio MODE        what the exported video does with the clip's sound:\n"
+"                      none; copy (the default), the source track remuxed\n"
+"                      and cut to the sample; opus[:KBPS] (libopus, 160,\n"
+"                      120 ms frames); aac[:KBPS] (160); flac[:LEVEL] (0 to\n"
+"                      12, 5); or wav, PCM at the source's depth: 24 bit\n"
+"                      little endian, or 16 bit for a 16 bit clip. The four\n"
+"                      encoders take the decoded samples, through\n"
+"                      libswresample only where the encoder wants another\n"
+"                      sample format or rate, cut to the same range as\n"
+"                      copy. The stream is the one playback uses, and a four\n"
+"                      channel stream is taken whole rather than cut down\n"
+"                      to the pair the speakers get. A mode the container\n"
+"                      cannot carry is refused with the muxer's reason:\n"
+"                      .mov takes neither opus nor flac, .mp4 and .mkv take\n"
+"                      all of them\n"
+"  --threads N         threads for a software video encoder, 0 (the default)\n"
+"                      for FFmpeg's own auto, 1 to the machine's core\n"
+"                      count; the Vulkan encoders have none. -v prints what\n"
+"                      the encoder settled on, since some clamp it\n"
+"  --codec NAME        encode with this encoder rather than the one the file\n"
+"                      name or the preset implies\n"
 "  --enc KEY=VALUE[,...]\n"
 "                      options for that encoder, e.g. cpu-used=8,threads=2\n"
 "                      for an AVIF or qmin=1 for a JPEG. For a video these\n"
@@ -1732,13 +1741,15 @@ static void view_usage(FILE *f)
 "                      A family on its own takes its default preset\n"
 "  --colour NAME       the colour space the video is written in: bt709 (the\n"
 "                      display look, the default), bt2020-sdr, bt2020-pq or\n"
-"                      bt2020-hlg, all four rendered and tone mapped; or\n"
-"                      the scene referred acescg, aces and xyz, which are\n"
-"                      written straight from the pipeline as float and so\n"
-"                      carry no tone curve, no gamut mapping, no film\n"
-"                      simulation and no grain at all. Those three need\n"
-"                      float samples, which means FFv1 (Vulkan) with an L4\n"
-"                      preset, and are written at native resolution\n"
+"                      bt2020-hlg, all four rendered and mapped exactly as\n"
+"                      the window is, with libplacebo's own tone and gamut\n"
+"                      mapping and per-frame peak detection; or the scene\n"
+"                      referred acescg, aces and xyz, which are written\n"
+"                      straight from the pipeline as float and so carry no\n"
+"                      tone curve, no gamut mapping, no film simulation and\n"
+"                      no grain at all. Those three need float samples,\n"
+"                      which means FFv1 (Vulkan) with an L4 preset, and are\n"
+"                      written at native resolution\n"
 "  --pix-fmt NAME      the pixel format the video is written in, by FFmpeg's\n"
 "                      own names: nv12, p010, yuv422p10, yuv444p12, gbrp16\n"
 "                      and so on. The default is the one the preset's\n"
@@ -1750,9 +1761,9 @@ static void view_usage(FILE *f)
 "                      AV1 Main is 4:2:0 and High is 4:4:4\n"
 "  --list-presets      print every family, preset and colour space with the\n"
 "                      options each one means and the pixel formats each\n"
-"                      encoder accepts on this machine, and exit. Opening\n"
-"                      the Vulkan encoders once each to find that out takes\n"
-"                      a few seconds\n"
+"                      encoder accepts, and exit. The device is opened so\n"
+"                      that a family whose engine is a Vulkan extension can\n"
+"                      say whether this GPU has it\n"
 "  --crop WxH+X+Y      export only that region of the source, in source\n"
 "                      pixels, with the edges snapped to even ones. The\n"
 "                      viewer shades everything outside it. A clip whose\n"
@@ -1780,7 +1791,9 @@ static void view_usage(FILE *f)
 "the wheel zooms about the pointer and dragging pans; c turns crop mode on\n"
 "and off, where a left drag draws the rectangle the export is cut to;\n"
 "r and t go to the previous and the next file on the command line;\n"
-"m mutes; q, or escape with no menu open, quits.\n",
+"m mutes; q, or escape with no menu open, quits. While a video export runs\n"
+"the panel and every key but q are locked; q stops the export, finishes\n"
+"the file and quits.\n",
     craw_tool_profile_builtin_list());
 }
 
@@ -1793,8 +1806,6 @@ enum {
     VIEW_OPT_EI,
     VIEW_OPT_EXPOSURE,
     VIEW_OPT_DEBAYER,
-    VIEW_OPT_TONE_MAP,
-    VIEW_OPT_GAMUT_MAP,
     VIEW_OPT_LUT,
     VIEW_OPT_LUT_TYPE,
     VIEW_OPT_LUT_SPACE,
@@ -1815,7 +1826,6 @@ enum {
     VIEW_OPT_NO_LOOP,
     VIEW_OPT_AUDIO_DUMP,
     VIEW_OPT_AUDIO_MAP,
-    VIEW_OPT_NO_PEAK,
     VIEW_OPT_ZOOM,
     VIEW_OPT_LIST_LUTS,
     VIEW_OPT_GRAIN,
@@ -1826,6 +1836,7 @@ enum {
     VIEW_OPT_VIBRANCE,
     VIEW_OPT_PIX_FMT,
     VIEW_OPT_BYPASS,
+    VIEW_OPT_THREADS,
 };
 
 static int view_parse_args(struct view_state *st, int argc, char **argv,
@@ -1840,8 +1851,6 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "ei",       required_argument, NULL, VIEW_OPT_EI        },
         { "exposure", required_argument, NULL, VIEW_OPT_EXPOSURE  },
         { "debayer",  required_argument, NULL, VIEW_OPT_DEBAYER   },
-        { "tone-map", required_argument, NULL, VIEW_OPT_TONE_MAP  },
-        { "gamut-map", required_argument, NULL, VIEW_OPT_GAMUT_MAP },
         { "lut",      required_argument, NULL, VIEW_OPT_LUT       },
         { "lut-type", required_argument, NULL, VIEW_OPT_LUT_TYPE  },
         { "lut-space", required_argument, NULL, VIEW_OPT_LUT_SPACE },
@@ -1864,7 +1873,6 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "no-loop",  no_argument,       NULL, VIEW_OPT_NO_LOOP   },
         { "audio-dump", required_argument, NULL, VIEW_OPT_AUDIO_DUMP },
         { "audio-map", required_argument,  NULL, VIEW_OPT_AUDIO_MAP },
-        { "no-peak-detect", no_argument,   NULL, VIEW_OPT_NO_PEAK   },
         { "zoom",     required_argument, NULL, VIEW_OPT_ZOOM      },
         { "grain",    required_argument, NULL, VIEW_OPT_GRAIN     },
         { "denoise",  required_argument, NULL, VIEW_OPT_DENOISE   },
@@ -1874,6 +1882,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
         { "pix-fmt",  required_argument, NULL, VIEW_OPT_PIX_FMT   },
         { "bypass",   required_argument, NULL, VIEW_OPT_BYPASS    },
+        { "threads",  required_argument, NULL, VIEW_OPT_THREADS   },
         { "help",     no_argument,       NULL, 'h'                },
         { NULL,       0,                 NULL, 0                  },
     };
@@ -1930,9 +1939,6 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 }
                 st->view.fit = false;
             }
-            break;
-        case VIEW_OPT_NO_PEAK:
-            st->look.video_preset.peak = 0;
             break;
         case VIEW_OPT_GRAIN:
             if ((ret = view_grain_parse(&st->grain, optarg)) < 0)
@@ -2021,28 +2027,6 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return ret;
             st->look.debayer = (enum CRAWDebayer)v;
             break;
-        /* Both are export options now: the window's mapping is libplacebo's
-         * own for whatever the compositor negotiated. */
-        case VIEW_OPT_TONE_MAP:
-            if ((ret = view_lookup(view_tone_map_names, view_nb_tone_maps,
-                                   "--tone-map", optarg, &v)) < 0)
-                return ret;
-            st->look.video_preset.tone_map = v;
-            break;
-        case VIEW_OPT_GAMUT_MAP:
-            /* "clip" is what this option called the absence of a gamut
-             * mapper before the list grew an "off": libplacebo's clip
-             * function is a no-op its mapper skips, so the two are the same
-             * thing and the old spelling still works. */
-            if (!strcmp(optarg, "clip")) {
-                st->look.video_preset.gamut_map = 0;
-                break;
-            }
-            if ((ret = view_lookup(view_gamut_map_names, view_nb_gamut_maps,
-                                   "--gamut-map", optarg, &v)) < 0)
-                return ret;
-            st->look.video_preset.gamut_map = v;
-            break;
         case VIEW_OPT_LUT:
             snprintf(st->look.lut_path, sizeof(st->look.lut_path), "%s", optarg);
             break;
@@ -2119,15 +2103,18 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return ret;
             break;
         case VIEW_OPT_AUDIO:
-            if (!strcmp(optarg, "copy")) {
-                st->cfg.video_audio = true;
-            } else if (!strcmp(optarg, "none")) {
-                st->cfg.video_audio = false;
-            } else {
-                fprintf(stderr, "--audio: expected copy or none, got `%s`\n",
-                        optarg);
+            if ((ret = view_presets_parse_audio(&st->look.video_preset,
+                                                optarg)) < 0)
+                return ret;
+            break;
+        case VIEW_OPT_THREADS:
+            v = (int)strtol(optarg, &end, 10);
+            if (end == optarg || *end || v < 0 || v > view_presets_max_threads()) {
+                fprintf(stderr, "--threads: expected 0 (auto) or 1 to %d, "
+                                "got `%s`\n", view_presets_max_threads(), optarg);
                 return CRAW_ERROR(EINVAL);
             }
+            st->look.video_preset.threads = v;
             break;
         case VIEW_OPT_CODEC:
             st->cfg.export_codec = optarg;
@@ -2150,11 +2137,11 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return ret;
             break;
         case VIEW_OPT_LIST_PRESETS:
-            /* The lists are fixed per family, so this needs no device; the
-             * one thing it cannot say is which Vulkan family has no engine
-             * on this GPU, which the panel finds out with one open each. */
-            view_presets_list();
-            return 1;
+            /* After the arguments, so that --device is honoured: the one
+             * thing the table cannot say on its own is which Vulkan family
+             * has no engine on this GPU. */
+            st->cfg.list_presets = true;
+            break;
         case VIEW_OPT_CROP:
             if ((ret = view_parse_crop(&st->crop, optarg)) < 0)
                 return ret;
@@ -2165,6 +2152,10 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             return CRAW_ERROR(EINVAL);
         }
     }
+
+    /* A listing wants no clip. */
+    if (st->cfg.list_presets)
+        return 0;
 
     /* Every remaining argument is a clip. getopt has moved them all to the
      * tail by now, including the ones --export and --export-video took off
@@ -2327,14 +2318,11 @@ static void view_log_look(const struct view_state *st)
 
     fprintf(stderr, ", lens %s", st->lens.on ? st->lens.keep ? "on (keep all)"
                                                              : "on (fill)" : "off");
-    /* The export's mapping, which is where these three live now: the window
-     * takes libplacebo's own defaults for whatever it is displaying on. */
-    fprintf(stderr, ", export tone %s, gamut %s, peak detect %s",
-            view_tone_map_names[CRAW_CLAMP(lk->video_preset.tone_map, 0,
-                                           view_nb_tone_maps - 1)],
-            view_gamut_map_names[CRAW_CLAMP(lk->video_preset.gamut_map, 0,
-                                            view_nb_gamut_maps - 1)],
-            lk->video_preset.peak ? "on" : "off");
+    /* The export's sound and threads, which carry like every other export
+     * setting. */
+    fprintf(stderr, ", export audio %s, threads %d",
+            view_presets_audio_label(&lk->video_preset, adj, sizeof(adj)),
+            lk->video_preset.threads);
     fprintf(stderr, ", lut %s", lk->lut_path[0] ? lk->lut_path
                                                 : view_lut_film_name(st));
     if (!st->sections.look)
@@ -2602,6 +2590,21 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
              (unsigned)e->key.key, (unsigned)e->key.mod,
              repeat ? ", repeat" : "");
 
+    /* A running video export owns the decoder and has copied the settings,
+     * so there is nothing a key could change that it should: the panel is
+     * locked, and the keyboard with it. What is left is q, which stops the
+     * run and quits once the file has its trailer, and Escape closing a
+     * menu, which is the one thing an open one has to be able to do. */
+    if (view_ui_locked(st)) {
+        if (e->key.key == SDLK_Q && !repeat) {
+            view_encode_cancel(st);
+            st->quit_pending = true;
+        } else if (e->key.key == SDLK_ESCAPE) {
+            view_ui_menu_key(st, SDLK_ESCAPE);
+        }
+        return;
+    }
+
     /* An open film simulation menu owns the arrows, Enter and Escape; it
      * says so itself, and says nothing while it is closed. */
     if (view_ui_menu_key(st, (int)e->key.key))
@@ -2858,6 +2861,7 @@ static int view_run_window(struct view_state *st)
         }
         while (SDL_PollEvent(&e)) {
             bool to_nuklear = true;
+            bool locked = view_ui_locked(st);
 
             /* Any event at all is a reason to draw: a key or a drag can
              * move the picture, the look or the panel, and chasing down
@@ -2866,7 +2870,14 @@ static int view_run_window(struct view_state *st)
 
             switch (e.type) {
             case SDL_EVENT_QUIT:
-                running = false;
+                /* A window closed on a running export stops the run and
+                 * leaves once the file has its trailer, the way q does. */
+                if (view_ui_locked(st)) {
+                    view_encode_cancel(st);
+                    st->quit_pending = true;
+                } else {
+                    running = false;
+                }
                 break;
             case SDL_EVENT_KEY_DOWN:
                 /* Let the text field have the keys while it is being typed
@@ -2877,11 +2888,18 @@ static int view_run_window(struct view_state *st)
                     view_handle_key(st, &e, &running);
                 break;
 
+            /* The pointer over the picture zooms, pans and draws the crop -
+             * except while a video export runs, when the picture is the
+             * export's and the pointer's only business is the panel's stop
+             * button. The events still reach nuklear, whose widgets are all
+             * disabled but that one. */
+
             /* SDL3 puts the pointer position in the wheel event itself, so
              * zooming about the cursor no longer has to ask for the mouse
              * state and risk a position from after the notch. */
             case SDL_EVENT_MOUSE_WHEEL:
-                if (view_over_picture(st, e.wheel.mouse_x, e.wheel.mouse_y)) {
+                if (!locked &&
+                    view_over_picture(st, e.wheel.mouse_x, e.wheel.mouse_y)) {
                     int px, py;
 
                     view_mouse_pos(st, e.wheel.mouse_x, e.wheel.mouse_y, &px, &py);
@@ -2891,6 +2909,8 @@ static int view_run_window(struct view_state *st)
                 break;
 
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                if (locked)
+                    break;
                 /* A click anywhere outside the open film simulation menu
                  * dismisses it and goes no further: that first click is
                  * the dismissal, not a pan, a crop or a panel widget. The
@@ -2920,7 +2940,7 @@ static int view_run_window(struct view_state *st)
                 }
                 break;
             case SDL_EVENT_MOUSE_BUTTON_UP:
-                if (e.button.button == SDL_BUTTON_LEFT &&
+                if (!locked && e.button.button == SDL_BUTTON_LEFT &&
                     (st->view.dragging || st->crop.dragging)) {
                     st->view.dragging = false;
                     view_crop_end(st);
@@ -2928,7 +2948,13 @@ static int view_run_window(struct view_state *st)
                 }
                 break;
             case SDL_EVENT_MOUSE_MOTION:
-                if (st->crop.dragging) {
+                if (locked) {
+                    /* A drag that was in flight when the run began ends
+                     * here rather than resuming a frame later on a picture
+                     * that has moved. */
+                    st->view.dragging = false;
+                    view_crop_end(st);
+                } else if (st->crop.dragging) {
                     int px, py;
 
                     view_mouse_pos(st, e.motion.x, e.motion.y, &px, &py);
@@ -2979,6 +3005,10 @@ static int view_run_window(struct view_state *st)
 
         if (st->video.active) {
             view_encode_step(st);
+            /* q, or the window closing, during the run: the file has its
+             * trailer now, so this is where the program leaves. */
+            if (st->quit_pending && !st->video.active)
+                running = false;
         } else if (st->exp.active) {
             if (view_export_step(st) < 0)
                 st->exp.active = false;
@@ -3326,7 +3356,6 @@ static int view_run_headless(struct view_state *st)
             .sel    = &st->look.video_preset,
             .codec  = st->cfg.export_codec,
             .enc    = st->cfg.export_enc,
-            .audio  = st->cfg.video_audio,
         };
 
         ret = view_encode_begin(st, &o);
@@ -3385,10 +3414,6 @@ int main(int argc, char **argv)
     st.seek_target = -1;
     st.playing = true;
     st.cfg.loop = true;
-    /* The exported video carries the clip's own audio unless --audio none
-     * says otherwise: a range of a take without its sound is rarely what
-     * anyone wanted. */
-    st.cfg.video_audio = true;
     st.view.fit = true;
     st.volume = 1.0f;
     /* Before the arguments, so that --grain and --denoise override the
@@ -3430,6 +3455,19 @@ int main(int argc, char **argv)
 
     st.cfg.profile = profile;
     st.cfg.tables = tables;
+
+    /* --list-presets, with the device open so that the families whose
+     * engine is a Vulkan extension can say whether this GPU has it. A
+     * device that will not open leaves the table to say what the build
+     * says. */
+    if (st.cfg.list_presets) {
+        if (view_gpu_open(&st.gpu, &st.cfg, NULL) < 0)
+            fprintf(stderr, "no Vulkan device: the families are listed as "
+                            "this build has them\n");
+        view_presets_list();
+        view_gpu_close(&st.gpu);
+        return 0;
+    }
 
     craw_awb_params_init(&st.awb.params);
 

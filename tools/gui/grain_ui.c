@@ -438,7 +438,10 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "%.72s", craw_grain_stock_source(g->stock));
 
-    if (grey) {
+    /* Not while a running video export has the whole panel locked: the
+     * pair does not nest, and the end here would unlock everything under
+     * this section. */
+    if (grey && !view_ui_locked(st)) {
         nk_widget_disable_end(ctx);
         st->ui_greyed = false;
     }
