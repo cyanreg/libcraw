@@ -2764,6 +2764,14 @@ static int view_run_window(struct view_state *st)
      * belong to the moment it reached the screen, which need not be the
      * iteration that decoded it. */
     bool stepped_pending = false;
+    /* Whether the panel has consumed nuklear's input since it was last
+     * opened. nk_input_begin() forgets the clicks and the deltas of the
+     * cycle before it, so it may only run once the panel has been built
+     * with them: an iteration that holds the picture back and builds
+     * nothing must leave the cycle open, or a click that lands during the
+     * hold - which while playing is nearly always - is wiped before any
+     * button sees it. */
+    bool ui_input_consumed = true;
     int w = VIEW_WINDOW_W, h = VIEW_WINDOW_H;
     int ret;
 
@@ -2844,7 +2852,10 @@ static int view_run_window(struct view_state *st)
 
         view_trace_iter(st, av_gettime_relative());
 
-        view_ui_input_begin();
+        if (ui_input_consumed) {
+            view_ui_input_begin();
+            ui_input_consumed = false;
+        }
         while (SDL_PollEvent(&e)) {
             bool to_nuklear = true;
 
@@ -3091,6 +3102,7 @@ static int view_run_window(struct view_state *st)
 
         if (st->present_due && hold <= 0.0) {
             view_ui_build(st);
+            ui_input_consumed = true;
 
             /* A grade change while paused replays the picture on screen;
              * while playing the next frame simply uses the current look,
