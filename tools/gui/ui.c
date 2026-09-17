@@ -23,6 +23,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
+#include <fontconfig/fontconfig.h>
+
 /* The vendored headers are third party and do not build clean under this
  * project's warning flags; the suppressions stop at the end of the include
  * block so that everything below is held to the same standard as the rest
@@ -71,12 +73,22 @@
 
 #define VIEW_UI_WIDTH  VIEW_PANEL_WIDTH
 #define VIEW_UI_MARGIN VIEW_PANEL_MARGIN
-#define VIEW_ROW       24.0f
+
+/* The panel's face is whatever fontconfig calls sans-serif on this machine,
+ * at this many pixels: the size at which the panel's longest readouts
+ * still fit its 360 px width and a row of the film menu still fits a
+ * modest window. Every row height below is sized for it; nuklear's own 13
+ * px bitmap face is only what the panel falls back to when fontconfig has
+ * nothing or the file will not load. */
+#define VIEW_FONT_PX   15.0f
+#define VIEW_ROW       26.0f
+/* A row in a combo's dropdown, which nuklear takes as an int. */
+#define VIEW_COMBO_ROW 24
 
 /* The cascading menu's own metrics. Its rows are tighter than the panel's:
  * a film category can hold twenty-six stocks and the column still has to
  * fit in a modest window. */
-#define VIEW_MENU_ROW   22.0f
+#define VIEW_MENU_ROW   24.0f
 #define VIEW_MENU_PAD    4.0f
 #define VIEW_MENU_XPAD   8.0f
 /* How long the pointer has to rest on an entry before its submenu opens,
@@ -94,13 +106,124 @@
 static struct nk_context *view_nk;
 static VkSemaphore view_ui_hold_sem[VIEW_SLOTS];
 
+/* What the panel cuts a value that will not fit with: the typographic
+ * ellipsis once a face that has it is loaded, three dots until then, since
+ * the built-in bitmap face has no U+2026. */
+static const char *view_ellipsis = "...";
+
 /* ------------------------------------------------------------ lifetime */
+
+/* The face fontconfig names for "sans-serif", the way every desktop
+ * application on the machine finds its UI font, so that the panel gets the
+ * one the person already reads everything else in: no option, no
+ * environment variable, nothing to configure. `path` is the file and
+ * `index` the face inside it for a collection; `ellipsis` says whether
+ * the face has U+2026, which fontconfig knows from its charset and which
+ * decides what long values are cut with. False when fontconfig has
+ * nothing to offer, in which case the built-in face stays.
+ *
+ * fontconfig's whole lifetime is inside this call: nothing else in the
+ * program uses it, and the atlas reads the file into memory of its own. */
+static bool view_font_find(char *path, size_t n, int *index, bool *ellipsis,
+                           char *family, size_t family_n)
+{
+    FcPattern *pat, *match = NULL;
+    FcResult res = FcResultNoMatch;
+    FcChar8 *str;
+    FcCharSet *cs;
+    bool ok = false;
+
+    if (!FcInit())
+        return false;
+
+    pat = FcNameParse((const FcChar8 *)"sans-serif");
+    if (pat) {
+        FcConfigSubstitute(NULL, pat, FcMatchPattern);
+        FcDefaultSubstitute(pat);
+        match = FcFontMatch(NULL, pat, &res);
+    }
+
+    if (match && res == FcResultMatch &&
+        FcPatternGetString(match, FC_FILE, 0, &str) == FcResultMatch) {
+        snprintf(path, n, "%s", (const char *)str);
+        if (FcPatternGetInteger(match, FC_INDEX, 0, index) != FcResultMatch)
+            *index = 0;
+        *ellipsis = FcPatternGetCharSet(match, FC_CHARSET, 0, &cs) == FcResultMatch &&
+                    FcCharSetHasChar(cs, 0x2026);
+        if (FcPatternGetString(match, FC_FAMILY, 0, &str) == FcResultMatch)
+            snprintf(family, family_n, "%s", (const char *)str);
+        else
+            family[0] = '\0';
+        ok = true;
+    }
+
+    if (match)
+        FcPatternDestroy(match);
+    if (pat)
+        FcPatternDestroy(pat);
+    FcFini();
+
+    return ok;
+}
+
+/* Adds that face to the atlas, or nothing: nuklear bakes its own bitmap
+ * face when the atlas is empty, which is the fallback. Returns the font to
+ * set as the style's, or NULL to leave nuklear's. */
+static struct nk_font *view_font_load(struct view_state *st,
+                                      struct nk_font_atlas *atlas)
+{
+    /* Latin-1, which nuklear's default range is and which the panel's
+     * degree sign needs, plus the ellipsis when the face has it. A
+     * collection's inner faces are beyond nuklear's loader, which always
+     * reads the first, so only a plain file at index 0 is taken. */
+    static const nk_rune latin1[] = { 0x0020, 0x00FF, 0 };
+    static const nk_rune latin1_ellipsis[] = { 0x0020, 0x00FF, 0x2026, 0x2026, 0 };
+    struct nk_font_config cfg = nk_font_config(VIEW_FONT_PX);
+    struct nk_font *font;
+    char path[VIEW_MAX_PATH], family[128];
+    bool ellipsis = false;
+    int index = 0;
+
+    if (!view_font_find(path, sizeof(path), &index, &ellipsis,
+                        family, sizeof(family))) {
+        view_log(st, "panel font: fontconfig has no sans-serif face, "
+                     "keeping the built-in one\n");
+        return NULL;
+    }
+    if (index != 0) {
+        view_log(st, "panel font: %s is face %d of a collection, which the "
+                     "atlas cannot take; keeping the built-in one\n",
+                 path, index);
+        return NULL;
+    }
+
+    /* Horizontal oversampling is what makes a small face read cleanly: the
+     * glyphs are rasterized at three times the width and sampled back, so
+     * their stems land between pixels without smearing. Vertically the
+     * rows are pixel aligned already. */
+    cfg.oversample_h = 3;
+    cfg.oversample_v = 1;
+    cfg.range = ellipsis ? latin1_ellipsis : latin1;
+
+    font = nk_font_atlas_add_from_file(atlas, path, VIEW_FONT_PX, &cfg);
+    if (!font) {
+        view_log(st, "panel font: %s would not load, keeping the built-in "
+                     "one\n", path);
+        return NULL;
+    }
+
+    view_ellipsis = ellipsis ? "\xe2\x80\xa6" : "...";
+    view_log(st, "panel font: %s (%s) at %.0f px\n", path, family, VIEW_FONT_PX);
+
+    return font;
+}
 
 int view_ui_open(struct view_state *st, void *sdl_window)
 {
     struct view_gpu *g = &st->gpu;
     struct nk_font_atlas *atlas;
-    int w = 0, h = 0;
+    struct nk_font *font;
+    int w = 0, h = 0, aw = 0, ah = 0;
     int ret;
 
     SDL_GetWindowSizeInPixels(sdl_window, &w, &h);
@@ -127,9 +250,14 @@ int view_ui_open(struct view_state *st, void *sdl_window)
         return CRAW_ERROR(ENOMEM);
 
     nk_sdl_font_stash_begin(&atlas);
+    font = view_font_load(st, atlas);
     view_gpu_lock(g);
-    nk_sdl_font_stash_end(g->queue);
+    nk_sdl_font_stash_end(g->queue, &aw, &ah);
     view_gpu_unlock(g);
+    /* The backend only installs the built-in face by itself. */
+    if (font)
+        nk_style_set_font(view_nk, &font->handle);
+    view_log(st, "panel font atlas: %dx%d\n", aw, ah);
 
     /* An opaque panel keeps the alpha the backend writes at 1.0 wherever it
      * matters; only the outermost antialiased border pixels are partially
@@ -208,78 +336,51 @@ static const char *view_wb_source_name(enum CRAWAwbSource s)
     return "none";
 }
 
-/* Marks the next row as one Up and Down can reach, and draws the focus ring
- * behind it. nuklear has no focus model of its own, so the list is simply
- * the order the rows are emitted in. */
-static bool view_row(struct view_state *st, struct nk_context *ctx)
+/* A text cut to fit `w` pixels of the panel's font, with the ellipsis on
+ * the end when it had to be: a value that does not fit its column is shown
+ * as far as it goes rather than clipped mid-glyph by the widget. The cut
+ * steps back over whole UTF-8 sequences, since the values carry a degree
+ * sign and a face may put anything in a camera's model name. */
+static void view_fit_text(const struct nk_user_font *f, float w,
+                          const char *text, char *out, size_t n)
 {
-    bool focused;
+    size_t len = strlen(text);
+    float ell;
 
-    /* A greyed row is not on the ring at all, which is what "the focus
-     * skips greyed rows" has to mean for a row that is still drawn: Up and
-     * Down walk straight past the whole section. */
-    if (st->ui_greyed)
-        return false;
+    if (len >= n)
+        len = n - 1;
 
-    focused = st->ui_row == st->focus;
-
-    if (focused) {
-        struct nk_rect b = nk_widget_bounds(ctx);
-        struct nk_rect c = nk_window_get_content_region(ctx);
-        struct nk_command_buffer *out = nk_window_get_canvas(ctx);
-
-        b.x = c.x - 2.0f;
-        b.w = c.w + 4.0f;
-        b.y -= 2.0f;
-        b.h += 4.0f;
-        nk_fill_rect(out, b, 2.0f, nk_rgba(46, 64, 96, 255));
+    if (f->width(f->userdata, f->height, text, (int)len) <= w) {
+        memcpy(out, text, len);
+        out[len] = '\0';
+        return;
     }
 
-    st->ui_row++;
-
-    return focused;
-}
-
-/* The pending Left/Right step for the focused row, consumed on read. */
-static int view_step(struct view_state *st, bool focused)
-{
-    int adj = focused ? st->adjust : 0;
-
-    if (adj)
-        st->adjust = 0;
-
-    return adj;
-}
-
-static void view_adjust_float(struct view_state *st, bool focused, float *v,
-                              float step, float lo, float hi)
-{
-    int adj = view_step(st, focused);
-
-    if (adj) {
-        *v = CRAW_CLAMP(*v + (float)adj * step, lo, hi);
-        /* Three sixths of a stop back from a half is not -0.00. */
-        if (fabsf(*v) < step * 1e-3f)
-            *v = 0.0f;
+    ell = f->width(f->userdata, f->height, view_ellipsis,
+                   (int)strlen(view_ellipsis));
+    while (len > 0) {
+        len--;
+        /* Not on a continuation byte: back to the start of the sequence. */
+        while (len > 0 && ((unsigned char)text[len] & 0xC0) == 0x80)
+            len--;
+        if (f->width(f->userdata, f->height, text, (int)len) + ell <= w)
+            break;
     }
-}
 
-static void view_adjust_cycle(struct view_state *st, bool focused, int *v, int n)
-{
-    int adj = view_step(st, focused);
-
-    if (adj)
-        *v = (*v + adj + n) % n;
+    if (len + strlen(view_ellipsis) >= n)
+        len = n - 1 - strlen(view_ellipsis);
+    memcpy(out, text, len);
+    strcpy(out + len, view_ellipsis);
 }
 
 /* The three sections a scene-referred export takes out of the picture: the
  * look, the adjustments and the grain. All three are display-referred
  * operators on values in [0,1], and a scene-referred export is written
  * straight out of the pipeline with none of them on it - so they are drawn
- * at half strength, take no input, and are off the focus ring. The same
- * hooks are left off the display too, which is the point: what is on screen
- * is what the file holds, up to the display transform, so a live control
- * here would be lying about the file and about the window at once.
+ * at half strength and take no input. The same hooks are left off the
+ * display too, which is the point: what is on screen is what the file
+ * holds, up to the display transform, so a live control here would be
+ * lying about the file and about the window at once.
  *
  * The section's own tree tab is deliberately left alive, because a section
  * you cannot open is a section that cannot tell you why it is greyed. */
@@ -288,26 +389,18 @@ static void view_adjust_cycle(struct view_state *st, bool focused, int *v, int n
  * export, the end of an inner stretch is not an end. nuklear's pair does
  * not nest - the end re-enables everything - and a section that greyed
  * three rows for its own reasons would otherwise unlock the rest of the
- * panel behind it. `rows` says whether the stretch's rows leave the focus
- * ring as well, which the greyed sections' do and a greyed switch's do
- * not. */
-static void view_disable_begin(struct view_state *st, struct nk_context *ctx,
-                               bool rows)
+ * panel behind it. */
+static void view_disable_begin(struct nk_context *ctx)
 {
     nk_widget_disable_begin(ctx);
-    if (rows)
-        st->ui_greyed = true;
 }
 
-static void view_disable_end(struct view_state *st, struct nk_context *ctx,
-                             bool rows)
+static void view_disable_end(struct view_state *st, struct nk_context *ctx)
 {
     if (view_ui_locked(st))
         return;
 
     nk_widget_disable_end(ctx);
-    if (rows)
-        st->ui_greyed = false;
 }
 
 static bool view_grey_begin(struct view_state *st, struct nk_context *ctx,
@@ -325,7 +418,7 @@ static bool view_grey_begin(struct view_state *st, struct nk_context *ctx,
         nk_label_wrap(ctx, why);
     }
 
-    view_disable_begin(st, ctx, true);
+    view_disable_begin(ctx);
 
     return true;
 }
@@ -335,7 +428,7 @@ static void view_grey_end(struct view_state *st, struct nk_context *ctx, bool on
     if (!on)
         return;
 
-    view_disable_end(st, ctx, true);
+    view_disable_end(st, ctx);
 }
 
 /* ------------------------------------------------- the section headers */
@@ -355,7 +448,8 @@ static void view_grey_end(struct view_state *st, struct nk_context *ctx, bool on
  * and the body indented under it the way nuklear indents a tree's.
  *
  * Which sections are open lives in view state rather than in nuklear's own
- * per-title table, because nothing but a tree widget writes that table. */
+ * per-title table, because nothing but a tree widget writes that table.
+ * Both halves are clicked; nothing on the keyboard reaches them. */
 
 /* Lit when on, an outline when off: down a column of ten of these the
  * state has to be readable without reading anything. */
@@ -389,24 +483,12 @@ static bool view_section_header(struct nk_context *ctx, struct view_state *st,
     float h = style->font->height + 2.0f * style->tab.padding.y;
     struct nk_style_button bs;
     struct nk_rect b;
-    bool focused;
-    int adj;
 
     /* A square switch cell as tall as the header, then the expander. */
     nk_layout_row_template_begin(ctx, h);
     nk_layout_row_template_push_static(ctx, h);
     nk_layout_row_template_push_dynamic(ctx);
     nk_layout_row_template_end(ctx);
-
-    focused = view_row(st, ctx);
-    st->sections.row[id] = st->ui_greyed ? -1 : st->ui_row - 1;
-
-    /* The step is consumed whether or not there is a switch to spend it on,
-     * or Left on a header with none would fall through to the row under
-     * it. */
-    adj = view_step(st, focused);
-    if (adj && on && !disabled)
-        *on = !*on;
 
     if (on) {
         bs = style->tab.tab_minimize_button;
@@ -424,25 +506,22 @@ static bool view_section_header(struct nk_context *ctx, struct view_state *st,
                 bs.disabled_factor;
 
         if (disabled)
-            view_disable_begin(st, ctx, false);
+            view_disable_begin(ctx);
         /* A disabled widget takes no input at all, so the click below
          * cannot happen while the section is greyed. */
         if (nk_button_symbol_styled(ctx, &bs, *on ? NK_SYMBOL_CIRCLE_SOLID
                                                   : NK_SYMBOL_CIRCLE_OUTLINE))
             *on = !*on;
         if (disabled)
-            view_disable_end(st, ctx, false);
+            view_disable_end(st, ctx);
     } else {
         nk_spacing(ctx, 1);
     }
 
     bs = style->tab.tab_minimize_button;
-    /* The expander fills its whole cell, so the focus ring view_row() drew
-     * behind the row would be covered by it: a focused header is drawn in
-     * the ring's own colour instead, which is the same thing said the same
-     * way. */
-    bs.normal = bs.hover = bs.active = focused
-        ? nk_style_item_color(nk_rgba(46, 64, 96, 255)) : style->tab.background;
+    /* The expander fills its whole cell and is drawn as the tree tab it
+     * replaces. */
+    bs.normal = bs.hover = bs.active = style->tab.background;
     bs.border = style->tab.border;
     bs.border_color = style->tab.border_color;
     bs.rounding = style->tab.rounding;
@@ -487,24 +566,12 @@ static void view_section_end(struct nk_context *ctx)
     view_section_indent(ctx, -1.0f);
 }
 
-bool view_ui_section_toggle(struct view_state *st, int row)
-{
-    for (int i = 0; i < VIEW_NB_SECTIONS; i++)
-        if (st->sections.row[i] == row) {
-            st->sections.open[i] = !st->sections.open[i];
-            return true;
-        }
-
-    return false;
-}
-
 /* ------------------------------------------------- the cascading menus */
 
 /* Three rows use this: the film simulation, the video export's codec
  * preset and the export's colour space. The geometry, the hover
- * hysteresis, the keyboard and the drawing are one implementation; what
- * differs is only what a column holds, which the five accessors below
- * answer per kind.
+ * hysteresis and the drawing are one implementation; what differs is only
+ * what a column holds, which the five accessors below answer per kind.
  *
  * nuklear has popups and groups but nothing cascading, and its windows
  * hand input to whichever one the pointer last activated, which is not how
@@ -1008,8 +1075,10 @@ static void view_menu_layout(struct nk_context *ctx, struct view_state *st)
         m->h[c] = h;
 
         s = CRAW_CLAMP(m->scroll[c], 0.0f, maxs);
-        /* Keyboard navigation must keep its highlight on screen. */
-        if (m->kb == c && m->sel[c] >= 0) {
+        /* A column opened on the current selection has to show it, or the
+         * menu opens scrolled to the top of a list twenty-six entries long
+         * with the highlighted one somewhere below the fold. */
+        if (m->sel[c] >= 0) {
             float top = (float)m->sel[c] * VIEW_MENU_ROW;
             float inner = h - 2 * VIEW_MENU_PAD;
 
@@ -1155,7 +1224,6 @@ static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
         if (clicked) {
             /* A click is unambiguous: act on it at once, whatever the
              * hover timers were about to do. */
-            m->kb = -1;
             if (leaf) {
                 view_menu_select(st, hit_col, hit_entry);
                 pick = 1;
@@ -1175,10 +1243,8 @@ static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
             if (leaf) {
                 /* Nothing to protect and nothing to open, so a leaf's
                  * highlight simply follows the pointer. */
-                m->kb = -1;
                 view_menu_descend(st, hit_col, hit_entry);
             } else if (!guarded && now - m->hover_since >= VIEW_MENU_OPEN_US) {
-                m->kb = -1;
                 view_menu_descend(st, hit_col, hit_entry);
                 m->guard_col = hit_col;
                 m->guard_until = now + VIEW_MENU_GUARD_US;
@@ -1235,9 +1301,7 @@ static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
             if (i == cur)
                 nk_fill_rect(out, e, 2.0f, nk_rgba(40, 62, 52, 255));
             if (on)
-                nk_fill_rect(out, e, 2.0f,
-                             m->kb == c ? nk_rgba(64, 92, 140, 255)
-                                        : nk_rgba(52, 66, 96, 255));
+                nk_fill_rect(out, e, 2.0f, nk_rgba(52, 66, 96, 255));
 
             t = nk_rect(e.x + VIEW_MENU_XPAD, e.y, e.w - 2 * VIEW_MENU_XPAD, e.h);
             nk_draw_text(out, t, buf, (int)strlen(buf), font,
@@ -1246,8 +1310,9 @@ static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
                               : nk_rgba(226, 226, 232, 255));
 
             /* The mark that says this entry opens another column. Plain
-             * ASCII: nuklear's built-in font atlas only bakes Latin-1, so
-             * a typographic arrow would come out as a missing glyph. */
+             * ASCII: the atlas bakes Latin-1 and the ellipsis, whichever
+             * face it holds, so a typographic arrow would come out as a
+             * missing glyph. */
             if (!leaf) {
                 const char *arrow = ">";
 
@@ -1298,9 +1363,7 @@ void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind)
 
     m->open = true;
     m->kind = kind;
-    m->row = m->rows[kind];
     m->cols = 1;
-    m->kb = 0;
     for (int c = 0; c < VIEW_MENU_COLS; c++) {
         m->sel[c] = -1;
         m->scroll[c] = 0.0f;
@@ -1314,23 +1377,20 @@ void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind)
     m->guard_col = -1;
     m->guard_until = 0;
 
-    /* Open on what is already selected, so Enter then the arrows walks on
-     * from the current setting rather than from the top of the list. */
+    /* Open on what is already selected, so the columns come up showing
+     * the current setting rather than the top of the list. */
     if (kind == VIEW_MENU_PRESET) {
         m->sel[0] = st->look.video_preset.family;
         m->sel[1] = st->look.video_preset.preset;
-        m->kb = 1;
         return;
     }
     if (kind == VIEW_MENU_COLOUR) {
         m->sel[0] = view_menu_current(st, 0);
         m->sel[1] = m->sel[0] >= 0 ? view_menu_current(st, 1) : -1;
-        m->kb = m->sel[1] >= 0 ? 1 : 0;
         return;
     }
     if (kind == VIEW_MENU_PIXFMT) {
         m->sel[0] = view_menu_current(st, 0);
-        m->kb = 0;
         return;
     }
 
@@ -1352,26 +1412,15 @@ void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind)
                 }
             }
             m->sel[3] = st->look.film_sim - f->first_lut;
-            m->kb = 3;
         }
     }
 #endif
-}
-
-void view_ui_menu_open_row(struct view_state *st, int row)
-{
-    for (int k = 0; k < VIEW_MENU_KINDS; k++)
-        if (st->menu.rows[k] == row) {
-            view_ui_menu_open(st, (enum view_menu_kind)k);
-            return;
-        }
 }
 
 void view_ui_menu_close(struct view_state *st)
 {
     st->menu.open = false;
     st->menu.cols = 0;
-    st->menu.kb = -1;
 }
 
 bool view_ui_menu_covers(const struct view_state *st, float x, float y)
@@ -1395,117 +1444,6 @@ bool view_ui_menu_covers(const struct view_state *st, float x, float y)
     return false;
 }
 
-bool view_ui_menu_key(struct view_state *st, int key)
-{
-    struct view_lut_menu *m = &st->menu;
-    int c, n;
-
-    if (!m->open)
-        return false;
-
-    if (key == SDLK_ESCAPE) {
-        view_ui_menu_close(st);
-        return true;
-    }
-
-    /* The pointer may have been driving; a key takes it back at whatever
-     * depth the columns are already open to. */
-    if (m->kb < 0)
-        m->kb = CRAW_MAX(m->cols - 1, 0);
-    c = CRAW_CLAMP(m->kb, 0, m->cols - 1);
-    n = view_menu_count(st, c);
-
-    switch (key) {
-    case SDLK_UP:
-    case SDLK_DOWN:
-        if (n > 0) {
-            int i = m->sel[c];
-
-            if (i < 0)
-                i = key == SDLK_DOWN ? 0 : n - 1;
-            else
-                i = (i + (key == SDLK_DOWN ? 1 : -1) + n) % n;
-            view_menu_descend(st, c, i);
-            m->kb = c;
-        }
-        return true;
-
-    case SDLK_RIGHT:
-    case SDLK_RETURN:
-    case SDLK_KP_ENTER:
-        if (m->sel[c] < 0 && n > 0)
-            view_menu_descend(st, c, 0);
-        if (view_menu_leaf(st, c)) {
-            /* Right on a leaf has nowhere to go; only Enter selects. */
-            if (key != SDLK_RIGHT) {
-                view_menu_select(st, c, m->sel[c]);
-                view_ui_menu_close(st);
-            }
-            return true;
-        }
-        /* Step into the column this entry opens, highlighting its first
-         * row so the next key has something to move from. */
-        if (view_menu_count(st, c + 1) > 0) {
-            if (m->sel[c + 1] < 0)
-                m->sel[c + 1] = 0;
-            m->kb = c + 1;
-        }
-        return true;
-
-    case SDLK_LEFT:
-        if (c > 0) {
-            m->kb = c - 1;
-        } else {
-            view_ui_menu_close(st);
-        }
-        return true;
-
-    default:
-        return false;
-    }
-}
-
-/* Left and Right on the focused row step through the renderings of the
- * film category the current selection belongs to. Films are contiguous
- * inside a category and renderings inside a film, so that whole category
- * is one run of indices and a step is one index inside it. */
-static void view_menu_step(struct view_state *st, int adj)
-{
-#if !CINEVIEW_HAVE_LUTS
-    (void)st; (void)adj;
-#else
-    int n = view_luts_count();
-    int cur = st->look.film_sim;
-    int lo = 0, hi = n - 1;
-    const ViewLut *l;
-    const ViewLutFilm *f;
-    const ViewLutFilmCategory *c;
-
-    if (!adj || n <= 0)
-        return;
-
-    if (cur < 0 || cur >= n) {
-        view_lut_select_film(st, adj > 0 ? 0 : n - 1);
-        return;
-    }
-
-    l = view_lut_get(cur);
-    f = l ? view_lut_film(l->film) : NULL;
-    c = f ? view_lut_film_category(f->category) : NULL;
-    if (c && c->n_films > 0) {
-        const ViewLutFilm *a = view_lut_film(c->first_film);
-        const ViewLutFilm *z = view_lut_film(c->first_film + c->n_films - 1);
-
-        if (a && z) {
-            lo = a->first_lut;
-            hi = z->first_lut + z->n_luts - 1;
-        }
-    }
-
-    view_lut_select_film(st, CRAW_CLAMP(cur + adj, lo, hi));
-#endif
-}
-
 /* One panel row that opens a cascade: a label, a button showing what is
  * selected, and the anchor the columns hang off. The menu itself is built
  * after the panel so that it draws on top. */
@@ -1516,11 +1454,6 @@ static void view_menu_row(struct nk_context *ctx, struct view_state *st,
     struct view_lut_menu *m = &st->menu;
     struct nk_rect content = nk_window_get_content_region(ctx);
     struct nk_rect b;
-
-    /* view_row() has already stepped the ring, except when it refused the
-     * row for being greyed - in which case this cascade owns no ring entry
-     * and Enter on whatever is focused must not find it. */
-    m->rows[kind] = st->ui_greyed ? -1 : st->ui_row - 1;
 
     nk_label(ctx, label, NK_TEXT_LEFT);
 
@@ -1535,7 +1468,6 @@ static void view_menu_row(struct nk_context *ctx, struct view_state *st,
         } else {
             view_ui_menu_close(st);
             view_ui_menu_open(st, kind);
-            m->kb = -1;
         }
     }
 
@@ -1548,19 +1480,13 @@ static void view_menu_row(struct nk_context *ctx, struct view_state *st,
         m->aw = content.w;
         m->ay = b.y;
         m->ah = b.h;
-        m->row = m->rows[kind];
         m->anchored = true;
     }
 }
 
 static void view_panel_film_sim(struct nk_context *ctx, struct view_state *st)
 {
-    bool focused;
-
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    focused = view_row(st, ctx);
-    view_menu_step(st, view_step(st, focused));
-
     view_menu_row(ctx, st, VIEW_MENU_FILM, "film simulation",
 #if CINEVIEW_HAVE_LUTS
                   view_lut_film_name(st));
@@ -1583,8 +1509,8 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
 
     /* The row the menu hangs off was not emitted this frame - its section
      * has been collapsed under it - so there is nothing to hang off and
-     * nothing to draw. Closing rather than hiding, or the keyboard would
-     * go on being swallowed by a menu nobody can see. A locked panel closes
+     * nothing to draw. Closing rather than hiding, or Escape would go on
+     * being swallowed by a menu nobody can see. A locked panel closes
      * it for the same reason: the columns do their own hit testing, and a
      * choice made in one would land on a setting the run has copied. */
     if (!m->anchored || view_ui_locked(st)) {
@@ -1621,24 +1547,15 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
     int pos;
 
     /* No transport buttons: the keyboard is the transport. Space plays and
-     * pauses, Shift with Page Up and Page Down are the ends of the clip and
-     * Shift with Left and Right steps a second. The scrub bar stays,
-     * because dragging to a frame is the one thing keys are bad at. */
+     * pauses, Shift with Page Up and Page Down are the ends of the clip,
+     * Left and Right step five seconds and Shift with them one. The scrub
+     * bar stays, because dragging to a frame is the one thing keys are bad
+     * at. */
     if (total > 1) {
-        bool f;
-        int adj;
-
         pos = (int)CRAW_CLAMP(st->index, 0, total - 1);
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        f = view_row(st, ctx);
-        adj = view_step(st, f);
-        if (adj) {
-            pos = (int)CRAW_CLAMP((int64_t)pos + adj, 0, total - 1);
-            st->playing = false;
-            st->seek_to = pos;
-            st->need_frame = true;
-        } else if (nk_slider_int(ctx, 0, &pos, (int)(total - 1), 1) &&
-                   pos != (int)st->index) {
+        if (nk_slider_int(ctx, 0, &pos, (int)(total - 1), 1) &&
+            pos != (int)st->index) {
             st->seek_to = pos;
             st->need_frame = true;
         }
@@ -1649,11 +1566,7 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
 {
     struct view_look *lk = &st->look;
 
-    int mode = (int)lk->wb;
-
     nk_layout_row_dynamic(ctx, VIEW_ROW, 3);
-    view_adjust_cycle(st, view_row(st, ctx), &mode, 3);
-    lk->wb = (enum view_wb)mode;
     if (nk_option_label(ctx, "As shot", lk->wb == VIEW_WB_AS_SHOT))
         lk->wb = VIEW_WB_AS_SHOT;
     if (nk_option_label(ctx, "Auto", lk->wb == VIEW_WB_AUTO))
@@ -1683,21 +1596,15 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
         nk_labelf(ctx, NK_TEXT_LEFT, "conf %.2f, from %s, spread %.0f mired",
                   e->confidence, view_wb_source_name(e->source), e->spread_mired);
 
-        view_adjust_float(st, view_row(st, ctx), &st->awb.params.ambience,
-                          0.05f, 0.0f, 1.0f);
         nk_property_float(ctx, "#ambience", 0.0f, &st->awb.params.ambience, 1.0f,
                           0.05f, 0.005f);
         break;
     }
 
     case VIEW_WB_MANUAL:
-        view_adjust_float(st, view_row(st, ctx), &lk->manual.cct,
-                          100.0f, 2000.0f, 11500.0f);
         nk_property_float(ctx, "#CCT (K)", 2000.0f, &lk->manual.cct, 11500.0f,
                           50.0f, 5.0f);
         nk_slider_float(ctx, 2000.0f, &lk->manual.cct, 11500.0f, 10.0f);
-        view_adjust_float(st, view_row(st, ctx), &lk->manual.tint,
-                          0.01f, -0.2f, 0.2f);
         nk_property_float(ctx, "#tint", -0.2f, &lk->manual.tint, 0.2f, 0.005f, 0.0005f);
         nk_slider_float(ctx, -0.2f, &lk->manual.tint, 0.2f, 0.002f);
         break;
@@ -1730,20 +1637,15 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
      * one - which is every developed clip this camera writes - only the
      * bias below means anything. */
     if (st->dec.raw || st->dec.meta_as_shot_ei > 0.0f) {
-        int pick;
+        int chosen;
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        /* The standard list is already a third of a stop per entry, so a
-         * step of one entry is a step of a third of a stop. */
-        pick = sel;
-        view_adjust_cycle(st, view_row(st, ctx), &pick, nb_items);
         nk_label(ctx, "exposure index", NK_TEXT_LEFT);
-        {
-            int chosen = nk_combo(ctx, items, nb_items, pick, 20, nk_vec2(140, 260));
-            if (chosen != sel) {
-                lk->ei = view_iso_list[chosen];
-                st->sections.exposure = true;
-            }
+        chosen = nk_combo(ctx, items, nb_items, sel, VIEW_COMBO_ROW,
+                          nk_vec2(140, 300));
+        if (chosen != sel) {
+            lk->ei = view_iso_list[chosen];
+            st->sections.exposure = true;
         }
     }
 
@@ -1753,8 +1655,6 @@ static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
          * the switch starts off and a lit one means the bias is in use. */
         float before = lk->exposure;
 
-        view_adjust_float(st, view_row(st, ctx), &lk->exposure,
-                          1.0f / 6.0f, -3.0f, 3.0f);
         nk_property_float(ctx, "#bias (stops)", -3.0f, &lk->exposure, 3.0f, 0.1f, 0.01f);
         nk_slider_float(ctx, -3.0f, &lk->exposure, 3.0f, 0.05f);
         if (lk->exposure != before)
@@ -1808,21 +1708,12 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
     /* What the warp does with the frame, DESIGN.md 16.8: fill it and lose
      * the source's corners, which is the trade the camera's own crop makes,
      * or shrink the corrected picture until all of the source fits and
-     * paint the rest black. The row keeps its place on the ring on a clip
-     * with no record too, so the ring does not change shape when such a
-     * clip is opened; it just cannot be moved. */
+     * paint the rest black. On a clip with no record the row is drawn but
+     * cannot be moved. */
     {
         int sel = ln->keep_sel;
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 3);
-
-        if (have) {
-            view_adjust_cycle(st, view_row(st, ctx), &sel, 2);
-        } else {
-            view_row(st, ctx);
-            view_step(st, false);
-        }
-
         nk_label(ctx, "frame", NK_TEXT_LEFT);
         if (have) {
             if (nk_option_label(ctx, "fill", sel == 0))
@@ -1899,7 +1790,6 @@ static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
               !d->have_model ? "no model: off"
                              : d->on ? "on, before the debayer" : "off");
 
-    view_adjust_float(st, view_row(st, ctx), &d->strength, 0.25f, 0.25f, 3.0f);
     nk_property_float(ctx, "#strength", 0.25f, &d->strength, 3.0f, 0.25f, 0.01f);
 
     /* 1.0 is "remove noise at exactly the modelled level", so the numbers
@@ -1959,44 +1849,21 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
 
     /* Soft light first, even though it runs last: it is the one control
      * most people came for, and the panel is not the pipeline. */
-    view_adjust_float(st, view_row(st, ctx), &a->softlight, 5.0f, 0.0f, 100.0f);
     nk_property_float(ctx, "#soft light", 0.0f, &a->softlight, 100.0f,
                       5.0f, 0.25f);
-
-    view_adjust_float(st, view_row(st, ctx), &a->pastels, 5.0f, -100.0f, 100.0f);
     nk_property_float(ctx, "#pastels", -100.0f, &a->pastels, 100.0f,
                       5.0f, 0.25f);
-
-    view_adjust_float(st, view_row(st, ctx), &a->saturated, 5.0f, -100.0f, 100.0f);
     nk_property_float(ctx, "#saturated", -100.0f, &a->saturated, 100.0f,
                       5.0f, 0.25f);
-
-    view_adjust_float(st, view_row(st, ctx), &a->threshold, 5.0f, 0.0f, 100.0f);
     nk_property_float(ctx, "#threshold", 0.0f, &a->threshold, 100.0f,
                       5.0f, 0.25f);
 
-    /* One focus row per nuklear row, each filling both columns: view_row()
-     * draws its ring across the whole content width, so two focusable
-     * widgets sharing one row would have the second one's ring painted over
-     * the first one's widget. */
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    {
-        bool f = view_row(st, ctx);
-
-        if (view_step(st, f))
-            a->protect_skin_flag = !a->protect_skin_flag;
-    }
     nk_checkbox_label(ctx, "protect skin", &a->protect_skin_flag);
     a->protect_skin = a->protect_skin_flag != 0;
     nk_label(ctx, a->protect_skin ? "warm hues held back" : "every hue alike",
              NK_TEXT_LEFT);
 
-    {
-        bool f = view_row(st, ctx);
-
-        if (view_step(st, f))
-            a->avoid_shift_flag = !a->avoid_shift_flag;
-    }
     nk_checkbox_label(ctx, "avoid colour shift", &a->avoid_shift_flag);
     a->avoid_shift = a->avoid_shift_flag != 0;
     nk_label(ctx, a->avoid_shift ? "chroma kept in gamut" : "chroma clipped",
@@ -2011,18 +1878,6 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     view_grey_end(st, ctx, grey);
 }
 
-/* The panel's numeric field for one export setting, on the focus ring:
- * Left and Right step it by `step`, the pointer drags or types it. */
-static void view_int_row(struct view_state *st, struct nk_context *ctx,
-                         const char *name, int *v, int lo, int hi, int step)
-{
-    int adj = view_step(st, view_row(st, ctx));
-
-    if (adj)
-        *v = CRAW_CLAMP(*v + adj * step, lo, hi);
-    nk_property_int(ctx, name, lo, v, hi, step, (float)step * 0.2f);
-}
-
 /* The sound row of the Video block: a combo of the six modes, with the
  * ones the file's container will not carry greyed and labelled with the
  * muxer's own reason, and under it the one number the mode takes. What the
@@ -2035,12 +1890,8 @@ static void view_panel_export_audio(struct nk_context *ctx, struct view_state *s
     const struct view_audio_spec *m;
     char label[160];
     int mode = CRAW_CLAMP(sel->audio_mode, 0, VIEW_NB_AUDIO_MODES - 1);
-    int adj;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    adj = view_step(st, view_row(st, ctx));
-    if (adj)
-        mode = (mode + adj + VIEW_NB_AUDIO_MODES) % VIEW_NB_AUDIO_MODES;
     nk_label(ctx, "audio", NK_TEXT_LEFT);
 
     m = &view_audio_modes[mode];
@@ -2060,9 +1911,9 @@ static void view_panel_export_audio(struct nk_context *ctx, struct view_state *s
             if (no) {
                 snprintf(label, sizeof(label), "%s: %s",
                          view_audio_modes[i].name, no);
-                view_disable_begin(st, ctx, false);
+                view_disable_begin(ctx);
                 nk_combo_item_label(ctx, label, NK_TEXT_LEFT);
-                view_disable_end(st, ctx, false);
+                view_disable_end(st, ctx);
             } else if (nk_combo_item_label(ctx, view_audio_modes[i].name,
                                            NK_TEXT_LEFT)) {
                 mode = i;
@@ -2076,16 +1927,16 @@ static void view_panel_export_audio(struct nk_context *ctx, struct view_state *s
     /* The number the mode takes, or what the mode is instead of one. */
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
     if (m->field) {
+        int step = !strcmp(m->field, "level") ? 1 : 16;
+
         snprintf(label, sizeof(label), "#%s", m->field);
-        view_int_row(st, ctx, label, &sel->audio_q[mode], m->min, m->max,
-                     !strcmp(m->field, "level") ? 1 : 16);
+        nk_property_int(ctx, label, m->min, &sel->audio_q[mode], m->max, step,
+                        (float)step * 0.2f);
         nk_label(ctx, mode == VIEW_AUDIO_OPUS ? "120 ms frames" : "", NK_TEXT_LEFT);
     } else {
         /* The second column is simply left empty: nk_spacing() over the
          * last column of a row opens a whole new row, which is a blank
          * line in the panel. */
-        view_row(st, ctx);
-        view_step(st, false);
         nk_label(ctx, mode == VIEW_AUDIO_COPY ? "the clip's own track"
                : mode == VIEW_AUDIO_WAV  ? "PCM at the clip's depth"
                : "no sound", NK_TEXT_LEFT);
@@ -2116,15 +1967,26 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     const char *codec, *why, *audio_why = NULL;
     bool busy = v->active;
     bool scene, vulkan;
+    /* The last frame there is, which is the most either field can hold:
+     * a range cannot reach past the clip. A clip whose length FFmpeg
+     * cannot tell has no such bound, and the engine finds the end by
+     * running into it. */
+    int last = st->dec.nb_frames > 0
+             ? (int)CRAW_MIN(st->dec.nb_frames - 1, INT_MAX - 1) : INT_MAX - 1;
 
     /* The whole clip until a range has been set: Ctrl+1 and Ctrl+2 mark
      * the start and the end at the frame on screen, and the two fields
-     * below take numbers. A clip whose length FFmpeg cannot tell ends at
-     * its last frame anyway, which the engine finds by running into it. */
-    if (!v->range_set && !busy) {
-        v->start_ui = 0;
-        v->end_ui = st->dec.nb_frames > 0 ? (int)(st->dec.nb_frames - 1)
-                                          : INT_MAX - 1;
+     * below take numbers. A range set on a longer clip is cut to this one
+     * without a word: the fields' own bounds are what say how far it can
+     * go. */
+    if (!busy) {
+        if (!v->range_set) {
+            v->start_ui = 0;
+            v->end_ui = last;
+        } else {
+            v->start_ui = CRAW_CLAMP(v->start_ui, 0, last);
+            v->end_ui = CRAW_CLAMP(v->end_ui, v->start_ui, last);
+        }
     }
 
     if (sel->family < 0 || sel->family >= view_nb_preset_families)
@@ -2153,12 +2015,10 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     }
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    view_row(st, ctx);
     view_menu_row(ctx, st, VIEW_MENU_PRESET, "video",
                   view_presets_label(sel, label, sizeof(label)));
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    view_row(st, ctx);
     view_menu_row(ctx, st, VIEW_MENU_COLOUR, "colour",
                   view_colours[CRAW_CLAMP(sel->colour, 0,
                                           VIEW_NB_COLOURS - 1)].name);
@@ -2173,7 +2033,6 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         enum AVPixelFormat f = view_presets_sel_fmt(sel);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        view_row(st, ctx);
         /* The format is known from the table the moment the preset is,
          * while the *list* has to be asked of the encoder one format at a
          * time; so the row says what the file will be written as straight
@@ -2239,14 +2098,12 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         view_crop_disp_rect(st, &x, &y, &cw, &ch);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        view_adjust_cycle(st, view_row(st, ctx), &sel->size, VIEW_NB_SIZES);
         nk_label(ctx, "size", NK_TEXT_LEFT);
         sel->size = nk_combo(ctx, view_size_names, VIEW_NB_SIZES, sel->size,
-                             20, nk_vec2(160, 200));
+                             VIEW_COMBO_ROW, nk_vec2(160, 220));
 
         if (sel->size == VIEW_SIZE_TYPED) {
             nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-            view_row(st, ctx);
             nk_property_int(ctx, "#width", 2, &sel->size_w, 16384, 2, 1.0f);
             nk_property_int(ctx, "#height", 2, &sel->size_h, 16384, 2, 1.0f);
         }
@@ -2264,7 +2121,6 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     if (view_colours[sel->colour].hdr &&
         sel->colour == VIEW_COLOUR_2020_PQ) {
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        view_row(st, ctx);
         nk_property_int(ctx, "#peak nits", 100, &sel->hdr_peak, 10000,
                         50, 5.0f);
     }
@@ -2272,19 +2128,16 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     /* Only the rows the family declares. */
     if (fam->ctrl & VIEW_CTRL_ASYNC) {
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        view_row(st, ctx);
         nk_property_int(ctx, "#async depth", fam->async_min, &sel->async,
                         fam->async_max, 1, 0.05f);
     }
     if (fam->ctrl & VIEW_CTRL_QP) {
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        view_row(st, ctx);
         nk_property_int(ctx, "#qp", fam->qp_min, &sel->qp, fam->qp_max,
                         1, 0.2f);
     }
     if (fam->ctrl & VIEW_CTRL_CPU) {
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        view_row(st, ctx);
         nk_property_int(ctx, "#cpu preset", fam->cpu_min, &sel->cpu,
                         fam->cpu_max, 1, 0.05f);
     }
@@ -2292,14 +2145,12 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         const struct view_rc_spec *rc;
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, fam->nb_rc);
-        view_row(st, ctx);
         for (int i = 0; i < fam->nb_rc; i++)
             if (nk_option_label(ctx, fam->rc[i].label, sel->rc == i))
                 sel->rc = i;
 
         rc = &fam->rc[CRAW_CLAMP(sel->rc, 0, fam->nb_rc - 1)];
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        view_row(st, ctx);
         if (rc->bitrate) {
             int mbit = CRAW_MAX(sel->kbit / 1000, 1);
 
@@ -2317,27 +2168,27 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         }
     }
 
-    /* The threads, which only a software encoder has: greyed, and off the
-     * ring, under a Vulkan family, with the note saying why. */
+    /* The threads, which only a software encoder has: greyed under a
+     * Vulkan family, with the note saying why. */
     {
         int max = view_presets_max_threads();
 
         if (vulkan)
-            view_disable_begin(st, ctx, true);
+            view_disable_begin(ctx);
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        view_int_row(st, ctx, "#threads", &sel->threads, 0, max, 1);
+        nk_property_int(ctx, "#threads", 0, &sel->threads, max, 1, 0.2f);
         nk_label(ctx, vulkan ? "none: a Vulkan encoder"
                              : sel->threads ? "" : "0: FFmpeg's auto", NK_TEXT_LEFT);
         if (vulkan)
-            view_disable_end(st, ctx, true);
+            view_disable_end(st, ctx);
     }
 
     view_panel_export_audio(ctx, st, v->field, audio_why);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    if (nk_property_int(ctx, "#start", 0, &v->start_ui, INT_MAX - 1, 1, 1.0f))
+    if (nk_property_int(ctx, "#start", 0, &v->start_ui, last, 1, 1.0f))
         v->range_set = true;
-    if (nk_property_int(ctx, "#end", v->start_ui, &v->end_ui, INT_MAX, 1, 1.0f))
+    if (nk_property_int(ctx, "#end", v->start_ui, &v->end_ui, last, 1, 1.0f))
         v->range_set = true;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
@@ -2449,9 +2300,10 @@ static void view_panel_block(struct nk_context *ctx, const char *title)
     nk_label(ctx, title, NK_TEXT_LEFT);
 }
 
-/* The "Crop" section: what a left drag has drawn and a way to take it back.
- * The mode the drag draws in is the header's switch, which `c` is the other
- * hand on; the rectangle is held in source pixels and reported on the
+/* The "Crop" section: what a left drag has drawn. The mode the drag draws
+ * in is the header's switch, which `c` is the other hand on, and switching
+ * it on is what clears a rectangle - so there is no clear button, only the
+ * readout. The rectangle is held in source pixels and reported on the
  * picture as it is shown, so the readout says which region the export will
  * write whatever the window is doing with it. On a rotated clip those are
  * two different rectangles and the one worth printing is the one that was
@@ -2460,14 +2312,11 @@ static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
 {
     int x, y, w, h;
 
-    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    nk_label(ctx, st->crop.on ? "drag to draw one" : "crop mode is off (c)",
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    nk_label(ctx, st->crop.on ? "drag to draw one; c or the switch keeps it"
+                              : "crop mode is off (c); on again clears",
              NK_TEXT_LEFT);
 
-    if (nk_button_label(ctx, "clear"))
-        view_crop_clear(st);
-
-    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     /* "(clip)" while the rectangle is the one the clip's own frame header
      * marked rather than one that was drawn or asked for: it says why a
      * picture that was never cropped by hand is shaded all the same. */
@@ -2476,6 +2325,60 @@ static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
                   st->crop.from_clip ? " (clip)" : "");
     else
         nk_label(ctx, "crop: none, drag one over the picture", NK_TEXT_LEFT);
+}
+
+/* The "Clip" block: what the file says about the recording, as one label
+ * and one value per row, and only the rows the file has something for. It
+ * is information and nothing else - nothing here is clicked - so the
+ * labels are dimmed and the values carry the row. A value too long for its
+ * column is cut with an ellipsis rather than let run under the scrollbar:
+ * the panel's width is fixed and a camera's model name is not.
+ *
+ * It sits under everything live - the readouts, the scrub bar, the mute
+ * and the volume - and above the first section, rather than straight
+ * under the clip line, because its height is the one thing in the panel's
+ * top that changes with the clip: four rows for a bare MP4, ten for a
+ * ProRes RAW take. Put above the scrub bar it would move the bar under
+ * the pointer at every clip switch; here the live rows keep their places
+ * and the block reads as the heading of the sections that follow. */
+static void view_panel_clip(struct nk_context *ctx, struct view_state *st)
+{
+    const struct nk_user_font *font = ctx->style.font;
+    struct view_info_row rows[VIEW_INFO_MAX];
+    int n = view_decoder_info(&st->dec, rows, VIEW_INFO_MAX);
+    float label_w = 0.0f;
+
+    if (!n)
+        return;
+
+    view_panel_block(ctx, "Clip");
+
+    /* The label column is as wide as its widest label, measured in the
+     * face that is loaded, plus a gap; the value gets the rest. */
+    for (int i = 0; i < n; i++) {
+        float w = font->width(font->userdata, font->height, rows[i].label,
+                              (int)strlen(rows[i].label));
+
+        label_w = CRAW_MAX(label_w, w);
+    }
+    label_w += 12.0f;
+
+    for (int i = 0; i < n; i++) {
+        struct nk_rect b;
+        char value[80];
+
+        nk_layout_row_template_begin(ctx, VIEW_ROW);
+        nk_layout_row_template_push_static(ctx, label_w);
+        nk_layout_row_template_push_dynamic(ctx);
+        nk_layout_row_template_end(ctx);
+
+        nk_label_colored(ctx, rows[i].label, NK_TEXT_LEFT,
+                         nk_rgba(158, 158, 170, 255));
+
+        b = nk_widget_bounds(ctx);
+        view_fit_text(font, b.w - 2.0f, rows[i].value, value, sizeof(value));
+        nk_label(ctx, value, NK_TEXT_LEFT);
+    }
 }
 
 static void view_panel(struct nk_context *ctx, struct view_state *st)
@@ -2488,16 +2391,16 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
     file = file ? file + 1 : st->cfg.input;
 
     /* A running video export locks the panel from here to the end: every
-     * row is drawn and none takes input, by mouse, wheel or key, and none
-     * is on the focus ring. The engine owns the decoder - it seeks it and
-     * steps it - and has copied the settings, so a slider that moved would
-     * be changing a picture nobody is looking at and nothing about the
-     * file. The Video block's stop button, progress bar and status are the
-     * one stretch left live, which view_panel_export_video() re-enables
-     * for exactly those three. The pair does not nest, which is what the
-     * lock-aware view_disable_end() is for. */
+     * row is drawn and none takes input, by mouse, wheel or key. The engine
+     * owns the decoder - it seeks it and steps it - and has copied the
+     * settings, so a slider that moved would be changing a picture nobody
+     * is looking at and nothing about the file. The Video block's stop
+     * button, progress bar and status are the one stretch left live, which
+     * view_panel_export_video() re-enables for exactly those three. The
+     * pair does not nest, which is what the lock-aware view_disable_end()
+     * is for. */
     if (locked)
-        view_disable_begin(st, ctx, true);
+        view_disable_begin(ctx);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     {
@@ -2541,12 +2444,6 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
      * about, and never behind a fold. */
     if (st->clip_status[0])
         nk_labelf(ctx, NK_TEXT_LEFT, "%.46s", st->clip_status);
-    /* The clip's own words, when they are what the picture is being read
-     * as: a V-Log clip's stream tags say BT.709 and the panel would
-     * otherwise give no sign that they are being ignored. */
-    if (st->dec.vlog)
-        nk_labelf(ctx, NK_TEXT_LEFT, "%s / %s", st->dec.capture_gamma,
-                  st->dec.capture_gamut);
     nk_labelf(ctx, NK_TEXT_LEFT, "frame %" PRId64 " / %" PRId64 "  %.3f s",
               st->index, st->dec.nb_frames ? st->dec.nb_frames - 1 : 0, st->pts);
     nk_labelf(ctx, NK_TEXT_LEFT, "%.0f/%.0f fps  decode %.1f ms  craw %.2f ms",
@@ -2556,17 +2453,8 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
     if (st->audio.available) {
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        {
-            bool f = view_row(st, ctx);
-            int adj = view_step(st, f);
-
-            if (adj)
-                st->mute_flag = !st->mute_flag;
-        }
         nk_checkbox_label(ctx, "mute", &st->mute_flag);
         st->mute = st->mute_flag != 0;
-        view_adjust_float(st, view_row(st, ctx), &st->volume,
-                          0.05f, 0.0f, 1.0f);
         nk_slider_float(ctx, 0.0f, &st->volume, 1.0f, 0.01f);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
@@ -2576,6 +2464,8 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
                   st->volume * 100.0f, view_audio_buffered(&st->audio) * 1000.0,
                   st->sync.diff * 1000.0, st->sync.dropped, st->audio.underruns);
     }
+
+    view_panel_clip(ctx, st);
 
     /* Every section from here down is a header - a switch and an expander -
      * and a body under it.
@@ -2600,11 +2490,7 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
     if (st->dec.raw &&
         view_section_header(ctx, st, VIEW_SEC_DEBAYER, "Debayer", NULL, false)) {
-        int dbg = (int)lk->debayer;
-
         nk_layout_row_dynamic(ctx, VIEW_ROW, 3);
-        view_adjust_cycle(st, view_row(st, ctx), &dbg, CRAW_DEBAYER_NB);
-        lk->debayer = (enum CRAWDebayer)dbg;
         for (int i = 0; i < CRAW_DEBAYER_NB; i++)
             if (nk_option_label(ctx, view_debayer_names[i], lk->debayer == i))
                 lk->debayer = (enum CRAWDebayer)i;
@@ -2646,6 +2532,27 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         else
             nk_labelf(ctx, NK_TEXT_LEFT, "ceiling %.0f nits", view_peak_ceiling(st));
 
+        /* The curve the window is tone mapped with, out of libplacebo's
+         * own list. A display setting rather than a look: it is above the
+         * greying and outside the section's switch, because the window is
+         * mapped through it whatever else is bypassed, and every
+         * display-referred export follows it (gpu.c). */
+        {
+            static const char *names[32];
+            static int nb_names;
+
+            if (!nb_names) {
+                nb_names = CRAW_MIN(view_tone_map_count(), 32);
+                for (int i = 0; i < nb_names; i++)
+                    names[i] = view_tone_map_name(i);
+            }
+
+            nk_label(ctx, "tone map", NK_TEXT_LEFT);
+            lk->tone_map = nk_combo(ctx, names, nb_names,
+                                    CRAW_CLAMP(lk->tone_map, 0, nb_names - 1),
+                                    VIEW_COMBO_ROW, nk_vec2(160, 340));
+        }
+
         grey = view_grey_begin(st, ctx,
             "not applied: the export is scene referred, so the film "
             "simulation is off and the screen shows what the file holds");
@@ -2663,15 +2570,13 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
             nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
             sel = lk->lut_type == PL_LUT_NORMALIZED ? 1 : 0;
-            view_adjust_cycle(st, view_row(st, ctx), &sel, 2);
             nk_label(ctx, "LUT type", NK_TEXT_LEFT);
-            sel = nk_combo(ctx, lut_types, 2, sel, 20, nk_vec2(140, 60));
+            sel = nk_combo(ctx, lut_types, 2, sel, VIEW_COMBO_ROW, nk_vec2(140, 70));
             lk->lut_type = sel ? PL_LUT_NORMALIZED : PL_LUT_NATIVE;
 
-            view_adjust_cycle(st, view_row(st, ctx), &lk->lut_space, view_nb_lut_spaces);
             nk_label(ctx, "LUT input", NK_TEXT_LEFT);
             sel = nk_combo(ctx, view_lut_space_names, view_nb_lut_spaces,
-                           lk->lut_space, 20, nk_vec2(160, 120));
+                           lk->lut_space, VIEW_COMBO_ROW, nk_vec2(160, 140));
             if (sel != lk->lut_space) {
                 lk->lut_space = sel;
                 view_lut_apply_space(st->lut, sel);
@@ -2700,11 +2605,22 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
     }
 
     /* The crop mode is a switch like any other, and `c` is the same
-     * switch: the rectangle it draws outlives both. */
-    if (view_section_header(ctx, st, VIEW_SEC_CROP, "Crop", &st->crop.on,
-                            false)) {
-        view_panel_crop(ctx, st);
-        view_section_end(ctx);
+     * switch. Switching it on clears whatever rectangle there was, so the
+     * whole frame is back and a new one can be drawn; off keeps the one
+     * that was drawn, shaded, for the export. Checked before the body is
+     * laid out so that the readout under the header never shows the old
+     * rectangle for a frame. */
+    {
+        bool was = st->crop.on;
+        bool open = view_section_header(ctx, st, VIEW_SEC_CROP, "Crop",
+                                        &st->crop.on, false);
+
+        if (st->crop.on && !was)
+            view_crop_clear(st);
+        if (open) {
+            view_panel_crop(ctx, st);
+            view_section_end(ctx);
+        }
     }
 
     if (view_section_header(ctx, st, VIEW_SEC_EXPORT, "Export", NULL, false)) {
@@ -2720,9 +2636,9 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         view_section_end(ctx);
     }
 
-    /* The end of the lock, for the same reason as its start below. */
+    /* The end of the lock, for the same reason as its start above. */
     if (locked)
-        view_disable_end(st, ctx, true);
+        view_disable_end(st, ctx);
 }
 
 /* ------------------------------------------------------- the crop shade */
@@ -2838,23 +2754,8 @@ void view_ui_build(struct view_state *st)
 {
     float h = (float)st->gpu.ui_h - 2 * VIEW_UI_MARGIN;
 
-    /* The focusable rows are counted as they are emitted; the list changes
-     * with the mode, so the focus is clamped to what was there last time. */
-    st->ui_row = 0;
     st->ui_edit_active = false;
     st->menu.anchored = false;
-    /* A row that is not emitted this frame - the export's two live inside a
-     * collapsed section most of the time - owns no cascade, or Enter on
-     * whatever row happens to have its old index would open one. */
-    for (int i = 0; i < VIEW_MENU_KINDS; i++)
-        st->menu.rows[i] = -1;
-    /* And the same for the section headers, which a developed clip has
-     * fewer of than a raw one: Enter must never find a header that is not
-     * on screen. */
-    for (int i = 0; i < VIEW_NB_SECTIONS; i++)
-        st->sections.row[i] = -1;
-    if (st->ui_rows > 0)
-        st->focus = (st->focus % st->ui_rows + st->ui_rows) % st->ui_rows;
 
     /* Before the panel, which is what puts the panel on top of it. */
     view_crop_draw(view_nk, st);
@@ -2862,8 +2763,20 @@ void view_ui_build(struct view_state *st)
     if (nk_begin(view_nk, "cineview",
                  nk_rect((float)st->gpu.ui_w - VIEW_UI_WIDTH - VIEW_UI_MARGIN,
                          VIEW_UI_MARGIN, VIEW_UI_WIDTH, h),
-                 NK_WINDOW_BORDER | NK_WINDOW_TITLE | NK_WINDOW_SCROLL_AUTO_HIDE))
+                 NK_WINDOW_BORDER | NK_WINDOW_TITLE | NK_WINDOW_SCROLL_AUTO_HIDE)) {
+        const struct nk_window *win = nk_window_find(view_nk, "cineview");
+
         view_panel(view_nk, st);
+
+        /* A number field being typed into takes the keyboard the way a
+         * text field does. nuklear keeps a property's edit in the window
+         * rather than reporting it from the widget, and a field that did
+         * not take the keys would hand a typed frame number to the
+         * shortcuts - `1` is the 1:1 zoom - and never see it itself, since
+         * SDL3 only sends text to a window that has asked for it. */
+        if (win && win->property.active)
+            st->ui_edit_active = true;
+    }
 
     nk_end(view_nk);
 
@@ -2880,9 +2793,6 @@ void view_ui_build(struct view_state *st)
      * keyboard, and SDL3 sends no text events to a window that has not
      * started text input, so the answer goes straight back to SDL here. */
     nk_sdl_text_input(st->ui_edit_active);
-
-    st->ui_rows = st->ui_row;
-    st->adjust = 0;
 }
 
 /* -------------------------------------------------------------- render */

@@ -25,6 +25,7 @@
 #include <libplacebo/swapchain.h>
 #include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/shaders/custom.h>
+#include <libplacebo/tone_mapping.h>
 /* Header-only in C, and it needs the Vulkan header first for AVVkFrame
  * support; view.h has already included it. */
 #include <libplacebo/utils/libav.h>
@@ -1433,6 +1434,45 @@ static uint64_t view_hash(uint64_t h, const void *p, size_t n)
     return h;
 }
 
+/* ------------------------------------------------- the tone map list */
+
+/* libplacebo's own table of curves, by index, so that the panel's combo,
+ * --tone-map and the settings line all name exactly what the library has
+ * and nothing is typed into this program. */
+int view_tone_map_count(void)
+{
+    return pl_num_tone_map_functions;
+}
+
+const char *view_tone_map_name(int i)
+{
+    if (i < 0 || i >= pl_num_tone_map_functions)
+        return "?";
+
+    return pl_tone_map_functions[i]->name;
+}
+
+int view_tone_map_default(void)
+{
+    for (int i = 0; i < pl_num_tone_map_functions; i++)
+        if (pl_tone_map_functions[i] ==
+            pl_color_map_default_params.tone_mapping_function)
+            return i;
+
+    return 0;
+}
+
+int view_tone_map_find(const char *name)
+{
+    const struct pl_tone_map_function *f = pl_find_tone_map_function(name);
+
+    for (int i = 0; f && i < pl_num_tone_map_functions; i++)
+        if (pl_tone_map_functions[i] == f)
+            return i;
+
+    return -1;
+}
+
 static void view_render_params(struct view_state *st,
                                struct pl_render_params *rp,
                                struct pl_color_map_params *cmp,
@@ -1447,16 +1487,20 @@ static void view_render_params(struct view_state *st,
      * picture up to the display transform or the panel would be grading
      * something nobody is going to get. */
     bool scene = view_export_is_scene(st);
+    int tm = CRAW_CLAMP(st->look.tone_map, 0, pl_num_tone_map_functions - 1);
 
-    /* One mapping for the window and the file: libplacebo's own defaults -
-     * the spline tone map, the perceptual gamut map - into whatever the
-     * target is, which for the window is what the compositor negotiated
-     * and for an export is the colour space that was chosen. The export
-     * used to have a mapping of its own, bt.2390 by default, and a file
-     * that came out thirteen per cent brighter in the mid-tones than the
-     * frame on screen is what that bought; a display-referred export is
-     * the picture as the viewer shows it, and this is what makes it so. */
+    /* One mapping for the window and the file: the tone map the Look
+     * section picks, spline unless it is told otherwise, and libplacebo's
+     * own defaults for the rest - the perceptual gamut map, the peak
+     * detection - into whatever the target is, which for the window is
+     * what the compositor negotiated and for an export is the colour space
+     * that was chosen. The export used to have a mapping of its own,
+     * bt.2390 by default, and a file that came out thirteen per cent
+     * brighter in the mid-tones than the frame on screen is what that
+     * bought; a display-referred export is the picture as the viewer shows
+     * it, and setting the curve here, for both, is what makes it so. */
     *cmp = pl_color_map_default_params;
+    cmp->tone_mapping_function = pl_tone_map_functions[tm];
     *pdp = pl_peak_detect_default_params;
 
     /* The raw path's texture is tagged scRGB, whose 1.0 is 80 nits, while
@@ -2078,6 +2122,19 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
     if (!pl_render_image(g->rr_export, &image, &target, &rp)) {
         fprintf(stderr, "pl_render_image failed while exporting\n");
         return CRAW_ERROR(EIO);
+    }
+
+    /* What the export's own detector measured, beside what the window's
+     * shows: the one number that says whether the file was mapped against
+     * the same peak as the frame on screen. */
+    if (g->verbose) {
+        struct pl_hdr_metadata measured;
+
+        if (pl_renderer_get_hdr_metadata(g->rr_export, &measured))
+            fprintf(stderr, "export: tone map %s, measured peak %.0f nits, "
+                            "window %.0f\n", cmp.tone_mapping_function->name,
+                    pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, measured.max_pq_y),
+                    g->measured_peak);
     }
 
     if (!pl_tex_download(g->gpu, pl_tex_transfer_params(

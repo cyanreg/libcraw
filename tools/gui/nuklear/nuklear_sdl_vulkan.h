@@ -263,7 +263,10 @@ nk_sdl_init(SDL_Window *win, VkDevice logical_device,
             VkDeviceSize max_element_buffer);
 NK_API void nk_sdl_shutdown(void);
 NK_API void nk_sdl_font_stash_begin(struct nk_font_atlas **atlas);
-NK_API void nk_sdl_font_stash_end(VkQueue graphics_queue);
+/* `atlas_w` and `atlas_h`, either of which may be NULL, receive the size
+ * of the texture the atlas was baked into. */
+NK_API void nk_sdl_font_stash_end(VkQueue graphics_queue, int *atlas_w,
+                                  int *atlas_h);
 NK_API int nk_sdl_handle_event(SDL_Event *evt);
 NK_API VkSemaphore nk_sdl_render(VkQueue graphics_queue, uint32_t buffer_index,
                                  VkSemaphore wait_semaphore,
@@ -1224,12 +1227,19 @@ NK_API void nk_sdl_font_stash_begin(struct nk_font_atlas **atlas) {
     *atlas = &sdl.atlas;
 }
 
-NK_API void nk_sdl_font_stash_end(VkQueue graphics_queue) {
+NK_API void nk_sdl_font_stash_end(VkQueue graphics_queue, int *atlas_w,
+                                  int *atlas_h) {
     struct nk_sdl_device *dev = &sdl.vulkan;
 
     const void *image;
     int w, h;
     image = nk_font_atlas_bake(&sdl.atlas, &w, &h, NK_FONT_ATLAS_RGBA32);
+    /* Reported here because nk_font_atlas_end() zeroes the atlas's own
+     * record of it. */
+    if (atlas_w)
+        *atlas_w = w;
+    if (atlas_h)
+        *atlas_h = h;
     nk_sdl_device_upload_atlas(graphics_queue, image, w, h);
     nk_font_atlas_end(&sdl.atlas, nk_handle_ptr(dev->font_image_view),
                       &dev->tex_null);

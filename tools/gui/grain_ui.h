@@ -52,8 +52,7 @@ const char *view_grain_setting(const struct view_grain *g, char *buf, size_t n);
 
 /* The body of the panel's "Film grain" section, laid out by ui.c inside the
  * section header it owns - the switch on that header is grain.on, so there
- * is none in here. Emits its rows through the same focus ring as every
- * other section. */
+ * is none in here. Worked with the pointer, like the rest of the panel. */
 void view_panel_grain(struct nk_context *ctx, struct view_state *st);
 
 #endif /* CINEVIEW_GRAIN_UI_H */

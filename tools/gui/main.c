@@ -1653,6 +1653,12 @@ static void view_usage(FILE *f)
 "                      vlog (V-Log in V-Gamut, what Panasonic's own\n"
 "                      V-Log to V-709 cubes take). Anything but native\n"
 "                      makes it a conversion LUT to a BT.709 display.\n"
+"  --tone-map NAME     the curve the window is tone mapped with, out of\n"
+"                      libplacebo's own list: spline (the default), bt2390,\n"
+"                      bt2446a, st2094-40, st2094-10, reinhard, mobius,\n"
+"                      hable, gamma, linear, linearlight or clip. A\n"
+"                      display-referred export is mapped with the same one,\n"
+"                      so the file keeps matching the window\n"
 "  --softlight PERCENT blend the picture with itself through the soft light\n"
 "                      blend mode, 0 to 100 (default: 0, off)\n"
 "  --vibrance PASTELS[,SATURATED[,THRESHOLD]]\n"
@@ -1783,17 +1789,20 @@ static void view_usage(FILE *f)
 "Audio is the master clock. The clip's PCM track plays through SDL3 with\n"
 "5 ms fades at every boundary; a silent clip falls back to wall time.\n"
 "\n"
-"Keys: space play/pause; up/down walk the panel rows; left/right adjust the\n"
-"focused row; shift with left/right seeks one second; page up/down zoom in\n"
-"and out; shift with page up/down goes to the first and last frame; control\n"
-"with the arrows pans; tab or 0 fits the picture again, 1 is one to one;\n"
-"enter opens the film simulation menu on its row and escape closes it;\n"
-"the wheel zooms about the pointer and dragging pans; c turns crop mode on\n"
-"and off, where a left drag draws the rectangle the export is cut to;\n"
-"r and t go to the previous and the next file on the command line;\n"
-"m mutes; q, or escape with no menu open, quits. While a video export runs\n"
-"the panel and every key but q are locked; q stops the export, finishes\n"
-"the file and quits.\n",
+"The panel is worked with the pointer: the section headers' switches and\n"
+"expanders, the sliders, the fields and the cascading menus are clicked,\n"
+"and no key reaches a panel row. Keys: space play/pause; left/right seek\n"
+"five seconds back and forward, shift with them one second; page up/down\n"
+"zoom in and out; shift with page up/down goes to the first and last\n"
+"frame; control with the arrows pans; tab or 0 fits the picture again, 1\n"
+"is one to one; the wheel zooms about the pointer and dragging pans; c\n"
+"turns crop mode on, clearing any rectangle, and off again keeping the\n"
+"one that was drawn, where a left drag draws the rectangle the export is\n"
+"cut to; ctrl+1 and ctrl+2 mark the video export's start and end at the\n"
+"frame on screen; r and t go to the previous and the next file on the\n"
+"command line; m mutes; escape closes an open menu, and otherwise quits,\n"
+"as q does. While a video export runs the panel and every key but q are\n"
+"locked; q stops the export, finishes the file and quits.\n",
     craw_tool_profile_builtin_list());
 }
 
@@ -1837,6 +1846,7 @@ enum {
     VIEW_OPT_PIX_FMT,
     VIEW_OPT_BYPASS,
     VIEW_OPT_THREADS,
+    VIEW_OPT_TONE_MAP,
 };
 
 static int view_parse_args(struct view_state *st, int argc, char **argv,
@@ -1883,6 +1893,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "pix-fmt",  required_argument, NULL, VIEW_OPT_PIX_FMT   },
         { "bypass",   required_argument, NULL, VIEW_OPT_BYPASS    },
         { "threads",  required_argument, NULL, VIEW_OPT_THREADS   },
+        { "tone-map", required_argument, NULL, VIEW_OPT_TONE_MAP  },
         { "help",     no_argument,       NULL, 'h'                },
         { NULL,       0,                 NULL, 0                  },
     };
@@ -2044,6 +2055,18 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         case VIEW_OPT_LIST_LUTS:
             view_list_luts();
             return 1;
+        case VIEW_OPT_TONE_MAP:
+            v = view_tone_map_find(optarg);
+            if (v < 0) {
+                fprintf(stderr, "--tone-map: `%s` is not one of libplacebo's "
+                                "curves, expected one of", optarg);
+                for (int i = 0; i < view_tone_map_count(); i++)
+                    fprintf(stderr, "%s %s", i ? "," : "", view_tone_map_name(i));
+                fprintf(stderr, "\n");
+                return CRAW_ERROR(EINVAL);
+            }
+            st->look.tone_map = v;
+            break;
         case VIEW_OPT_PROFILE:
             *profile = optarg;
             break;
@@ -2327,6 +2350,9 @@ static void view_log_look(const struct view_state *st)
                                                 : view_lut_film_name(st));
     if (!st->sections.look)
         fprintf(stderr, " (bypassed)");
+    /* The display's curve, which the Look section holds and every
+     * display-referred export follows. */
+    fprintf(stderr, ", tone map %s", view_tone_map_name(lk->tone_map));
     fprintf(stderr, ", adjustments %s",
             view_adjust_summary(&st->adjustments, adj, sizeof(adj)));
     if (!st->sections.adjust)
@@ -2554,31 +2580,42 @@ static bool view_over_picture(const struct view_state *st, float x, float y)
     return (float)px < area.x1;
 }
 
-/* One second of the clip, in frames: what Shift with Left or Right moves. */
-static int64_t view_seek_second(const struct view_state *st)
+/* A stretch of the clip in frames: five seconds for Left and Right, one
+ * for Shift with them. Rounded, so that five seconds of 29.97 is 150
+ * frames and not 149. */
+static int64_t view_seek_frames(const struct view_state *st, double seconds)
 {
     double fps = av_q2d(st->dec.frame_rate);
 
-    return fps > 0.0 ? (int64_t)(fps + 0.5) : 25;
+    return (int64_t)((fps > 0.0 ? fps : 25.0) * seconds + 0.5);
+}
+
+/* `frame` held to the clip: never past its last frame when the count is
+ * known, never negative. What the marks, the seeks and the export's range
+ * all go through, so that none of them can name a frame there is not. */
+static int64_t view_last_frame(const struct view_state *st, int64_t frame)
+{
+    int64_t last = st->dec.nb_frames > 0 ? st->dec.nb_frames - 1 : INT64_MAX;
+
+    return CRAW_CLAMP(frame, 0, last);
 }
 
 /* Seeks relative to the picture on screen without touching the transport:
  * a clip that was playing keeps playing from where it lands. */
 static void view_seek_by(struct view_state *st, int64_t frames)
 {
-    int64_t last = CRAW_MAX(st->dec.nb_frames - 1, 0);
-
-    st->seek_to = CRAW_CLAMP(st->index + frames, 0, last);
+    st->seek_to = view_last_frame(st, st->index + frames);
     st->need_frame = true;
 }
 
-/* Space plays; Up and Down walk the panel and Left and Right adjust the row
- * they land on; Shift with Left or Right seeks a second; Page Up and Page
- * Down zoom and Shift with them goes to the ends of the clip; Control with
- * the arrows pans, which only does anything while the picture is larger
- * than its area; c turns crop mode on and off; r and t walk the files the
- * command line was given. A key that toggles, seeks or changes clip acts
- * once per press, the ones that step act on every repeat. */
+/* Space plays; Left and Right seek five seconds and Shift with them one;
+ * Page Up and Page Down zoom and Shift with them goes to the ends of the
+ * clip; Control with the arrows pans, which only does anything while the
+ * picture is larger than its area; c turns crop mode on and off; r and t
+ * walk the files the command line was given. The panel is the pointer's:
+ * Up, Down and Enter do nothing at all, since there is no focus through
+ * its rows for them to move. A key that toggles, seeks or changes clip
+ * acts once per press, the ones that step act on every repeat. */
 static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *running)
 {
     bool shift = (e->key.mod & SDL_KMOD_SHIFT) != 0;
@@ -2600,15 +2637,10 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
             view_encode_cancel(st);
             st->quit_pending = true;
         } else if (e->key.key == SDLK_ESCAPE) {
-            view_ui_menu_key(st, SDLK_ESCAPE);
+            view_ui_menu_close(st);
         }
         return;
     }
-
-    /* An open film simulation menu owns the arrows, Enter and Escape; it
-     * says so itself, and says nothing while it is closed. */
-    if (view_ui_menu_key(st, (int)e->key.key))
-        return;
 
     switch (e->key.key) {
     case SDLK_SPACE:
@@ -2619,31 +2651,23 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
     case SDLK_UP:
         if (ctrl)
             view_pan_fraction(st, 0.0f, -0.125f);
-        else if (st->ui_rows > 0)
-            st->focus = (st->focus - 1 + st->ui_rows) % st->ui_rows;
         break;
     case SDLK_DOWN:
         if (ctrl)
             view_pan_fraction(st, 0.0f, 0.125f);
-        else if (st->ui_rows > 0)
-            st->focus = (st->focus + 1) % st->ui_rows;
         break;
 
     case SDLK_LEFT:
         if (ctrl)
             view_pan_fraction(st, -0.125f, 0.0f);
-        else if (shift)
-            view_seek_by(st, -view_seek_second(st));
         else
-            st->adjust = -1;
+            view_seek_by(st, -view_seek_frames(st, shift ? 1.0 : 5.0));
         break;
     case SDLK_RIGHT:
         if (ctrl)
             view_pan_fraction(st, 0.125f, 0.0f);
-        else if (shift)
-            view_seek_by(st, view_seek_second(st));
         else
-            st->adjust = 1;
+            view_seek_by(st, view_seek_frames(st, shift ? 1.0 : 5.0));
         break;
 
     case SDLK_PAGEUP:
@@ -2684,14 +2708,6 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
         }
         break;
 
-    case SDLK_RETURN:
-    case SDLK_KP_ENTER:
-        /* A section header expands or collapses; any other row means
-         * nothing unless it owns a cascade, which no header does. */
-        if (!repeat && !view_ui_section_toggle(st, st->focus))
-            view_ui_menu_open_row(st, st->focus);
-        break;
-
     case SDLK_TAB:
     case SDLK_0:
         if (!repeat)
@@ -2703,7 +2719,7 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
          * start, so the range never turns inside out. */
         if (ctrl) {
             if (!repeat) {
-                st->video.start_ui = (int)st->index;
+                st->video.start_ui = (int)view_last_frame(st, st->index);
                 if (st->video.end_ui < st->video.start_ui)
                     st->video.end_ui = st->video.start_ui;
                 st->video.range_set = true;
@@ -2715,7 +2731,7 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
     case SDLK_2:
         /* Ctrl+2 marks the export's end at the frame on screen. */
         if (ctrl && !repeat) {
-            st->video.end_ui = (int)st->index;
+            st->video.end_ui = (int)view_last_frame(st, st->index);
             if (st->video.start_ui > st->video.end_ui)
                 st->video.start_ui = st->video.end_ui;
             st->video.range_set = true;
@@ -2724,9 +2740,15 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
 
     case SDLK_C:
         /* Crop mode: a left drag draws the rectangle instead of panning.
-         * The rectangle itself outlives the mode. */
-        if (!repeat)
+         * Switching the mode on clears whatever rectangle there was, so the
+         * whole frame is back and a new one can be drawn; switching it off
+         * keeps the one that was drawn, shaded, for the export. The Crop
+         * header's switch is this same switch and does the same. */
+        if (!repeat) {
             st->crop.on = !st->crop.on;
+            if (st->crop.on)
+                view_crop_clear(st);
+        }
         break;
 
     case SDLK_M:
@@ -2749,6 +2771,14 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
         break;
 
     case SDLK_ESCAPE:
+        /* An open cascade is what Escape closes; with none open it quits,
+         * as q does. */
+        if (st->menu.open) {
+            view_ui_menu_close(st);
+            break;
+        }
+        *running = false;
+        break;
     case SDLK_Q:
         *running = false;
         break;
@@ -3401,15 +3431,14 @@ int main(int argc, char **argv)
         .debayer   = CRAW_DEBAYER_RCD,
         .lut_type  = PL_LUT_NATIVE,
         .film_sim  = -1,
+        /* libplacebo's own default curve, spline; --tone-map overrides. */
+        .tone_map  = view_tone_map_default(),
     };
-    /* Before the arguments, so that --preset, --colour, --size, --tone-map,
-     * --gamut-map and --no-peak-detect all override it. */
+    /* Before the arguments, so that --preset, --colour, --size and
+     * --pix-fmt all override it. */
     view_presets_default(&st.look.video_preset);
-    st.menu.kb = -1;
     for (int i = 0; i < VIEW_MENU_COLS; i++)
         st.menu.sel[i] = -1;
-    for (int i = 0; i < VIEW_MENU_KINDS; i++)
-        st.menu.rows[i] = -1;
     st.seek_to = -1;
     st.seek_target = -1;
     st.playing = true;

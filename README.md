@@ -79,20 +79,40 @@ container's model name; `--tables` loads others from a text file.
 `cineview` is the interactive viewer and exporter built on SDL3, nuklear
 and libplacebo, when those are found. It decodes with FFmpeg's Vulkan
 hwaccel on libplacebo's device, runs libcraw on the same device, reads the
-file on its own thread and loops by default (`--no-loop`). Space plays and
-pauses; Up and Down walk the panel's rows and Left and Right adjust the
-focused one; Shift with Left and Right seeks one second; Page Up and Page
-Down zoom in and out, and Shift with them goes to the first and last frame;
-Control with the arrows pans; Tab or `0` fits the picture again and `1` is
-one to one; Enter expands or collapses the section header it is on and
-opens the film simulation menu on that row, and Escape closes the menu; the
-wheel zooms about the pointer and a left drag pans; `r` and `t` go to the
-previous and the next file; Ctrl+1 and Ctrl+2 mark the start and the end of
-the video export at the frame on screen, the whole clip being the default;
-`m` mutes; `q`, or Escape with no menu open, quits. Zoom and pan only touch
-the view, never the export. While a video export runs the whole panel and
-every key but `q` are locked, the picture is the export's; `q` then stops
-the export, finishes the file and quits.
+file on its own thread and loops by default (`--no-loop`). The panel is
+worked with the pointer: its switches, expanders, sliders, fields and
+cascading menus are clicked, and no key reaches a panel row. The keys are
+the transport's and the view's. Space plays and pauses; Left and Right
+seek five seconds back and forward, and Shift with them one second; Page
+Up and Page Down zoom in and out, and Shift with them goes to the first and
+last frame; Control with the arrows pans; Tab or `0` fits the picture again
+and `1` is one to one; the wheel zooms about the pointer and a left drag
+pans; `r` and `t` go to the previous and the next file; Ctrl+1 and Ctrl+2
+mark the start and the end of the video export at the frame on screen, the
+whole clip being the default; `m` mutes; Escape closes an open menu and
+otherwise quits, as `q` does. Zoom and pan only touch the view, never the
+export. While a video export runs the whole panel and every key but `q` are
+locked, the picture is the export's; `q` then stops the export, finishes
+the file and quits.
+
+The panel is set in whatever face fontconfig names for `sans-serif` on the
+machine, at 15 px, the way every other desktop application finds its UI
+font: there is no option and nothing to configure, and nuklear's own
+bitmap face is only what remains when fontconfig has nothing or the file
+will not load. Under the playback readouts sits a "Clip" block with what
+the file says about the recording, one row per fact and only the rows the
+file has: camera, format (the codec with its bit depth and coded size,
+"ProRes RAW 16-bit 5760x3040"), frame rate, ISO, aperture, the white
+balance as recorded, the exposure index when it differs from the ISO, the
+capture gamma and gamut of a developed clip, the timecode at the clip's
+start and the recording date - the camera's own, with its zone, when the
+clip carries the Panasonic XML, else the container's creation time in the
+machine's zone. All of it comes through FFmpeg's demuxer: the Apple and
+RDD 18 tags a ProRes RAW clip carries, the stream's own tags and the XML,
+which a developed clip has too and an MP4 does not. The shutter angle, the
+focal length and the lens name sit in the maker note the demuxer does not
+export from these files; they arrive with a libavformat change, not with a
+box parser here. `-v` prints the same rows once per clip.
 
 The panel is a column of sections — White balance, Exposure, Debayer,
 Denoise, Lens, Look, Adjustments, Film grain, Crop, Export — each behind a
@@ -104,9 +124,8 @@ where it was, Look off drops the film simulation or the `--lut` cube
 without unselecting it, Adjustments off drops soft light and vibrance, Film
 grain, Denoise and Lens off turn their stages off, and Crop is the same
 switch `c` is. White balance and Debayer have nothing to bypass and carry
-an empty slot so the titles stay in line. The headers are on the keyboard's
-focus ring too: Left and Right work the switch, Enter opens and closes the
-section. A lit switch always means the section is doing something:
+an empty slot so the titles stay in line. A lit switch always means the
+section is doing something:
 Exposure, Look and Adjustments start off and switch themselves on the
 moment one of their parameters is touched — a slider moved, a film
 simulation picked, `--exposure`, `--ei`, `--lut`, `--softlight` or
@@ -131,9 +150,8 @@ no audio at all — and a switch keeps every setting exactly as it was: the
 white balance mode and a manual CCT, the exposure index and bias, debayer,
 denoise, lens correction and its fit, the export's colour space, size,
 pixel format, audio mode and threads, the two export file paths once typed,
-the film
-simulation, the adjustments, the grain, every section's switch and the
-zoom. A setting a clip's kind
+the film simulation, the tone map, the adjustments, the grain, every
+section's switch and the zoom. A setting a clip's kind
 cannot use is kept rather than dropped, so the white balance a raw clip was
 graded with is still there after a developed one. Only what is read from the
 clip is read again: its tables and as-shot values, its crop, its lens
@@ -147,11 +165,22 @@ G'MIC film emulation collection — see `tools/gui/luts/LICENSE.md` for the
 provenance and the attribution they carry. The panel's "film simulation"
 row opens a cascading menu over the same two category trees the site uses,
 Films (colour negative, slide, black and white, instant, cinema print,
-Fujifilm simulations) and Looks (warm, cool, vintage, cinematic and so on).
+Fujifilm simulations) and Looks (warm, cool, vintage, cinematic and so on),
+by a click on the row; a click elsewhere, a choice or Escape closes it.
 `--lut` takes a rendering's name or slug as well as a file path, and
 `--list-luts` prints both trees. The `.cube` files live in the tree; the
 compact pack that ends up in the executable is built by
 `tools/luts_build.py` at build time.
+
+The Look section also holds the "tone map" row: the curve the window is
+tone mapped with, out of libplacebo's own list — spline, the default;
+bt2390; bt2446a; st2094-40; st2094-10; reinhard; mobius; hable; gamma;
+linear; linearlight; clip — with `--tone-map NAME` as the starting value.
+It is a display setting rather than a look: it sits above the section's
+switch and is applied whatever else is bypassed, and every display-referred
+export is mapped with the same curve, so the file keeps matching the window
+whichever one is picked. Nothing else of the mapping has a row; the gamut
+map and the peak detection stay libplacebo's defaults.
 
 The panel's "Film grain" section emulates film grain through libplacebo's
 AV1 grain synthesis, applied after scaling and colour management so that
@@ -184,8 +213,12 @@ than approximated.
 The picture can be cropped for the export. `c` turns crop mode on, a left
 drag over the picture then draws the rectangle instead of panning, and
 everything outside it is shaded with a thin border around what is kept; the
-Crop section's switch is that same mode, and its body reports the region
-and clears it. The rectangle is held in
+Crop section's switch is that same mode, and its body reports the region.
+Switching the mode on clears whatever rectangle there was, so the whole
+frame is back and a new one can be drawn; switching it off keeps the one
+that was drawn, shaded, for the export — `c`, draw, `c` leaves the
+rectangle in place with the mode off, and `c` again starts afresh. There
+is no clear button: on again is the clearing. The rectangle is held in
 source pixels with even edges, so zoom, pan and a resized window leave it
 where it is, and the export writes exactly that region at source
 resolution. On a rotated clip it is drawn on the picture as it is shown and
@@ -196,8 +229,11 @@ rotated clip is the readout's rectangle turned back.
 
 The Export section holds two exports, laid out as two separate blocks and
 independent of each other: a **Still** of the frame on screen, one image,
-and a **Video** of a range. Each has its own file field, its own button and
-its own status line, and neither field names the other's file. Each field
+and a **Video** of a range, whose start and end fields are bounded by the
+clip's last frame — Ctrl+1, Ctrl+2 and `--export-video` hold to it the same
+way, so a range cannot reach past the clip. Each has its own file field,
+its own button and its own status line, and neither field names the
+other's file. Each field
 follows its own default name until it is typed into — the still's the clip
 and the frame, the video's the clip and the range in the clip's directory —
 and once a path is typed it is the user's and is kept, across clips too. A
@@ -243,18 +279,23 @@ There are two, and they are not two settings of one thing.
 
 A **display-referred** export — BT.709, BT.2020 SDR, BT.2020 PQ, BT.2020
 HLG — is the picture as the viewer shows it. libplacebo renders it into the
-target exactly the way it renders the window: the same tone mapping, the
-same gamut mapping and the same per-frame peak detection — libplacebo's own
-defaults — with the film simulation, the adjustments and the grain on it,
-encoded with the target's own transfer. There is no tone-map, gamut-map or
-peak-detection choice, because the export does not get to decide how the
-picture is mapped any more than the window does: the mapping is the
-display's, so the file is the frame on screen. The one mapping parameter the
-selection still holds is PQ's target peak in nits, because that is part of
-what the HDR target *is* rather than a choice about the picture. (An export
-used to default to a bt.2390 map with peak detection off, and a file that
-came out thirteen per cent brighter in the mid-tones than the frame on
-screen is what that bought.)
+target exactly the way it renders the window: the same tone mapping — the
+Look section's curve — the same gamut mapping and the same per-frame peak
+detection, with the film simulation, the adjustments and the grain on it,
+encoded with the target's own transfer. The export has no mapping choice of
+its own, because it does not get to decide how the picture is mapped any
+more than the window does: the mapping is the display's, so the file is the
+frame on screen. The one mapping parameter the selection still holds is
+PQ's target peak in nits, because that is part of what the HDR target *is*
+rather than a choice about the picture. (An export used to default to a
+bt.2390 map with peak detection off, and a file that came out thirteen per
+cent brighter in the mid-tones than the frame on screen is what that
+bought.) One caveat is libplacebo's: when the window shows the picture
+downscaled it measures the peak after the scaler, on the smaller picture,
+while a full-size export measures it on every pixel, so a curve that leans
+on the peak — bt2390 above all — can come out a percent or two brighter in
+the file than on a fitted window; spline, the default, is all but
+insensitive to it.
 
 A **scene-referred** export — ACEScg, ACES2065-1, CIE XYZ D65 — never goes
 near the renderer. The frame is put through the pipeline a second time with
@@ -273,8 +314,7 @@ Because those four display-referred operators cannot reach such a file, the
 Look, Adjustments and Film grain sections grey out while one is selected,
 each with a line saying why, and their hooks come off the *display* too — so
 what is on screen is what the file holds, up to the display transform. Greyed
-rows take no input and are off the keyboard's focus ring, and the film
-simulation cascade will not open.
+rows take no input, and the film simulation cascade will not open.
 
 Linear light needs float samples, which of the encoder families here means
 FFV1 at version 4 — `FFv1 (Vulkan)` or `FFv1` with an L4 preset, writing

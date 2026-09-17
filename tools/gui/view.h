@@ -110,6 +110,14 @@ struct view_look {
      * conversion from that space to a BT.709 display. */
     int lut_space;
 
+    /* The tone mapping curve the window is mapped with, as an index into
+     * libplacebo's own list (view_tone_map_name() and friends). It is a
+     * display setting and not an export setting: a display-referred export
+     * is mapped exactly as the window is, so it follows this rather than
+     * carrying a curve of its own, and the file keeps matching the frame on
+     * screen whichever curve is picked. */
+    int tone_map;
+
     /* Which encoder, which preset, which knobs, which colour space, what
      * happens to the sound: everything the export decides. It lives here
      * rather than beside the run in struct view_video because it is a
@@ -118,9 +126,9 @@ struct view_look {
      *
      * How the picture is mapped into the target is not in here, because it
      * is not a decision the export gets to make: a display-referred export
-     * is the picture as the window shows it, mapped with libplacebo's own
-     * defaults into the chosen space, the way the window is mapped into
-     * whatever the compositor negotiated. */
+     * is the picture as the window shows it, mapped into the chosen space
+     * with the tone map above and libplacebo's defaults for the rest, the
+     * way the window is mapped into whatever the compositor negotiated. */
     struct view_preset_sel video_preset;
 };
 
@@ -185,22 +193,16 @@ struct view_lut_menu {
      * highlighted yet, which keeps every column to its right shut. */
     int sel[VIEW_MENU_COLS];
     int cols;                   /* how many are on screen */
-    /* The column the keyboard is in, or -1 while the pointer is driving.
-     * A menu opened with Enter must not close because the pointer happens
-     * to be somewhere else, so the two modes are kept apart. */
-    int kb;
     float scroll[VIEW_MENU_COLS];
     float x[VIEW_MENU_COLS], y[VIEW_MENU_COLS];
     float w[VIEW_MENU_COLS], h[VIEW_MENU_COLS];
 
-    /* The panel row the menu hangs off, in window pixels, and its index in
-     * the focus ring so that Enter on it opens the menu. `rows` is one per
-     * kind, filled as each row is emitted, so Enter on any of them knows
-     * which cascade it owns; `row` is the open one's. */
+    /* The panel row the menu hangs off, in window pixels. Written by that
+     * row as it is laid out, so a row that is not laid out this frame -
+     * its section collapsed under it - leaves the menu with nothing to
+     * hang off and it closes. */
     float ax, ay, aw, ah;
     bool anchored;
-    int row;
-    int rows[VIEW_MENU_KINDS];
 
     /* Hover hysteresis, so the cascade behaves like a real menu rather
      * than snapping to whatever the pointer crossed last. An entry has to
@@ -350,6 +352,36 @@ struct view_decoder {
      * because it is the clearest confirmation that `raw` below and the
      * capture gamma above are two different questions. */
     char essence_codec[32];
+
+    /* The rest of the acquisition record, for the panel's Clip block and
+     * -v: nothing below decides anything about the picture. All of it
+     * comes through FFmpeg's demuxer - the Apple and RDD 18 format tags a
+     * ProRes RAW clip carries, the stream's own tags, and the Panasonic
+     * XML - and a field the file does not carry stays empty or zero, which
+     * is how the block knows to leave its row out. The shutter angle, the
+     * focal length and the lens name are in the maker note the demuxer
+     * does not export from these files, so they are not here at all. */
+    char cam_make[64];          /* "Panasonic" */
+    char cam_model[64];         /* "DC-S1M2", the camera's own words */
+    /* The codec as a person names it - "ProRes RAW", "ProRes 422 HQ",
+     * "HEVC" - with the depth and the coded size beside it. The depth is
+     * the XML's when it has one, else the stream's, and 0 when neither
+     * says. */
+    char format_name[32];
+    int bit_depth;
+    int coded_w, coded_h;
+    /* The XML's own frame rate, "29.97p"; empty means the stream's. */
+    char frame_rate_str[16];
+    float aperture;             /* f-number, 0 when absent */
+    /* Exif's exposure index, shown only when it differs from the ISO the
+     * camera recorded at (meta_as_shot_ei above). */
+    float exif_ei;
+    int wb_kelvin;              /* the white balance as recorded, 0: none */
+    char timecode[16];          /* at the clip's start, "01:36:02:00" */
+    /* When the recording was made, as "2025-07-05 01:42:48 +09:00": the
+     * XML's own date with the camera's zone when the clip carries it, else
+     * the container's creation_time turned into this machine's zone. */
+    char recorded[40];
 
     /* A developed clip whose XML says V-Log in V-Gamut, which is the one
      * case where the stream's own colour tags have to be overridden: the
@@ -892,10 +924,6 @@ enum view_section {
  * other setting they carry from clip to clip. */
 struct view_sections {
     bool open[VIEW_NB_SECTIONS];
-    /* Where each header sits on the focus ring, filled as the panel is laid
-     * out; -1 for a section this clip does not show at all, so that Enter
-     * on some other row never finds it. */
-    int row[VIEW_NB_SECTIONS];
 
     /* Off: the bias is zero and the working index is the as-shot one, with
      * the slider and the combo left where they were set. */
@@ -934,17 +962,10 @@ struct view_state {
     struct view_lens lens;
     struct view_adjust adjustments;
 
-    /* Keyboard focus through the panel's adjustable rows. `row` counts them
-     * as the panel is laid out; `adjust` is the pending Left/Right step,
-     * consumed by whichever row is focused. */
-    int focus;
-    int ui_row, ui_rows;
-    int adjust;
-    /* Set while a greyed section is being laid out: its rows are drawn but
-     * take no input and are left off the ring entirely, so Up and Down walk
-     * past the whole section rather than stopping on a row that does
-     * nothing. */
-    bool ui_greyed;
+    /* The panel is worked with the pointer alone: there is no keyboard
+     * focus through its rows, and the keys are the transport's and the
+     * view's. The one thing the panel takes from the keyboard is typing,
+     * while a text field is being typed into. */
     bool ui_edit_active;        /* a text field is being typed into */
     struct view_lut_menu menu;
     struct view_sections sections;
@@ -1079,6 +1100,16 @@ void view_gpu_drop_src_views(struct view_gpu *g);
  * conversion LUT is applied in the space it was authored for. */
 void view_lut_apply_space(struct pl_custom_lut *lut, int space);
 
+/* libplacebo's tone mapping curves, by index into its own list, which is
+ * what look.tone_map holds: nothing about them is typed into this program.
+ * The default is whichever one pl_color_map_default_params names, and
+ * view_tone_map_find() answers --tone-map with -1 for a name it does not
+ * know. */
+int  view_tone_map_count(void);
+const char *view_tone_map_name(int i);
+int  view_tone_map_default(void);
+int  view_tone_map_find(const char *name);
+
 /* What libplacebo makes of the current source's peak, in nits. */
 float view_gpu_infer_ceiling(const struct view_gpu *g);
 
@@ -1160,6 +1191,21 @@ int  view_profile_from_frame(CRAWProfile *p, const AVFrame *frame);
 void view_decoder_lens(struct view_decoder *d, int64_t pts,
                        CRAWLensCorrection *out);
 
+/* The clip's acquisition record as the panel's Clip block shows it and -v
+ * prints it: one label and one value per row, in the block's order, and
+ * only the rows the file has something for. Fills up to `max` of `rows`
+ * and returns how many. Formatted in one place so that the two never
+ * disagree about what a clip carries. */
+struct view_info_row {
+    const char *label;
+    /* Room for the longest row - a make and a model of 63 bytes each -
+     * with the panel cutting what will not fit its column. */
+    char value[160];
+};
+#define VIEW_INFO_MAX 12
+int  view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
+                       int max);
+
 /* ----------------------------------------------------------- export.c */
 
 /* Starts writing one frame to one file. An empty `path` means the default
@@ -1199,23 +1245,14 @@ int  view_ui_resize(struct view_state *st, int w, int h);
  * been handed to the swapchain. */
 void view_ui_rotate(struct view_gpu *g);
 
-/* The cascading menus - the film simulation's and the video export's two.
- * They own their own hit testing rather than going through nuklear's
- * widgets, because a cascade is not a thing nuklear has and the columns
- * have to keep taking the pointer while the panel below them is what
- * nuklear considers active. */
+/* The cascading menus - the film simulation's and the video export's
+ * three. They own their own hit testing rather than going through
+ * nuklear's widgets, because a cascade is not a thing nuklear has and the
+ * columns have to keep taking the pointer while the panel below them is
+ * what nuklear considers active. A cascade opens by a click on its row and
+ * closes by a click elsewhere, a choice, or Escape. */
 void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind);
-/* Opens whichever cascade the focus ring's row `row` owns, if any: what
- * Enter on a menu row does. */
-void view_ui_menu_open_row(struct view_state *st, int row);
-
-/* Expands or collapses the section whose header is the focus ring's row
- * `row`, and says whether there was one: the other half of what Enter does,
- * tried first because a header and a cascade can never be the same row. */
-bool view_ui_section_toggle(struct view_state *st, int row);
 void view_ui_menu_close(struct view_state *st);
-/* Handles one key while the menu is open; true when it consumed it. */
-bool view_ui_menu_key(struct view_state *st, int key);
 /* True when the open menu covers that point, given in window points the
  * way SDL reports them. The picture must not zoom or pan underneath it. */
 bool view_ui_menu_covers(const struct view_state *st, float x, float y);

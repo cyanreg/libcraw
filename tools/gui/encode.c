@@ -2122,6 +2122,14 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     e->report = !st->win;
     e->start = CRAW_MAX(o->start, 0);
     e->end   = CRAW_MAX(o->end, e->start);
+    /* Never past the clip's last frame when the count is known, whichever
+     * way the range came - the panel's fields are bounded the same way,
+     * and --export-video is cut here without a word. A count FFmpeg could
+     * not tell leaves the end to be found by running into it. */
+    if (st->dec.nb_frames > 0) {
+        e->start = CRAW_MIN(e->start, st->dec.nb_frames - 1);
+        e->end   = CRAW_MIN(e->end, st->dec.nb_frames - 1);
+    }
     e->next  = e->start;
     e->t0 = e->last_report = av_gettime_relative();
 

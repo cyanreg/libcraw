@@ -13,11 +13,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
+#include <libavcodec/defs.h>
 #include <libavutil/dict.h>
 #include <libavutil/display.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
+#include <libavutil/parseutils.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/raw_color_params.h>
 #include <libavutil/time.h>
@@ -242,6 +245,8 @@ static enum AVPixelFormat view_get_format(AVCodecContext *avc,
  * full so that the element is still matched in its own context. */
 #define VIEW_XP_CUM "//*[local-name()='CameraUnitMetadata']"
 #define VIEW_XP_ESS "//*[local-name()='EssenceList']/*[local-name()='Video']"
+#define VIEW_XP_DEV "//*[local-name()='ClipMetadata']/*[local-name()='Device']"
+#define VIEW_XP_ACC "//*[local-name()='ClipMetadata']/*[local-name()='Access']"
 
 /* The text of the first node an expression selects, whitespace trimmed.
  * Anything unexpected - no match, an empty element, a value longer than the
@@ -284,13 +289,35 @@ static bool view_xpath_text(xmlXPathContextPtr xp, const char *expr,
     return ok;
 }
 
+/* The XML's dates are ISO 8601 with the camera's own zone -
+ * "2025-07-05T01:42:48+09:00" - which is kept as it is, the T made a space
+ * and the zone set off by one, so that the row reads as a date and a time
+ * rather than as a token. Anything shaped differently is passed through
+ * with only the T changed: it is still the camera's word for when. */
+static void view_date_from_xml(const char *iso, char *out, size_t n)
+{
+    size_t len = strlen(iso);
+    size_t o = 0;
+
+    for (size_t i = 0; i < len && o + 2 < n; i++) {
+        if (i == 10 && iso[i] == 'T') {
+            out[o++] = ' ';
+            continue;
+        }
+        if (i == 19 && (iso[i] == '+' || iso[i] == '-'))
+            out[o++] = ' ';
+        out[o++] = iso[i];
+    }
+    out[o] = '\0';
+}
+
 /* Reads one such document. Networked entity loading is off: this is a blob
  * out of a file the user opened, and it must not become a fetch. */
 static void view_read_clip_xml(struct view_decoder *d, const char *xml)
 {
     xmlDocPtr doc;
     xmlXPathContextPtr xp;
-    char iso[32];
+    char iso[32], num[32], date[40];
 
     /* Idempotent, and matched by the xmlCleanupParser() in
      * view_decoder_cleanup(): the viewer opens a decoder per clip and
@@ -333,10 +360,70 @@ static void view_read_clip_xml(struct view_decoder *d, const char *xml)
                             iso, sizeof(iso)))
             d->meta_as_shot_ei = (float)atof(iso);
 
+        /* The rest of the record, for the Clip block. The camera and the
+         * white balance fill in behind the Apple and RDD 18 tags, which a
+         * developed clip does not carry; the frame rate and the depth are
+         * the XML's own words wherever it has them, since "29.97p" says
+         * more than 30000/1001 does. */
+        if (!d->cam_make[0])
+            view_xpath_text(xp, VIEW_XP_DEV "/*[local-name()='Manufacturer']",
+                            d->cam_make, sizeof(d->cam_make));
+        if (!d->cam_model[0])
+            view_xpath_text(xp, VIEW_XP_DEV "/*[local-name()='ModelName']",
+                            d->cam_model, sizeof(d->cam_model));
+        view_xpath_text(xp, VIEW_XP_ESS "/*[local-name()='FrameRate']",
+                        d->frame_rate_str, sizeof(d->frame_rate_str));
+        if (view_xpath_text(xp, VIEW_XP_ESS "/*[local-name()='BitDepth']",
+                            num, sizeof(num)) && atoi(num) > 0)
+            d->bit_depth = atoi(num);
+        /* Only a clip recorded in the camera's Kelvin mode carries this,
+         * and then as "5500K". */
+        if (!d->wb_kelvin &&
+            view_xpath_text(xp, VIEW_XP_CUM
+                            "/*[local-name()='WhiteBalanceColorTemperature']",
+                            num, sizeof(num)) && atoi(num) > 0)
+            d->wb_kelvin = atoi(num);
+        if (!d->timecode[0])
+            view_xpath_text(xp, VIEW_XP_ESS "/*[local-name()='StartTimecode']",
+                            d->timecode, sizeof(d->timecode));
+        /* Preferred over the container's creation_time, which is UTC: this
+         * one carries the zone the camera was set to, which is where the
+         * clip was shot. */
+        if (view_xpath_text(xp, VIEW_XP_ACC "/*[local-name()='CreationDate']",
+                            date, sizeof(date)))
+            view_date_from_xml(date, d->recorded, sizeof(d->recorded));
+
         xmlXPathFreeContext(xp);
     }
 
     xmlFreeDoc(doc);
+}
+
+/* The container's creation_time, an ISO 8601 UTC instant, as a date and
+ * time in this machine's zone: what the clock on the wall said here when
+ * the clip was shot, which is the best a file without the XML can do. */
+static void view_date_from_utc(const char *iso, char *out, size_t n)
+{
+    int64_t us;
+    time_t t;
+    struct tm tm;
+    char zone[8];
+    size_t len;
+
+    if (av_parse_time(&us, iso, 0) < 0)
+        return;
+
+    t = (time_t)(us / 1000000);
+    if (!localtime_r(&t, &tm))
+        return;
+
+    len = strftime(out, n, "%Y-%m-%d %H:%M:%S ", &tm);
+    if (!len)
+        return;
+    /* strftime's zone is "+0900"; the XML writes "+09:00", and one shape
+     * on the row is better than two. */
+    if (strftime(zone, sizeof(zone), "%z", &tm) == 5)
+        snprintf(out + len, n - len, "%.3s:%s", zone, zone + 3);
 }
 
 /* The camera model and the as-shot ISO hide in whichever metadata
@@ -357,6 +444,44 @@ static void view_read_metadata(struct view_decoder *d)
         e = av_dict_get(dicts[i], "com.apple.proapps.modelname", NULL, 0);
         if (e && !d->model[0])
             snprintf(d->model, sizeof(d->model), "%s", e->value);
+        if (e && !d->cam_model[0])
+            snprintf(d->cam_model, sizeof(d->cam_model), "%s", e->value);
+
+        /* The rest of what a ProRes RAW clip's Apple and RDD 18 tags say
+         * about the take, for the Clip block. The two aperture keys carry
+         * the same number in two spellings - "2.800000" and "F2.8" - so
+         * either serves. */
+        e = av_dict_get(dicts[i], "com.apple.proapps.manufacturer", NULL, 0);
+        if (e && !d->cam_make[0])
+            snprintf(d->cam_make, sizeof(d->cam_make), "%s", e->value);
+
+        e = av_dict_get(dicts[i], "com.apple.proapps.exif.{Exif}.FNumber", NULL, 0);
+        if (e && !(d->aperture > 0.0f))
+            d->aperture = (float)atof(e->value);
+        e = av_dict_get(dicts[i], "org.smpte.rdd18.lens.irisfnumber", NULL, 0);
+        if (e && !(d->aperture > 0.0f))
+            d->aperture = (float)atof(e->value + (e->value[0] == 'F' ||
+                                                  e->value[0] == 'f'));
+
+        e = av_dict_get(dicts[i], "com.apple.proapps.exif.{Exif}.ExposureIndex", NULL, 0);
+        if (e && !(d->exif_ei > 0.0f))
+            d->exif_ei = (float)atof(e->value);
+
+        e = av_dict_get(dicts[i], "org.smpte.rdd18.camera.whitebalance", NULL, 0);
+        if (e && !d->wb_kelvin && atoi(e->value) > 0)
+            d->wb_kelvin = atoi(e->value);
+
+        /* The tmcd track's start, which the demuxer copies onto the video
+         * stream; the format dictionary has none and the loop is harmless
+         * there. */
+        e = av_dict_get(dicts[i], "timecode", NULL, 0);
+        if (e && !d->timecode[0])
+            snprintf(d->timecode, sizeof(d->timecode), "%s", e->value);
+
+        /* Overwritten below by the XML's own date, which knows the zone. */
+        e = av_dict_get(dicts[i], "creation_time", NULL, 0);
+        if (e && !d->recorded[0])
+            view_date_from_utc(e->value, d->recorded, sizeof(d->recorded));
     }
 
     /* The Panasonic clip XML. It is the only record of what the camera was
@@ -405,6 +530,102 @@ static void view_read_metadata(struct view_decoder *d)
             }
         }
     }
+}
+
+/* The codec the way a person names it, for the Clip block's format row.
+ * FFmpeg's short names are identifiers - `prores_raw`, `hevc` - and its
+ * long ones are catalogue entries, so the few this viewer is likely to meet
+ * are named here and anything else keeps the short name. A ProRes profile
+ * is part of what the format is, and the stream carries it. */
+static void view_format_name(const AVCodecParameters *par, const AVCodec *codec,
+                             char *out, size_t n)
+{
+    const char *profile = NULL;
+
+    switch (par->codec_id) {
+    case AV_CODEC_ID_PRORES_RAW:
+        snprintf(out, n, "ProRes RAW");
+        return;
+    case AV_CODEC_ID_PRORES:
+        switch (par->profile) {
+        case AV_PROFILE_PRORES_PROXY:    profile = "422 Proxy"; break;
+        case AV_PROFILE_PRORES_LT:       profile = "422 LT";    break;
+        case AV_PROFILE_PRORES_STANDARD: profile = "422";       break;
+        case AV_PROFILE_PRORES_HQ:       profile = "422 HQ";    break;
+        case AV_PROFILE_PRORES_4444:     profile = "4444";      break;
+        case AV_PROFILE_PRORES_XQ:       profile = "4444 XQ";   break;
+        default: break;
+        }
+        snprintf(out, n, "ProRes%s%s", profile ? " " : "", profile ? profile : "");
+        return;
+    case AV_CODEC_ID_HEVC: snprintf(out, n, "HEVC");  return;
+    case AV_CODEC_ID_H264: snprintf(out, n, "H.264"); return;
+    case AV_CODEC_ID_AV1:  snprintf(out, n, "AV1");   return;
+    default:
+        snprintf(out, n, "%s", codec->name);
+        return;
+    }
+}
+
+int view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
+                      int max)
+{
+    int n = 0;
+
+#define VIEW_INFO(lbl, ...) do {                                            \
+        if (n < max) {                                                      \
+            rows[n].label = lbl;                                            \
+            snprintf(rows[n].value, sizeof(rows[n].value), __VA_ARGS__);    \
+            n++;                                                            \
+        }                                                                   \
+    } while (0)
+
+    if (d->cam_make[0] || d->cam_model[0])
+        VIEW_INFO("camera", "%s%s%s", d->cam_make,
+                  d->cam_make[0] && d->cam_model[0] ? " " : "", d->cam_model);
+
+    if (d->format_name[0]) {
+        char depth[16] = "";
+
+        if (d->bit_depth > 0)
+            snprintf(depth, sizeof(depth), " %d-bit", d->bit_depth);
+        VIEW_INFO("format", "%s%s %dx%d", d->format_name, depth,
+                  d->coded_w, d->coded_h);
+    }
+
+    if (d->frame_rate_str[0])
+        VIEW_INFO("frame rate", "%s", d->frame_rate_str);
+    else if (d->frame_rate.num > 0 && d->frame_rate.den > 0)
+        VIEW_INFO("frame rate", d->frame_rate.num % d->frame_rate.den
+                  ? "%.2f fps" : "%.0f fps", av_q2d(d->frame_rate));
+
+    if (d->meta_as_shot_ei > 0.0f)
+        VIEW_INFO("ISO", "%.0f", (double)d->meta_as_shot_ei);
+    if (d->aperture > 0.0f)
+        VIEW_INFO("aperture", "f/%.1f", (double)d->aperture);
+    if (d->wb_kelvin > 0)
+        VIEW_INFO("white balance", "%d K", d->wb_kelvin);
+    /* The Exif index is the ISO again on every clip seen so far; the row
+     * exists for the day a clip rates itself differently. */
+    if (d->exif_ei > 0.0f && fabsf(d->exif_ei - d->meta_as_shot_ei) >= 0.5f)
+        VIEW_INFO("exposure index", "%.0f", (double)d->exif_ei);
+
+    /* A raw clip's XML says V-Log too, describing what the sensor data
+     * would have become; the pipeline develops it and the row would
+     * mislead. */
+    if (!d->raw && (d->capture_gamma[0] || d->capture_gamut[0]))
+        VIEW_INFO("gamma", "%s%s%s", d->capture_gamma,
+                  d->capture_gamma[0] && d->capture_gamut[0] ? " / " : "",
+                  d->capture_gamut);
+
+    if (d->timecode[0])
+        VIEW_INFO("timecode", "%s", d->timecode);
+    if (d->recorded[0])
+        VIEW_INFO("recorded", "%s", d->recorded);
+
+#undef VIEW_INFO
+
+    return n;
 }
 
 /* The track header's display matrix, which is how a camera says the body
@@ -515,6 +736,23 @@ int view_decoder_open(struct view_decoder *d, const char *path,
 
     view_read_metadata(d);
 
+    /* The format row's own facts. The XML's bit depth, when there was one,
+     * is already in; the stream is asked otherwise - ProRes RAW says 16 in
+     * its own field, a developed clip says nothing there and its pixel
+     * format says 10. */
+    view_format_name(st->codecpar, codec, d->format_name, sizeof(d->format_name));
+    d->coded_w = st->codecpar->width;
+    d->coded_h = st->codecpar->height;
+    if (!d->bit_depth) {
+        const AVPixFmtDescriptor *desc =
+            av_pix_fmt_desc_get((enum AVPixelFormat)st->codecpar->format);
+
+        if (st->codecpar->bits_per_raw_sample > 0)
+            d->bit_depth = st->codecpar->bits_per_raw_sample;
+        else if (desc && desc->nb_components > 0)
+            d->bit_depth = desc->comp[0].depth;
+    }
+
     ret = view_hw_device_create(d, g);
     if (ret < 0)
         return ret;
@@ -565,6 +803,17 @@ int view_decoder_open(struct view_decoder *d, const char *path,
                 d->essence_codec[0] ? d->essence_codec : "(none)",
                 d->vlog ? ", overriding the stream's colour tags"
                         : d->raw ? ", raw: the pipeline develops it" : "");
+
+    /* The Clip block's rows, exactly as the panel shows them. */
+    if (verbose) {
+        struct view_info_row rows[VIEW_INFO_MAX];
+        int n = view_decoder_info(d, rows, VIEW_INFO_MAX);
+
+        fprintf(stderr, "clip:");
+        for (int i = 0; i < n; i++)
+            fprintf(stderr, "%s %s %s", i ? "," : "", rows[i].label, rows[i].value);
+        fprintf(stderr, "%s\n", n ? "" : " nothing the demuxer exposes");
+    }
 
     return 0;
 }

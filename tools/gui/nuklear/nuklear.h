@@ -29666,7 +29666,14 @@ nk_property(struct nk_context *ctx, const char *name, struct nk_property_variant
         win->property.name = hash;
         win->property.select_start = *select_begin;
         win->property.select_end = *select_end;
-        win->edit.active = nk_true;
+        /* cineview: upstream also raises win->edit.active here, which is
+         * the text fields' own "one of us is being typed into" flag, and
+         * leaves win->edit.name as it was. The first nk_edit_string() of
+         * the window then matches that stale name on the next frame,
+         * wakes up as active and takes every character typed into the
+         * number field, which never sees any of them. A property keeps
+         * its own state in win->property; the edit flag is not its to
+         * raise. */
         if (*state == NK_PROPERTY_DRAG) {
             ctx->input.mouse.grab = nk_true;
             ctx->input.mouse.grabbed = nk_true;
@@ -29682,7 +29689,6 @@ nk_property(struct nk_context *ctx, const char *name, struct nk_property_variant
         win->property.select_start = 0;
         win->property.select_end = 0;
         win->property.active = 0;
-        win->edit.active = nk_false;
     }
 }
 NK_API nk_bool

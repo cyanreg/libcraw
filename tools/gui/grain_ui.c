@@ -49,74 +49,10 @@
 #include "grain.h"
 #include "grain_ui.h"
 
-/* The row height and margin ui.c lays the panel out with. */
-#define GRAIN_ROW 24.0f
-
-/* ------------------------------------------------------- panel plumbing */
-
-/* These three mirror ui.c's view_row(), view_step() and view_adjust_*(),
- * which are static to that file. They are copied rather than shared because
- * this section is meant to cost ui.c exactly one line; they are eleven lines
- * of nuklear's public API and no state of their own, but if ui.c's focus
- * ring ever changes - a different colour, a different inset, a modifier on
- * the step - these have to change with it. */
-static bool grain_row(struct view_state *st, struct nk_context *ctx)
-{
-    bool focused;
-
-    /* The same rule as ui.c's: a greyed row is off the ring entirely. */
-    if (st->ui_greyed)
-        return false;
-
-    focused = st->ui_row == st->focus;
-
-    if (focused) {
-        struct nk_rect b = nk_widget_bounds(ctx);
-        struct nk_rect c = nk_window_get_content_region(ctx);
-        struct nk_command_buffer *out = nk_window_get_canvas(ctx);
-
-        b.x = c.x - 2.0f;
-        b.w = c.w + 4.0f;
-        b.y -= 2.0f;
-        b.h += 4.0f;
-        nk_fill_rect(out, b, 2.0f, nk_rgba(46, 64, 96, 255));
-    }
-
-    st->ui_row++;
-
-    return focused;
-}
-
-static int grain_step(struct view_state *st, bool focused)
-{
-    int adj = focused ? st->adjust : 0;
-
-    if (adj)
-        st->adjust = 0;
-
-    return adj;
-}
-
-static void grain_adjust_float(struct view_state *st, bool focused, float *v,
-                               float step, float lo, float hi)
-{
-    int adj = grain_step(st, focused);
-
-    if (adj) {
-        *v = CRAW_CLAMP(*v + (float)adj * step, lo, hi);
-        if (fabsf(*v) < step * 1e-3f)
-            *v = 0.0f;
-    }
-}
-
-static void grain_adjust_cycle(struct view_state *st, bool focused, int *v,
-                               int n)
-{
-    int adj = grain_step(st, focused);
-
-    if (adj)
-        *v = (*v + adj + n) % n;
-}
+/* The row height ui.c lays the panel out with, and the height of a row in
+ * a combo's dropdown, both sized for the panel's font. */
+#define GRAIN_ROW       26.0f
+#define GRAIN_COMBO_ROW 24.0f
 
 /* ------------------------------------------------------------ defaults */
 
@@ -365,7 +301,6 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
         nk_label_wrap(ctx, "not applied: the export is scene referred, and "
                            "grain is a display-referred operator");
         nk_widget_disable_begin(ctx);
-        st->ui_greyed = true;
         grey = true;
     }
 
@@ -376,73 +311,49 @@ void view_panel_grain(struct nk_context *ctx, struct view_state *st)
               view_grain_summary(g, buf, sizeof(buf)));
 
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    grain_adjust_cycle(st, grain_row(st, ctx), &g->gauge,
-                       CRAW_GRAIN_GAUGE_NB);
     nk_label(ctx, "gauge", NK_TEXT_LEFT);
-    g->gauge = nk_combo(ctx, gauges, CRAW_GRAIN_GAUGE_NB, g->gauge, 20,
-                        nk_vec2(180, 260));
+    g->gauge = nk_combo(ctx, gauges, CRAW_GRAIN_GAUGE_NB, g->gauge,
+                        (int)GRAIN_COMBO_ROW, nk_vec2(180, 300));
 
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    grain_adjust_cycle(st, grain_row(st, ctx), &g->stock,
-                       CRAW_GRAIN_STOCK_NB);
     nk_label(ctx, "stock", NK_TEXT_LEFT);
-    g->stock = nk_combo(ctx, stocks, CRAW_GRAIN_STOCK_NB, g->stock, 20,
-                        nk_vec2(180, 280));
+    g->stock = nk_combo(ctx, stocks, CRAW_GRAIN_STOCK_NB, g->stock,
+                        (int)GRAIN_COMBO_ROW, nk_vec2(180, 320));
 
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    grain_adjust_cycle(st, grain_row(st, ctx), &g->response,
-                       CRAW_GRAIN_RESPONSE_NB);
     nk_label(ctx, "response", NK_TEXT_LEFT);
     g->response = nk_combo(ctx, responses, CRAW_GRAIN_RESPONSE_NB,
-                           g->response, 20, nk_vec2(160, 120));
+                           g->response, (int)GRAIN_COMBO_ROW, nk_vec2(160, 130));
 
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 1);
-    grain_adjust_float(st, grain_row(st, ctx), &g->amount, 0.05f, 0.0f, 3.0f);
     nk_property_float(ctx, "#amount", 0.0f, &g->amount, 3.0f, 0.05f, 0.01f);
-
-    grain_adjust_float(st, grain_row(st, ctx), &g->size, 0.05f, 0.25f, 4.0f);
     nk_property_float(ctx, "#size", 0.25f, &g->size, 4.0f, 0.05f, 0.01f);
 
     /* Chroma is the one control with a meaningful "unset": below zero the
-     * stock's own figure is used, which is what most people want, so the
-     * slider starts one step above that and stepping down off the bottom
-     * goes back to it. */
+     * stock's own figure is used, which is what most people want. */
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    {
-        bool f = grain_row(st, ctx);
-        float c = g->chroma < 0.0f ? -0.05f : g->chroma;
-
-        grain_adjust_float(st, f, &c, 0.05f, -0.05f, 2.0f);
-        g->chroma = c < 0.0f ? -1.0f : c;
-        if (g->chroma < 0.0f)
-            nk_label(ctx, "chroma: auto", NK_TEXT_LEFT);
-        else
-            nk_labelf(ctx, NK_TEXT_LEFT, "chroma: %.2f", (double)g->chroma);
-        nk_labelf(ctx, NK_TEXT_LEFT, "%s",
-                  craw_grain_response_name(g->response));
-    }
+    if (g->chroma < 0.0f)
+        nk_label(ctx, "chroma: auto", NK_TEXT_LEFT);
+    else
+        nk_labelf(ctx, NK_TEXT_LEFT, "chroma: %.2f", (double)g->chroma);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%s", craw_grain_response_name(g->response));
 
     nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    {
-        int boil = g->boil ? 1 : 0;
+    nk_checkbox_label(ctx, "boil", &g->boil_flag);
+    g->boil = g->boil_flag != 0;
+    nk_label(ctx, g->boil ? "new grain each frame" : "held still",
+             NK_TEXT_LEFT);
 
-        grain_adjust_cycle(st, grain_row(st, ctx), &boil, 2);
-        g->boil_flag = boil;
-        nk_checkbox_label(ctx, "boil", &g->boil_flag);
-        g->boil = g->boil_flag != 0;
-        nk_label(ctx, g->boil ? "new grain each frame" : "held still",
-                 NK_TEXT_LEFT);
-    }
-
-    /* Where the numbers came from, since half the stocks are estimates. */
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 1);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%.72s", craw_grain_stock_source(g->stock));
+    /* Where the numbers came from, since half the stocks are estimates.
+     * Wrapped over three rows: the notes run to a sentence or two, and a
+     * line cut mid-word at the panel's edge said less than nothing. The
+     * longest of them still loses its tail, at a line boundary. */
+    nk_layout_row_dynamic(ctx, GRAIN_ROW * 3.0f, 1);
+    nk_label_wrap(ctx, craw_grain_stock_source(g->stock));
 
     /* Not while a running video export has the whole panel locked: the
      * pair does not nest, and the end here would unlock everything under
      * this section. */
-    if (grey && !view_ui_locked(st)) {
+    if (grey && !view_ui_locked(st))
         nk_widget_disable_end(ctx);
-        st->ui_greyed = false;
-    }
 }

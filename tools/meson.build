@@ -43,10 +43,14 @@ swscale = dependency('libswscale', required: false)
 # the picture is read. Hand-matching elements in a blob is the kind of thing
 # that works until a camera indents differently, so it is parsed properly.
 libxml = dependency('libxml-2.0', required: false)
+# The panel's font is whatever the machine calls sans-serif, and fontconfig
+# is the one place that knows: the same lookup every desktop application
+# makes, so the panel reads in the face the rest of the screen does.
+fontconfig = dependency('fontconfig', required: false)
 
 craw_tools_ffmpeg = libavformat_dep.found() and libavcodec_dep.found() and libavutil_dep.found()
 craw_tools_gui = craw_tools_ffmpeg and sdl3.found() and placebo.found() and \
-                 swscale.found() and libxml.found()
+                 swscale.found() and libxml.found() and fontconfig.found()
 
 if craw_tools_ffmpeg
     tools_args = []
@@ -126,7 +130,7 @@ if craw_tools_ffmpeg
             dependencies: [
                 craw_dep, vulkan_dep, sdl3, placebo,
                 libavformat_dep, libavcodec_dep, libavutil_dep, swscale,
-                libxml,
+                libxml, fontconfig,
                 cc.find_library('m', required: false),
             ] + gui_deps,
             install: true,
