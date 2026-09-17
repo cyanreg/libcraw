@@ -227,21 +227,24 @@ was drawn and the file holds exactly that region, upright. `--crop WxH+X+Y`
 sets the same rectangle from the command line, in source pixels — which on a
 rotated clip is the readout's rectangle turned back.
 
-The Export section holds two exports, laid out as two separate blocks and
-independent of each other: a **Still** of the frame on screen, one image,
-and a **Video** of a range, whose start and end fields are bounded by the
-clip's last frame — Ctrl+1, Ctrl+2 and `--export-video` hold to it the same
-way, so a range cannot reach past the clip. Each has its own file field,
-its own button and its own status line, and neither field names the
-other's file. Each field
-follows its own default name until it is typed into — the still's the clip
-and the frame, the video's the clip and the range in the clip's directory —
-and once a path is typed it is the user's and is kept, across clips too. A
-typed path always wins; the video path's extension picks the container as
-long as the muxer carries the encoder, and is refused with the reason
-otherwise.
+The Export section holds two exports on two tabs, **Screenshot** and
+**Video**, independent of each other: the screenshot is the frame on
+screen, one image, and the video is a range, whose start and end fields
+are bounded by the clip's last frame — Ctrl+1, Ctrl+2 and `--export-video`
+hold to it the same way, so a range cannot reach past the clip. The tab
+row sits at the top of the section, the chosen tab lit and the other
+dimmed, and only the chosen tab's rows are laid out under it; the choice
+is kept for the session and starts on Screenshot. Each tab has its own
+file field, its own button and its own status line, neither field names
+the other's file, and a field keeps what was typed into it while the other
+tab is up. Each field follows its own default name until it is typed into
+— the screenshot's the clip and the frame, the video's the clip and the
+range in the clip's directory — and once a path is typed it is the user's
+and is kept, across clips too. A typed path always wins; the video path's
+extension picks the container as long as the muxer carries the encoder,
+and is refused with the reason otherwise.
 
-`--export FRAME OUT` is the still from the command line: it writes one frame
+`--export FRAME OUT` is the screenshot from the command line: it writes one frame
 to one file and exits without opening a window, upright and at the crop
 rectangle's own size. The file name picks the format through libavformat,
 which knows both the muxer and the codec an extension implies: `.png` and
@@ -254,7 +257,7 @@ cent of the size) and TIFF uncompressed. The stream is tagged as what the
 export really is: full range, BT.709 primaries, sRGB transfer, display
 referred. A sequence of stills is deliberately not offered — that is a video
 encode. `--export-video START END OUT` is the video export headless. The
-still panel has no codec box: the extension is the choice.
+Screenshot tab has no codec box: the extension is the choice.
 
 Every video export into an `.mp4` or `.mov` is written with `movflags
 +faststart`, always: the `moov` atom is moved ahead of the media so the file
@@ -267,8 +270,9 @@ has none; `--threads N` sets it and `-v` prints the count the encoder
 settled on since some clamp it — and, while a run is going, an *exporting: N
 of M frames* line, a progress bar and a stop button. From the moment the
 export starts until it ends or is stopped, every panel section and every row
-but the stop button is disabled: nothing can be scrubbed, seeked or changed
-by mouse, wheel or keyboard, the scrub bar takes no input, and the key
+but the stop button is disabled, the tab row with them, held on Video:
+nothing can be scrubbed, seeked or changed by mouse, wheel or keyboard, the
+scrub bar takes no input, and the key
 handler ignores everything but `q` (which stops the export cleanly and then
 quits) and Escape closing a menu. When the export ends everything unlocks
 and the picture returns to where it was.

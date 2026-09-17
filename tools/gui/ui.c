@@ -2243,11 +2243,11 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         nk_widget_disable_begin(ctx);
 }
 
-/* The Still block of the Export section: the frame on screen, one image,
- * the format picked by the file field's extension. The field follows the
- * frame on screen until it is typed into: once it differs from the default
- * that was last put there, it is the user's and is left alone, on this
- * clip and the next. */
+/* The Screenshot tab of the Export section: the frame on screen, one
+ * image, the format picked by the file field's extension. The field
+ * follows the frame on screen until it is typed into: once it differs from
+ * the default that was last put there, it is the user's and is left alone,
+ * on this clip and the next. */
 static void view_panel_export_still(struct nk_context *ctx, struct view_state *st)
 {
     struct view_export *e = &st->exp;
@@ -2268,7 +2268,7 @@ static void view_panel_export_still(struct nk_context *ctx, struct view_state *s
         st->ui_edit_active = true;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-    if (nk_button_label(ctx, "export still") && !e->active) {
+    if (nk_button_label(ctx, "export screenshot") && !e->active) {
         /* The current frame, and nothing but it: a range of stills is a
          * video encode, which this is not. The encoder is the one the
          * name implies; there is no codec box, the extension is the
@@ -2289,9 +2289,44 @@ static void view_panel_export_still(struct nk_context *ctx, struct view_state *s
     }
 }
 
-/* A block's title inside the Export section, with a rule over it so that
- * the two blocks read as two things: the still and the video are two
- * exports with two files, and neither field names the other. */
+/* The Export section's two tabs. The screenshot of the frame on screen and
+ * the video of a range are two exports with two files, and only one of the
+ * two is on the panel at a time: two buttons on one row, drawn as tabs,
+ * the chosen one in the section headers' own tab colour with its title at
+ * full strength and the other sunk into the panel's background with its
+ * title dimmed. A running video export locks the row along with the rest
+ * of the panel and holds it on Video, where the stop button and the
+ * progress are; nothing else moves it but a click. */
+static void view_panel_export_tabs(struct nk_context *ctx, struct view_state *st)
+{
+    const struct nk_style *style = &ctx->style;
+    static const char *const titles[2] = { "Screenshot", "Video" };
+    struct nk_style_button on = style->button, off = style->button;
+
+    if (st->video.active)
+        st->sections.export_video = true;
+
+    on.normal = on.hover = on.active = style->tab.background;
+    on.border_color = style->tab.border_color;
+    on.text_normal = on.text_hover = on.text_active = style->tab.text;
+
+    off.normal = off.active = style->window.fixed_background;
+    off.hover = nk_style_item_color(nk_rgba(36, 36, 42, 255));
+    off.border_color = style->tab.border_color;
+    off.text_normal = off.text_hover = off.text_active =
+        nk_rgb_factor(style->tab.text, 0.6f);
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+    for (int i = 0; i < 2; i++) {
+        bool chosen = st->sections.export_video == (i == 1);
+
+        if (nk_button_label_styled(ctx, chosen ? &on : &off, titles[i]))
+            st->sections.export_video = i == 1;
+    }
+}
+
+/* A block's title with a rule over it, so that the block reads as a thing
+ * of its own under the rows above it. */
 static void view_panel_block(struct nk_context *ctx, const char *title)
 {
     nk_layout_row_dynamic(ctx, 6.0f, 1);
@@ -2624,14 +2659,16 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
     }
 
     if (view_section_header(ctx, st, VIEW_SEC_EXPORT, "Export", NULL, false)) {
-        /* Two exports, two blocks, two files: the still of the frame on
+        /* Two exports, two tabs, two files: the screenshot of the frame on
          * screen, and the video of the range. Neither field names the
-         * other's file. */
-        view_panel_block(ctx, "Still");
-        view_panel_export_still(ctx, st);
-
-        view_panel_block(ctx, "Video");
-        view_panel_export_video(ctx, st);
+         * other's file, and each keeps what was typed into it while the
+         * other tab is up: the fields are state, and a tab that is not
+         * laid out simply is not looked at. */
+        view_panel_export_tabs(ctx, st);
+        if (st->sections.export_video)
+            view_panel_export_video(ctx, st);
+        else
+            view_panel_export_still(ctx, st);
 
         view_section_end(ctx);
     }
