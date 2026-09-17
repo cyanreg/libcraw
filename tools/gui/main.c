@@ -898,10 +898,11 @@ void view_pan_pixels(struct view_state *st, int dx, int dy)
 /* ------------------------------------------------------------- the crop */
 
 /* Window pixels to the rotated picture's pixels, through the same two
- * rectangles the display path is built from, so that the rubber band lands
- * on the pixels it is drawn over at any zoom and pan. */
-static void view_picture_pos(const struct view_state *st, int px, int py,
-                             float *sx, float *sy)
+ * rectangles the display path is built from, so that the rubber band - and
+ * the spot white balance's click - lands on the pixels it is drawn over at
+ * any zoom and pan. */
+void view_picture_pos(const struct view_state *st, int px, int py,
+                      float *sx, float *sy)
 {
     pl_rect2df src, dst;
     float dw, dh;
@@ -1221,8 +1222,10 @@ static int view_awb_step(struct view_state *st)
 /* The raw path from the held picture to a submitted pipeline pass: the
  * profile from the frame's side data, the exposure model, the parameters
  * from the look, the pass itself and the auto white balance step that reads
- * the previous pass's histogram. */
-static int view_process_frame(struct view_state *st)
+ * the previous pass's histogram. `flags` are CRAW_FRAME_FLAG_* bits added
+ * for this one pass on top of what the look asks for; zero for every
+ * picture that is meant to be looked at. */
+static int view_process_frame(struct view_state *st, uint32_t flags)
 {
     CRAWFrameParams fp;
     int ret;
@@ -1254,6 +1257,7 @@ static int view_process_frame(struct view_state *st)
     view_crop_from_clip(st, st->frame);
 
     view_frame_params(st, &fp);
+    fp.flags |= flags;
     /* Taken before the white balance step below moves the track, so that a
      * new estimate counts as a change and a paused picture follows it. */
     st->processed = view_pipeline_look(st);
@@ -1298,7 +1302,7 @@ static int view_process_frame(struct view_state *st)
     return 0;
 }
 
-int view_replay_frame(struct view_state *st)
+int view_replay_frame_flags(struct view_state *st, uint32_t flags)
 {
     if (!st->dec.raw || !st->have_frame || !st->frame->buf[0] ||
         st->frame->format != AV_PIX_FMT_VULKAN) {
@@ -1306,9 +1310,15 @@ int view_replay_frame(struct view_state *st)
         return 0;
     }
 
-    view_log(st, "replay frame %" PRId64 "\n", st->index);
+    view_log(st, "replay frame %" PRId64 "%s\n", st->index,
+             flags ? " (uncompressed, for a pick)" : "");
 
-    return view_process_frame(st);
+    return view_process_frame(st, flags);
+}
+
+int view_replay_frame(struct view_state *st)
+{
+    return view_replay_frame_flags(st, 0);
 }
 
 int view_step_frame(struct view_state *st)
@@ -1462,7 +1472,7 @@ int view_step_frame(struct view_state *st)
         return 2;
     }
 
-    ret = view_process_frame(st);
+    ret = view_process_frame(st, 0);
     if (ret < 0)
         return ret;
 
@@ -1493,8 +1503,9 @@ static int view_lookup(const char *const *names, int nb, const char *opt,
     return CRAW_ERROR(EINVAL);
 }
 
-static int view_parse_wb(struct view_look *lk, const char *arg)
+static int view_parse_wb(struct view_state *st, const char *arg)
 {
+    struct view_look *lk = &st->look;
     char *end;
     double cct, tint = 0.0;
 
@@ -1507,9 +1518,36 @@ static int view_parse_wb(struct view_look *lk, const char *arg)
         return 0;
     }
 
+    /* pick:X,Y: the spot white balance on that source pixel of the first
+     * frame the run develops - frame 0 in the window, the exported frame
+     * headless - through exactly the path the panel's button takes. The
+     * mode stays as it was until the pick lands, and becomes manual with
+     * what it found. */
+    if (!strncmp(arg, "pick:", 5)) {
+        long x, y;
+        const char *p = arg + 5;
+
+        x = strtol(p, &end, 10);
+        if (end == p || *end != ',') {
+            fprintf(stderr, "--wb: expected pick:X,Y in source pixels, got `%s`\n",
+                    arg);
+            return CRAW_ERROR(EINVAL);
+        }
+        p = end + 1;
+        y = strtol(p, &end, 10);
+        if (end == p || *end || x < 0 || y < 0 || x > INT_MAX || y > INT_MAX) {
+            fprintf(stderr, "--wb: expected pick:X,Y in source pixels, got `%s`\n",
+                    arg);
+            return CRAW_ERROR(EINVAL);
+        }
+        view_pick_at(st, (int)x, (int)y);
+        return 0;
+    }
+
     cct = strtod(arg, &end);
     if (end == arg || (*end && *end != ':')) {
-        fprintf(stderr, "--wb: expected as-shot, auto or CCT[:TINT], got `%s`\n", arg);
+        fprintf(stderr, "--wb: expected as-shot, auto, CCT[:TINT] or pick:X,Y, "
+                        "got `%s`\n", arg);
         return CRAW_ERROR(EINVAL);
     }
     if (*end == ':') {
@@ -1621,7 +1659,14 @@ static void view_usage(FILE *f)
 "  -v                  verbose: timings, metadata and libcraw's own log\n"
 "  -h                  this text\n"
 "\n"
-"  --wb MODE           as-shot, auto, or CCT[:TINT] in Kelvin\n"
+"  --wb MODE           as-shot, auto, CCT[:TINT] in Kelvin, or pick:X,Y: the\n"
+"                      spot white balance on the source pixel X,Y of the\n"
+"                      first frame the run develops - frame 0 in the window,\n"
+"                      the exported frame headless - which is the panel's\n"
+"                      \"pick white\" button on that pixel. The 24x24 patch\n"
+"                      around it is read back and the illuminant that makes\n"
+"                      it neutral becomes the manual white balance; -v\n"
+"                      prints what was found\n"
 "  --ei INDEX          working exposure index; the frame is scaled by\n"
 "                      INDEX / as-shot ISO\n"
 "  --exposure STOPS    exposure bias on top of --ei (default: 0)\n"
@@ -1800,9 +1845,11 @@ static void view_usage(FILE *f)
 "one that was drawn, where a left drag draws the rectangle the export is\n"
 "cut to; ctrl+1 and ctrl+2 mark the video export's start and end at the\n"
 "frame on screen; r and t go to the previous and the next file on the\n"
-"command line; m mutes; escape closes an open menu, and otherwise quits,\n"
-"as q does. While a video export runs the panel and every key but q are\n"
-"locked; q stops the export, finishes the file and quits.\n",
+"command line; m mutes; escape disarms the White balance section's \"pick\n"
+"white\" (whose next click on the picture samples instead of panning or\n"
+"cropping), closes an open menu, and otherwise quits, as q does. While a\n"
+"video export runs the panel and every key but q are locked; q stops the\n"
+"export, finishes the file and quits.\n",
     craw_tool_profile_builtin_list());
 }
 
@@ -2011,7 +2058,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return ret;
             break;
         case VIEW_OPT_WB:
-            if ((ret = view_parse_wb(&st->look, optarg)) < 0)
+            if ((ret = view_parse_wb(st, optarg)) < 0)
                 return ret;
             break;
         case VIEW_OPT_EI:
@@ -2638,6 +2685,7 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
             st->quit_pending = true;
         } else if (e->key.key == SDLK_ESCAPE) {
             view_ui_menu_close(st);
+            view_pick_arm(st, false);
         }
         return;
     }
@@ -2771,10 +2819,14 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
         break;
 
     case SDLK_ESCAPE:
-        /* An open cascade is what Escape closes; with none open it quits,
-         * as q does. */
+        /* An open cascade is what Escape closes, and an armed pick is what
+         * it disarms; with neither it quits, as q does. */
         if (st->menu.open) {
             view_ui_menu_close(st);
+            break;
+        }
+        if (st->pick.armed) {
+            view_pick_arm(st, false);
             break;
         }
         *running = false;
@@ -2954,9 +3006,17 @@ static int view_run_window(struct view_state *st)
                 }
                 if (e.button.button == SDL_BUTTON_LEFT &&
                     view_over_picture(st, e.button.x, e.button.y)) {
-                    /* In crop mode the drag draws a rectangle; otherwise it
-                     * pans, which is what it has always done. */
-                    if (st->crop.on) {
+                    /* An armed pick takes the click and nothing else does:
+                     * no pan, no rectangle, and crop mode stays whatever it
+                     * was. Otherwise in crop mode the drag draws a
+                     * rectangle, and otherwise it pans, which is what it
+                     * has always done. */
+                    if (st->pick.armed) {
+                        int px, py;
+
+                        view_mouse_pos(st, e.button.x, e.button.y, &px, &py);
+                        view_pick_click(st, px, py);
+                    } else if (st->crop.on) {
                         int px, py;
 
                         view_mouse_pos(st, e.button.x, e.button.y, &px, &py);
@@ -3110,6 +3170,21 @@ static int view_run_window(struct view_state *st)
                         break;
                 }
             }
+        }
+
+        /* A pick that is waiting - a click that landed, or --wb pick:X,Y
+         * until the first picture - is taken here, once a picture is held
+         * and nothing is about to replace it: it puts that picture through
+         * the pipeline twice and reads the device back, which is not a
+         * thing to do from inside the event handler or under an export.
+         * The click has already paused the transport, so what it is taken
+         * on is the picture on screen. */
+        if (st->pick.pending && !st->exp.active && !st->video.active &&
+            st->have_frame && !st->need_frame && st->seek_to < 0) {
+            ret = view_pick_run(st);
+            if (ret < 0)
+                break;
+            st->present_due = true;
         }
 
         now = av_gettime_relative();
@@ -3333,6 +3408,9 @@ static void view_close(struct view_state *st)
     view_adjust_close(&st->adjustments);
     view_gpu_close(&st->gpu);
 
+    /* The crosshair, if a pick was still armed, before the window it was
+     * shown on. */
+    view_pick_arm(st, false);
     if (st->win)
         SDL_DestroyWindow(st->win);
     if (st->sdl_init)
@@ -3348,6 +3426,39 @@ static int64_t view_phase(const struct view_state *st, int64_t t0, const char *w
     view_log(st, "%s: %.0f ms\n", what, (double)(now - t0) / 1000.0);
 
     return now;
+}
+
+/* --wb pick:X,Y without a window: the pick is taken on the first frame the
+ * run exports, before the export starts, so that the still or every frame
+ * of the video is developed with what it found. The walk is the export's
+ * own - one seek, then decode until the frame is the one wanted - and the
+ * export then finds the picture already held and does not walk again. */
+static int view_headless_pick(struct view_state *st, int64_t frame)
+{
+    int ret;
+
+    st->seek_to = frame;
+    while (1) {
+        ret = view_step_frame(st);
+        if (ret == 2 || ret == 3)
+            continue;           /* dropped as stale, or the reader is behind */
+        if (ret < 0)
+            return ret;
+        if (ret > 0) {
+            fprintf(stderr, "--wb pick: the clip ends before frame %" PRId64 "\n",
+                    frame);
+            return CRAW_ERROR(ENOENT);
+        }
+        if (st->index == frame)
+            break;
+        if (st->index > frame) {
+            fprintf(stderr, "--wb pick: the seek to frame %" PRId64 " landed on "
+                            "%" PRId64 "\n", frame, st->index);
+            return CRAW_ERROR(EIO);
+        }
+    }
+
+    return view_pick_run(st);
 }
 
 static int view_run_headless(struct view_state *st)
@@ -3377,6 +3488,14 @@ static int view_run_headless(struct view_state *st)
     if (ret < 0)
         return ret;
     t0 = view_phase(st, t0, "decoder, profile and LUT");
+
+    if (st->pick.pending) {
+        ret = view_headless_pick(st, st->cfg.export_video ? st->cfg.video_start
+                                                          : st->cfg.export_frame);
+        if (ret < 0)
+            return ret;
+        t0 = view_phase(st, t0, "spot white balance");
+    }
 
     if (st->cfg.export_video) {
         struct view_encode_opts o = {

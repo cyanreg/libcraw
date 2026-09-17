@@ -1574,6 +1574,27 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
     if (nk_option_label(ctx, "Manual", lk->wb == VIEW_WB_MANUAL))
         lk->wb = VIEW_WB_MANUAL;
 
+    /* The spot white balance. The button arms it and the next click on the
+     * picture samples, so while armed it is lit - its title and border in
+     * the colour the section switches light up in - and the pointer over
+     * the picture is a crosshair; a second press or Escape disarms. What a
+     * pick finds goes into the manual rows below, which is the readout;
+     * what it could not find is the one word beside the button, and
+     * nothing else on the panel says anything about it. */
+    {
+        struct nk_style_button bs = ctx->style.button;
+
+        if (st->pick.armed) {
+            bs.border_color = VIEW_SWITCH_ON;
+            bs.text_normal = bs.text_hover = bs.text_active = VIEW_SWITCH_ON;
+        }
+
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        if (nk_button_label_styled(ctx, &bs, "pick white"))
+            view_pick_arm(st, !st->pick.armed);
+        nk_label(ctx, st->pick.refused, NK_TEXT_LEFT);
+    }
+
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
 
     switch (lk->wb) {
@@ -2673,9 +2694,15 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         view_section_end(ctx);
     }
 
-    /* The end of the lock, for the same reason as its start above. */
+    /* The end of the lock. nuklear's disable rewrites the style in place
+     * and only its end puts the colours back, so this has to be the real
+     * end whenever the top of the panel began one - not the lock-aware
+     * helper, which skips the end while locked so that the sections
+     * inside cannot undo the lock. Skipped here, the style stayed
+     * disabled after the export was over, with nothing left to restore
+     * it: everything greyed out and dead until the program was restarted. */
     if (locked)
-        view_disable_end(st, ctx);
+        nk_widget_disable_end(ctx);
 }
 
 /* ------------------------------------------------------- the crop shade */

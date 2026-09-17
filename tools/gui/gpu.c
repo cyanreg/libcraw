@@ -744,8 +744,9 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
 
     if (!g->slots[0].tex || g->width != w || g->height != h) {
         plfmt = pl_find_named_fmt(g->gpu, "rgba16hf");
-        if (!plfmt || !(plfmt->caps & PL_FMT_CAP_STORABLE)) {
-            fprintf(stderr, "the GPU has no storable RGBA16F format\n");
+        if (!plfmt || !(plfmt->caps & PL_FMT_CAP_STORABLE) ||
+            !(plfmt->caps & PL_FMT_CAP_HOST_READABLE)) {
+            fprintf(stderr, "the GPU has no storable, readable RGBA16F format\n");
             return CRAW_ERROR(ENOTSUP);
         }
 
@@ -757,12 +758,17 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
             pl_tex_destroy(g->gpu, &sl->tex);
             sl->busy = false;
 
+            /* Readable by the host as well, for the spot white balance,
+             * which downloads a patch of it through view_gpu_read_region():
+             * one more usage bit on the image, and the only alternative is
+             * a second full-size texture and a blit. */
             sl->tex = pl_tex_create(g->gpu, pl_tex_params(
-                .w          = (int)w,
-                .h          = (int)h,
-                .format     = plfmt,
-                .storable   = true,
-                .sampleable = true,
+                .w             = (int)w,
+                .h             = (int)h,
+                .format        = plfmt,
+                .storable      = true,
+                .sampleable    = true,
+                .host_readable = true,
             ));
             if (!sl->tex) {
                 fprintf(stderr, "cannot create the %ux%u output texture\n", w, h);
@@ -1208,6 +1214,44 @@ int view_gpu_wait_prev(struct view_gpu *g, struct view_timing *tm)
         g->rec->fence_ms += (double)(av_gettime_relative() - t0) / 1000.0;
 
     sl->busy = false;
+
+    return 0;
+}
+
+int view_gpu_read_region(struct view_gpu *g, int x, int y, int w, int h,
+                         uint16_t *rgba)
+{
+    struct view_slot *sl = &g->slots[g->display_slot];
+
+    if (!g->pipe || !sl->tex || !g->submitted || !rgba)
+        return CRAW_ERROR(EINVAL);
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
+        (uint32_t)(x + w) > g->width || (uint32_t)(y + h) > g->height)
+        return CRAW_ERROR(EINVAL);
+
+    /* The slot's own fence, so that the read is of the pass that was
+     * submitted and not of whatever the texture held before it. `busy` is
+     * left set: the next recording into this slot reads its timestamps
+     * through that flag, and a wait that has already been paid for
+     * returns at once. libplacebo orders its copy behind the semaphore the
+     * slot was released with as well, so this is belt and braces on the
+     * device and a plain statement of intent on the host. */
+    if (sl->busy &&
+        vkWaitForFences(g->vk->device, 1, &sl->fence, VK_TRUE,
+                        UINT64_MAX) != VK_SUCCESS)
+        return CRAW_ERROR(EIO);
+
+    /* The rectangle and nothing else: no row pitch means the rows come
+     * out packed at the rectangle's own width, and a download to host
+     * memory without a callback blocks until the copy has landed. */
+    if (!pl_tex_download(g->gpu, pl_tex_transfer_params(
+            .tex = sl->tex,
+            .rc  = { x, y, 0, x + w, y + h, 1 },
+            .ptr = rgba,
+        ))) {
+        fprintf(stderr, "cannot read the picture back\n");
+        return CRAW_ERROR(EIO);
+    }
 
     return 0;
 }

@@ -771,6 +771,38 @@ struct view_crop {
     int frame_w, frame_h;
 };
 
+/* The spot white balance: a click on something that ought to be white, and
+ * the illuminant that makes it so. The White balance section's "pick
+ * white" button arms it, the next left click on the picture samples, and
+ * the mode ends with that click; Escape or a second press ends it without
+ * one. The pick itself - the read-back of the patch, the inversion of the
+ * colour stage and the locus lookup - is pick.c, and what it finds lands
+ * in look.manual with the mode set to manual, so that the sliders and the
+ * paused replay do the rest. See VIEW_PICK_SIZE. */
+struct view_pick {
+    bool armed;                 /* the next left click on the picture samples */
+    /* A pick waiting to be taken, in source pixels: a click that landed,
+     * or --wb pick:X,Y until the first frame is held. It is taken on the
+     * run loop rather than in the event handler because it puts the frame
+     * through the pipeline twice and reads the device back, which wants
+     * the frame settled and the export paths out of the way. */
+    bool pending;
+    int x, y;
+    /* Why the last pick was refused, in the one word the section shows
+     * beside the button - "clipped" or "too dark" - and empty when it took
+     * or none has been made. Cleared when the next one is armed. */
+    char refused[12];
+    /* The crosshair shown while armed, created on arming and destroyed on
+     * disarming; NULL headless. */
+    SDL_Cursor *cursor;
+};
+
+/* The patch a pick averages: this many source pixels a side, centred on
+ * the click and held inside the frame. 576 pixels is enough to average the
+ * sensor's noise well below the locus's own resolution and small enough
+ * to sit on a sheet of paper at 5.8K. */
+#define VIEW_PICK_SIZE 24
+
 /* How well the picture is keeping up with the master clock. */
 struct view_sync {
     double diff;                /* clock minus frame pts at present time */
@@ -963,6 +995,7 @@ struct view_state {
     struct view_trace trace;
     struct view_zoom view;
     struct view_crop crop;
+    struct view_pick pick;
     struct view_grain grain;
     struct view_denoise denoise;
     struct view_lens lens;
@@ -1162,6 +1195,14 @@ int  view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
                            enum CRAWColorSpace space, int x, int y, int w, int h,
                            float *rgba, double *gpu_ms, double *dl_ms);
 
+/* Reads the rectangle (x, y, w, h) of the picture on screen back from the
+ * display slot's own RGBA16F texture, as the texels libcraw wrote: w * h
+ * packed RGBA halves, rows tightly packed. Waits for that slot's
+ * submission first. Nothing about the picture changes; this is what the
+ * spot white balance samples through. */
+int  view_gpu_read_region(struct view_gpu *g, int x, int y, int w, int h,
+                          uint16_t *rgba);
+
 /* The overlay texture nuklear draws into. On a resize the previous texture
  * and view are kept until view_gpu_ui_drop_old(), which must be called once
  * nuklear has rebuilt its framebuffers from the new view. */
@@ -1356,8 +1397,13 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
 
 /* Runs the picture on screen through the pipeline again with the current
  * look. A no-op for an already developed clip, whose grade is applied at
- * display time, and while no picture is held. */
+ * display time, and while no picture is held. The second form adds
+ * CRAW_FRAME_FLAG_* bits to the frame's parameters for this one pass,
+ * which is how the spot white balance reads the colour stage's output
+ * uncompressed; the look the picture is recorded as processed with does
+ * not know about them, so the caller puts the frame through again. */
 int  view_replay_frame(struct view_state *st);
+int  view_replay_frame_flags(struct view_state *st, uint32_t flags);
 
 void view_log(const struct view_state *st, const char *fmt, ...)
               craw_printf_format(2, 3);
@@ -1425,6 +1471,12 @@ void view_zoom_reset(struct view_state *st, bool one_to_one);
 void view_pan_fraction(struct view_state *st, float fx, float fy);
 void view_pan_pixels(struct view_state *st, int dx, int dy);
 
+/* Window pixels to the rotated picture's pixels, through the same two
+ * rectangles the display path is built from, so that whatever is placed by
+ * the pointer lands on the pixels it is drawn over at any zoom and pan. */
+void view_picture_pos(const struct view_state *st, int px, int py,
+                      float *sx, float *sy);
+
 /* The crop, drawn by a left drag in crop mode. The positions are in window
  * pixels, the way view_zoom_rects() gives them. */
 void view_crop_begin(struct view_state *st, int px, int py);
@@ -1447,5 +1499,29 @@ bool view_crop_disp_rect(const struct view_state *st, int *x, int *y,
 /* Where that rectangle lands on screen, in window pixels, through the same
  * transform the renderer is handed. False when there is nothing to draw. */
 bool view_crop_screen(const struct view_state *st, pl_rect2df *out);
+
+/* ------------------------------------------------------------- pick.c */
+
+/* Arms the spot white balance, or disarms it: the crosshair goes up or
+ * comes down with it. Arming clears the last refusal's word. */
+void view_pick_arm(struct view_state *st, bool on);
+
+/* A left click on the picture while armed, in window pixels: maps it to
+ * the source pixel under the pointer, queues the pick there, pauses the
+ * transport - a pick is a decision about one frame - and disarms. */
+void view_pick_click(struct view_state *st, int px, int py);
+
+/* Queues a pick at a source pixel, which is what --wb pick:X,Y does. */
+void view_pick_at(struct view_state *st, int x, int y);
+
+/* Takes the queued pick on the frame that is held: puts it through the
+ * pipeline uncompressed, reads the patch back, inverts the colour stage to
+ * the raw ratios and looks the illuminant up on the profile's locus, then
+ * sets the manual white balance to it and puts the frame through again
+ * with the result. A refused pick - too much of the patch clipped or too
+ * dark - leaves the look alone and says why in pick.refused. Returns a
+ * negative error only when the device or the decoder failed; a refusal
+ * is 0. */
+int  view_pick_run(struct view_state *st);
 
 #endif /* CINEVIEW_H */

@@ -89,9 +89,9 @@ last frame; Control with the arrows pans; Tab or `0` fits the picture again
 and `1` is one to one; the wheel zooms about the pointer and a left drag
 pans; `r` and `t` go to the previous and the next file; Ctrl+1 and Ctrl+2
 mark the start and the end of the video export at the frame on screen, the
-whole clip being the default; `m` mutes; Escape closes an open menu and
-otherwise quits, as `q` does. Zoom and pan only touch the view, never the
-export. While a video export runs the whole panel and every key but `q` are
+whole clip being the default; `m` mutes; Escape closes an open menu, calls
+off an armed "pick white", and otherwise quits, as `q` does. Zoom and pan
+only touch the view, never the export. While a video export runs the whole panel and every key but `q` are
 locked, the picture is the export's; `q` then stops the export, finishes
 the file and quits.
 
@@ -134,6 +134,28 @@ off` and the absence of `--grain` start those three off, and `--bypass
 exposure,look,adjustments` pins the other three off whatever the other
 options set, which is how a headless export is handed the state the panel
 is in.
+
+The White balance section's "pick white" button is the spot white balance
+of every raw developer: press it, and the next left click on the picture
+— the pointer is a crosshair while it waits, and Escape or a second press
+calls it off — takes the 24x24 source pixels under the click as something
+that ought to be white and sets the manual white balance to the illuminant
+that makes them so. The patch is read back out of libcraw's own output for
+the frame on screen (paused first: a pick is a decision about one frame),
+the colour stage is undone through the profile's matrix and gains for the
+illuminant the frame was developed with, and the raw ratios that leaves go
+to `craw_profile_neutral_to_illuminant()`; the temperature and tint land
+in the manual sliders. Pixels within 2% of the clip or below the camera's
+noise floor are left out, and a patch with fewer than a quarter of its
+pixels usable is refused with the one word beside the button, "clipped" or
+"too dark". The click does not pan and does not draw a crop, whatever mode
+the picture is in. `--wb pick:X,Y` is the same pick on the source pixel
+X,Y of the first frame the run develops — frame 0 in the window, the
+exported frame headless — and `-v` prints what it read and found, then
+checks it: the same patch under the picked illuminant read again, which
+comes out neutral to within a percent (the locus is sampled every 5
+mired, and what is left is the half step between samples), and picked
+again, which returns the same illuminant.
 
 The "Denoise" section sets the strength and reports the noise model it
 found for the clip's own ISO — the stage stays off when the camera has
