@@ -262,9 +262,12 @@ the other's file, and a field keeps what was typed into it while the other
 tab is up. Each field follows its own default name until it is typed into
 — the screenshot's the clip and the frame, the video's the clip and the
 range in the clip's directory — and once a path is typed it is the user's
-and is kept, across clips too. A typed path always wins; the video path's
-extension picks the container as long as the muxer carries the encoder,
-and is refused with the reason otherwise.
+and is kept, across clips too. A typed path always wins. Nothing judges a
+name while it is being typed: the extension picks the container when the
+button is pressed, a name with no extension libavformat knows gets the
+family's container appended (`.png` on the Screenshot tab) in the field
+itself, and a container that will not carry the encoder or the sound is
+refused on the status line under the button, in a sentence.
 
 `--export FRAME OUT` is the screenshot from the command line: it writes one frame
 to one file and exits without opening a window, upright and at the crop

@@ -1899,13 +1899,39 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     view_grey_end(st, ctx, grey);
 }
 
+/* A status line: one row when it fits, wrapped over as many as it takes
+ * when it does not. A refusal is a sentence, and a sentence cut at the
+ * panel's edge is not one anybody can act on. */
+static void view_status_rows(struct nk_context *ctx, const char *text)
+{
+    const struct nk_user_font *f = ctx->style.font;
+    float avail = nk_window_get_content_region(ctx).w
+                - 2.0f * ctx->style.window.padding.x
+                - 2.0f * ctx->style.text.padding.x;
+    float tw = f->width(f->userdata, f->height, text, (int)strlen(text));
+    int lines = 1;
+
+    if (avail > 1.0f && tw > avail)
+        lines = CRAW_MIN((int)ceilf(tw * 1.15f / avail), 4);
+
+    if (lines == 1) {
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        nk_label(ctx, text, NK_TEXT_LEFT);
+    } else {
+        float line = f->height + 2.0f * ctx->style.text.padding.y;
+
+        nk_layout_row_dynamic(ctx, CRAW_MAX(VIEW_ROW, (float)lines * line + 4.0f), 1);
+        nk_label_wrap(ctx, text);
+    }
+}
+
 /* The sound row of the Video block: a combo of the six modes, with the
  * ones the file's container will not carry greyed and labelled with the
  * muxer's own reason, and under it the one number the mode takes. What the
- * container is comes from the file field, so typing `.mov` into it greys
- * opus and flac right there. */
+ * container is comes from the file field: the popup, which only opens once
+ * the field is left, greys opus and flac under a `.mov`. */
 static void view_panel_export_audio(struct nk_context *ctx, struct view_state *st,
-                                    const char *path, const char *why)
+                                    const char *path)
 {
     struct view_preset_sel *sel = &st->look.video_preset;
     const struct view_audio_spec *m;
@@ -1962,14 +1988,6 @@ static void view_panel_export_audio(struct nk_context *ctx, struct view_state *s
                : mode == VIEW_AUDIO_WAV  ? "PCM at the clip's depth"
                : "no sound", NK_TEXT_LEFT);
     }
-
-    /* Why the selected mode cannot go into this file, in full: the popup
-     * says it beside the entry, but the entry that is selected is the one
-     * that has to say it out loud. */
-    if (why) {
-        nk_layout_row_dynamic(ctx, VIEW_ROW * 2.0f, 1);
-        nk_labelf_wrap(ctx, "no audio: %s", why);
-    }
 }
 
 /* The Video block of the Export section: the codec preset and the colour
@@ -1985,7 +2003,7 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     struct view_preset_sel *sel = &st->look.video_preset;
     const struct view_preset_family *fam;
     char want[VIEW_MAX_PATH], label[128];
-    const char *codec, *why, *audio_why = NULL;
+    const char *codec, *why;
     bool busy = v->active;
     bool scene, vulkan;
     /* The last frame there is, which is the most either field can hold:
@@ -2025,8 +2043,10 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
      * the family's container, next to the clip - until it differs from the
      * default it was last given: once it does, it is the user's and is
      * left alone, on this clip and the next. Not while a run is on: the
-     * name the run is writing is the one to show. */
-    if (!busy) {
+     * name the run is writing is the one to show. And not while the field
+     * is being typed into: a field cleared to type a fresh name into would
+     * otherwise be refilled under the cursor. */
+    if (!busy && !v->field_active) {
         view_encode_default_path(st, v->start_ui, v->end_ui, sel, codec,
                                  want, sizeof(want));
         if (!v->field[0] || !strcmp(v->field, v->field_def)) {
@@ -2088,17 +2108,17 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     if (!why && scene && !st->dec.raw)
         why = "a scene-referred export comes out of the raw pipeline, and "
               "this clip is already developed";
-    /* The file's own say: a typed extension picks the container, and a
-     * container that does not carry the encoder is refused here, in a
-     * sentence, rather than at the muxer with a file already open. The
-     * sound's refusal is shown on its own row below. */
-    if (!why && !busy)
-        why = view_encode_video_why_not(st, v->field, sel, st->cfg.export_codec);
-    if (!busy && view_encode_has_audio(st))
-        audio_why = view_encode_audio_why_not(st, v->field, sel->audio_mode);
-    /* Three rows of height for both: a wrapped label clips at the bottom of
-     * the rectangle it is given, and a refusal that ends mid-sentence is
-     * not a refusal anybody can act on. */
+    /* What the file's name decides - the container, whether it carries the
+     * encoder and the sound - is judged when the button is pressed, by
+     * view_encode_begin(), and never while the name is being typed: every
+     * name on the way from `.mkv` to `.mp4` is a name that picks no muxer,
+     * and a row that appeared above the field for as long as that lasted
+     * pushed the field down the panel, out of the window and out of
+     * nuklear's hands, which drops a text field it cannot see. A row that
+     * comes and goes under the cursor is not a refusal, it is a fight. */
+    /* Three rows of height: a wrapped label clips at the bottom of the
+     * rectangle it is given, and a refusal that ends mid-sentence is not a
+     * refusal anybody can act on. */
     if (why) {
         nk_layout_row_dynamic(ctx, VIEW_ROW * 3.0f, 1);
         nk_labelf_wrap(ctx, "cannot export: %s", why);
@@ -2204,7 +2224,7 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
             view_disable_end(st, ctx);
     }
 
-    view_panel_export_audio(ctx, st, v->field, audio_why);
+    view_panel_export_audio(ctx, st, v->field);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
     if (nk_property_int(ctx, "#start", 0, &v->start_ui, last, 1, 1.0f))
@@ -2214,9 +2234,12 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     nk_label(ctx, "file (the extension picks the container)", NK_TEXT_LEFT);
-    if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, v->field,
-                                       sizeof(v->field),
-                                       nk_filter_default) & NK_EDIT_ACTIVE)
+    v->field_active = !!(nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD,
+                                                        v->field,
+                                                        sizeof(v->field),
+                                                        nk_filter_default)
+                         & NK_EDIT_ACTIVE);
+    if (v->field_active)
         st->ui_edit_active = true;
 
     /* The one stretch of a locked panel that stays live: the stop button,
@@ -2229,7 +2252,7 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     if (nk_button_label(ctx, busy ? "stop" : "export video")) {
         if (busy) {
             view_encode_cancel(st);
-        } else if (!why && !audio_why) {
+        } else if (!why) {
             struct view_encode_opts o = {
                 .start = v->start_ui,
                 .end   = v->end_ui,
@@ -2239,6 +2262,12 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
                 .enc   = st->cfg.export_enc,
             };
 
+            /* A name without an extension gets the family's container,
+             * in the field itself, so that what the panel shows is what
+             * is written. Everything else about the name - a container
+             * that will not carry the encoder or the sound - is refused by
+             * the engine, on the status line under this button. */
+            view_encode_complete_path(sel, codec, v->field, sizeof(v->field));
             v->range_set = true;
             view_encode_begin(st, &o);
         }
@@ -2249,10 +2278,8 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         nk_progress(ctx, &cur, 1000, nk_false);
     }
 
-    if (v->status[0]) {
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        nk_labelf(ctx, NK_TEXT_LEFT, "%s", v->status);
-    }
+    if (v->status[0])
+        view_status_rows(ctx, v->status);
     if (v->path[0]) {
         const char *name = strrchr(v->path, '/');
 
@@ -2275,17 +2302,24 @@ static void view_panel_export_still(struct nk_context *ctx, struct view_state *s
     char want[VIEW_MAX_PATH];
     int x, y, w, h;
 
-    view_export_default_path(st, st->index, want, sizeof(want));
-    if (!e->field[0] || !strcmp(e->field, e->field_def)) {
-        snprintf(e->field, sizeof(e->field), "%s", want);
-        snprintf(e->field_def, sizeof(e->field_def), "%s", want);
+    /* Not while the field is being typed into: a field cleared to type a
+     * fresh name into would otherwise be refilled under the cursor. */
+    if (!e->field_active) {
+        view_export_default_path(st, st->index, want, sizeof(want));
+        if (!e->field[0] || !strcmp(e->field, e->field_def)) {
+            snprintf(e->field, sizeof(e->field), "%s", want);
+            snprintf(e->field_def, sizeof(e->field_def), "%s", want);
+        }
     }
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     nk_label(ctx, "file (the extension picks the format)", NK_TEXT_LEFT);
-    if (nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, e->field,
-                                       sizeof(e->field),
-                                       nk_filter_default) & NK_EDIT_ACTIVE)
+    e->field_active = !!(nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD,
+                                                        e->field,
+                                                        sizeof(e->field),
+                                                        nk_filter_default)
+                         & NK_EDIT_ACTIVE);
+    if (e->field_active)
         st->ui_edit_active = true;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
@@ -2295,6 +2329,10 @@ static void view_panel_export_still(struct nk_context *ctx, struct view_state *s
          * name implies; there is no codec box, the extension is the
          * choice. */
         st->playing = false;
+        /* A name without an extension gets the .png the default has, in
+         * the field itself, so that what the panel shows is what is
+         * written. */
+        view_export_complete_path(e->field, sizeof(e->field));
         view_export_begin(st, st->index, e->field, NULL);
     }
     /* What the file will be, which is the rotated size: the still is
@@ -2304,10 +2342,8 @@ static void view_panel_export_still(struct nk_context *ctx, struct view_state *s
     else
         nk_labelf(ctx, NK_TEXT_LEFT, "%dx%d full", w, h);
 
-    if (e->status[0]) {
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        nk_labelf(ctx, NK_TEXT_LEFT, "%s", e->status);
-    }
+    if (e->status[0])
+        view_status_rows(ctx, e->status);
 }
 
 /* The Export section's two tabs. The screenshot of the frame on screen and

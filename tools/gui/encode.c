@@ -2069,12 +2069,31 @@ out:
 
 /* ---------------------------------------------------------------- the run */
 
+/* The extension the selection writes by default. The family names its own
+ * container - QuickTime for the codecs a camera writes, Matroska for the
+ * archival ones it does not, MP4 for x264 - because a .mov with FFV1 in it
+ * is not a file anything else will open. A --codec that is not one of the
+ * families falls back to what its name says. */
+static const char *view_enc_ext(const struct view_preset_sel *sel,
+                                const char *codec)
+{
+    if (sel && (!codec || !codec[0] || !strcmp(codec, view_presets_encoder(sel))))
+        return view_presets_container(sel);
+    if (codec && (strstr(codec, "ffv1") || strstr(codec, "x265") ||
+                  strstr(codec, "hevc") || strstr(codec, "vp9") ||
+                  strstr(codec, "huff")))
+        return "mkv";
+    if (codec && (strstr(codec, "av1") || strstr(codec, "apv")))
+        return "mp4";
+    return "mov";
+}
+
 void view_encode_default_path(const struct view_state *st, int64_t start,
                               int64_t end, const struct view_preset_sel *sel,
                               const char *codec, char *out, size_t size)
 {
     const char *file = strrchr(st->cfg.input, '/');
-    const char *dot, *ext = "mov";
+    const char *dot;
     char base[128];
     size_t n;
 
@@ -2085,24 +2104,23 @@ void view_encode_default_path(const struct view_state *st, int64_t start,
     memcpy(base, file, n);
     base[n] = '\0';
 
-    /* The family names its own container - QuickTime for the codecs a
-     * camera writes, Matroska for the archival ones it does not, MP4 for
-     * x264 - because a .mov with FFV1 in it is not a file anything else
-     * will open. A --codec that is not one of the families falls back to
-     * what its name says. */
-    if (sel && (!codec || !codec[0] ||
-                !strcmp(codec, view_presets_encoder(sel)))) {
-        ext = view_presets_container(sel);
-    } else if (codec && (strstr(codec, "ffv1") || strstr(codec, "x265") ||
-                         strstr(codec, "hevc") || strstr(codec, "vp9") ||
-                         strstr(codec, "huff"))) {
-        ext = "mkv";
-    } else if (codec && (strstr(codec, "av1") || strstr(codec, "apv"))) {
-        ext = "mp4";
-    }
-
     snprintf(out, size, "%s/%s-%05d-%05d.%s", view_clip_dir(st), base,
-             (int)start, (int)end, ext);
+             (int)start, (int)end, view_enc_ext(sel, codec));
+}
+
+void view_encode_complete_path(const struct view_preset_sel *sel,
+                               const char *codec, char *path, size_t size)
+{
+    size_t len = strlen(path);
+
+    /* A name that picks no muxer has no extension libavformat knows, and
+     * the selection's own container is what such a name means. A name that
+     * ends in a slash is a directory, which no extension makes a file. */
+    if (!len || view_enc_muxer(path) || path[len - 1] == '/')
+        return;
+    if (path[len - 1] == '.')
+        len--;
+    snprintf(path + len, size - len, ".%s", view_enc_ext(sel, codec));
 }
 
 int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
@@ -2224,6 +2242,7 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
         view_encode_default_path(st, e->start, e->end, &e->sel,
                                  v->codec[0] ? v->codec : NULL,
                                  v->path, sizeof(v->path));
+    view_encode_complete_path(&e->sel, o->codec, v->path, sizeof(v->path));
 
     /* Everything the name decides, decided now: the muxer, whether it
      * carries the encoder, and whether it carries the sound the selection

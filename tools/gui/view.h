@@ -706,6 +706,7 @@ struct view_export {
      * which it is the user's and is kept, across clips too. */
     char field[VIEW_MAX_PATH];
     char field_def[VIEW_MAX_PATH];
+    bool field_active;          /* being typed into, as of the last frame */
 
     /* One RGBA16 frame, grown once and kept. */
     uint16_t *rgba;
@@ -1265,6 +1266,9 @@ int  view_export_step(struct view_state *st);
 /* Next to the clip, named after the clip and the frame, .png. */
 void view_export_default_path(const struct view_state *st, int64_t frame,
                               char *out, size_t size);
+/* Gives a name that picks no muxer the .png the default has, in place; a
+ * name that already picks one is left alone. `size` is the buffer's. */
+void view_export_complete_path(char *path, size_t size);
 
 /* ----------------------------------------------------------- ui.c */
 

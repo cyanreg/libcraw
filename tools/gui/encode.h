@@ -75,6 +75,7 @@ struct view_video {
      * and is left alone, across clips too. */
     char field[1024];
     char field_def[1024];
+    bool field_active;          /* being typed into, as of the last frame */
 
     /* The frame that was on screen when the run started, and whether there
      * was one: the export walks the decoder, and when it is done the
@@ -100,6 +101,12 @@ void view_encode_list(void);
 void view_encode_default_path(const struct view_state *st, int64_t start,
                               int64_t end, const struct view_preset_sel *sel,
                               const char *codec, char *out, size_t size);
+
+/* Gives a name that picks no muxer the extension the selection writes by
+ * default, in place: "awb" is awb.mkv under FFV1 and awb.mov under ProRes.
+ * A name that already picks one is left alone. `size` is the buffer's. */
+void view_encode_complete_path(const struct view_preset_sel *sel,
+                               const char *codec, char *path, size_t size);
 
 /* Whether the open clip has a sound track the export could carry at all,
  * by the same rule that picks it. A clip without one is exported without

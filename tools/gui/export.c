@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <libavformat/avformat.h>
 #include <libavutil/time.h>
 
 #include "view.h"
@@ -42,6 +43,20 @@ void view_export_default_path(const struct view_state *st, int64_t frame,
     snprintf(out, size, "%s/%s-%05d.png", view_clip_dir(st), base, (int)frame);
 }
 
+void view_export_complete_path(char *path, size_t size)
+{
+    size_t len = strlen(path);
+
+    /* A name that picks no muxer has no extension libavformat knows, and
+     * the default's PNG is what such a name means. A name that ends in a
+     * slash is a directory, which no extension makes a file. */
+    if (!len || av_guess_format(NULL, path, NULL) || path[len - 1] == '/')
+        return;
+    if (path[len - 1] == '.')
+        len--;
+    snprintf(path + len, size - len, ".png");
+}
+
 void view_export_begin(struct view_state *st, int64_t frame, const char *path,
                        const char *codec)
 {
@@ -59,6 +74,7 @@ void view_export_begin(struct view_state *st, int64_t frame, const char *path,
         snprintf(e->path, sizeof(e->path), "%s", path);
     else
         view_export_default_path(st, e->frame, e->path, sizeof(e->path));
+    view_export_complete_path(e->path, sizeof(e->path));
 
     /* A clean peak detection track, so that one frame exported twice gives
      * the same file twice. */
