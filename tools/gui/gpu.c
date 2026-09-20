@@ -1589,8 +1589,18 @@ static void view_render_params(struct view_state *st,
      * simulation in RawTherapee.
      *
      * The Look section's switch takes both away at once and leaves the
-     * selection selected, which is what view_look_active() answers. */
-    rp->lut = st->look.film_sim >= 0 || !view_look_active(st) ? NULL : st->lut;
+     * selection selected, which is what view_look_active() answers.
+     *
+     * The menu's preview stands in for the chosen film on the window, and
+     * shows as the rendering would once picked: the hook attached whatever
+     * the section's switch says, since picking switches it on, and in
+     * place of a user .cube, since picking replaces it. An export renders
+     * the choice. */
+    const struct pl_custom_lut *film =
+        !export_path && st->preview ? st->preview
+      : view_look_active(st) && st->look.film_sim >= 0 ? st->lut : NULL;
+
+    rp->lut = !film && st->look.film_sim < 0 && view_look_active(st) ? st->lut : NULL;
     rp->lut_type = st->look.lut_space > 0 ? PL_LUT_CONVERSION : st->look.lut_type;
 
     /* Only the non-raw path needs a shader for exposure; on the raw path
@@ -1624,8 +1634,7 @@ static void view_render_params(struct view_state *st,
         craw_adjust *aj = view_adjust_state(st, export_path);
         const struct pl_hook *h;
 
-        if (aj && view_look_active(st) && st->look.film_sim >= 0 && st->lut &&
-            (h = craw_adjust_lut(aj, st->lut)))
+        if (aj && film && (h = craw_adjust_lut(aj, film)))
             hook[nb_hooks++] = h;
 
         /* Soft light and vibrance are one switch of their own: the
@@ -1671,6 +1680,9 @@ static void view_render_params(struct view_state *st,
     *sig = view_hash(*sig, adj, sizeof(*adj));
     *sig = view_hash(*sig, &rp->lut, sizeof(rp->lut));
     *sig = view_hash(*sig, &rp->lut_type, sizeof(rp->lut_type));
+    /* The film hook is one object whichever LUT it carries, so the LUT
+     * itself is what tells a preview from the choice. */
+    *sig = view_hash(*sig, &film, sizeof(film));
     *sig = view_hash(*sig, &nb_hooks, sizeof(nb_hooks));
     *sig = view_hash(*sig, hook, (size_t)nb_hooks * sizeof(hook[0]));
     *sig = view_hash(*sig, &st->look, offsetof(struct view_look, video_preset));

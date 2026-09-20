@@ -394,20 +394,29 @@ int view_lut_select_film(struct view_state *st, int index)
         return CRAW_ERROR(EINVAL);
     }
 
-    /* The pack stores the LUT quantized; this is the one place it is
-     * expanded, and only ever for the rendering that was picked. */
-    ret = view_luts_cube_text(index, &text, &len);
-    if (ret < 0) {
-        snprintf(st->lut_error, sizeof(st->lut_error), "cannot unpack the LUT");
-        return ret;
-    }
+    /* A pick from the menu is a pick of what its highlight was on, which
+     * the preview has already parsed and shown: that LUT is handed over
+     * as it is. Otherwise - --lut on the command line - the pack's
+     * quantized LUT is expanded here, for this rendering alone. */
+    if (st->preview && st->preview_sim == index) {
+        pl_lut_free(&st->lut);
+        st->lut = st->preview;
+        st->preview = NULL;
+        st->preview_sim = -1;
+    } else {
+        ret = view_luts_cube_text(index, &text, &len);
+        if (ret < 0) {
+            snprintf(st->lut_error, sizeof(st->lut_error), "cannot unpack the LUT");
+            return ret;
+        }
 
-    pl_lut_free(&st->lut);
-    st->lut = pl_lut_parse_cube(st->gpu.log, text, len);
-    view_luts_cube_free(text);
-    if (!st->lut) {
-        snprintf(st->lut_error, sizeof(st->lut_error), "the packed LUT did not parse");
-        return CRAW_ERROR(EINVAL);
+        pl_lut_free(&st->lut);
+        st->lut = pl_lut_parse_cube(st->gpu.log, text, len);
+        view_luts_cube_free(text);
+        if (!st->lut) {
+            snprintf(st->lut_error, sizeof(st->lut_error), "the packed LUT did not parse");
+            return CRAW_ERROR(EINVAL);
+        }
     }
 
     /* One LUT at a time: a film simulation and a user .cube would
@@ -424,6 +433,36 @@ int view_lut_select_film(struct view_state *st, int index)
              st->lut->size[0], st->lut->size[1], st->lut->size[2]);
 
     return 0;
+}
+
+void view_lut_preview(struct view_state *st, int index)
+{
+    char *text = NULL;
+    size_t len = 0;
+
+    /* The chosen rendering previews as itself: nothing to show that the
+     * window is not showing already. */
+    if (index == st->look.film_sim)
+        index = -1;
+    if (index == st->preview_sim)
+        return;
+
+    pl_lut_free(&st->preview);
+    st->preview_sim = -1;
+    if (index < 0)
+        return;
+
+    /* A rendering that cannot be unpacked or parsed previews as nothing,
+     * and says nothing: the click on it is what reports the failure. */
+    if (view_luts_cube_text(index, &text, &len) < 0)
+        return;
+    st->preview = pl_lut_parse_cube(st->gpu.log, text, len);
+    view_luts_cube_free(text);
+    if (!st->preview)
+        return;
+
+    view_lut_apply_space(st->preview, st->look.lut_space);
+    st->preview_sim = index;
 }
 
 /* Prints both category trees, indented, the way the menu walks them. */
@@ -468,6 +507,12 @@ int view_lut_select_film(struct view_state *st, int index)
     snprintf(st->lut_error, sizeof(st->lut_error),
              "built without the film simulation collection");
     return CRAW_ERROR(ENOTSUP);
+}
+
+void view_lut_preview(struct view_state *st, int index)
+{
+    (void)st;
+    (void)index;
 }
 
 static void view_list_luts(void)
@@ -3453,6 +3498,7 @@ static void view_close(struct view_state *st)
     view_encode_close(st);
     free(st->exp.rgba);
     pl_lut_free(&st->lut);
+    pl_lut_free(&st->preview);
     av_frame_free(&st->frame);
     craw_awb_smoother_free(&st->awb.smoother);
 
@@ -3616,6 +3662,7 @@ int main(int argc, char **argv)
     view_presets_default(&st.look.video_preset);
     for (int i = 0; i < VIEW_MENU_COLS; i++)
         st.menu.sel[i] = -1;
+    st.preview_sim = -1;
     st.seek_to = -1;
     st.seek_target = -1;
     st.playing = true;

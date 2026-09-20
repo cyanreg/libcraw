@@ -204,6 +204,11 @@ row opens a cascading menu over the same two category trees the site uses,
 Films (colour negative, slide, black and white, instant, cinema print,
 Fujifilm simulations) and Looks (warm, cool, vintage, cinematic and so on),
 by a click on the row; a click elsewhere, a choice or Escape closes it.
+The rendering the highlight rests on is previewed on the picture while it
+does, with the menu open and wherever the pointer goes from there, so the
+collection can be walked rather than picked through; a click keeps it and
+closing the menu any other way puts the chosen one back. Exports never see
+a preview.
 `--lut` takes a rendering's name or slug as well as a file path, and
 `--list-luts` prints both trees. The `.cube` files live in the tree; the
 compact pack that ends up in the executable is built by

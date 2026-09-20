@@ -1421,6 +1421,9 @@ void view_ui_menu_close(struct view_state *st)
 {
     st->menu.open = false;
     st->menu.cols = 0;
+    /* A pick has already taken the preview over; anything else closing
+     * the menu puts the chosen rendering back. */
+    view_lut_preview(st, -1);
 }
 
 bool view_ui_menu_covers(const struct view_state *st, float x, float y)
@@ -1537,6 +1540,16 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
     }
 
     view_menu_layout(ctx, st);
+
+    /* The film menu's highlight is a preview: whatever rendering the leaf
+     * column's rests on is shown while it does. The leaf is the last
+     * column open, and view_menu_lut() answers -1 for anything that is
+     * not a rendering - a parent column, or a leaf with nothing
+     * highlighted yet - which is no preview. */
+    if (m->kind == VIEW_MENU_FILM)
+        view_lut_preview(st, view_menu_lut(st, m->cols - 1,
+                                           m->sel[m->cols - 1]));
+
     view_menu_draw(ctx, st);
 }
 

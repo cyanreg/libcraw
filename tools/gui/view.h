@@ -1064,6 +1064,16 @@ struct view_state {
     struct pl_custom_lut *lut;
     char lut_error[128];
 
+    /* The rendering the film simulation menu's highlight rests on, parsed
+     * and shown in place of the chosen one for as long as it does: a
+     * preview, so that the menu can be walked to see what each one looks
+     * like rather than picked and unpicked. A click hands it over and it
+     * becomes the choice, at no cost; the menu closing any other way, or
+     * the highlight moving off the leaf column, takes it away. Only the
+     * window shows it: an export renders the choice. */
+    struct pl_custom_lut *preview;
+    int preview_sim;            /* which rendering, -1 for none */
+
     /* Volume as the panel holds it; the callback ramps towards it.
      * nuklear's checkbox wants an int, so the flag is mirrored. */
     float volume;
@@ -1447,6 +1457,9 @@ void view_lut_clear(struct view_state *st);
  * materializes it as .cube text and hands that to the same parser a user
  * LUT goes through. Clears look.lut_path: one LUT is active at a time. */
 int  view_lut_select_film(struct view_state *st, int index);
+/* Previews rendering `index`, -1 or the chosen one for none. Idempotent:
+ * the menu calls it every frame with whatever its highlight is on. */
+void view_lut_preview(struct view_state *st, int index);
 /* The name to print for the current selection, or "none". */
 const char *view_lut_film_name(const struct view_state *st);
 
