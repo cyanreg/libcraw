@@ -249,6 +249,14 @@ float view_denoise_strength(const struct view_state *st)
     return st->denoise.strength;
 }
 
+float view_chroma_strength(const struct view_state *st)
+{
+    if (!st->denoise.on || !(st->denoise.chroma > 0.0f))
+        return 0.0f;
+
+    return CRAW_MIN(st->denoise.chroma, 1.0f);
+}
+
 /* The warp runs when the switch is on and the picture on screen carried a
  * record. A clip whose frames have none - every ProRes RAW clip that is not
  * from this camera - can never turn it on, which is why the panel's row
@@ -276,6 +284,7 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
      * so craw_pipeline_record() evaluates the table at the frame's own
      * as-shot index. */
     fp->denoise_strength = view_denoise_strength(st);
+    fp->denoise_chroma_strength = view_chroma_strength(st);
     /* The pipeline is always built with the stage (gpu.c), so the count is
      * all it takes; zero is not dispatched. */
     fp->false_color_passes = (uint32_t)CRAW_CLAMP(st->look.false_color, 0,
@@ -309,6 +318,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .ambience   = st->awb.params.ambience,
         .debayer    = st->look.debayer,
         .false_color = st->look.false_color,
+        .chroma     = view_chroma_strength(st),
         .denoise    = view_denoise_strength(st),
         .lens       = view_lens_active(st),
         .lens_keep  = view_lens_keep_all(st),
@@ -326,7 +336,7 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->illum.cct == b->illum.cct && a->illum.tint == b->illum.tint &&
            a->ei == b->ei && a->exposure == b->exposure &&
            a->ambience == b->ambience && a->debayer == b->debayer &&
-           a->false_color == b->false_color &&
+           a->false_color == b->false_color && a->chroma == b->chroma &&
            a->denoise == b->denoise && a->lens == b->lens &&
            a->lens_keep == b->lens_keep;
 }
@@ -1684,11 +1694,16 @@ static void view_usage(FILE *f)
 "                      coloured dots of glints smaller than a CFA quad\n"
 "                      neutral and leave luminance alone; 0 (the default)\n"
 "                      is off. The Debayer section has the same row\n"
-"  --denoise STRENGTH  raw domain denoising, in units of the camera's\n"
+"  --denoise STRENGTH[,CHROMA]\n"
+"                      raw domain denoising, in units of the camera's\n"
 "                      modelled noise level: 1.0 removes exactly that much,\n"
-"                      0.25 to 3.0, 0 (the default) leaves it off. Needs a\n"
-"                      noise model for the clip's ISO; the Denoise section\n"
-"                      says which one it found\n"
+"                      0.25 to 3.0, 0 (the default) leaves the section off.\n"
+"                      Needs a noise model for the clip's ISO; the Denoise\n"
+"                      section says which one it found. CHROMA, 0 to 1, is\n"
+"                      the section's chroma denoise after the debayer, the\n"
+"                      luma-guided smoothing of the quarter resolution\n"
+"                      chroma band; it needs no model and defaults to 1\n"
+"                      when the section is on\n"
 "  --lens on|off       geometric lens correction from each frame's own\n"
 "                      optical_correction record: a per-channel radial warp\n"
 "                      after the colour stage that takes the distortion out\n"
@@ -2044,9 +2059,9 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         case VIEW_OPT_DENOISE: {
             float v2 = strtof(optarg, &end);
 
-            if (end == optarg || *end || v2 < 0.0f || v2 > 3.0f) {
-                fprintf(stderr, "--denoise: expected a strength from 0 to 3, "
-                                "got `%s`\n", optarg);
+            if (end == optarg || (*end && *end != ',') || v2 < 0.0f || v2 > 3.0f) {
+                fprintf(stderr, "--denoise: expected STRENGTH[,CHROMA], the strength "
+                                "0 to 3, got `%s`\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
             /* Zero keeps it off and leaves the panel's own strength where
@@ -2054,6 +2069,20 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             st->denoise.on = v2 > 0.0f;
             if (v2 > 0.0f)
                 st->denoise.strength = v2;
+            if (*end == ',') {
+                const char *arg = end + 1;
+                float c2 = strtof(arg, &end);
+
+                if (end == arg || *end || c2 < 0.0f || c2 > 1.0f) {
+                    fprintf(stderr, "--denoise: CHROMA must be 0 to 1, got `%s`\n", arg);
+                    return CRAW_ERROR(EINVAL);
+                }
+                st->denoise.chroma = c2;
+                /* A chroma strength alone is still a reason to switch the
+                 * section on. */
+                if (c2 > 0.0f)
+                    st->denoise.on = true;
+            }
             break;
         }
         case VIEW_OPT_SOFTLIGHT:
@@ -2409,8 +2438,9 @@ static void view_log_look(const struct view_state *st)
     if (lk->false_color)
         fprintf(stderr, ", false colour x%d", lk->false_color);
 
-    if (st->denoise.on && st->denoise.strength > 0.0f)
-        fprintf(stderr, ", denoise %.2f", st->denoise.strength);
+    if (st->denoise.on && (st->denoise.strength > 0.0f || st->denoise.chroma > 0.0f))
+        fprintf(stderr, ", denoise %.2f, chroma %.2f", st->denoise.strength,
+                st->denoise.chroma);
     else
         fprintf(stderr, ", denoise off");
 
@@ -3596,6 +3626,7 @@ int main(int argc, char **argv)
      * defaults. The strength is set even though the stage is off, so that
      * the panel's switch turns it on at something sensible. */
     st.denoise.strength = 1.0f;
+    st.denoise.chroma = 1.0f;
     /* On by default: a frame that carries a record is a frame the camera
      * expects to be corrected, and one that does not is untouched either
      * way. --lens off turns it off. */

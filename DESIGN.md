@@ -26,6 +26,9 @@ In:
   including a sensor noise model by exposure index.
 - Raw domain denoising: non-local means on the four CFA planes in a
   variance stabilised domain, optional, per-frame strength. Section 14.
+- Chroma denoising after the debayer: the quarter resolution chroma band
+  replaced by its luma-guided bilateral smoothing, optional, per-frame
+  strength. Section 14.4.
 - False colour suppression: a median and a blur of the colour differences
   after the debayer, one to five passes, optional, per frame. Section 17.
 - Geometric lens correction: a per-channel radial resampling warp on the
@@ -36,8 +39,7 @@ In:
 - CPU reference of every stage, tests comparing it against the GPU.
 
 Out, deliberately, with a slot reserved: temporal denoising (section 14.7
-says how it attaches), a second chroma-only denoise stage (14.4 says why
-not yet), scaling, learned debayer, highlight reconstruction beyond the
+says how it attaches), scaling, learned debayer, highlight reconstruction beyond the
 clip, OCIO-generated transforms, LUTs, other CFA phases, and ARRIRAW and
 BRAW profiles. Vignetting is out too, and unlike distortion it is out for
 good on this camera: the optical_correction record carries no shading
@@ -86,11 +88,17 @@ denoise stage and read by the debayer in its place. Section 14.1.
 Intermediate image (internal): `VK_FORMAT_R16G16B16A16_SFLOAT`, camera RGB
 after prep and debayer, alpha unused.
 
-Filtered intermediate (internal, only with
-`CRAW_PIPELINE_FLAG_FALSE_COLOR`): the intermediate's format, written by
-the false colour stage and read by everything after it in the
-intermediate's place. With RCD it is RCD's own aux image, borrowed; with
-the other methods it is an image of its own. Section 17.3.
+Scratch intermediate (internal, only with `CRAW_PIPELINE_FLAG_FALSE_COLOR`
+or `CRAW_PIPELINE_FLAG_CHROMA_DENOISE`): the intermediate's format, a
+second image for the stages that cannot run in place; each writes it and
+the two swap roles, so what everything downstream reads is always the
+latest. With RCD it is RCD's own aux image, borrowed; with the other
+methods it is an image of its own. Section 17.3.
+
+Quarter resolution chroma images (internal, only with
+`CRAW_PIPELINE_FLAG_CHROMA_DENOISE`): two RGBA16F images of ceil(W/4) x
+ceil(H/4), the block means of (R - G, B - G, G) and the same with the
+differences filtered. Section 14.4.
 
 Linear image (internal, only with `CRAW_PIPELINE_FLAG_LENS`): the output
 format, holding what the colour stage produced before the lens warp reads
@@ -145,6 +153,13 @@ Replaces the intermediate with a copy whose colour differences have been
 median filtered and blurred, G untouched. Defined in section 17; the
 histogram of 4.4 and the colour stage of 4.3 read the copy.
 
+### 4.2c Chroma denoise (optional, after 4.2b)
+
+Replaces the intermediate with a copy whose quarter resolution chroma
+band has been smoothed by a luma-guided bilateral, G untouched. Defined
+in section 14.4; the histogram of 4.4 and the colour stage of 4.3 read
+the copy.
+
 ### 4.3 Colour
 
 With `c` the camera RGB from the intermediate and the frame's
@@ -176,8 +191,8 @@ has to keep meaning "whatever the pipeline was created with".
 
 ### 4.4 Auto white balance histogram (optional stage)
 
-Reads the intermediate (the filtered one when the stage of section 17
-runs) at 1/8 resolution: one sample per 8x8 pixel block,
+Reads the intermediate (the filtered one when the stages of sections 17
+and 14.4 run) at 1/8 resolution: one sample per 8x8 pixel block,
 the mean of the block's camera RGB (a 4x4 arrangement of 2x2 quads). Only
 whole blocks count: floor(W/8) x floor(H/8) samples, any remainder at the
 right and bottom edges is ignored, on the GPU and in the CPU builder alike.
@@ -1476,52 +1491,112 @@ The same applies to the viewer: anything that puts this library's output on
 an 8- or 10-bit surface needs dither at that step, which libplacebo does by
 default.
 
-### 14.4 A chroma stage after the debayer: measured, not built
+### 14.4 The chroma stage after the debayer
 
-The argument for a second, lighter stage is that chroma noise is what
-people see and that a chroma-only filter on a luma/chroma split at reduced
-resolution is cheap. The measurement above says it is not needed yet, and
-says by how much.
+Measured first, and not built then: at ISO 1000 the raw stage leaves the
+chroma noise of a dim shadow at 2.7% of the level (below), and a second
+stage would have been chasing the difference between that and half of it.
+What changed the case is section 17: on a wet street in the rain the
+colour that survives the false colour suppression is not single pixels
+but blobs of three and more — the glints two and three sensels wide that
+the debayer measured on two sites, and the correlated chroma noise of a
+dark road — and a 4K downscale leaves that flicker whole. A quarter
+resolution chroma stage works at exactly that scale. It is the same class
+of operation as Adobe's colour noise reduction, the one setting a photo
+converter turns on for every file, and RawTherapee's wavelet chrominance
+denoise.
 
-The raw stage reduces the output's chroma noise by 3.8x (R-G) and 3.4x
-(B-G) against 4.2x for luma, so the chroma-to-luma ratio moves from 2.00 to
-2.20 at strength 1.0 and 2.42 at strength 2.0. There is a residual — the
-chroma error the stage leaves is slightly more correlated than the luma
-error, because a 7x7 search on a half resolution plane reaches 14x14 full
-resolution pixels and cannot see a blotch larger than that — but in
-absolute terms chroma noise in a dim shadow is down from 10.4% of the level
-to 2.7%, and the second stage would be chasing the difference between 2.7%
-and perhaps 1.4%.
+Where it sits: after the false colour stage of section 17, on the camera
+RGB intermediate, before the histogram of 4.4 and the colour stage of 4.3,
+which read what it leaves. The intermediate is always RGBA16F whatever
+the output space, G is the channel the sensor sampled twice as densely,
+and R - G and B - G are the colour differences the debayer built its
+chroma in.
 
-So: not built this round. What it would be, when it is:
+Definition, three passes:
 
-- Between the debayer and the colour stage, on the camera RGB intermediate,
-  not on the output. The intermediate is always RGBA16F whatever the output
-  space, G is a good luma for a Bayer sensor, and R-G and B-G are the
-  colour difference signals the debayer already builds its chroma in.
-- Three dispatches. Downsample (mean of each 4x4 block of R-G, B-G and G
-  into a quarter resolution RGBA16F image); a joint bilateral blur of the
-  two chroma planes at quarter resolution with the range term on the
-  downsampled G, radius 4, which reaches 36x36 full resolution pixels;
-  then a recombine pass that bilinearly upsamples the filtered differences
-  and writes R = G + d_r, B = G + d_b, blended by the chroma strength.
-- Quarter resolution means the blur itself is 1/16 of the work and the only
-  full resolution passes are a read and a read-modify-write, so the whole
-  thing should land near 0.4 ms, well inside what 14.3 leaves.
-- The luma/chroma split guarantees it cannot soften a luma edge; the range
-  term on G is what stops chroma bleeding across one.
-- It needs its own parameter, `denoise_chroma_strength`, and the CLI
-  spelling is already reserved as `--denoise STRENGTH,CHROMA`.
+    quarter grid: Wq = ceil(W / 4), Hq = ceil(H / 4); texel q holds the
+    mean over the pixels of block [4q, 4q + 4) that lie inside the frame of
+        (d_r, d_b, G) = (R - G, B - G, G)
 
-The measurement to repeat before building it is the chroma-to-luma ratio
-above, on an ISO 12800 frame from the planned series rather than on ISO
-1000: the residual grows with the noise, and a stage that is not worth 0.4
-ms at ISO 1000 may well be at ISO 12800.
+    bilateral, at every texel q, borders mirrored on the quarter grid,
+    with L = max(G_q, 0) + eps the centre's level:
+        w(s) = exp(-(dx^2 + dy^2) / (2 sigma_s^2)
+                   - ((G_s - G_q) / (K L))^2
+                   - ((d_r,s - d_r,q) / (K_c L))^2 - ((d_b,s - d_b,q) / (K_c L))^2)
+        f(q) = sum w(s) d(s) / sum w(s)        over |dx|, |dy| <= R
+    with R = 4, sigma_s = 2 quarter texels, K = 0.35, K_c = 0.35,
+    eps = 0.02, the sums row by row, left to right
+
+    recombine, at every pixel p, with `up` the bilinear interpolation of
+    a quarter image at (p + 0.5) / 4 - 0.5 in texel centre units, the
+    coordinates clamped to the grid, the four corners summed top left
+    first:
+        d' = d + strength * (up(f) - up(d_quarter))
+        R = G + d'_r,  B = G + d'_b                G and alpha unchanged
+
+Only the band the quarter grid holds is replaced: what the stage puts
+back is the difference between the smoothed and the unsmoothed block
+means, so chroma detail finer than a block, which section 17 has already
+dealt with, passes through unchanged, and a strength of one replaces the
+band completely. The range terms are on the *block means*, relative to
+the centre's own G so that they mean the same in a shadow and a
+highlight, and that is the one difference from the design as first
+written: a range term on G per pixel would fence off every glint and
+keep the colour this stage exists to remove. On the block mean a glint
+smaller than a block is invisible to it, while a real luminance edge,
+which spans blocks, still stops chroma from crossing. The second range
+term, on the colour differences themselves, is what stops it at a colour
+edge of equal luminance, which the G term alone cannot see: on the
+synthetic scene the neutral flat patch sits beside a strong gradient at
+a luminance 24% away, and with the G term alone the gradient's chroma
+walked 16 pixels into it and moved the warm patch's centre by 6%; with
+both terms the warm patch moves by 0.0%. K_c is a trade: tighter
+protects glints too, since their block means differ in chroma as a
+small coloured object's do, and looser lets the surround's chroma into a
+flat patch as a trend, which on the synthetic scene is what happens at
+0.5. At 0.35 the road's flicker reduction is 6% less than with the G
+term alone and the neutral patch keeps 49% of blotches painted onto it
+against 62% at 0.5. The frame must be at least
+20 pixels on each side, so that the quarter grid's mirror is good for
+one reflection at radius 4.
+
+Measured on the GPU output of a 128x128 crop of the road of 17.1 over
+four consecutive frames, RCD, on top of two false colour passes: the
+mean frame-to-frame change of the colour differences goes 0.055 (plain)
+to 0.034 (two passes) to 0.023 (both stages at full strength), the mean
+saturation of the brightest tenth 0.29 to 0.25 to 0.22, and the
+frame-to-frame change of G stays at 0.05, the rain. On the 320x240 crop
+of the neon signs, two passes move 2.5% of pixels' chroma by more than
+0.1 and both stages 4.1%, the crop's mean saturation going 0.250, 0.236,
+0.224: the thin ornaments lose a little, the flat reds and the text
+keep theirs. An unguided Gaussian of the same width, tried in emulation,
+reaches the same flicker but bleeds red into the white of the signs
+until the crop's saturation goes back up. What remains after both stages
+is at least partly real: the wet road reflects the signs, and moving
+water changes which colour lands where.
+
+Cost: one read of the full resolution intermediate into 1/16 of an
+RGBA16F image, an 81 tap bilateral over that quarter image, and one more
+read and write of the full resolution intermediate for the recombine; the
+two quarter images are 8.75 MB each at 5.8K, and the full resolution
+scratch image is shared with section 17 (RCD lends its aux to both).
+Measured with `cineraw --bench` at 5.8K, RCD: 5.8 ms a frame without it,
+7.2 ms with it at full strength, 1.4 ms for the stage, and the same 1.4
+ms on top of two false colour passes. That is above the 0.4 ms first
+estimated, and the difference is the two full resolution reads and one
+write: folding the recombine into the colour stage, which reads the
+intermediate and writes the output anyway, would take most of it back,
+at the price of the histogram seeing the unsmoothed chroma. Not done;
+1.4 ms fits.
 
 ### 14.5 Parameters and API
 
-`CRAW_PIPELINE_FLAG_DENOISE` builds the pass and its extra full resolution
-R16_UNORM image. Per frame, `CRAWFrameParams` carries:
+`CRAW_PIPELINE_FLAG_DENOISE` builds the raw pass and its extra full
+resolution R16_UNORM image; `CRAW_PIPELINE_FLAG_CHROMA_DENOISE` builds the
+chroma stage of 14.4, its two quarter resolution images and, without RCD
+and without section 17's flag, the full resolution scratch image. Per
+frame, `CRAWFrameParams` carries:
 
 - `denoise_strength`, the h of 14.3. 0 skips the pass for that frame
   without rebuilding the pipeline and is the default; the skip is free
@@ -1532,6 +1607,10 @@ R16_UNORM image. Per frame, `CRAWFrameParams` carries:
   `craw_pipeline_record()` fail with `CRAW_ERROR(ENOTSUP)` whenever the
   strength is positive. Failing is right: there is no default noise level,
   and silently doing nothing would look like a broken pass.
+- `denoise_chroma_strength`, the blend of 14.4, 0 to 1. 0 skips the stage
+  for that frame and is the default; above 1 is `CRAW_ERROR(EINVAL)`, the
+  band cannot be replaced by more than all of itself. It needs no noise
+  model: the bilateral's range term is relative to the level.
 
 `CRAWProfile` grows `noise_knots` and `nb_noise_knots` at the end of the
 struct, which changes its size; it is plain caller-filled data with no
@@ -1539,7 +1618,7 @@ padding tail, so this is an ABI break and the soname covers it.
 `CRAWFrameParams` and `CRAWPipelineParams` keep their sizes, the new fields
 coming out of their padding tails as intended.
 
-`cineraw` gains `--denoise STRENGTH`, `--noise A,B`, and
+`cineraw` gains `--denoise STRENGTH[,CHROMA]`, `--noise A,B`, and
 `--noise-estimate`, and its 8-bit writer gains the triangular dither of
 14.3. It also gains `--crop X,Y,W,H`, which writes and takes `--stats` over
 one rectangle of the output while the pipeline still runs on the whole
@@ -1550,7 +1629,20 @@ file without one leaves a built-in profile's noise table alone.
 
 ### 14.6 Testing
 
-`test_pipeline` covers the stage four ways.
+`test_pipeline` covers the raw stage four ways, and the chroma stage of
+14.4 the way section 17.5 covers its neighbour: both ways off reproduce
+the plain chain, half and full strength on MHC (its own scratch image) and
+on RCD (RCD's aux) match the reference within twice the debayer's
+intermediate bound and sit at least three floors from the unfiltered
+chain, a strength above one is refused, and on the CPU chroma blotches of
++-0.02 per 8x8 block painted over the neutral flat patch keep at most 60%
+of the spread of their 4x4 block means while the centre of the warm flat
+patch keeps its colour differences within 5% and G is untouched bit for
+bit. On the real frame it runs at full strength
+on top of two false colour passes and is held to twice the plain chain's
+absolute error.
+
+The raw stage:
 
 - GPU against `craw_ref_denoise()` on the synthetic mosaic at strengths 1.0
   and 2.0, tolerance 2e-3 absolute on the camera RGB intermediate, which is
@@ -2493,9 +2585,8 @@ median rightly keeps and the blur spreads and desaturates. This stage is
 that step on the differences to G, with mirrored borders.
 
 Two things it is not. It is not the chroma denoise of section 14.4: that
-is a bilateral blur of the chroma at quarter resolution whose range term
-on G isolates a bright dot and keeps its colour, and it would not do this
-job. And it is not a temporal filter: the temporal stage of 14.7 sees a
+works at the scale of blobs, on what this stage leaves, and runs after it
+for that reason. And it is not a temporal filter: the temporal stage of 14.7 sees a
 glint as motion and passes it through, and a glint lasts one frame. The
 video demosaicking literature (Wu and Zhang, IEEE TCSVT 2006) fetches the
 missing colours from motion-compensated neighbouring frames, which needs

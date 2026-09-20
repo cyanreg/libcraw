@@ -78,6 +78,18 @@ enum CRAWDebayer {
  * delivery; five is a visible chroma blur at 1:1. DESIGN.md 17.2. */
 #define CRAW_FALSE_COLOR_MAX_PASSES 5
 
+/* Build the chroma denoise pass, DESIGN.md 14.4: the colour differences of
+ * the debayered intermediate, at quarter resolution, smoothed by a joint
+ * bilateral guided by the quarter resolution G, and that band put back
+ * into every pixel. It reaches the chroma blotches of a dark scene and the
+ * colour of glints two and three sensels wide, which the false colour pass
+ * leaves. It costs two quarter resolution RGBA16F images and, with the
+ * bilinear or MHC debayer and no false colour pass, one full resolution
+ * RGBA16F image (the two passes share it; RCD lends its own). Once built
+ * it is switched per frame with CRAWFrameParams.denoise_chroma_strength,
+ * which costs nothing when zero. */
+#define CRAW_PIPELINE_FLAG_CHROMA_DENOISE (1 << 4)
+
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
 typedef struct CRAWPipelineParams {
@@ -190,6 +202,14 @@ typedef struct CRAWFrameParams {
      * unless the pipeline was created with CRAW_PIPELINE_FLAG_FALSE_COLOR. */
     uint32_t false_color_passes;
 
+    /* Chroma denoise, DESIGN.md 14.4: how much of the quarter resolution
+     * chroma band is replaced by its bilateral smoothing, 0.0 to 1.0. 0.0,
+     * the default, skips the pass for this frame without rebuilding the
+     * pipeline; above 1.0 makes craw_pipeline_record() fail with
+     * CRAW_ERROR(EINVAL). Ignored unless the pipeline was created with
+     * CRAW_PIPELINE_FLAG_CHROMA_DENOISE. */
+    float denoise_chroma_strength;
+
     /* Geometric lens correction for this frame, by value rather than by
      * pointer: the record changes every frame while the lens zooms or
      * focuses, and a frame's parameters have to stay self-contained when a
@@ -201,9 +221,10 @@ typedef struct CRAWFrameParams {
 
     /* Padding to allow for future options. Must always be set to 0. The
      * `- 8` after the 64 is out_space, out_space_set and the alignment hole
-     * after it, and the `- 4` is false_color_passes, both taken out of the
-     * tail so that sizeof stays what it was. */
-    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8 - 4];
+     * after it, and the two `- 4` are false_color_passes and
+     * denoise_chroma_strength, all taken out of the tail so that sizeof
+     * stays what it was. */
+    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8 - 4 - 4];
 } CRAWFrameParams;
 
 /* Fills `p` with defaults: RGGB, RCD, XYZ D65 output, RGBA16F, no flags.
@@ -211,9 +232,9 @@ typedef struct CRAWFrameParams {
 CRAW_API void craw_pipeline_params_init(CRAWPipelineParams *p);
 
 /* Fills `fp` with defaults: as-shot white balance, the pipeline's own
- * output colour space, no exposure change, no denoising, no noise model
- * override, no false colour suppression, no lens correction. The profile
- * pointer is left NULL and must be set by the caller. */
+ * output colour space, no exposure change, no denoising of either kind, no
+ * noise model override, no false colour suppression, no lens correction.
+ * The profile pointer is left NULL and must be set by the caller. */
 CRAW_API void craw_frame_params_init(CRAWFrameParams *fp);
 
 /* Allocates the pipeline's intermediate images and histogram buffers for
@@ -231,6 +252,7 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
  *     -> black/white normalization, as-shot white balance, clip
  *     -> debayer to full resolution camera RGB
  *     -> [false colour suppression, a median of the colour differences]
+ *     -> [chroma denoise, the quarter resolution chroma band smoothed]
  *     -> [auto white balance histogram]
  *     -> white balance re-balance, camera matrix, gain and exposure
  *     -> XYZ to the frame's output space (CRAWFrameParams.out_space when

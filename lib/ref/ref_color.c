@@ -137,9 +137,15 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
             goto done;
     }
 
-    /* On the intermediate, before anything reads it, DESIGN.md 17.3. */
+    /* On the intermediate, before anything reads it, DESIGN.md 17.3, and
+     * the chroma denoise after it, on what it left, 14.4. */
     if ((params->flags & CRAW_PIPELINE_FLAG_FALSE_COLOR) && fp->false_color_passes > 0) {
         ret = craw_ref_false_color(out, width, height, fp->false_color_passes);
+        if (ret < 0)
+            goto done;
+    }
+    if ((params->flags & CRAW_PIPELINE_FLAG_CHROMA_DENOISE) && fp->denoise_chroma_strength > 0.0f) {
+        ret = craw_ref_chroma_denoise(out, width, height, fp->denoise_chroma_strength);
         if (ret < 0)
             goto done;
     }

@@ -149,6 +149,7 @@ struct view_pipeline_look {
     float ei, exposure, ambience;
     enum CRAWDebayer debayer;
     int false_color;            /* passes, 0 when the stage did not run */
+    float chroma;               /* chroma denoise strength, 0 when it did not run */
     /* The strength the pass actually ran at, 0 when it did not: a toggle
      * while paused has to put the frame through again. */
     float denoise;
@@ -858,6 +859,11 @@ struct view_adjust {
 struct view_denoise {
     bool on;
     float strength;
+    /* The chroma denoise after the debayer, DESIGN.md 14.4, 0 to 1: the
+     * section's second control, switched with the section, and unlike the
+     * raw stage it needs no noise model. Kept across an off like the
+     * strength. */
+    float chroma;
 
     /* What the frame on screen resolved, for the readout. */
     CRAWNoiseModel model;
@@ -1399,6 +1405,10 @@ bool view_lens_keep_all(const struct view_state *st);
 /* The strength the denoise stage will actually run at: zero unless the
  * switch is on, the strength is positive and a model exists. */
 float view_denoise_strength(const struct view_state *st);
+
+/* The chroma denoise strength the pass will run at: zero whenever the
+ * Denoise section is off or the control is at zero. */
+float view_chroma_strength(const struct view_state *st);
 
 /* The pipeline-relevant part of the current look, and whether two of them
  * would give the same picture. */

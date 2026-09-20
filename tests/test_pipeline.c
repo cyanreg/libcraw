@@ -2696,6 +2696,265 @@ done:
     return ret;
 }
 
+/* -------------------------------------------------------- chroma denoise */
+
+/* Mean of a channel's colour difference over a rectangle. */
+static double test_patch_mean_diff(const float *rgb, int c, int x0, int y0, int x1, int y1)
+{
+    double acc = 0.0;
+    int n = 0;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            const float *px = &rgb[((size_t)y * TEST_W + x) * 4];
+            acc += (double)px[c] - (double)px[1];
+            n++;
+        }
+    }
+
+    return acc / n;
+}
+
+/* Spread of the 4x4 block means of R - G over a rectangle whose corners
+ * lie on the block grid, the band the stage works on, with each block's
+ * 3x3 neighbourhood mean taken out first so that a smooth trend across the
+ * patch (what little of the surround's chroma the range terms let in) is
+ * not counted as noise. */
+static double test_patch_band_noise(const float *rgb, int x0, int y0, int x1, int y1)
+{
+    double m[16][16];
+    double acc = 0.0, acc2 = 0.0;
+    int nx = 0, ny = 0, n = 0;
+
+    for (int by = y0; by + 3 <= y1 && ny < 16; by += 4, ny++) {
+        nx = 0;
+        for (int bx = x0; bx + 3 <= x1 && nx < 16; bx += 4, nx++)
+            m[ny][nx] = test_patch_mean_diff(rgb, 0, bx, by, bx + 3, by + 3);
+    }
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            double local = 0.0;
+            int k = 0;
+
+            for (int dj = -1; dj <= 1; dj++) {
+                for (int di = -1; di <= 1; di++) {
+                    int jj = CRAW_CLAMP(j + dj, 0, ny - 1), ii = CRAW_CLAMP(i + di, 0, nx - 1);
+                    local += m[jj][ii];
+                    k++;
+                }
+            }
+            local = m[j][i] - local / k;
+            acc += local;
+            acc2 += local * local;
+            n++;
+        }
+    }
+
+    return sqrt(CRAW_MAX(acc2 / n - (acc / n) * (acc / n), 0.0));
+}
+
+/* GPU against the reference with the chroma denoise after the debayer,
+ * DESIGN.md 14.6: both ways of switching it off, half and full strength on
+ * MHC (its own scratch image) and on RCD (RCD's aux, borrowed), a strength
+ * above one refused, and the definition on the CPU. The same three-floor
+ * reading as the false colour test. */
+static int test_chroma(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                       const uint16_t *mosaic, CRAWTestImage *src, CRAWTestImage *dst,
+                       float *gpu, float *ref)
+{
+    static const enum CRAWDebayer methods[] = { CRAW_DEBAYER_MHC, CRAW_DEBAYER_RCD };
+    static const float strengths[] = { 0.5f, 1.0f };
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    float *plain = NULL;
+    double ms = 0.0;
+    int ret = -1;
+
+    plain = malloc(npix * 4 * sizeof(*plain));
+    if (!plain)
+        goto done;
+
+    for (int off = 0; off < 2; off++) {
+        double base;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = CRAW_DEBAYER_MHC;
+        pp.out_space = CRAW_CS_XYZ_D65;
+        pp.flags = off ? 0 : CRAW_PIPELINE_FLAG_CHROMA_DENOISE;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.denoise_chroma_strength = off ? 1.0f : 0.0f;
+
+        if (craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, identity,
+                             CRAW_DEBAYER_MHC, ref) < 0)
+            goto done;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+
+        base = test_max_abs(gpu, ref, npix);
+        printf("  chroma   %-12s: max abs %.3e\n", off ? "flag not set" : "strength 0", base);
+        if (!(base <= 2e-3)) {
+            fprintf(stderr, "the chroma denoise ran when it should not have (%.3e)\n", base);
+            goto done;
+        }
+    }
+
+    for (size_t mi = 0; mi < CRAW_ARRAY_ELEMS(methods); mi++) {
+        enum CRAWDebayer method = methods[mi];
+        const char *mname = test_method_name(method);
+        double tol = TEST_FC_TOL_FACTOR * (method == CRAW_DEBAYER_RCD ? 5e-3 : 2e-3);
+        double base;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = method;
+        pp.out_space = CRAW_CS_XYZ_D65;
+        pp.flags = CRAW_PIPELINE_FLAG_CHROMA_DENOISE;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+
+        fp.denoise_chroma_strength = 0.0f;
+        if (craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, identity, method, ref) < 0)
+            goto done;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+        base = test_max_abs(gpu, ref, npix);
+
+        for (size_t si = 0; si < CRAW_ARRAY_ELEMS(strengths); si++) {
+            double cross, err;
+
+            fp.denoise_chroma_strength = strengths[si];
+            if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+                goto done;
+
+            cross = test_max_abs(gpu, ref, npix);
+
+            if (craw_ref_process(mosaic, TEST_W, TEST_H, TEST_W, &pp, &fp, ref) < 0) {
+                fprintf(stderr, "chroma: craw_ref_process failed\n");
+                goto done;
+            }
+            err = test_max_abs(gpu, ref, npix);
+
+            printf("  chroma   %-8s strength %.1f: max abs %.3e (tol %.1e), %.3e against the "
+                   "unfiltered chain (floor %.3e), %.3f ms\n",
+                   mname, (double)strengths[si], err, tol, cross, base, ms);
+            if (!(err <= tol)) {
+                fprintf(stderr, "chroma denoise on %s at %.1f differs by %.3e, tolerance %.1e\n",
+                        mname, (double)strengths[si], err, tol);
+                goto done;
+            }
+            if (!(cross > 3.0 * base)) {
+                fprintf(stderr, "a chroma denoised %s frame is only %.3e from an unfiltered one "
+                        "against a floor of %.3e; the pass cannot have run\n",
+                        mname, cross, base);
+                goto done;
+            }
+
+            if (craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, identity, method, ref) < 0)
+                goto done;
+        }
+    }
+
+    /* The definition, on the CPU: chroma blotches painted over the neutral
+     * flat patch, +-0.02 per 8x8 block, the kind of thing a dark road
+     * carries, lose most of their spread in the band the stage works on; a
+     * flat coloured patch keeps its colour at its centre; and G is not the
+     * stage's to touch. The synthetic mosaic's own chroma noise is a few
+     * 1e-5, too small to measure the stage against. */
+    {
+        double before, after, warm_r, warm_b, warm_r2, warm_b2;
+
+        if (craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, identity,
+                             CRAW_DEBAYER_BILINEAR, plain) < 0)
+            goto done;
+        for (int y = 24; y <= 55; y++) {
+            for (int x = 160; x <= 199; x++) {
+                uint32_t hb = test_hash((uint32_t)((y / 8) * 64 + x / 8) * 2246822519u);
+                float *px = &plain[((size_t)y * TEST_W + x) * 4];
+
+                px[0] += (float)((int)(hb % 41u) - 20) * 0.001f;
+                px[2] += (float)((int)((hb >> 8) % 41u) - 20) * 0.001f;
+            }
+        }
+        memcpy(ref, plain, npix * 4 * sizeof(*ref));
+        if (craw_ref_chroma_denoise(ref, TEST_W, TEST_H, 1.0f) < 0) {
+            fprintf(stderr, "craw_ref_chroma_denoise failed\n");
+            goto done;
+        }
+
+        for (size_t i = 0; i < npix; i++) {
+            if (ref[i * 4 + 1] != plain[i * 4 + 1] || ref[i * 4 + 3] != plain[i * 4 + 3]) {
+                fprintf(stderr, "chroma denoise moved G or alpha at pixel %zu\n", i);
+                goto done;
+            }
+        }
+
+        /* The neutral patch of test_scene_rgb() is 160..199 x 24..55; its
+         * 4x4 blocks from (164, 28) are whole and inset. */
+        before = test_patch_band_noise(plain, 164, 28, 195, 51);
+        after = test_patch_band_noise(ref, 164, 28, 195, 51);
+        /* The warm patch is 16..47 square; its central 8x8. */
+        warm_r = test_patch_mean_diff(plain, 0, 28, 28, 35, 35);
+        warm_b = test_patch_mean_diff(plain, 2, 28, 28, 35, 35);
+        warm_r2 = test_patch_mean_diff(ref, 0, 28, 28, 35, 35);
+        warm_b2 = test_patch_mean_diff(ref, 2, 28, 28, 35, 35);
+
+        printf("  chroma   definition   : neutral patch blotches %.2e -> %.2e (%.0f%%, want "
+               "<= 60%%), warm patch centre R-G %.3f -> %.3f, B-G %.3f -> %.3f (want within 5%%)\n",
+               before, after, 100.0 * after / before, warm_r, warm_r2, warm_b, warm_b2);
+        if (!(after <= 0.6 * before)) {
+            fprintf(stderr, "chroma denoise left %.0f%% of the blotches\n", 100.0 * after / before);
+            goto done;
+        }
+        if (!(fabs(warm_r2 - warm_r) <= 0.05 * fabs(warm_r)) ||
+            !(fabs(warm_b2 - warm_b) <= 0.05 * fabs(warm_b))) {
+            fprintf(stderr, "chroma denoise moved a flat colour by more than 5%%\n");
+            goto done;
+        }
+    }
+
+    /* A strength above one is an error, not a clamp. */
+    {
+        CRAWPipeline *pipe = NULL;
+        struct test_run run;
+        int rec;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.flags = CRAW_PIPELINE_FLAG_CHROMA_DENOISE;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.denoise_chroma_strength = 1.5f;
+
+        if (craw_pipeline_create(ctx, &pp, &pipe) < 0)
+            goto done;
+
+        run = (struct test_run) { .pipe = pipe, .src = src, .dst = dst, .fp = &fp };
+        rec = craw_testdev_run(td, test_record, &run);
+        craw_pipeline_free(&pipe);
+        if (rec != CRAW_ERROR(EINVAL)) {
+            fprintf(stderr, "a chroma strength of 1.5 returned %d, wanted %d\n",
+                    rec, CRAW_ERROR(EINVAL));
+            goto done;
+        }
+    }
+
+    ret = 0;
+
+done:
+    free(plain);
+    return ret;
+}
+
 /* ----------------------------------------------------------- real frame */
 
 static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile)
@@ -2898,6 +3157,54 @@ static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfi
         }
     }
 
+    /* And the chroma denoise at full strength on top of two false colour
+     * passes, the pairing DESIGN.md 14.4 describes. `ref` holds the false
+     * colour reference from above, so the plain one is rebuilt first. */
+    {
+        double cross, err_abs, err_rel;
+
+        pp.flags = CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_CHROMA_DENOISE;
+        fp.false_color_passes = 2;
+        fp.denoise_chroma_strength = 1.0f;
+
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, gpu, NULL, NULL, &ms);
+        if (ret < 0)
+            goto done;
+
+        fp.false_color_passes = 0;
+        fp.denoise_chroma_strength = 0.0f;
+        ret = craw_ref_process(mosaic, FRAME_W, FRAME_H, FRAME_W, &pp, &fp, ref);
+        if (ret < 0)
+            goto done;
+        cross = test_max_rel(gpu, ref, npix);
+
+        fp.false_color_passes = 2;
+        fp.denoise_chroma_strength = 1.0f;
+        ret = craw_ref_process(mosaic, FRAME_W, FRAME_H, FRAME_W, &pp, &fp, ref);
+        if (ret < 0)
+            goto done;
+
+        err_abs = test_max_abs(gpu, ref, npix);
+        err_rel = test_max_rel(gpu, ref, npix);
+        printf("  rcd + false colour x2 + chroma on %dx%d: %.2f ms, max abs %.3e (plain %.3e, "
+               "tol %.3e), max rel %.3e, %.3e relative against the plain chain\n",
+               FRAME_W, FRAME_H, ms, err_abs, plain_abs, TEST_FC_REAL_FACTOR * plain_abs,
+               err_rel, cross);
+
+        if (!(err_abs <= TEST_FC_REAL_FACTOR * plain_abs)) {
+            fprintf(stderr, "chroma denoise on the real frame differs by %.3e absolute, "
+                    "tolerance %.3e\n", err_abs, TEST_FC_REAL_FACTOR * plain_abs);
+            ret = -1;
+            goto done;
+        }
+        if (!(cross > 5.0 * err_rel)) {
+            fprintf(stderr, "the chroma denoised frame is only %.3e relative from the plain "
+                    "one; the pass cannot have run\n", cross);
+            ret = -1;
+            goto done;
+        }
+    }
+
 done:
     if (ret < 0)
         fprintf(stderr, "real frame run failed: %d\n", ret);
@@ -3090,6 +3397,9 @@ int main(void)
         goto done;
 
     if (test_false_color(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
+
+    if (test_chroma(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
         goto done;
 
     if (test_lens(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)

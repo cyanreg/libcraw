@@ -823,7 +823,8 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
      * and a lens pass handed a frame with no record drops out entirely,
      * which is what makes all three live controls. */
     pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE |
-                    CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_LENS;
+                    CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_CHROMA_DENOISE |
+                    CRAW_PIPELINE_FLAG_LENS;
     /* Enough copies that the previous frame's histogram is still readable
      * while the current one is in flight, which is what lets the auto white
      * balance run without a per-frame stall. */
@@ -2333,7 +2334,7 @@ int view_gpu_direct_open(struct view_gpu *g)
     pp.out_space  = CRAW_CS_ACES_AP1_LINEAR;
     pp.out_format = VK_FORMAT_R32G32B32A32_SFLOAT;
     pp.flags      = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_FALSE_COLOR |
-                    CRAW_PIPELINE_FLAG_LENS;
+                    CRAW_PIPELINE_FLAG_CHROMA_DENOISE | CRAW_PIPELINE_FLAG_LENS;
 
     ret = craw_pipeline_create(g->ctx, &pp, &g->direct_pipe);
     if (ret < 0) {

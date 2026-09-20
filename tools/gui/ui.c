@@ -1808,7 +1808,7 @@ static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "%s",
-              !d->have_model ? "no model: off"
+              !d->have_model ? "no model: raw stage off"
                              : d->on ? "on, before the debayer" : "off");
 
     nk_property_float(ctx, "#strength", 0.25f, &d->strength, 3.0f, 0.25f, 0.01f);
@@ -1826,6 +1826,12 @@ static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
     else
         nk_labelf(ctx, NK_TEXT_LEFT, "noise a %.3g, b %.2g at ISO %.0f",
                   (double)d->model.a, (double)d->model.b, (double)d->iso);
+
+    /* The chroma denoise after the debayer, DESIGN.md 14.4: the quarter
+     * resolution chroma band replaced by its luma-guided smoothing. It
+     * needs no model, so it runs whenever the section is on and this is
+     * above zero. */
+    nk_property_float(ctx, "#chroma", 0.0f, &d->chroma, 1.0f, 0.1f, 0.005f);
 
     /* Two smoothed averages of libcraw's own pass time, one for the frames
      * that ran the stage and one for the frames that did not, so the cost

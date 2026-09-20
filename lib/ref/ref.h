@@ -44,6 +44,13 @@ int craw_ref_debayer(const uint16_t *bayer, uint32_t width, uint32_t height,
  * decision not to call. */
 int craw_ref_false_color(float *rgb, uint32_t width, uint32_t height, uint32_t passes);
 
+/* Chroma denoise, DESIGN.md 14.4, in place on a camera RGB buffer of
+ * width*height*4 floats: the quarter resolution band of R - G and B - G
+ * replaced by its joint bilateral smoothing, blended by `strength` in
+ * (0, 1], G and alpha untouched. Zero is the caller's decision not to
+ * call; the frame must be at least 20 pixels on each side. */
+int craw_ref_chroma_denoise(float *rgb, uint32_t width, uint32_t height, float strength);
+
 /* Runs the colour stage on a camera RGB buffer in place: matrix, gain and
  * exposure for the frame's illuminant, then XYZ to `out_space`, which is
  * the *effective* space — the caller has already resolved the frame's own
@@ -71,13 +78,16 @@ static inline enum CRAWColorSpace craw_ref_out_space(const CRAWPipelineParams *p
 int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
                   const CRAWLensCorrection *lc, bool keep_all, float *dst);
 
-/* Whole chain: [denoise,] debayer, [false colour,] colour, [lens]. `out`
- * receives width*height*4 floats. The denoise runs when `params` carries
- * CRAW_PIPELINE_FLAG_DENOISE and `fp->denoise_strength` is positive, the
- * false colour suppression when it carries CRAW_PIPELINE_FLAG_FALSE_COLOR
- * and `fp->false_color_passes` is positive, and the warp when it carries
- * CRAW_PIPELINE_FLAG_LENS and `fp->lens` is valid; all three are the
- * conditions craw_pipeline_record() applies. */
+/* Whole chain: [denoise,] debayer, [false colour,] [chroma denoise,]
+ * colour, [lens]. `out` receives width*height*4 floats. The denoise runs
+ * when `params` carries CRAW_PIPELINE_FLAG_DENOISE and
+ * `fp->denoise_strength` is positive, the false colour suppression when it
+ * carries CRAW_PIPELINE_FLAG_FALSE_COLOR and `fp->false_color_passes` is
+ * positive, the chroma denoise when it carries
+ * CRAW_PIPELINE_FLAG_CHROMA_DENOISE and `fp->denoise_chroma_strength` is
+ * positive, and the warp when it carries CRAW_PIPELINE_FLAG_LENS and
+ * `fp->lens` is valid; all four are the conditions craw_pipeline_record()
+ * applies. */
 int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
                      size_t stride, const CRAWPipelineParams *params,
                      const CRAWFrameParams *fp, float *out);

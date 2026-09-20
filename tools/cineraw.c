@@ -111,6 +111,7 @@ struct tool_cfg {
     int64_t crop_x, crop_y, crop_w, crop_h;
 
     float denoise;            /* 0 = off */
+    float chroma;             /* chroma denoise strength, 0 = off */
     CRAWNoiseModel noise;     /* a > 0 overrides the profile's table */
     bool noise_estimate;
 
@@ -279,11 +280,18 @@ static void tool_usage(FILE *f)
 "                      alone. 0 (the default) is off. One or two are below\n"
 "                      what a 4:2:0 delivery keeps of the chroma anyway;\n"
 "                      five is a visible chroma blur at 1:1. DESIGN.md 17\n"
-"  --denoise STRENGTH  raw domain denoising at this strength: 1.0 removes\n"
+"  --denoise STRENGTH[,CHROMA]\n"
+"                      raw domain denoising at this strength: 1.0 removes\n"
 "                      noise at the level the camera's noise model predicts,\n"
 "                      2.0 smooths twice as far, 0 (the default) is off. The\n"
 "                      model comes from the profile's table at the clip's\n"
-"                      as-shot ISO unless --noise overrides it\n"
+"                      as-shot ISO unless --noise overrides it. CHROMA, 0 to\n"
+"                      1, is the chroma denoise after the debayer: how much\n"
+"                      of the quarter resolution chroma band is replaced by\n"
+"                      its luma-guided smoothing, which takes the colour\n"
+"                      blotches out of a dark scene and the colour out of\n"
+"                      the glints --false-colour leaves; 0 (the default) is\n"
+"                      off, and it needs no noise model. DESIGN.md 14.4\n"
 "  --noise A,B         override the noise model: variance = A * u + B with u\n"
 "                      the signal above black over the sensor range. Print a\n"
 "                      clip's own pair with --noise-estimate\n"
@@ -841,6 +849,8 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
     pp.flags = cfg->wb == TOOL_WB_AUTO ? CRAW_PIPELINE_FLAG_AWB_HISTOGRAM : 0;
     if (cfg->denoise > 0.0f)
         pp.flags |= CRAW_PIPELINE_FLAG_DENOISE;
+    if (cfg->chroma > 0.0f)
+        pp.flags |= CRAW_PIPELINE_FLAG_CHROMA_DENOISE;
     if (cfg->false_color > 0)
         pp.flags |= CRAW_PIPELINE_FLAG_FALSE_COLOR;
     /* Only built once a frame has been seen to carry a record: a clip
@@ -1789,15 +1799,27 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
             if ((ret = tool_parse_crop(cfg, optarg)) < 0)
                 return ret;
             break;
-        case TOOL_OPT_DENOISE:
-            if ((ret = tool_parse_double("--denoise", optarg, &d)) < 0)
-                return ret;
-            if (d < 0.0) {
-                fprintf(stderr, "--denoise: %g is not a strength\n", d);
+        case TOOL_OPT_DENOISE: {
+            char *end;
+
+            d = strtod(optarg, &end);
+            if (end == optarg || d < 0.0 || (*end && *end != ',')) {
+                fprintf(stderr, "--denoise: expected STRENGTH[,CHROMA], got `%s`\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
             cfg->denoise = (float)d;
+            if (*end == ',') {
+                const char *arg = end + 1;
+
+                d = strtod(arg, &end);
+                if (end == arg || *end || d < 0.0 || d > 1.0) {
+                    fprintf(stderr, "--denoise: CHROMA must be 0 to 1, got `%s`\n", arg);
+                    return CRAW_ERROR(EINVAL);
+                }
+                cfg->chroma = (float)d;
+            }
             break;
+        }
         case TOOL_OPT_FALSE_COLOUR:
             if ((ret = tool_parse_double("--false-colour", optarg, &d)) < 0)
                 return ret;
@@ -2231,6 +2253,7 @@ have_device:
         if (cfg.lens == TOOL_LENS_KEEP)
             fp.flags |= CRAW_FRAME_FLAG_LENS_KEEP_ALL;
         fp.denoise_strength = cfg.denoise;
+        fp.denoise_chroma_strength = cfg.chroma;
         fp.noise_override = cfg.noise;
         fp.false_color_passes = cfg.false_color;
         fp.lens = lens;

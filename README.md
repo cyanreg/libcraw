@@ -62,10 +62,13 @@ The options that matter most:
     cineraw --denoise 1.0 --crop 2750,1450,1000,1000 -o c_%d.png clip.MOV
     cineraw --noise-estimate --frames 10 flatfield.MOV   fit the noise model
 
-`--denoise` takes a strength in units of the camera's modelled noise
-level, 1.0 meaning "remove exactly that much"; `--noise A,B` overrides the
-model and `--noise-estimate` measures one, printing a line ready for a
-`--tables` file. `--false-colour PASSES` runs one to five passes of a
+`--denoise STRENGTH[,CHROMA]` takes a strength in units of the camera's
+modelled noise level, 1.0 meaning "remove exactly that much", and an
+optional chroma denoise amount from 0 to 1, the quarter resolution chroma
+band replaced by its luma-guided smoothing, which takes the colour
+blotches out of a dark scene and needs no noise model; `--noise A,B`
+overrides the model and `--noise-estimate` measures one, printing a line
+ready for a `--tables` file. `--false-colour PASSES` runs one to five passes of a
 median and a blur over the colour differences after the debayer,
 RawTherapee's false colour suppression steps, which turn the coloured
 dots that rain glints and other sub-pixel highlights leave into neutral
@@ -165,10 +168,13 @@ The "Debayer" section picks the method and carries the false colour
 suppression row: the number of median and blur passes over the colour
 differences after the debayer, zero to five, which is what stops a wet street from
 shimmering in colour as the rain hits it; `--false-colour PASSES` sets it
-from the command line. The "Denoise" section sets the strength and reports the noise model it
-found for the clip's own ISO — the stage stays off when the camera has
-none, which the section says rather than leaving you guessing; `--denoise
-STRENGTH` sets both the switch and the strength from the command line.
+from the command line. The "Denoise" section sets the raw stage's strength and reports the
+noise model it found for the clip's own ISO — that stage stays off when
+the camera has none, which the section says rather than leaving you
+guessing — and the chroma amount, the luma-guided smoothing of the
+quarter resolution chroma band after the debayer, which needs no model;
+`--denoise STRENGTH[,CHROMA]` sets the switch and both amounts from the
+command line.
 With four mono audio tracks the last two are taken as the stereo pair
 (`--audio-map` overrides). `cineview -h` lists the options.
 

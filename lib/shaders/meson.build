@@ -34,6 +34,9 @@ craw_shader_names = [
     'denoise_nlm',
     'lens',
     'false_color',
+    'chroma_down',
+    'chroma_blur',
+    'chroma_up',
 ]
 
 spv_embed = files('../../tools/spv_embed.py')
