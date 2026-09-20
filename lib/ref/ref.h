@@ -38,9 +38,10 @@ int craw_ref_debayer(const uint16_t *bayer, uint32_t width, uint32_t height,
                      enum CRAWDebayer method, float *rgb);
 
 /* False colour suppression, DESIGN.md 17, in place on a camera RGB buffer
- * of width*height*4 floats: `passes` 3x3 medians of R - G and B - G with
- * mirrored borders, G and alpha untouched. `passes` must be 1 to
- * CRAW_FALSE_COLOR_MAX_PASSES; zero is the caller's decision not to call. */
+ * of width*height*4 floats: `passes` times a 3x3 median and then a 3x3 box
+ * blur of R - G and B - G with mirrored borders, G and alpha untouched.
+ * `passes` must be 1 to CRAW_FALSE_COLOR_MAX_PASSES; zero is the caller's
+ * decision not to call. */
 int craw_ref_false_color(float *rgb, uint32_t width, uint32_t height, uint32_t passes);
 
 /* Runs the colour stage on a camera RGB buffer in place: matrix, gain and

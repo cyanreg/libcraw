@@ -176,13 +176,26 @@ static_assert((2 * CRAW_DN_PATCH_R + 1) * (2 * CRAW_DN_PATCH_R + 1) <= 25,
 #define CRAW_DN_GUARD_LO 0.90f
 #define CRAW_DN_GUARD_HI 1.00f
 
-/* The false colour shader's shared tile is sized for a 16x16 workgroup
- * plus an apron of CRAW_FALSE_COLOR_MAX_PASSES on every side, both fixed
- * in lib/shaders/false_color.comp.glsl; craw_wg_dim() never hands out more
- * than it is asked for, so the workgroup is asked for at this size. */
+/* The false colour shader's shared tile is the workgroup plus an apron of
+ * two pixels per pass on every side, one for the median and one for the
+ * blur, sized through specialization constant 4 from the workgroup the
+ * device gets. Two copies of a vec2 per entry: for a 16x16 workgroup and
+ * five passes that is 36x36 and 20 KB, more than the 16 KB Vulkan
+ * guarantees, so a device with only the guarantee gets an 8x8 workgroup
+ * and a 28x28 tile of 12.5 KB. DESIGN.md 17.3. */
 #define CRAW_FC_WG_MAX 16
 
-static_assert(CRAW_FALSE_COLOR_MAX_PASSES == 4, "false colour apron must match the shader's tile");
+static_assert(CRAW_FALSE_COLOR_MAX_PASSES == 5, "false colour passes must match the shader's");
+
+static uint32_t craw_fc_tile(uint32_t wg)
+{
+    return wg + 4 * CRAW_FALSE_COLOR_MAX_PASSES;
+}
+
+static uint32_t craw_fc_shared_bytes(uint32_t wg)
+{
+    return 2 * craw_fc_tile(wg) * craw_fc_tile(wg) * 2 * (uint32_t)sizeof(float);
+}
 
 #define CRAW_AWB_HIST_ENTRIES (CRAW_AWB_HIST_BINS * CRAW_AWB_HIST_BINS)
 #define CRAW_AWB_HIST_BYTES   (CRAW_AWB_HIST_ENTRIES * (uint32_t)sizeof(uint32_t))
@@ -253,14 +266,16 @@ static const CRAWVkBinding craw_bind_awb[4] = {
 
 /* Specialization constants below 253: 0 is the CFA phase (common.glsl), 1
  * the RCD pass C phase (rcd_rb.comp.glsl), 2 and 3 the denoise search and
- * patch radii (denoise_nlm.comp.glsl). A shader that does not declare one
- * of these ignores its map entry, so every shader is given the prefix of
- * this array it needs. */
-static const VkSpecializationMapEntry craw_spec_map[4] = {
+ * patch radii (denoise_nlm.comp.glsl), 4 the false colour tile side
+ * (false_color.comp.glsl). A shader that does not declare one of these
+ * ignores its map entry, so every shader is given the prefix of this
+ * array it needs. */
+static const VkSpecializationMapEntry craw_spec_map[5] = {
     { .constantID = 0, .offset = 0,                    .size = sizeof(uint32_t) },
     { .constantID = 1, .offset = 1 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 2, .offset = 2 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 3, .offset = 3 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 4, .offset = 4 * sizeof(uint32_t), .size = sizeof(uint32_t) },
 };
 
 void craw_pipeline_params_init(CRAWPipelineParams *p)
@@ -333,8 +348,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                          CRAWPipeline **pipe)
 {
     CRAWPipeline *p;
-    uint32_t spec[4];
-    uint32_t wg2d, wgrcd, wgdn, wgfc;
+    uint32_t spec[5];
+    uint32_t wg2d, wgrcd, wgdn, wgfc, shared_max;
     int ret;
 
     if (!ctx || !params || !pipe)
@@ -388,8 +403,14 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
      * that many invocations gets a smaller one, which only shrinks the
      * tile. */
     wgdn  = craw_wg_dim(ctx, CRAW_DN_WG);
-    /* Likewise the false colour tile: a smaller workgroup only shrinks it. */
+    /* The false colour tile has to fit the device's shared memory, and a
+     * smaller workgroup only shrinks it. A limit below the 16 KB Vulkan
+     * guarantees means the properties were never filled in, and only the
+     * guarantee is trusted. */
+    shared_max = CRAW_MAX(ctx->props.properties.limits.maxComputeSharedMemorySize, 16384u);
     wgfc  = craw_wg_dim(ctx, CRAW_FC_WG_MAX);
+    while (wgfc > 4 && craw_fc_shared_bytes(wgfc) > shared_max)
+        wgfc /= 2;
 
     ret = craw_vk_image_create(ctx, &p->inter, params->width, params->height,
                                VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
@@ -400,6 +421,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     spec[1] = 0;
     spec[2] = CRAW_DN_SEARCH_R;
     spec[3] = CRAW_DN_PATCH_R;
+    spec[4] = craw_fc_tile(wgfc);
 
     if (p->has_denoise) {
         /* The denoise stage mirrors inside each CFA plane, and one
@@ -491,7 +513,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         ret = craw_pipeline_shader(p, &p->false_color, "false_color",
                                    craw_false_color_spv_data, craw_false_color_spv_len,
                                    craw_bind_images, 2, sizeof(CRAWFalseColorPush), wgfc,
-                                   NULL, 0);
+                                   spec, 5);
         if (ret < 0)
             goto fail;
     }
@@ -567,7 +589,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
              p->awb ? ", awb histogram" : "",
              p->has_denoise ? ", denoise" : "",
-             p->has_fc ? ", false colour" : "",
+             p->has_fc ? (wgfc == CRAW_FC_WG_MAX ? ", false colour" : ", false colour (small tile)") : "",
              p->has_lens ? ", lens" : "");
 
     *pipe = p;

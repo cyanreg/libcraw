@@ -62,22 +62,21 @@ enum CRAWDebayer {
  * bit what a pipeline built without the flag produces. See DESIGN.md 16. */
 #define CRAW_PIPELINE_FLAG_LENS (1 << 2)
 
-/* Build the false colour suppression pass, DESIGN.md 17: a 3x3 median of
- * the colour differences of the debayered intermediate, run up to
- * CRAW_FALSE_COLOR_MAX_PASSES times, which turns the coloured dots that a
- * glint smaller than a CFA quad leaves into neutral ones and touches
- * nothing else. With the RCD debayer it costs no memory: the stage writes
+/* Build the false colour suppression pass, DESIGN.md 17: a 3x3 median
+ * followed by a 3x3 box blur of the colour differences of the debayered
+ * intermediate, run up to CRAW_FALSE_COLOR_MAX_PASSES times, which turns
+ * the coloured dots that a glint smaller than a CFA quad leaves into
+ * neutral ones and touches nothing else. With the RCD debayer it costs no memory: the stage writes
  * RCD's own auxiliary image, which is free by then. With bilinear or MHC
  * it costs an extra full resolution RGBA16F image. Once built it is
  * switched per frame with CRAWFrameParams.false_color_passes, which costs
  * nothing when zero. */
 #define CRAW_PIPELINE_FLAG_FALSE_COLOR (1 << 3)
 
-/* The most passes the stage's fused dispatch carries an apron for, and the
- * most any debayer needs: four clear the blob every method makes of a
- * single site glint (bilinear and RCD in three, MHC in four), and on real
- * footage the median has converged by then. DESIGN.md 17.2. */
-#define CRAW_FALSE_COLOR_MAX_PASSES 4
+/* The most passes the stage's fused dispatch carries an apron for, the
+ * same range as RawTherapee's steps. One or two are free in a 4:2:0
+ * delivery; five is a visible chroma blur at 1:1. DESIGN.md 17.2. */
+#define CRAW_FALSE_COLOR_MAX_PASSES 5
 
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
@@ -183,9 +182,9 @@ typedef struct CRAWFrameParams {
      * denoise_strength is positive. */
     CRAWNoiseModel noise_override;
 
-    /* False colour suppression, DESIGN.md 17: the number of 3x3 median
-     * passes over the colour differences of the debayered intermediate, 0
-     * to CRAW_FALSE_COLOR_MAX_PASSES. 0, the default, skips the pass for
+    /* False colour suppression, DESIGN.md 17: the number of median and
+     * blur passes over the colour differences of the debayered
+     * intermediate, 0 to CRAW_FALSE_COLOR_MAX_PASSES. 0, the default, skips the pass for
      * this frame without rebuilding the pipeline; more than the maximum
      * makes craw_pipeline_record() fail with CRAW_ERROR(EINVAL). Ignored
      * unless the pipeline was created with CRAW_PIPELINE_FLAG_FALSE_COLOR. */

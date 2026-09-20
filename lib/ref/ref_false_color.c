@@ -1,9 +1,11 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
 /* CPU reference of the false colour suppression stage, DESIGN.md 17. The
- * definition is sequential: every pass reads the whole result of the pass
- * before it, borders mirrored. lib/shaders/false_color.comp.glsl fuses the
- * passes into one dispatch and is held to this by tests/test_pipeline.c. */
+ * definition is sequential: each pass is a 3x3 median sweep and then a
+ * 3x3 box blur sweep over the two colour differences, every sweep reading
+ * the whole result of the one before it, borders mirrored.
+ * lib/shaders/false_color.comp.glsl fuses the sweeps into one dispatch and
+ * is held to this by tests/test_pipeline.c. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +40,19 @@ static float craw_ref_median9(float v[9])
     return v[4];
 }
 
+/* The box blur: the nine summed in stencil order, top row left to right
+ * first, then scaled by the float nearest 1/9, exactly as the shader
+ * sums them, so the two agree bit for bit on equal inputs. */
+static float craw_ref_mean9(const float v[9])
+{
+    float s = v[0];
+
+    for (int i = 1; i < 9; i++)
+        s += v[i];
+
+    return s * (1.0f / 9.0f);
+}
+
 int craw_ref_false_color(float *rgb, uint32_t width, uint32_t height, uint32_t passes)
 {
     float *cur = NULL, *nxt = NULL;
@@ -68,7 +83,10 @@ int craw_ref_false_color(float *rgb, uint32_t width, uint32_t height, uint32_t p
         cur[2 * i + 1] = rgb[4 * i + 2] - rgb[4 * i + 1];
     }
 
-    for (uint32_t k = 0; k < passes; k++) {
+    /* Sweep sw of 2 * passes: the median of a pass when sw is even, its
+     * blur when sw is odd. */
+    for (uint32_t sw = 0; sw < 2 * passes; sw++) {
+        const bool blur = (sw & 1) != 0;
         float *t;
 
         for (int y = 0; y < h; y++) {
@@ -86,8 +104,13 @@ int craw_ref_false_color(float *rgb, uint32_t width, uint32_t height, uint32_t p
                     }
                 }
 
-                nxt[2 * ((size_t)y * w + x) + 0] = craw_ref_median9(v[0]);
-                nxt[2 * ((size_t)y * w + x) + 1] = craw_ref_median9(v[1]);
+                if (blur) {
+                    nxt[2 * ((size_t)y * w + x) + 0] = craw_ref_mean9(v[0]);
+                    nxt[2 * ((size_t)y * w + x) + 1] = craw_ref_mean9(v[1]);
+                } else {
+                    nxt[2 * ((size_t)y * w + x) + 0] = craw_ref_median9(v[0]);
+                    nxt[2 * ((size_t)y * w + x) + 1] = craw_ref_median9(v[1]);
+                }
             }
         }
 

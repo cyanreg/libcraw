@@ -26,8 +26,8 @@ In:
   including a sensor noise model by exposure index.
 - Raw domain denoising: non-local means on the four CFA planes in a
   variance stabilised domain, optional, per-frame strength. Section 14.
-- False colour suppression: a median of the colour differences after the
-  debayer, one to four passes, optional, per frame. Section 17.
+- False colour suppression: a median and a blur of the colour differences
+  after the debayer, one to five passes, optional, per frame. Section 17.
 - Geometric lens correction: a per-channel radial resampling warp on the
   linear output, driven per frame by the camera's own
   `com.panasonic.Semi-Pro.optical_correction` record, which the library
@@ -142,8 +142,8 @@ Produces R, G, B at every pixel from `v`. Definitions in section 5.
 ### 4.2b False colour suppression (optional, after the debayer)
 
 Replaces the intermediate with a copy whose colour differences have been
-median filtered, G untouched. Defined in section 17; the histogram of 4.4
-and the colour stage of 4.3 read the copy.
+median filtered and blurred, G untouched. Defined in section 17; the
+histogram of 4.4 and the colour stage of 4.3 read the copy.
 
 ### 4.3 Colour
 
@@ -2483,8 +2483,14 @@ debayer can do is decide, and the decision every raw converter makes is
 that chrominance is smooth: an isolated pixel whose colour differs from
 all of its neighbours is wrong, whatever its luminance. That is a median
 of the colour differences, Freeman's 1988 patent, the final step of
-Hirakawa and Parks' AHD (IEEE TIP 2005), dcraw's `-m`, RawTherapee's
-"false colour suppression steps" and darktable's "colour smoothing".
+Hirakawa and Parks' AHD (IEEE TIP 2005), dcraw's `-m`, darktable's
+"colour smoothing" and RawTherapee's "false colour suppression steps".
+RawTherapee's step, read from `rtengine/rawimagesource.cc`, is a 3x3
+median of the two chroma planes followed by a 3x3 box blur of them, in
+YIQ with Y kept, one to five steps, and it is the blur that reaches what a
+median alone leaves: a glint two or three sensels wide is a blob the
+median rightly keeps and the blur spreads and desaturates. This stage is
+that step on the differences to G, with mirrored borders.
 
 Two things it is not. It is not the chroma denoise of section 14.4: that
 is a bilateral blur of the chroma at quarter resolution whose range term
@@ -2498,45 +2504,54 @@ the feature to persist; rain does not.
 ### 17.2 Definition
 
 On the camera RGB intermediate of section 3, after the debayer and before
-anything reads it, with `passes` in 1..4:
+anything reads it, with `passes` in 1..5:
 
     d_r = R - G,  d_b = B - G                     at every pixel
     repeat `passes` times:
         d_r = median of the 3x3 neighbourhood of d_r, borders mirrored (section 3)
         d_b = the same for d_b
+        d_r = mean of the 3x3 neighbourhood of d_r, borders mirrored
+        d_b = the same for d_b
     R = G + d_r,  B = G + d_b                     G and alpha unchanged
 
-Every pass reads the whole result of the pass before it. The median is a
-selection, so every output difference is one of the input differences bit
-for bit, and G is not touched at all: the stage cannot soften a luminance
-edge, cannot move a neutral value, and on a region where the colour
+Every sweep reads the whole result of the sweep before it. The mean is
+the nine summed in stencil order, top row first, left to right, then
+scaled by the float nearest 1/9, so that the two implementations sum in
+the same order. G is not touched at all: the stage cannot soften a
+luminance edge or move a neutral value, and on a region where the colour
 differences are affine — every gradient, every flat patch — it is the
-identity, because the centre of a symmetric stencil is the median of
-affine samples.
+identity, because the centre of a symmetric stencil is both the median
+and the mean of affine samples.
 
 The colour differences and not the ratios, because that is what the
-debayers build their chroma in (5.2, 5.3); and on the white-balanced
-intermediate rather than after the matrix, so that "neutral" is the
-frame's illuminant and a glint that loses its colour comes out the colour
-of the light.
+debayers build their chroma in (5.2, 5.3); to G and not to a weighted
+luma, because G is the channel the sensor sampled twice as densely and
+the one every debayer built its chroma from, and RawTherapee's YIQ moves
+all three channels for nothing; and on the white-balanced intermediate
+rather than after the matrix, so that "neutral" is the frame's illuminant
+and a glint that loses its colour comes out the colour of the light.
 
-How many passes. A single-sensel spike of amplitude A at an R site comes
-out of bilinear as an R - G of A at the pixel, A/2 at its four edge
-neighbours and A/4 at the corners: one pass halves the centre and
-quarters the edges, two leave A/4 at the centre alone, three clear it.
-RCD's ratio correction pushes part of the spike into its green estimate,
-so its blob starts lower and also clears in three. MHC's 5x5 kernels
-reach two pixels and put the same A/2 at the centre and at its four edge
-neighbours, a plus that one pass leaves whole; it needs four. Four is the
-maximum, and the shader's tile is sized for it. On real footage the
-median has converged by then: on the road of 17.1, with RCD, the mean
-saturation of the brightest tenth of a crop goes 0.38, 0.35, 0.34, 0.33
-for zero to three passes and does not move after that, and what is left
-is the colour of glints two and three sensels wide, which the debayer
-measured on two sites and which a 3x3 median rightly keeps, plus the
-chroma noise of a road at ISO 1250, which is section 14's business. One
-pass is a lighter touch that clears the small glints and halves the large
-ones.
+What the two sweeps do. A single-sensel spike of amplitude A at an R site
+comes out of bilinear as an R - G of A at the pixel, A/2 at its four edge
+neighbours and A/4 at the corners: the median halves the centre and
+quarters the edges, the blur then leaves a sixth of A at the centre, and
+the maximum leaves nothing measurable through any debayer. The median is
+edge preserving and removes the isolated dots outright; the blur is not
+and is what reaches the wider glints, at the price of bleeding colour a
+pixel across every colour edge per pass. Measured on the GPU output of a
+128x128 crop of the road of 17.1 over four consecutive frames, RCD, the
+mean frame-to-frame change of the colour differences goes 0.055, 0.039,
+0.034, 0.031, 0.028 for zero, one, two, three and five passes, where the
+median alone had converged at 0.036 by three; the mean saturation of the
+brightest tenth goes 0.29 to 0.24, and the frame-to-frame change of G
+stays at 0.05, because it is the rain itself and the stage never touches
+it. On a 320x240 crop of the neon signs in the same frame, two passes
+move 1.7% of the pixels' chroma by more than 0.1 and five move 3.4%,
+which at 6x is a slightly softer one-pixel red border and nothing else.
+One or two passes cost nothing visible in a delivered file: 4K 4:2:0
+from a 5.8K frame keeps one chroma sample per two source pixels, below
+what one 3x3 blur removes. Five is a visible chroma blur at 1:1, which
+is why the default is zero, as it is in every raw converter.
 
 ### 17.3 Where it sits, and the fused dispatch
 
@@ -2550,40 +2565,54 @@ until the next frame's pass A), so the default pipeline pays no memory for
 the stage. Bilinear and MHC have no such image and get one, 140 MB at 5.8K.
 
 The passes run in one dispatch. Each workgroup loads a tile with an apron
-of `passes` pixels into shared memory, as the two differences in one vec2
-so that the componentwise min and max of a selection network sort both
-planes at once, and pass k is computed on the part of the tile that lies
-k inside its edge: that is where its stencil stays inside what pass k - 1
-produced, and it is all that pass k + 1, or the final store, reads. The
+of two pixels per pass into shared memory, as the two differences in one
+vec2 so that the componentwise min and max of a selection network sort
+both planes at once, and sweep s — the median of a pass when s is odd, its
+blur when s is even — is computed on the part of the tile that lies s
+inside its edge: that is where its stencil stays inside what sweep s - 1
+produced, and it is all that sweep s + 1, or the final store, reads. The
 apron is loaded through the mirror of section 3, and the fused result
 equals the sequential definition at the borders as well: the mirror is a
-reflection, the stencil is symmetric under it, so a pass computed at a
-mirrored position is that pass at the position it mirrors, by induction
-over the passes. The tile for a 16x16 workgroup and four passes is 24x24;
-a workgroup smaller than 16 only shrinks it.
+reflection, both stencils are symmetric under it, so a sweep computed at a
+mirrored position is that sweep at the position it mirrors, by induction
+over the sweeps.
+
+The tile's side is specialization constant 4, the workgroup's side plus
+four times the maximum passes, and the shared array is sized by it: for a
+16x16 workgroup that is 36x36 and 20 KB, which is more than the 16 KB
+Vulkan guarantees, so the host halves the workgroup until the tile fits
+the device's `maxComputeSharedMemorySize`, and a device with only the
+guarantee runs 8x8 workgroups on a 28x28 tile of 12.5 KB. The picture is
+the same either way; only the occupancy differs.
 
 The median of nine is Smith's 20 exchange selection network, the one in
 McGuire's median shader: each step discards the minimum and the maximum of
 a shrinking set, neither of which can be the median, until three are left.
-The reference sorts; both select, so they agree bit for bit on equal
-inputs. On the fp16 intermediate they differ, in absolute terms, by no
-more than the debayer already differed by within the stencil's reach plus
-one more fp16 store, because a median moves by no more than its inputs
-do. In relative terms they can differ by more: the difference selected
-for a dark pixel beside a clipped lamp is the lamp's, error included, and
-the same absolute error is several times larger against the dark pixel.
-The tests are written accordingly (17.5).
+The reference sorts; both select, and both sum the blur in the same order,
+so they agree bit for bit on equal inputs. On the fp16 intermediate they
+differ, in absolute terms, by no more than the debayer already differed by
+within the stencil's reach plus one more fp16 store, because neither a
+median nor a mean moves by more than its inputs do. In relative terms they
+can differ by more: the difference selected or averaged for a dark pixel
+beside a clipped lamp is the lamp's, error included, and the same absolute
+error is several times larger against the dark pixel. The tests are
+written accordingly (17.5).
 
 ### 17.4 Cost and API
 
-One read of the intermediate with up to a 2.25x overhead for the apron
-that the L2 mostly absorbs, one write, and up to four passes of twenty
-min/max on a vec2 per tile entry. Measured with `cineraw --bench` on the
-6900 XT:
-5.8 ms a frame at 5.8K without the stage, 6.6 ms with three passes and
-7.0 ms with four, so 0.8 to 1.2 ms, most of it the extra read and write
-of a 140 MB image. Nothing at all on a frame with zero passes, which is
-not dispatched.
+One read of the intermediate with the apron's overhead, which the L2
+mostly absorbs, one write, and two sweeps per pass over the tile, twenty
+min/max or nine adds on a vec2 per entry, all from shared memory.
+Measured with `cineraw --bench` on the 6900 XT at 5.8K, RCD, 5.8 ms a
+frame without the stage:
+
+    passes        1     2     3     5
+    ms a frame    6.6   7.0   7.6   9.5
+    the stage     0.8   1.2   1.8   3.7
+
+The apron grows with the passes, so five is not five times one: the tile
+is 36x36 for 16x16 pixels and ten sweeps run over it. Nothing at all on a
+frame with zero passes, which is not dispatched.
 
 `CRAW_PIPELINE_FLAG_FALSE_COLOR` builds the stage and
 `CRAWFrameParams.false_color_passes`, 0 to `CRAW_FALSE_COLOR_MAX_PASSES`,
@@ -2597,19 +2626,17 @@ Debayer section carries the same number.
 `test_pipeline`, on the synthetic mosaic: the two ways of switching the
 stage off (no flag with passes set; the flag with zero passes) reproduce
 the plain chain within its floor; one pass and the maximum on MHC (its
-own image) and on RCD (the borrowed aux) match the reference within twice the
-debayer's own intermediate tolerance — the output at a pixel is its G plus
-a difference selected from a neighbour, so it carries two pixels' worth of
-disagreement, and the copy is stored in fp16 once more — and sit at least
-three floors away from the unfiltered chain, so the pass cannot have
-silently not run; five passes are refused with EINVAL. On the CPU, three
-single-site spikes injected into the neutral flat patch — one per site
-colour — keep at most 10% of their colour after the maximum number of
-passes through every debayer, and through bilinear at most 65% after one,
-which is what 17.2 predicts, while the G plane is unchanged bit for bit.
-With `CRAW_TEST_FRAME` the real frame runs RCD with the maximum number of
-passes, timed, and is held to twice the plain
+own image) and on RCD (the borrowed aux) match the reference within twice
+the debayer's own intermediate tolerance — the output at a pixel is its G
+plus a difference selected and averaged from its neighbours, so it
+carries other pixels' disagreement, and the copy is stored in fp16 once
+more — and sit at least three floors away from the unfiltered chain, so
+the pass cannot have silently not run; six passes are refused with
+EINVAL. On the CPU, three single-site spikes injected into the neutral
+flat patch — one per site colour — keep at most 10% of their colour after
+the maximum number of passes through every debayer, and through bilinear
+at most 65% after one, which is what 17.2 predicts, while the G plane is
+unchanged bit for bit. With `CRAW_TEST_FRAME` the real frame runs RCD
+with the maximum number of passes, timed, and is held to twice the plain
 chain's absolute error against the reference rather than to the relative
-bound of section 11, for the reason 17.3 ends with: on this frame the
-relative disagreement is 5e-2 under a clipped lamp while the absolute one
-is 1.1 times the plain chain's.
+bound of section 11, for the reason 17.3 ends with.

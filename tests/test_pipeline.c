@@ -514,10 +514,11 @@ static int test_check_histogram(const char *method, const uint32_t *gpu_count,
 
 /* The false colour stage is held to twice the debayer's own intermediate
  * tolerance on the synthetic frame: the output at a pixel is its G plus a
- * difference selected from a neighbour, so it carries two pixels' worth of
- * fp16 and arithmetic disagreement, and the copy is stored in fp16 once
- * more. On the real frame it is held to this factor of the plain chain's
- * absolute error, for the reason test_real_frame() gives. DESIGN.md 17.5. */
+ * difference selected and averaged from its neighbours, so it carries
+ * other pixels' fp16 and arithmetic disagreement, and the copy is stored
+ * in fp16 once more. On the real frame it is held to this factor of the
+ * plain chain's absolute error, for the reason test_real_frame() gives.
+ * DESIGN.md 17.5. */
 #define TEST_FC_TOL_FACTOR   2.0
 #define TEST_FC_REAL_FACTOR  2.0
 
@@ -2606,10 +2607,10 @@ static int test_false_color(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProf
 
     /* The definition, on the CPU: a single site spike through the bilinear
      * debayer is a blob of its own colour, A at the centre, A/2 at the
-     * edges and A/4 at the corners in the colour differences, which one
-     * pass halves and three clear; MHC's wider kernels need four, which is
-     * why four is the maximum (DESIGN.md 17.2). G is not the stage's to
-     * touch. */
+     * edges and A/4 at the corners in the colour differences. The median
+     * of one pass halves the centre and the blur then spreads it, leaving
+     * a sixth; the maximum leaves nothing measurable whatever the debayer
+     * (DESIGN.md 17.2). G is not the stage's to touch. */
     memcpy(spiked, mosaic, npix * sizeof(*spiked));
     for (size_t i = 0; i < CRAW_ARRAY_ELEMS(spikes); i++)
         spiked[spikes[i][1] * TEST_W + spikes[i][0]] = 40000;

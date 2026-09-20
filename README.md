@@ -65,10 +65,11 @@ The options that matter most:
 `--denoise` takes a strength in units of the camera's modelled noise
 level, 1.0 meaning "remove exactly that much"; `--noise A,B` overrides the
 model and `--noise-estimate` measures one, printing a line ready for a
-`--tables` file. `--false-colour PASSES` runs one to four median passes
-over the colour differences after the debayer, which turns the coloured
+`--tables` file. `--false-colour PASSES` runs one to five passes of a
+median and a blur over the colour differences after the debayer,
+RawTherapee's false colour suppression steps, which turn the coloured
 dots that rain glints and other sub-pixel highlights leave into neutral
-ones and touches nothing else. `--crop X,Y,W,H` writes one rectangle of the output while
+ones and touch nothing else. `--crop X,Y,W,H` writes one rectangle of the output while
 the pipeline still runs on the whole frame, which is how a 5.8K frame gets
 looked at 1:1 without a 5.8K file.
 
@@ -161,8 +162,8 @@ mired, and what is left is the half step between samples), and picked
 again, which returns the same illuminant.
 
 The "Debayer" section picks the method and carries the false colour
-suppression row: the number of median passes over the colour differences
-after the debayer, zero to four, which is what stops a wet street from
+suppression row: the number of median and blur passes over the colour
+differences after the debayer, zero to five, which is what stops a wet street from
 shimmering in colour as the rain hits it; `--false-colour PASSES` sets it
 from the command line. The "Denoise" section sets the strength and reports the noise model it
 found for the clip's own ISO — the stage stays off when the camera has
