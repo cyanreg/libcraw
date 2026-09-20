@@ -1812,6 +1812,7 @@ static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
                              : d->on ? "on, before the debayer" : "off");
 
     nk_property_float(ctx, "#strength", 0.25f, &d->strength, 3.0f, 0.25f, 0.01f);
+    nk_slider_float(ctx, 0.25f, &d->strength, 3.0f, 0.05f);
 
     /* 1.0 is "remove noise at exactly the modelled level", so the numbers
      * either side of it are worth naming. */
@@ -1832,6 +1833,7 @@ static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
      * needs no model, so it runs whenever the section is on and this is
      * above zero. */
     nk_property_float(ctx, "#chroma", 0.0f, &d->chroma, 1.0f, 0.1f, 0.005f);
+    nk_slider_float(ctx, 0.0f, &d->chroma, 1.0f, 0.02f);
 
     /* Two smoothed averages of libcraw's own pass time, one for the frames
      * that ran the stage and one for the frames that did not, so the cost
@@ -1878,12 +1880,16 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
      * most people came for, and the panel is not the pipeline. */
     nk_property_float(ctx, "#soft light", 0.0f, &a->softlight, 100.0f,
                       5.0f, 0.25f);
+    nk_slider_float(ctx, 0.0f, &a->softlight, 100.0f, 1.0f);
     nk_property_float(ctx, "#pastels", -100.0f, &a->pastels, 100.0f,
                       5.0f, 0.25f);
+    nk_slider_float(ctx, -100.0f, &a->pastels, 100.0f, 1.0f);
     nk_property_float(ctx, "#saturated", -100.0f, &a->saturated, 100.0f,
                       5.0f, 0.25f);
+    nk_slider_float(ctx, -100.0f, &a->saturated, 100.0f, 1.0f);
     nk_property_float(ctx, "#threshold", 0.0f, &a->threshold, 100.0f,
                       5.0f, 0.25f);
+    nk_slider_float(ctx, 0.0f, &a->threshold, 100.0f, 1.0f);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
     nk_checkbox_label(ctx, "protect skin", &a->protect_skin_flag);
@@ -2599,6 +2605,7 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
         nk_property_int(ctx, "#false colour passes", 0, &lk->false_color,
                         CRAW_FALSE_COLOR_MAX_PASSES, 1, 0.05f);
+        nk_slider_int(ctx, 0, &lk->false_color, CRAW_FALSE_COLOR_MAX_PASSES, 1);
         view_section_end(ctx);
     }
 
