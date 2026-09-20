@@ -1681,8 +1681,12 @@ static void view_render_params(struct view_state *st,
     *sig = view_hash(*sig, &rp->lut, sizeof(rp->lut));
     *sig = view_hash(*sig, &rp->lut_type, sizeof(rp->lut_type));
     /* The film hook is one object whichever LUT it carries, so the LUT
-     * itself is what tells a preview from the choice. */
-    *sig = view_hash(*sig, &film, sizeof(film));
+     * itself is what tells a preview from the choice - by its signature,
+     * libplacebo's hash of the cube, and not by its address: one preview
+     * freed and the next parsed lands on the same allocation, and a paused
+     * picture hashed on the pointer stayed on the first rendering hovered. */
+    uint64_t film_sig = film ? film->signature : 0;
+    *sig = view_hash(*sig, &film_sig, sizeof(film_sig));
     *sig = view_hash(*sig, &nb_hooks, sizeof(nb_hooks));
     *sig = view_hash(*sig, hook, (size_t)nb_hooks * sizeof(hook[0]));
     *sig = view_hash(*sig, &st->look, offsetof(struct view_look, video_preset));

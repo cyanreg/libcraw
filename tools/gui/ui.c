@@ -600,6 +600,43 @@ static const ViewLutFilm *view_menu_film(const struct view_state *st)
 
     return view_lut_film(c->first_film + m->sel[2]);
 }
+
+/* The rendering that stands for a film while the film itself is what the
+ * highlight is on: the one labelled "base", or failing that the first
+ * whose label mentions it ("NC, base"), then the first that is neither a
+ * push nor a pull, then the first there is. Six films have no base at
+ * all - the print stocks are three gamut mappings each, Velvia 100 a
+ * single generic profile - and the Polaroids call theirs "cold" and
+ * "warm", which the third rule reaches. */
+static int view_menu_film_base(const ViewLutFilm *f)
+{
+    int found = -1;
+
+    if (!f || f->n_luts <= 0)
+        return -1;
+
+    for (int i = f->first_lut; i < f->first_lut + f->n_luts; i++) {
+        const ViewLut *l = view_lut_get(i);
+
+        if (!l)
+            continue;
+        if (!strcmp(l->label, "base"))
+            return i;
+        if (found < 0 && strstr(l->label, "base"))
+            found = i;
+    }
+    if (found >= 0)
+        return found;
+
+    for (int i = f->first_lut; i < f->first_lut + f->n_luts; i++) {
+        const ViewLut *l = view_lut_get(i);
+
+        if (l && !strstr(l->label, "stop"))
+            return i;
+    }
+
+    return f->first_lut;
+}
 #endif
 
 /* The colour spaces are grouped by their first column entry, so that the
@@ -1545,10 +1582,19 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
      * column's rests on is shown while it does. The leaf is the last
      * column open, and view_menu_lut() answers -1 for anything that is
      * not a rendering - a parent column, or a leaf with nothing
-     * highlighted yet - which is no preview. */
-    if (m->kind == VIEW_MENU_FILM)
-        view_lut_preview(st, view_menu_lut(st, m->cols - 1,
-                                           m->sel[m->cols - 1]));
+     * highlighted yet. A film with none of its renderings highlighted
+     * previews as its base, so the films column can be walked without
+     * going into every submenu; a look category has no such rendering,
+     * and previews as nothing. */
+    if (m->kind == VIEW_MENU_FILM) {
+        int ix = view_menu_lut(st, m->cols - 1, m->sel[m->cols - 1]);
+
+#if CINEVIEW_HAVE_LUTS
+        if (ix < 0)
+            ix = view_menu_film_base(view_menu_film(st));
+#endif
+        view_lut_preview(st, ix);
+    }
 
     view_menu_draw(ctx, st);
 }
