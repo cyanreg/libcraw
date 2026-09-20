@@ -512,6 +512,15 @@ static int test_check_histogram(const char *method, const uint32_t *gpu_count,
  * storage alone is worth tens of millis absolute and means nothing. */
 #define TEST_DENOISE_REAL_TOL 1.5e-2
 
+/* The false colour stage is held to twice the debayer's own intermediate
+ * tolerance on the synthetic frame: the output at a pixel is its G plus a
+ * difference selected from a neighbour, so it carries two pixels' worth of
+ * fp16 and arithmetic disagreement, and the copy is stored in fp16 once
+ * more. On the real frame it is held to this factor of the plain chain's
+ * absolute error, for the reason test_real_frame() gives. DESIGN.md 17.5. */
+#define TEST_FC_TOL_FACTOR   2.0
+#define TEST_FC_REAL_FACTOR  2.0
+
 /* The 3x3 [1 -2 1; -2 4 -2; 1 -2 1] / 6 high pass of one CFA plane has
  * unit gain on white noise variance and none at all on a bilinear signal,
  * so its median absolute value over a flat patch is 0.6745 noise standard
@@ -2452,6 +2461,240 @@ static int test_validation(CRAWContext *ctx)
     return 0;
 }
 
+/* --------------------------------------------------------- false colour */
+
+/* Largest |R - G| or |B - G| over a rectangle of a camera RGB buffer. */
+static double test_patch_chroma(const float *rgb, int x0, int y0, int x1, int y1)
+{
+    double worst = 0.0;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            const float *px = &rgb[((size_t)y * TEST_W + x) * 4];
+            double dr = fabs((double)px[0] - (double)px[1]);
+            double db = fabs((double)px[2] - (double)px[1]);
+
+            worst = CRAW_MAX(worst, CRAW_MAX(dr, db));
+        }
+    }
+
+    return worst;
+}
+
+/* GPU against the reference with the false colour stage after the debayer,
+ * DESIGN.md 17.5: both ways of switching it off, one and three passes on
+ * MHC (the stage's own image) and on RCD (RCD's aux, borrowed), too many
+ * passes refused, and the definition itself on the CPU.
+ *
+ * As in test_denoise(), every filtered frame is read against two numbers:
+ * the reference of the same configuration, which it has to match within
+ * the debayer's own tolerance, and the unfiltered reference, which it has
+ * to sit well away from, at least three floors, or the pass did not run. */
+static int test_false_color(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                            const uint16_t *mosaic, CRAWTestImage *src, CRAWTestImage *dst,
+                            float *gpu, float *ref)
+{
+    static const enum CRAWDebayer methods[] = { CRAW_DEBAYER_MHC, CRAW_DEBAYER_RCD };
+    static const uint32_t passes[] = { 1, CRAW_FALSE_COLOR_MAX_PASSES };
+    /* One spike per site colour, well inside the neutral flat patch of
+     * test_scene_rgb() and well apart: (170, 30) is an R site, (181, 41) a
+     * B site and (191, 34) a G site of an R row. */
+    static const int spikes[3][2] = { { 170, 30 }, { 181, 41 }, { 191, 34 } };
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    uint16_t *spiked = NULL;
+    float *plain = NULL;
+    double ms = 0.0;
+    int ret = -1;
+
+    spiked = malloc(npix * sizeof(*spiked));
+    plain = malloc(npix * 4 * sizeof(*plain));
+    if (!spiked || !plain)
+        goto done;
+
+    /* Off both ways: passes set on a pipeline built without the flag, and
+     * no passes on one built with it. Both must reproduce the plain chain. */
+    for (int off = 0; off < 2; off++) {
+        double base;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = CRAW_DEBAYER_MHC;
+        pp.out_space = CRAW_CS_XYZ_D65;
+        pp.flags = off ? 0 : CRAW_PIPELINE_FLAG_FALSE_COLOR;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.false_color_passes = off ? CRAW_FALSE_COLOR_MAX_PASSES : 0;
+
+        if (craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, identity,
+                             CRAW_DEBAYER_MHC, ref) < 0)
+            goto done;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+
+        base = test_max_abs(gpu, ref, npix);
+        printf("  false colour %-12s: max abs %.3e\n", off ? "flag not set" : "passes 0", base);
+        if (!(base <= 2e-3)) {
+            fprintf(stderr, "the false colour pass ran when it should not have (%.3e)\n", base);
+            goto done;
+        }
+    }
+
+    for (size_t mi = 0; mi < CRAW_ARRAY_ELEMS(methods); mi++) {
+        enum CRAWDebayer method = methods[mi];
+        const char *mname = test_method_name(method);
+        double tol = TEST_FC_TOL_FACTOR * (method == CRAW_DEBAYER_RCD ? 5e-3 : 2e-3);
+        double base;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = method;
+        pp.out_space = CRAW_CS_XYZ_D65;
+        pp.flags = CRAW_PIPELINE_FLAG_FALSE_COLOR;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+
+        /* The floor: this debayer's own GPU/CPU disagreement plus the fp16
+         * intermediate, before the stage adds anything. */
+        fp.false_color_passes = 0;
+        if (craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, identity, method, ref) < 0)
+            goto done;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+        base = test_max_abs(gpu, ref, npix);
+
+        for (size_t pi = 0; pi < CRAW_ARRAY_ELEMS(passes); pi++) {
+            double cross, err;
+
+            fp.false_color_passes = passes[pi];
+            if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+                goto done;
+
+            /* `ref` holds the unfiltered reference, rebuilt below. */
+            cross = test_max_abs(gpu, ref, npix);
+
+            if (craw_ref_process(mosaic, TEST_W, TEST_H, TEST_W, &pp, &fp, ref) < 0) {
+                fprintf(stderr, "false colour: craw_ref_process failed\n");
+                goto done;
+            }
+            err = test_max_abs(gpu, ref, npix);
+
+            printf("  false colour %-8s %u pass%s: max abs %.3e (tol %.1e), %.3e against the "
+                   "unfiltered chain (floor %.3e), %.3f ms\n",
+                   mname, passes[pi], passes[pi] == 1 ? " " : "es", err, tol, cross, base, ms);
+            if (!(err <= tol)) {
+                fprintf(stderr, "false colour on %s with %u passes differs by %.3e, "
+                        "tolerance %.1e\n", mname, passes[pi], err, tol);
+                goto done;
+            }
+            if (!(cross > 3.0 * base)) {
+                fprintf(stderr, "a filtered %s frame is only %.3e from an unfiltered one "
+                        "against a floor of %.3e; the pass cannot have run\n",
+                        mname, cross, base);
+                goto done;
+            }
+
+            if (craw_ref_debayer(mosaic, TEST_W, TEST_H, TEST_W, identity, method, ref) < 0)
+                goto done;
+        }
+    }
+
+    /* The definition, on the CPU: a single site spike through the bilinear
+     * debayer is a blob of its own colour, A at the centre, A/2 at the
+     * edges and A/4 at the corners in the colour differences, which one
+     * pass halves and three clear; MHC's wider kernels need four, which is
+     * why four is the maximum (DESIGN.md 17.2). G is not the stage's to
+     * touch. */
+    memcpy(spiked, mosaic, npix * sizeof(*spiked));
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(spikes); i++)
+        spiked[spikes[i][1] * TEST_W + spikes[i][0]] = 40000;
+
+    for (int mi = 0; mi < CRAW_DEBAYER_NB; mi++) {
+        enum CRAWDebayer method = (enum CRAWDebayer)mi;
+        double before, after1, after_max;
+
+        if (craw_ref_debayer(spiked, TEST_W, TEST_H, TEST_W, identity, method, plain) < 0)
+            goto done;
+
+        before = test_patch_chroma(plain, 164, 28, 195, 51);
+
+        memcpy(ref, plain, npix * 4 * sizeof(*ref));
+        if (craw_ref_false_color(ref, TEST_W, TEST_H, 1) < 0) {
+            fprintf(stderr, "craw_ref_false_color failed\n");
+            goto done;
+        }
+        after1 = test_patch_chroma(ref, 164, 28, 195, 51);
+
+        memcpy(ref, plain, npix * 4 * sizeof(*ref));
+        if (craw_ref_false_color(ref, TEST_W, TEST_H, CRAW_FALSE_COLOR_MAX_PASSES) < 0) {
+            fprintf(stderr, "craw_ref_false_color failed\n");
+            goto done;
+        }
+        after_max = test_patch_chroma(ref, 164, 28, 195, 51);
+
+        for (size_t i = 0; i < npix; i++) {
+            if (ref[i * 4 + 1] != plain[i * 4 + 1] || ref[i * 4 + 3] != plain[i * 4 + 3]) {
+                fprintf(stderr, "false colour moved G or alpha at pixel %zu\n", i);
+                goto done;
+            }
+        }
+
+        printf("  false colour %-8s spikes : chroma %.3f -> %.3f after one pass (%.0f%%%s), "
+               "%.4f after %u (%.1f%%, want <= 10%%)\n", test_method_name(method),
+               before, after1, 100.0 * after1 / before,
+               method == CRAW_DEBAYER_BILINEAR ? ", want <= 65%" : "",
+               after_max, (unsigned)CRAW_FALSE_COLOR_MAX_PASSES, 100.0 * after_max / before);
+        if (!(after_max <= 0.10 * before) ||
+            (method == CRAW_DEBAYER_BILINEAR && !(after1 <= 0.65 * before))) {
+            fprintf(stderr, "false colour left %.0f%% of a %s spike's colour after one pass "
+                    "and %.1f%% after %u\n", 100.0 * after1 / before,
+                    test_method_name(method), 100.0 * after_max / before,
+                    (unsigned)CRAW_FALSE_COLOR_MAX_PASSES);
+            goto done;
+        }
+    }
+
+    /* More passes than the tile has apron for is an error, not a clamp. */
+    {
+        CRAWPipeline *pipe = NULL;
+        struct test_run run;
+        int rec;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.flags = CRAW_PIPELINE_FLAG_FALSE_COLOR;
+
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.false_color_passes = CRAW_FALSE_COLOR_MAX_PASSES + 1;
+
+        if (craw_pipeline_create(ctx, &pp, &pipe) < 0)
+            goto done;
+
+        run = (struct test_run) { .pipe = pipe, .src = src, .dst = dst, .fp = &fp };
+        rec = craw_testdev_run(td, test_record, &run);
+        craw_pipeline_free(&pipe);
+        if (rec != CRAW_ERROR(EINVAL)) {
+            fprintf(stderr, "%u false colour passes returned %d, wanted %d\n",
+                    (unsigned)CRAW_FALSE_COLOR_MAX_PASSES + 1, rec, CRAW_ERROR(EINVAL));
+            goto done;
+        }
+    }
+
+    ret = 0;
+
+done:
+    free(plain);
+    free(spiked);
+    return ret;
+}
+
 /* ----------------------------------------------------------- real frame */
 
 static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile)
@@ -2465,7 +2708,7 @@ static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfi
     CRAWFrameParams fp;
     CRAWTestImage src = { 0 }, dst = { 0 };
     bool have_src = false, have_dst = false;
-    double ms = 0.0;
+    double ms = 0.0, plain_abs = 0.0;
     FILE *f;
     int ret = 0;
 
@@ -2543,8 +2786,9 @@ static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfi
     if (ret < 0)
         goto done;
 
+    plain_abs = test_max_abs(gpu, ref, npix);
     printf("  rcd on %dx%d: %.2f ms, max abs %.3e, max rel %.3e\n", FRAME_W, FRAME_H, ms,
-           test_max_abs(gpu, ref, npix), test_max_rel(gpu, ref, npix));
+           plain_abs, test_max_rel(gpu, ref, npix));
 
     /* The same frame through the denoise pass, with the model fitted on
      * the frame itself so that the stage is handed the noise it really
@@ -2592,6 +2836,61 @@ static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfi
         }
         if (!(cross > 5.0 * err_rel)) {
             fprintf(stderr, "the denoised frame is only %.3e relative from the undenoised "
+                    "one; the pass cannot have run\n", cross);
+            ret = -1;
+            goto done;
+        }
+    }
+
+    /* And with three passes of false colour suppression on the plain RCD
+     * chain, DESIGN.md 17.5. `ref` holds the denoised reference by now, so
+     * the plain one is rebuilt for the cross check. */
+    {
+        double cross, err_abs, err_rel;
+
+        pp.flags = CRAW_PIPELINE_FLAG_FALSE_COLOR;
+        fp.denoise_strength = 0.0f;
+        fp.false_color_passes = CRAW_FALSE_COLOR_MAX_PASSES;
+
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, gpu, NULL, NULL, &ms);
+        if (ret < 0)
+            goto done;
+
+        fp.false_color_passes = 0;
+        ret = craw_ref_process(mosaic, FRAME_W, FRAME_H, FRAME_W, &pp, &fp, ref);
+        if (ret < 0)
+            goto done;
+        cross = test_max_rel(gpu, ref, npix);
+
+        fp.false_color_passes = CRAW_FALSE_COLOR_MAX_PASSES;
+        ret = craw_ref_process(mosaic, FRAME_W, FRAME_H, FRAME_W, &pp, &fp, ref);
+        if (ret < 0)
+            goto done;
+
+        err_abs = test_max_abs(gpu, ref, npix);
+        err_rel = test_max_rel(gpu, ref, npix);
+        printf("  rcd + false colour x%u on %dx%d: %.2f ms, max abs %.3e (plain %.3e, tol "
+               "%.3e), max rel %.3e, %.3e relative against the unfiltered chain\n",
+               (unsigned)CRAW_FALSE_COLOR_MAX_PASSES, FRAME_W, FRAME_H, ms, err_abs,
+               plain_abs, TEST_FC_REAL_FACTOR * plain_abs, err_rel, cross);
+
+        /* Absolute, against the plain chain's own disagreement: a median
+         * moves by no more than its inputs do, so the stage cannot add to
+         * the absolute error beyond what carrying a neighbour's error and
+         * one more fp16 store costs. The relative bound of section 11 is
+         * not the right yardstick here: the difference selected for a dark
+         * pixel beside a clipped lamp is the lamp's, error included, and
+         * the same absolute error is several times larger relative to the
+         * dark pixel. DESIGN.md 17.5. */
+        if (!(err_abs <= TEST_FC_REAL_FACTOR * plain_abs)) {
+            fprintf(stderr, "false colour on the real frame differs by %.3e absolute, "
+                    "tolerance %.3e (%.1f times the plain chain's %.3e)\n", err_abs,
+                    TEST_FC_REAL_FACTOR * plain_abs, TEST_FC_REAL_FACTOR, plain_abs);
+            ret = -1;
+            goto done;
+        }
+        if (!(cross > 5.0 * err_rel)) {
+            fprintf(stderr, "the filtered frame is only %.3e relative from the unfiltered "
                     "one; the pass cannot have run\n", cross);
             ret = -1;
             goto done;
@@ -2787,6 +3086,9 @@ int main(void)
     }
 
     if (test_denoise(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
+
+    if (test_false_color(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
         goto done;
 
     if (test_lens(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)

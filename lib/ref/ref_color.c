@@ -137,6 +137,13 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
             goto done;
     }
 
+    /* On the intermediate, before anything reads it, DESIGN.md 17.3. */
+    if ((params->flags & CRAW_PIPELINE_FLAG_FALSE_COLOR) && fp->false_color_passes > 0) {
+        ret = craw_ref_false_color(out, width, height, fp->false_color_passes);
+        if (ret < 0)
+            goto done;
+    }
+
     ret = craw_ref_color(out, width, height, fp, craw_ref_out_space(params, fp));
     if (ret < 0)
         goto done;

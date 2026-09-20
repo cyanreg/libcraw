@@ -2586,6 +2586,13 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         for (int i = 0; i < CRAW_DEBAYER_NB; i++)
             if (nk_option_label(ctx, view_debayer_names[i], lk->debayer == i))
                 lk->debayer = (enum CRAWDebayer)i;
+        /* False colour suppression, DESIGN.md 17: median passes over the
+         * colour differences after the debayer, which is why it is this
+         * section's row and not a section of its own. Zero is off and
+         * costs nothing; the pipeline always carries the stage. */
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        nk_property_int(ctx, "#false colour passes", 0, &lk->false_color,
+                        CRAW_FALSE_COLOR_MAX_PASSES, 1, 0.05f);
         view_section_end(ctx);
     }
 

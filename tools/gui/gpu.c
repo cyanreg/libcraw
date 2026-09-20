@@ -815,14 +815,15 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
      * pipeline for it per frame through CRAWFrameParams.out_space. */
     pp.out_space  = CRAW_CS_ACES_AP1_LINEAR;
     pp.out_format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    /* All three always built: the panel can switch to auto white balance,
-     * to denoising or to lens correction at any time and a pipeline rebuild
-     * mid-clip would drop a frame. A denoise pass that is built but left at
-     * strength 0 costs nothing measurable, and a lens pass handed a frame
-     * with no record drops out entirely, which is what makes both live
-     * controls. */
+    /* All four always built: the panel can switch to auto white balance,
+     * to denoising, to false colour suppression or to lens correction at
+     * any time and a pipeline rebuild mid-clip would drop a frame. A
+     * denoise pass that is built but left at strength 0 costs nothing
+     * measurable, a false colour pass at zero passes is not dispatched,
+     * and a lens pass handed a frame with no record drops out entirely,
+     * which is what makes all three live controls. */
     pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE |
-                    CRAW_PIPELINE_FLAG_LENS;
+                    CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_LENS;
     /* Enough copies that the previous frame's histogram is still readable
      * while the current one is in flight, which is what lets the auto white
      * balance run without a per-frame stall. */
@@ -2319,8 +2320,9 @@ int view_gpu_direct_open(struct view_gpu *g)
     }
 
     /* The same stages as the display's, so that what is exported is what is
-     * on screen up to the output space: a denoise strength or a lens warp
-     * set in the panel has to be in the file too. The histogram is not: the
+     * on screen up to the output space: a denoise strength, a false colour
+     * pass or a lens warp set in the panel has to be in the file too. The
+     * histogram is not: the
      * auto white balance reads the display pipeline's own, and a second set
      * of slots would only be another buffer to zero every frame. */
     craw_pipeline_params_init(&pp);
@@ -2330,7 +2332,8 @@ int view_gpu_direct_open(struct view_gpu *g)
     pp.debayer    = g->pipe_debayer;
     pp.out_space  = CRAW_CS_ACES_AP1_LINEAR;
     pp.out_format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    pp.flags      = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_LENS;
+    pp.flags      = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_FALSE_COLOR |
+                    CRAW_PIPELINE_FLAG_LENS;
 
     ret = craw_pipeline_create(g->ctx, &pp, &g->direct_pipe);
     if (ret < 0) {

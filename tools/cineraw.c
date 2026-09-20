@@ -114,6 +114,8 @@ struct tool_cfg {
     CRAWNoiseModel noise;     /* a > 0 overrides the profile's table */
     bool noise_estimate;
 
+    uint32_t false_color;     /* median passes after the debayer, 0 = off */
+
     enum tool_lens lens;
 
     const char *tables;
@@ -268,6 +270,14 @@ static void tool_usage(FILE *f)
 "                      is still decoded and developed) is written cut to that\n"
 "                      picture by default; --crop 0,0,W,H of the coded size\n"
 "                      writes all of it\n"
+"  --false-colour PASSES\n"
+"                      false colour suppression after the debayer: PASSES\n"
+"                      (1 to 4) 3x3 medians of the colour differences R-G\n"
+"                      and B-G, which turn the coloured dots a glint smaller\n"
+"                      than a CFA quad leaves into neutral ones and leave\n"
+"                      luminance alone. 0 (the default) is off; 3 clears a\n"
+"                      single site glint entirely (4 with mhc), 1 halves a\n"
+"                      large one and clears the small ones. DESIGN.md 17\n"
 "  --denoise STRENGTH  raw domain denoising at this strength: 1.0 removes\n"
 "                      noise at the level the camera's noise model predicts,\n"
 "                      2.0 smooths twice as far, 0 (the default) is off. The\n"
@@ -830,6 +840,8 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
     pp.flags = cfg->wb == TOOL_WB_AUTO ? CRAW_PIPELINE_FLAG_AWB_HISTOGRAM : 0;
     if (cfg->denoise > 0.0f)
         pp.flags |= CRAW_PIPELINE_FLAG_DENOISE;
+    if (cfg->false_color > 0)
+        pp.flags |= CRAW_PIPELINE_FLAG_FALSE_COLOR;
     /* Only built once a frame has been seen to carry a record: a clip
      * without one never pays for the extra image. */
     if (lens)
@@ -1636,6 +1648,7 @@ enum {
     TOOL_OPT_STATS,
     TOOL_OPT_CROP,
     TOOL_OPT_DENOISE,
+    TOOL_OPT_FALSE_COLOUR,
     TOOL_OPT_NOISE,
     TOOL_OPT_NOISE_EST,
     TOOL_OPT_LENS,
@@ -1664,6 +1677,7 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         { "stats",          no_argument,       NULL, TOOL_OPT_STATS     },
         { "crop",           required_argument, NULL, TOOL_OPT_CROP      },
         { "denoise",        required_argument, NULL, TOOL_OPT_DENOISE   },
+        { "false-colour",   required_argument, NULL, TOOL_OPT_FALSE_COLOUR },
         { "noise",          required_argument, NULL, TOOL_OPT_NOISE     },
         { "noise-estimate", no_argument,       NULL, TOOL_OPT_NOISE_EST },
         { "lens",           required_argument, NULL, TOOL_OPT_LENS      },
@@ -1782,6 +1796,16 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
                 return CRAW_ERROR(EINVAL);
             }
             cfg->denoise = (float)d;
+            break;
+        case TOOL_OPT_FALSE_COLOUR:
+            if ((ret = tool_parse_double("--false-colour", optarg, &d)) < 0)
+                return ret;
+            if (d < 0.0 || d > CRAW_FALSE_COLOR_MAX_PASSES || d != (double)(int)d) {
+                fprintf(stderr, "--false-colour: expected 0 to %d passes, got %g\n",
+                        CRAW_FALSE_COLOR_MAX_PASSES, d);
+                return CRAW_ERROR(EINVAL);
+            }
+            cfg->false_color = (uint32_t)d;
             break;
         case TOOL_OPT_NOISE:
             if ((ret = tool_parse_noise(cfg, optarg)) < 0)
@@ -2207,6 +2231,7 @@ have_device:
             fp.flags |= CRAW_FRAME_FLAG_LENS_KEEP_ALL;
         fp.denoise_strength = cfg.denoise;
         fp.noise_override = cfg.noise;
+        fp.false_color_passes = cfg.false_color;
         fp.lens = lens;
 
         if (cfg.wb == TOOL_WB_FIXED) {

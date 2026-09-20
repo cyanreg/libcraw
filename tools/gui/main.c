@@ -276,6 +276,10 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
      * so craw_pipeline_record() evaluates the table at the frame's own
      * as-shot index. */
     fp->denoise_strength = view_denoise_strength(st);
+    /* The pipeline is always built with the stage (gpu.c), so the count is
+     * all it takes; zero is not dispatched. */
+    fp->false_color_passes = (uint32_t)CRAW_CLAMP(st->look.false_color, 0,
+                                                  CRAW_FALSE_COLOR_MAX_PASSES);
     /* By value: the record is this frame's own and the next frame's will be
      * different, so the parameters must not point at anything the panel
      * owns. An invalid one is the documented "leave this frame alone". */
@@ -304,6 +308,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .exposure   = view_exposure_bias(st),
         .ambience   = st->awb.params.ambience,
         .debayer    = st->look.debayer,
+        .false_color = st->look.false_color,
         .denoise    = view_denoise_strength(st),
         .lens       = view_lens_active(st),
         .lens_keep  = view_lens_keep_all(st),
@@ -321,6 +326,7 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->illum.cct == b->illum.cct && a->illum.tint == b->illum.tint &&
            a->ei == b->ei && a->exposure == b->exposure &&
            a->ambience == b->ambience && a->debayer == b->debayer &&
+           a->false_color == b->false_color &&
            a->denoise == b->denoise && a->lens == b->lens &&
            a->lens_keep == b->lens_keep;
 }
@@ -1671,6 +1677,13 @@ static void view_usage(FILE *f)
 "                      INDEX / as-shot ISO\n"
 "  --exposure STOPS    exposure bias on top of --ei (default: 0)\n"
 "  --debayer METHOD    bilinear, mhc or rcd (default: rcd)\n"
+"  --false-colour PASSES\n"
+"                      false colour suppression after the debayer: 1 to 4\n"
+"                      median passes over the colour differences, which\n"
+"                      turn the coloured dots of glints smaller than a CFA\n"
+"                      quad neutral and leave luminance alone; 0 (the\n"
+"                      default) is off. The Debayer section has the same\n"
+"                      row\n"
 "  --denoise STRENGTH  raw domain denoising, in units of the camera's\n"
 "                      modelled noise level: 1.0 removes exactly that much,\n"
 "                      0.25 to 3.0, 0 (the default) leaves it off. Needs a\n"
@@ -1886,6 +1899,7 @@ enum {
     VIEW_OPT_LIST_LUTS,
     VIEW_OPT_GRAIN,
     VIEW_OPT_DENOISE,
+    VIEW_OPT_FALSE_COLOUR,
     VIEW_OPT_LENS,
     VIEW_OPT_LENS_FIT,
     VIEW_OPT_SOFTLIGHT,
@@ -1908,6 +1922,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "ei",       required_argument, NULL, VIEW_OPT_EI        },
         { "exposure", required_argument, NULL, VIEW_OPT_EXPOSURE  },
         { "debayer",  required_argument, NULL, VIEW_OPT_DEBAYER   },
+        { "false-colour", required_argument, NULL, VIEW_OPT_FALSE_COLOUR },
         { "lut",      required_argument, NULL, VIEW_OPT_LUT       },
         { "lut-type", required_argument, NULL, VIEW_OPT_LUT_TYPE  },
         { "lut-space", required_argument, NULL, VIEW_OPT_LUT_SPACE },
@@ -2085,6 +2100,17 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return ret;
             st->look.debayer = (enum CRAWDebayer)v;
             break;
+        case VIEW_OPT_FALSE_COLOUR: {
+            long n = strtol(optarg, &end, 10);
+
+            if (end == optarg || *end || n < 0 || n > CRAW_FALSE_COLOR_MAX_PASSES) {
+                fprintf(stderr, "--false-colour: expected 0 to %d passes, got `%s`\n",
+                        CRAW_FALSE_COLOR_MAX_PASSES, optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            st->look.false_color = (int)n;
+            break;
+        }
         case VIEW_OPT_LUT:
             snprintf(st->look.lut_path, sizeof(st->look.lut_path), "%s", optarg);
             break;
@@ -2380,6 +2406,8 @@ static void view_log_look(const struct view_state *st)
     fprintf(stderr, ", debayer %s",
             (unsigned)lk->debayer < CRAW_DEBAYER_NB
                 ? view_debayer_names[lk->debayer] : "?");
+    if (lk->false_color)
+        fprintf(stderr, ", false colour x%d", lk->false_color);
 
     if (st->denoise.on && st->denoise.strength > 0.0f)
         fprintf(stderr, ", denoise %.2f", st->denoise.strength);

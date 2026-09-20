@@ -52,6 +52,7 @@ craw_sources = files(
     'ref/ref_debayer.c',
     'ref/ref_color.c',
     'ref/ref_denoise.c',
+    'ref/ref_false_color.c',
     'ref/ref_lens.c',
 )
 

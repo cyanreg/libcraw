@@ -33,6 +33,7 @@ craw_shader_names = [
     'awb_hist',
     'denoise_nlm',
     'lens',
+    'false_color',
 ]
 
 spv_embed = files('../../tools/spv_embed.py')

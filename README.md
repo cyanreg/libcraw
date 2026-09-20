@@ -65,7 +65,10 @@ The options that matter most:
 `--denoise` takes a strength in units of the camera's modelled noise
 level, 1.0 meaning "remove exactly that much"; `--noise A,B` overrides the
 model and `--noise-estimate` measures one, printing a line ready for a
-`--tables` file. `--crop X,Y,W,H` writes one rectangle of the output while
+`--tables` file. `--false-colour PASSES` runs one to four median passes
+over the colour differences after the debayer, which turns the coloured
+dots that rain glints and other sub-pixel highlights leave into neutral
+ones and touches nothing else. `--crop X,Y,W,H` writes one rectangle of the output while
 the pipeline still runs on the whole frame, which is how a 5.8K frame gets
 looked at 1:1 without a 5.8K file.
 
@@ -157,7 +160,11 @@ comes out neutral to within a percent (the locus is sampled every 5
 mired, and what is left is the half step between samples), and picked
 again, which returns the same illuminant.
 
-The "Denoise" section sets the strength and reports the noise model it
+The "Debayer" section picks the method and carries the false colour
+suppression row: the number of median passes over the colour differences
+after the debayer, zero to four, which is what stops a wet street from
+shimmering in colour as the rain hits it; `--false-colour PASSES` sets it
+from the command line. The "Denoise" section sets the strength and reports the noise model it
 found for the clip's own ISO — the stage stays off when the camera has
 none, which the section says rather than leaving you guessing; `--denoise
 STRENGTH` sets both the switch and the strength from the command line.
@@ -169,8 +176,9 @@ the previous and the next clip and wrap at both ends, and the panel's clip
 line reads `3/7 P1000347.MOV [hevc video, gpu]`. The clips need not match —
 ProRes RAW and already developed, different sizes, stereo or four-channel or
 no audio at all — and a switch keeps every setting exactly as it was: the
-white balance mode and a manual CCT, the exposure index and bias, debayer,
-denoise, lens correction and its fit, the export's colour space, size,
+white balance mode and a manual CCT, the exposure index and bias, debayer
+and its false colour passes, denoise, lens correction and its fit, the
+export's colour space, size,
 pixel format, audio mode and threads, the two export file paths once typed,
 the film simulation, the tone map, the adjustments, the grain, every
 section's switch and the zoom. A setting a clip's kind

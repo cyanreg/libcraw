@@ -99,6 +99,12 @@ struct view_look {
     float exposure;             /* bias in stops on top of ei */
 
     enum CRAWDebayer debayer;
+    /* False colour suppression after the debayer, DESIGN.md 17: the number
+     * of median passes, 0 to CRAW_FALSE_COLOR_MAX_PASSES, and 0 is off. A
+     * row of the Debayer section rather than a section of its own, because
+     * it is a property of how the mosaic comes off. An int because that is
+     * what a nuklear property wants. */
+    int false_color;
 
     char lut_path[VIEW_MAX_PATH];
     /* The embedded film simulation, or -1 for none. Mutually exclusive
@@ -142,6 +148,7 @@ struct view_pipeline_look {
     bool have_illum;
     float ei, exposure, ambience;
     enum CRAWDebayer debayer;
+    int false_color;            /* passes, 0 when the stage did not run */
     /* The strength the pass actually ran at, 0 when it did not: a toggle
      * while paused has to put the frame through again. */
     float denoise;

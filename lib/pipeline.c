@@ -24,6 +24,7 @@
 #include "awb_hist.spv.h"
 #include "denoise_nlm.spv.h"
 #include "lens.spv.h"
+#include "false_color.spv.h"
 
 /* Every debayer pass shares this block; it mirrors CRAWPrepPushBuf in
  * lib/shaders/common.glsl field for field. Scalar layout gives every member
@@ -120,6 +121,15 @@ static_assert(offsetof(CRAWLensPush, k) == 20, "CRAWLensPush layout");
 static_assert(offsetof(CRAWLensPush, inv_scale) == 68, "CRAWLensPush layout");
 static_assert(offsetof(CRAWLensPush, keep_all) == 72, "CRAWLensPush layout");
 
+/* Mirrors CRAWFalseColorPushBuf in lib/shaders/false_color.comp.glsl. */
+typedef struct CRAWFalseColorPush {
+    int32_t size[2];
+    int32_t passes;        /* 1 to CRAW_FALSE_COLOR_MAX_PASSES */
+} CRAWFalseColorPush;
+
+static_assert(sizeof(CRAWFalseColorPush) == 12, "CRAWFalseColorPush layout");
+static_assert(offsetof(CRAWFalseColorPush, passes) == 8, "CRAWFalseColorPush layout");
+
 /* Mirrors CRAWAwbPushBuf in lib/shaders/awb_hist.comp.glsl. */
 typedef struct CRAWAwbPush {
     int32_t blocks[2];
@@ -166,6 +176,14 @@ static_assert((2 * CRAW_DN_PATCH_R + 1) * (2 * CRAW_DN_PATCH_R + 1) <= 25,
 #define CRAW_DN_GUARD_LO 0.90f
 #define CRAW_DN_GUARD_HI 1.00f
 
+/* The false colour shader's shared tile is sized for a 16x16 workgroup
+ * plus an apron of CRAW_FALSE_COLOR_MAX_PASSES on every side, both fixed
+ * in lib/shaders/false_color.comp.glsl; craw_wg_dim() never hands out more
+ * than it is asked for, so the workgroup is asked for at this size. */
+#define CRAW_FC_WG_MAX 16
+
+static_assert(CRAW_FALSE_COLOR_MAX_PASSES == 4, "false colour apron must match the shader's tile");
+
 #define CRAW_AWB_HIST_ENTRIES (CRAW_AWB_HIST_BINS * CRAW_AWB_HIST_BINS)
 #define CRAW_AWB_HIST_BYTES   (CRAW_AWB_HIST_ENTRIES * (uint32_t)sizeof(uint32_t))
 
@@ -177,6 +195,7 @@ struct CRAWPipeline {
     bool awb;
     bool has_denoise;
     bool has_lens;
+    bool has_fc;
 
     /* One of `debayer` or the three RCD passes is created, never both.
      * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
@@ -188,11 +207,14 @@ struct CRAWPipeline {
     CRAWVkShader awb_hist;
     CRAWVkShader denoise;
     CRAWVkShader lens;
+    CRAWVkShader false_color;
 
     CRAWVkImage inter;   /* camera RGB, RGBA16F */
     CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
     CRAWVkImage green;   /* RCD: pass B green plane, R16F */
     CRAWVkImage clean;   /* denoise: the filtered mosaic, R16_UNORM */
+    CRAWVkImage fc;      /* false colour: the filtered intermediate, RGBA16F,
+                          * only without RCD, whose aux is borrowed instead */
     CRAWVkImage linear;  /* lens: the colour stage's output, out_format */
 
     CRAWVkBuffer hist_count;
@@ -312,7 +334,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
 {
     CRAWPipeline *p;
     uint32_t spec[4];
-    uint32_t wg2d, wgrcd, wgdn;
+    uint32_t wg2d, wgrcd, wgdn, wgfc;
     int ret;
 
     if (!ctx || !params || !pipe)
@@ -354,6 +376,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     p->awb = !!(params->flags & CRAW_PIPELINE_FLAG_AWB_HISTOGRAM);
     p->has_denoise = !!(params->flags & CRAW_PIPELINE_FLAG_DENOISE);
     p->has_lens = !!(params->flags & CRAW_PIPELINE_FLAG_LENS);
+    p->has_fc = !!(params->flags & CRAW_PIPELINE_FLAG_FALSE_COLOR);
     p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
     p->blocks[1] = (int32_t)(params->height / CRAW_AWB_BLOCK);
 
@@ -365,6 +388,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
      * that many invocations gets a smaller one, which only shrinks the
      * tile. */
     wgdn  = craw_wg_dim(ctx, CRAW_DN_WG);
+    /* Likewise the false colour tile: a smaller workgroup only shrinks it. */
+    wgfc  = craw_wg_dim(ctx, CRAW_FC_WG_MAX);
 
     ret = craw_vk_image_create(ctx, &p->inter, params->width, params->height,
                                VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
@@ -449,6 +474,28 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
+    if (p->has_fc) {
+        /* The stage cannot run in place, so it needs a second intermediate
+         * to write. With RCD that is the aux image: pass A writes it, pass
+         * C is its last reader, and nothing touches it again until the
+         * next frame's pass A, so the stage borrows it and the pipeline
+         * costs no more memory than without the flag. The other two
+         * methods have no such image and get one. DESIGN.md 17.3. */
+        if (!p->rcd) {
+            ret = craw_vk_image_create(ctx, &p->fc, params->width, params->height,
+                                       VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+            if (ret < 0)
+                goto fail;
+        }
+
+        ret = craw_pipeline_shader(p, &p->false_color, "false_color",
+                                   craw_false_color_spv_data, craw_false_color_spv_len,
+                                   craw_bind_images, 2, sizeof(CRAWFalseColorPush), wgfc,
+                                   NULL, 0);
+        if (ret < 0)
+            goto fail;
+    }
+
     ret = craw_pipeline_shader(p, &p->color, "color", craw_color_spv_data, craw_color_spv_len,
                                craw_bind_images, 2, sizeof(CRAWColorPush), wg2d, NULL, 0);
     if (ret < 0)
@@ -516,10 +563,11 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
-    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s\n",
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s\n",
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
              p->awb ? ", awb histogram" : "",
              p->has_denoise ? ", denoise" : "",
+             p->has_fc ? ", false colour" : "",
              p->has_lens ? ", lens" : "");
 
     *pipe = p;
@@ -558,6 +606,8 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->denoise);
     if (p->lens.pipeline)
         craw_vk_shader_free(ctx, &p->lens);
+    if (p->false_color.pipeline)
+        craw_vk_shader_free(ctx, &p->false_color);
 
     if (p->inter.image)
         craw_vk_image_free(ctx, &p->inter);
@@ -567,6 +617,8 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_image_free(ctx, &p->green);
     if (p->clean.image)
         craw_vk_image_free(ctx, &p->clean);
+    if (p->fc.image)
+        craw_vk_image_free(ctx, &p->fc);
     if (p->linear.image)
         craw_vk_image_free(ctx, &p->linear);
 
@@ -760,7 +812,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
 {
     CRAWContext *ctx;
     CRAWVkImage src_img, dst_img;
-    CRAWVkImage *mosaic, *color_dst;
+    CRAWVkImage *mosaic, *inter, *color_dst;
     CRAWVkDescWrite writes[4];
     CRAWColorParams frame;
     CRAWPrepPush pp;
@@ -768,8 +820,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     CRAWAwbPush ap;
     CRAWDenoisePush dp;
     CRAWLensPush lp;
+    CRAWFalseColorPush fcp;
     enum CRAWColorSpace out_space;
-    bool denoise, lens;
+    bool denoise, lens, false_color;
     float m_out[3][3], scale;
     uint32_t w, h;
     int ret;
@@ -823,6 +876,24 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
         ret = craw_pipeline_denoise_push(p, fp->profile, fp, &dp);
         if (ret < 0)
             return ret;
+    }
+
+    /* Zero passes is the documented way to leave one frame alone, on a
+     * pipeline built with the stage or without it. More passes than the
+     * shader's tile has apron for is an error rather than a clamp: a
+     * caller who asked for five would not get what it asked for. */
+    false_color = p->has_fc && fp->false_color_passes > 0;
+    if (false_color) {
+        if (fp->false_color_passes > CRAW_FALSE_COLOR_MAX_PASSES) {
+            craw_log(ctx, CRAW_LOG_ERROR,
+                     "false_color_passes = %u; at most %u passes are supported\n",
+                     fp->false_color_passes, (unsigned)CRAW_FALSE_COLOR_MAX_PASSES);
+            return CRAW_ERROR(EINVAL);
+        }
+        fcp = (CRAWFalseColorPush) {
+            .size   = { (int32_t)w, (int32_t)h },
+            .passes = (int32_t)fp->false_color_passes,
+        };
     }
 
     /* A correction marked invalid is the documented way to leave one frame
@@ -966,6 +1037,27 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
+    /* The intermediate everything downstream reads: the debayer's own, or
+     * the filtered copy the false colour stage makes of it. The copy is
+     * RCD's aux image when there is one (its last reader was pass C, just
+     * above) and the stage's own otherwise. DESIGN.md 17.3. */
+    inter = &p->inter;
+    if (false_color) {
+        CRAWVkImage *filtered = p->rcd ? &p->aux : &p->fc;
+
+        craw_vk_image_barrier(ctx, cmd, filtered, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        craw_vk_desc_image(&writes[0], 0, &p->inter);
+        craw_vk_desc_image(&writes[1], 1, filtered);
+        craw_pipeline_dispatch(p, cmd, &p->false_color, writes, 2, &fcp, sizeof(fcp), w, h, 1);
+
+        craw_vk_image_barrier(ctx, cmd, filtered, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        inter = filtered;
+    }
+
     if (p->awb) {
         ap = (CRAWAwbPush) {
             .blocks  = { p->blocks[0], p->blocks[1] },
@@ -974,7 +1066,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
             .log_min = CRAW_AWB_HIST_LOG_MIN,
             .log_max = CRAW_AWB_HIST_LOG_MAX,
         };
-        craw_vk_desc_image(&writes[0], 0, &p->inter);
+        craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_buffer(&writes[1], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                             &p->hist_count, 0, CRAW_AWB_HIST_BYTES);
         craw_vk_desc_buffer(&writes[2], 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -993,7 +1085,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     craw_vk_image_barrier(ctx, cmd, color_dst, VK_IMAGE_LAYOUT_GENERAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    craw_vk_desc_image(&writes[0], 0, &p->inter);
+    craw_vk_desc_image(&writes[0], 0, inter);
     craw_vk_desc_image(&writes[1], 1, color_dst);
     craw_pipeline_dispatch(p, cmd, &p->color, writes, 2, &cp, sizeof(cp), w, h, 1);
 
