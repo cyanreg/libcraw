@@ -427,8 +427,9 @@ static void view_date_from_utc(const char *iso, char *out, size_t n)
 }
 
 /* The camera model and the as-shot ISO hide in whichever metadata
- * dictionary the muxer felt like using, so look at both. */
-static void view_read_metadata(struct view_decoder *d)
+ * dictionary the muxer felt like using, so look at both. `xml` is the clip
+ * XML pana.c found in an MP4's psmd box, NULL for any other file. */
+static void view_read_metadata(struct view_decoder *d, const char *xml)
 {
     AVDictionary *const dicts[2] = {
         d->fmt->metadata, d->fmt->streams[d->stream_index]->metadata,
@@ -506,6 +507,21 @@ static void view_read_metadata(struct view_decoder *d)
                 view_read_clip_xml(d, e->value);
     }
 
+    /* An MP4 clip's copy of the same document, which the demuxer skips. */
+    if (!d->capture_gamma[0] && xml)
+        view_read_clip_xml(d, xml);
+
+    /* The maker note fills in behind everything above, and is all a
+     * developed clip has for the aperture and for a white balance the
+     * camera chose itself: the XML names a colour temperature only when it
+     * was set in Kelvin. */
+    if (!(d->meta_as_shot_ei > 0.0f))
+        d->meta_as_shot_ei = d->pana.iso;
+    if (!(d->aperture > 0.0f))
+        d->aperture = d->pana.fnumber;
+    if (!d->wb_kelvin)
+        d->wb_kelvin = d->pana.wb_kelvin;
+
     /* The one clip the tags have to be overridden for. The codec comes
      * first because the same two elements appear in a ProRes RAW clip's
      * XML, where they describe what the sensor data would become and not
@@ -567,6 +583,25 @@ static void view_format_name(const AVCodecParameters *par, const AVCodec *codec,
     }
 }
 
+/* Panasonic's white balance modes, as exiftool names them. */
+static const char *view_wb_mode_name(int mode)
+{
+    switch (mode) {
+    case 1:  return "auto";
+    case 2:  return "daylight";
+    case 3:  return "cloudy";
+    case 4:  return "incandescent";
+    case 5:  return "manual";
+    case 8:  return "flash";
+    case 11: return "manual 2";
+    case 12: return "shade";
+    case 14: return "manual 3";
+    case 15: return "manual 4";
+    case 19: return "auto (cool)";
+    default: return NULL;
+    }
+}
+
 int view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
                       int max)
 {
@@ -583,6 +618,15 @@ int view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
     if (d->cam_make[0] || d->cam_model[0])
         VIEW_INFO("camera", "%s%s%s", d->cam_make,
                   d->cam_make[0] && d->cam_model[0] ? " " : "", d->cam_model);
+
+    /* The focal length is the first frame's: a zoom during the take is
+     * not in the file. */
+    if (d->pana.lens[0] && d->pana.focal_mm > 0.0f)
+        VIEW_INFO("lens", "%s, %.0f mm", d->pana.lens, (double)d->pana.focal_mm);
+    else if (d->pana.lens[0])
+        VIEW_INFO("lens", "%s", d->pana.lens);
+    else if (d->pana.focal_mm > 0.0f)
+        VIEW_INFO("lens", "%.0f mm", (double)d->pana.focal_mm);
 
     if (d->format_name[0]) {
         char depth[16] = "";
@@ -603,7 +647,16 @@ int view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
         VIEW_INFO("ISO", "%.0f", (double)d->meta_as_shot_ei);
     if (d->aperture > 0.0f)
         VIEW_INFO("aperture", "f/%.1f", (double)d->aperture);
-    if (d->wb_kelvin > 0)
+    if (d->pana.exposure_s >= 1.0f)
+        VIEW_INFO("shutter", "%.1f s", (double)d->pana.exposure_s);
+    else if (d->pana.exposure_s > 0.0f)
+        VIEW_INFO("shutter", "1/%.0f", 1.0 / d->pana.exposure_s);
+    /* The mode is said only when it is not Kelvin, which the number
+     * already says. */
+    if (d->wb_kelvin > 0 && view_wb_mode_name(d->pana.wb_mode))
+        VIEW_INFO("white balance", "%s, %d K",
+                  view_wb_mode_name(d->pana.wb_mode), d->wb_kelvin);
+    else if (d->wb_kelvin > 0)
         VIEW_INFO("white balance", "%d K", d->wb_kelvin);
     /* The Exif index is the ISO again on every clip seen so far; the row
      * exists for the day a clip rates itself differently. */
@@ -734,7 +787,15 @@ int view_decoder_open(struct view_decoder *d, const char *path,
 
     view_read_display_matrix(d, st);
 
-    view_read_metadata(d);
+    /* Only a QuickTime or ISO file has boxes to walk. */
+    {
+        char *xml = NULL;
+
+        if (strstr(d->fmt->iformat->name, "mov"))
+            view_pana_read(path, &d->pana, &xml);
+        view_read_metadata(d, xml);
+        av_free(xml);
+    }
 
     /* The format row's own facts. The XML's bit depth, when there was one,
      * is already in; the stream is asked otherwise - ProRes RAW says 16 in
@@ -803,6 +864,14 @@ int view_decoder_open(struct view_decoder *d, const char *path,
                 d->essence_codec[0] ? d->essence_codec : "(none)",
                 d->vlog ? ", overriding the stream's colour tags"
                         : d->raw ? ", raw: the pipeline develops it" : "");
+
+    /* The multipliers are for the white balance of a developed clip and
+     * have no row of their own. */
+    if (verbose && d->pana.wb_levels[1] > 0.0f)
+        fprintf(stderr, "maker note: white balance mode %d, %d K, "
+                        "multipliers %.4f %.4f %.4f\n",
+                d->pana.wb_mode, d->pana.wb_kelvin, d->pana.wb_levels[0],
+                d->pana.wb_levels[1], d->pana.wb_levels[2]);
 
     /* The Clip block's rows, exactly as the panel shows them. */
     if (verbose) {

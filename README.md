@@ -108,18 +108,23 @@ font: there is no option and nothing to configure, and nuklear's own
 bitmap face is only what remains when fontconfig has nothing or the file
 will not load. Under the playback readouts sits a "Clip" block with what
 the file says about the recording, one row per fact and only the rows the
-file has: camera, format (the codec with its bit depth and coded size,
-"ProRes RAW 16-bit 5760x3040"), frame rate, ISO, aperture, the white
-balance as recorded, the exposure index when it differs from the ISO, the
-capture gamma and gamut of a developed clip, the timecode at the clip's
-start and the recording date - the camera's own, with its zone, when the
-clip carries the Panasonic XML, else the container's creation time in the
-machine's zone. All of it comes through FFmpeg's demuxer: the Apple and
-RDD 18 tags a ProRes RAW clip carries, the stream's own tags and the XML,
-which a developed clip has too and an MP4 does not. The shutter angle, the
-focal length and the lens name sit in the maker note the demuxer does not
-export from these files; they arrive with a libavformat change, not with a
-box parser here. `-v` prints the same rows once per clip.
+file has: camera, lens (with the first frame's focal length), format (the
+codec with its bit depth and coded size, "ProRes RAW 16-bit 5760x3040"),
+frame rate, ISO, aperture, shutter, the white balance as recorded (with
+the camera's mode, "auto, 3100 K", unless it was set in Kelvin), the
+exposure index when it differs from the ISO, the capture gamma and gamut
+of a developed clip, the timecode at the clip's start and the recording
+date - the camera's own, with its zone, when the clip carries the
+Panasonic XML, else the container's creation time in the machine's zone.
+Most of it comes through FFmpeg's demuxer: the Apple and RDD 18 tags a
+ProRes RAW clip carries, the stream's own tags and the XML. The rest the
+viewer reads out of the file itself, because the demuxer skips both
+places it is in: the Exif block and Panasonic maker note in
+`moov/udta/PANA`, which every clip from the camera carries and which is a
+developed clip's only record of its lens, shutter and white balance, and
+the copy of the XML an MP4 keeps in a top-level `psmd` meta box rather
+than as a tag. `-v` prints the same rows once per clip, and the maker
+note's white balance multipliers with them.
 
 The panel is a column of sections — White balance, Exposure, Debayer,
 Denoise, Lens, Look, Adjustments, Film grain, Crop, Export — each behind a

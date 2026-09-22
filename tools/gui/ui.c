@@ -2500,8 +2500,8 @@ static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
  * It sits under everything live - the readouts, the scrub bar, the mute
  * and the volume - and above the first section, rather than straight
  * under the clip line, because its height is the one thing in the panel's
- * top that changes with the clip: four rows for a bare MP4, ten for a
- * ProRes RAW take. Put above the scrub bar it would move the bar under
+ * top that changes with the clip: two rows for a phone's MP4, eleven for
+ * a camera's HEVC take. Put above the scrub bar it would move the bar under
  * the pointer at every clip switch; here the live rows keep their places
  * and the block reads as the heading of the sections that follow. */
 static void view_panel_clip(struct nk_context *ctx, struct view_state *st)

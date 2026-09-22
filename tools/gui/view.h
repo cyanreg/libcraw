@@ -279,6 +279,26 @@ struct view_reader {
     int64_t depth_sum, depth_n;
 };
 
+/* What a Panasonic clip's PANA box says about the take, out of the Exif
+ * block the camera writes there (see pana.c). Zero or empty wherever the
+ * clip carries nothing, which is every clip from another camera. */
+struct view_pana {
+    /* The maker note's white balance: the mode (1 auto, 2 daylight,
+     * 3 cloudy, 13 Kelvin and a few more), the colour temperature it
+     * applied - on an auto clip the one the camera settled on for the take
+     * - and the multipliers themselves, in sensor RGB over green. The only
+     * record a developed clip has of how it was balanced. */
+    int wb_mode;
+    int wb_kelvin;
+    float wb_levels[3];
+    /* The Exif IFD's exposure and lens, as of the first frame. */
+    float iso;
+    float fnumber;
+    float exposure_s;
+    float focal_mm;
+    char lens[64];
+};
+
 struct view_decoder {
     AVFormatContext *fmt;
     AVCodecContext *dec;
@@ -362,13 +382,12 @@ struct view_decoder {
     char essence_codec[32];
 
     /* The rest of the acquisition record, for the panel's Clip block and
-     * -v: nothing below decides anything about the picture. All of it
-     * comes through FFmpeg's demuxer - the Apple and RDD 18 format tags a
-     * ProRes RAW clip carries, the stream's own tags, and the Panasonic
-     * XML - and a field the file does not carry stays empty or zero, which
-     * is how the block knows to leave its row out. The shutter angle, the
-     * focal length and the lens name are in the maker note the demuxer
-     * does not export from these files, so they are not here at all. */
+     * -v: nothing below decides anything about the picture. It comes from
+     * FFmpeg's demuxer - the Apple and RDD 18 format tags a ProRes RAW clip
+     * carries, the stream's own tags, and the Panasonic XML - with the
+     * maker note in `pana` below filling in behind them, and a field the
+     * file does not carry stays empty or zero, which is how the block
+     * knows to leave its row out. */
     char cam_make[64];          /* "Panasonic" */
     char cam_model[64];         /* "DC-S1M2", the camera's own words */
     /* The codec as a person names it - "ProRes RAW", "ProRes 422 HQ",
@@ -390,6 +409,10 @@ struct view_decoder {
      * XML's own date with the camera's zone when the clip carries it, else
      * the container's creation_time turned into this machine's zone. */
     char recorded[40];
+
+    /* What the camera wrote where the demuxer does not look: the Exif and
+     * maker note in moov/udta/PANA. See pana.c. */
+    struct view_pana pana;
 
     /* A developed clip whose XML says V-Log in V-Gamut, which is the one
      * case where the stream's own colour tags have to be overridden: the
@@ -1273,9 +1296,18 @@ struct view_info_row {
      * with the panel cutting what will not fit its column. */
     char value[160];
 };
-#define VIEW_INFO_MAX 12
+#define VIEW_INFO_MAX 16
 int  view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
                        int max);
+
+/* ------------------------------------------------------------- pana.c */
+
+/* Walks the file's boxes for the two Panasonic records the demuxer leaves
+ * alone: fills `p` from the Exif in moov/udta/PANA, and hands back in
+ * `xml` the clip XML an MP4 keeps in a top-level psmd meta box (av_free()
+ * it), NULL when there is none. Anything missing or malformed reads as
+ * absent; nothing fails. */
+void view_pana_read(const char *path, struct view_pana *p, char **xml);
 
 /* ----------------------------------------------------------- export.c */
 
