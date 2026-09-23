@@ -90,6 +90,19 @@ enum CRAWDebayer {
  * which costs nothing when zero. */
 #define CRAW_PIPELINE_FLAG_CHROMA_DENOISE (1 << 4)
 
+/* Build the highlight reconstruction pass, DESIGN.md 18: every sensel
+ * that clipped gets its clipped channels rebuilt from the channels that
+ * did not clip around it and from the colour of the unclipped light around
+ * the blown area, before the debayer, and the result is allowed above the
+ * balanced clip point of 1.0 that the prep otherwise cuts everything at. A
+ * sky where only green clipped keeps its clouds, and an area blown in every
+ * channel keeps the colour of its surroundings instead of going flat white.
+ * It costs an extra full resolution R16F mosaic and a quarter resolution
+ * RGBA32F colour field with its pyramid, 58 MB at 5.8K. Once built it is
+ * switched per frame with CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION, which
+ * costs nothing when unset. */
+#define CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION (1 << 5)
+
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
 typedef struct CRAWPipelineParams {
@@ -148,6 +161,14 @@ typedef struct CRAWPipelineParams {
  * created with CRAW_PIPELINE_FLAG_LENS and the frame carries a valid
  * correction. See DESIGN.md 16.8 and craw_lens_keep_all_scale(). */
 #define CRAW_FRAME_FLAG_LENS_KEEP_ALL (1 << 1)
+
+/* Rebuild the clipped highlights of this frame, DESIGN.md 18. Unset, the
+ * frame is clipped at the balanced clip point exactly as on a pipeline
+ * built without the stage, and the pass is not dispatched. Ignored unless
+ * the pipeline was created with CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION.
+ * A flag rather than a strength because there is nothing to dial: a
+ * rebuilt channel is either the estimate or the clip. */
+#define CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION (1 << 3)
 
 /* Per-frame settings. */
 typedef struct CRAWFrameParams {
@@ -233,8 +254,9 @@ CRAW_API void craw_pipeline_params_init(CRAWPipelineParams *p);
 
 /* Fills `fp` with defaults: as-shot white balance, the pipeline's own
  * output colour space, no exposure change, no denoising of either kind, no
- * noise model override, no false colour suppression, no lens correction.
- * The profile pointer is left NULL and must be set by the caller. */
+ * noise model override, no highlight reconstruction, no false colour
+ * suppression, no lens correction. The profile pointer is left NULL and
+ * must be set by the caller. */
 CRAW_API void craw_frame_params_init(CRAWFrameParams *fp);
 
 /* Allocates the pipeline's intermediate images and histogram buffers for
@@ -249,7 +271,8 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
  *
  *   src (VK_FORMAT_R16_UNORM Bayer mosaic, params width x height)
  *     -> [denoise, in the raw domain, on the four CFA planes]
- *     -> black/white normalization, as-shot white balance, clip
+ *     -> black/white normalization, as-shot white balance, and either the
+ *        clip or [highlight reconstruction, clipped channels rebuilt]
  *     -> debayer to full resolution camera RGB
  *     -> [false colour suppression, a median of the colour differences]
  *     -> [chroma denoise, the quarter resolution chroma band smoothed]

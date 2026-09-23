@@ -32,6 +32,20 @@ int craw_ref_debayer_wb(const uint16_t *bayer, uint32_t width, uint32_t height,
                         size_t stride, const CRAWProfile *profile,
                         const float wb[3], enum CRAWDebayer method, float *rgb);
 
+/* Debayers an already prepped mosaic: `v` is width*height floats, the
+ * balanced samples of DESIGN.md 4.1 (clipped or not; the debayer does not
+ * care). `rgb` as above. */
+int craw_ref_debayer_mosaic(const float *v, uint32_t width, uint32_t height,
+                            enum CRAWDebayer method, float *rgb);
+
+/* Highlight reconstruction, DESIGN.md 18: the prep of 4.1 with the gains
+ * `wb` and without its clip, every clipped site rebuilt, and each value
+ * rounded to fp16 as the GPU stores it. `out` receives width*height
+ * floats, the mosaic craw_ref_debayer_mosaic() then debayers. */
+int craw_ref_highlights(const uint16_t *bayer, uint32_t width, uint32_t height,
+                        size_t stride, const CRAWProfile *profile,
+                        const float wb[3], float *out);
+
 /* The same with the profile's as-shot gains. */
 int craw_ref_debayer(const uint16_t *bayer, uint32_t width, uint32_t height,
                      size_t stride, const CRAWProfile *profile,
@@ -78,15 +92,18 @@ static inline enum CRAWColorSpace craw_ref_out_space(const CRAWPipelineParams *p
 int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
                   const CRAWLensCorrection *lc, bool keep_all, float *dst);
 
-/* Whole chain: [denoise,] debayer, [false colour,] [chroma denoise,]
- * colour, [lens]. `out` receives width*height*4 floats. The denoise runs
- * when `params` carries CRAW_PIPELINE_FLAG_DENOISE and
- * `fp->denoise_strength` is positive, the false colour suppression when it
+/* Whole chain: [denoise,] [highlight reconstruction,] debayer, [false
+ * colour,] [chroma denoise,] colour, [lens]. `out` receives
+ * width*height*4 floats. The denoise runs when `params` carries
+ * CRAW_PIPELINE_FLAG_DENOISE and `fp->denoise_strength` is positive, the
+ * highlight reconstruction when it carries
+ * CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION and `fp->flags`
+ * CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION, the false colour suppression when it
  * carries CRAW_PIPELINE_FLAG_FALSE_COLOR and `fp->false_color_passes` is
  * positive, the chroma denoise when it carries
  * CRAW_PIPELINE_FLAG_CHROMA_DENOISE and `fp->denoise_chroma_strength` is
  * positive, and the warp when it carries CRAW_PIPELINE_FLAG_LENS and
- * `fp->lens` is valid; all four are the conditions craw_pipeline_record()
+ * `fp->lens` is valid; all five are the conditions craw_pipeline_record()
  * applies. */
 int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
                      size_t stride, const CRAWPipelineParams *params,

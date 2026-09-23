@@ -116,6 +116,7 @@ struct tool_cfg {
     bool noise_estimate;
 
     uint32_t false_color;     /* median passes after the debayer, 0 = off */
+    bool highlights;          /* rebuild clipped highlights, DESIGN.md 18 */
 
     enum tool_lens lens;
 
@@ -126,6 +127,12 @@ struct tool_cfg {
 struct tool_name_map {
     const char *name;
     int value;
+};
+
+static const struct tool_name_map tool_switches[] = {
+    { "on",  1 },
+    { "off", 0 },
+    { NULL,  0 },
 };
 
 static const struct tool_name_map tool_debayers[] = {
@@ -280,6 +287,14 @@ static void tool_usage(FILE *f)
 "                      alone. 0 (the default) is off. One or two are below\n"
 "                      what a 4:2:0 delivery keeps of the chroma anyway;\n"
 "                      five is a visible chroma blur at 1:1. DESIGN.md 17\n"
+"  --highlights on|off\n"
+"                      rebuild clipped highlights before the debayer\n"
+"                      (default: on): every channel that clipped is\n"
+"                      estimated from the channels that did not clip around\n"
+"                      it and from the colour of the unclipped light around\n"
+"                      the blown area, and may exceed the balanced clip\n"
+"                      point, so a sky where only green clipped keeps its\n"
+"                      clouds and a blown lamp keeps its colour. DESIGN.md 18\n"
 "  --denoise STRENGTH[,CHROMA]\n"
 "                      raw domain denoising at this strength: 1.0 removes\n"
 "                      noise at the level the camera's noise model predicts,\n"
@@ -853,6 +868,8 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
         pp.flags |= CRAW_PIPELINE_FLAG_CHROMA_DENOISE;
     if (cfg->false_color > 0)
         pp.flags |= CRAW_PIPELINE_FLAG_FALSE_COLOR;
+    if (cfg->highlights)
+        pp.flags |= CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION;
     /* Only built once a frame has been seen to carry a record: a clip
      * without one never pays for the extra image. */
     if (lens)
@@ -1660,6 +1677,7 @@ enum {
     TOOL_OPT_CROP,
     TOOL_OPT_DENOISE,
     TOOL_OPT_FALSE_COLOUR,
+    TOOL_OPT_HIGHLIGHTS,
     TOOL_OPT_NOISE,
     TOOL_OPT_NOISE_EST,
     TOOL_OPT_LENS,
@@ -1689,6 +1707,7 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         { "crop",           required_argument, NULL, TOOL_OPT_CROP      },
         { "denoise",        required_argument, NULL, TOOL_OPT_DENOISE   },
         { "false-colour",   required_argument, NULL, TOOL_OPT_FALSE_COLOUR },
+        { "highlights",     required_argument, NULL, TOOL_OPT_HIGHLIGHTS },
         { "noise",          required_argument, NULL, TOOL_OPT_NOISE     },
         { "noise-estimate", no_argument,       NULL, TOOL_OPT_NOISE_EST },
         { "lens",           required_argument, NULL, TOOL_OPT_LENS      },
@@ -1706,6 +1725,9 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         .space    = CRAW_CS_BT709_LINEAR,
         .encode   = TOOL_ENC_SDR,
         .wb       = TOOL_WB_AS_SHOT,
+        /* A correction, like the lens: what clipped is rebuilt unless
+         * --highlights off asks for the plain clip. */
+        .highlights = true,
     };
 
     while ((c = getopt_long(argc, argv, "o:vh", opts, NULL)) != -1) {
@@ -1841,6 +1863,11 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
             if ((ret = tool_lookup(tool_lenses, "--lens", optarg, &v)) < 0)
                 return ret;
             cfg->lens = (enum tool_lens)v;
+            break;
+        case TOOL_OPT_HIGHLIGHTS:
+            if ((ret = tool_lookup(tool_switches, "--highlights", optarg, &v)) < 0)
+                return ret;
+            cfg->highlights = v != 0;
             break;
         case TOOL_OPT_TABLES:
             cfg->tables = optarg;
@@ -2252,6 +2279,8 @@ have_device:
             fp.flags |= CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION;
         if (cfg.lens == TOOL_LENS_KEEP)
             fp.flags |= CRAW_FRAME_FLAG_LENS_KEEP_ALL;
+        if (cfg.highlights)
+            fp.flags |= CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
         fp.denoise_strength = cfg.denoise;
         fp.denoise_chroma_strength = cfg.chroma;
         fp.noise_override = cfg.noise;

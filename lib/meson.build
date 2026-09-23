@@ -55,6 +55,7 @@ craw_sources = files(
     'ref/ref_false_color.c',
     'ref/ref_chroma.c',
     'ref/ref_lens.c',
+    'ref/ref_highlight.c',
 )
 
 # Generate local configure file

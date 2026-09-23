@@ -131,8 +131,24 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
         if (ret < 0)
             goto done;
 
-        ret = craw_ref_debayer_wb(bayer, width, height, stride, fp->profile, par.wb,
-                                  params->debayer, out);
+        /* The rebuilt mosaic replaces the prep and its clip, DESIGN.md
+         * 18.3. */
+        if ((params->flags & CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION) &&
+            (fp->flags & CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION)) {
+            float *v = malloc((size_t)width * height * sizeof(*v));
+
+            if (!v) {
+                ret = CRAW_ERROR(ENOMEM);
+                goto done;
+            }
+            ret = craw_ref_highlights(bayer, width, height, stride, fp->profile, par.wb, v);
+            if (ret >= 0)
+                ret = craw_ref_debayer_mosaic(v, width, height, params->debayer, out);
+            free(v);
+        } else {
+            ret = craw_ref_debayer_wb(bayer, width, height, stride, fp->profile, par.wb,
+                                      params->debayer, out);
+        }
         if (ret < 0)
             goto done;
     }

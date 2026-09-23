@@ -132,6 +132,25 @@ static float view_matrix_headroom(const CRAWColorParams *cp)
     return headroom;
 }
 
+/* What the highlight reconstruction adds on top of the balanced clip,
+ * DESIGN.md 18.2: an area blown in every channel is rebuilt to the plateau
+ * where the channel with the largest gain clipped, which is that gain over
+ * the smallest one. A strongly coloured blown area can be rebuilt higher
+ * still; peak detection measures that, and this is only the ceiling it
+ * starts from. */
+static float view_highlight_headroom(const struct view_state *st, const CRAWColorParams *cp)
+{
+    float lo, hi;
+
+    if (!st->look.highlights)
+        return 1.0f;
+
+    lo = CRAW_MIN(CRAW_MIN(cp->wb[0], cp->wb[1]), cp->wb[2]);
+    hi = CRAW_MAX(CRAW_MAX(cp->wb[0], cp->wb[1]), cp->wb[2]);
+
+    return lo > 0.0f ? hi / lo : 1.0f;
+}
+
 /* The Exposure section's switch, applied. Bypassed means a bias of zero at
  * the index the camera shot at - which is what rates a camera original at
  * 1.0 - while the panel keeps both numbers, so switching the section back
@@ -193,7 +212,7 @@ float view_peak_ceiling(const struct view_state *st)
         return VIEW_REF_WHITE_NITS;
 
     return VIEW_REF_WHITE_NITS * cp.gain * exp2f(view_exposure_bias(st))
-         * view_matrix_headroom(&cp);
+         * view_matrix_headroom(&cp) * view_highlight_headroom(st, &cp);
 }
 
 bool view_export_is_scene(const struct view_state *st)
@@ -289,6 +308,10 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
      * all it takes; zero is not dispatched. */
     fp->false_color_passes = (uint32_t)CRAW_CLAMP(st->look.false_color, 0,
                                                   CRAW_FALSE_COLOR_MAX_PASSES);
+    /* Built into the pipeline the same way; unflagged, the pass is not
+     * dispatched and the frame is clipped as it always was. */
+    if (st->look.highlights)
+        fp->flags |= CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
     /* By value: the record is this frame's own and the next frame's will be
      * different, so the parameters must not point at anything the panel
      * owns. An invalid one is the documented "leave this frame alone". */
@@ -318,6 +341,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .ambience   = st->awb.params.ambience,
         .debayer    = st->look.debayer,
         .false_color = st->look.false_color,
+        .highlights = st->look.highlights != 0,
         .chroma     = view_chroma_strength(st),
         .denoise    = view_denoise_strength(st),
         .lens       = view_lens_active(st),
@@ -364,7 +388,8 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->illum.cct == b->illum.cct && a->illum.tint == b->illum.tint &&
            a->ei == b->ei && a->exposure == b->exposure &&
            a->ambience == b->ambience && a->debayer == b->debayer &&
-           a->false_color == b->false_color && a->chroma == b->chroma &&
+           a->false_color == b->false_color && a->highlights == b->highlights &&
+           a->chroma == b->chroma &&
            a->denoise == b->denoise && a->lens == b->lens &&
            a->lens_keep == b->lens_keep;
 }
@@ -1790,6 +1815,13 @@ static void view_usage(FILE *f)
 "                      luma-guided smoothing of the quarter resolution\n"
 "                      chroma band; it needs no model and defaults to 1\n"
 "                      when the section is on\n"
+"  --highlights on|off rebuild clipped highlights before the debayer (on by\n"
+"                      default): every channel that clipped is estimated\n"
+"                      from the channels that did not clip around it and\n"
+"                      from the colour of the unclipped light around the\n"
+"                      blown area, and may exceed the balanced clip, so a\n"
+"                      sky where only green clipped keeps its clouds. The\n"
+"                      Debayer section has the same switch\n"
 "  --lens on|off       geometric lens correction from each frame's own\n"
 "                      optical_correction record: a per-channel radial warp\n"
 "                      after the colour stage that takes the distortion out\n"
@@ -2002,6 +2034,7 @@ enum {
     VIEW_OPT_DENOISE,
     VIEW_OPT_FALSE_COLOUR,
     VIEW_OPT_LENS,
+    VIEW_OPT_HIGHLIGHTS,
     VIEW_OPT_LENS_FIT,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
@@ -2050,6 +2083,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "grain",    required_argument, NULL, VIEW_OPT_GRAIN     },
         { "denoise",  required_argument, NULL, VIEW_OPT_DENOISE   },
         { "lens",     required_argument, NULL, VIEW_OPT_LENS      },
+        { "highlights", required_argument, NULL, VIEW_OPT_HIGHLIGHTS },
         { "lens-fit", required_argument, NULL, VIEW_OPT_LENS_FIT  },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
@@ -2125,6 +2159,16 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 st->lens.on = false;
             } else {
                 fprintf(stderr, "--lens: expected on or off, got `%s`\n", optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            break;
+        case VIEW_OPT_HIGHLIGHTS:
+            if (!strcmp(optarg, "on")) {
+                st->look.highlights = 1;
+            } else if (!strcmp(optarg, "off")) {
+                st->look.highlights = 0;
+            } else {
+                fprintf(stderr, "--highlights: expected on or off, got `%s`\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
             break;
@@ -2526,6 +2570,7 @@ static void view_log_look(const struct view_state *st)
                 ? view_debayer_names[lk->debayer] : "?");
     if (lk->false_color)
         fprintf(stderr, ", false colour x%d", lk->false_color);
+    fprintf(stderr, ", highlights %s", lk->highlights ? "rebuilt" : "clipped");
 
     if (st->denoise.on && (st->denoise.strength > 0.0f || st->denoise.chroma > 0.0f))
         fprintf(stderr, ", denoise %.2f, chroma %.2f", st->denoise.strength,
@@ -3706,6 +3751,9 @@ int main(int argc, char **argv)
         .wb        = VIEW_WB_AS_SHOT,
         .manual    = { .cct = 5500.0f, .tint = 0.0f },
         .debayer   = CRAW_DEBAYER_RCD,
+        /* On: rebuilding what clipped is a correction, like the lens, not
+         * a look. */
+        .highlights = 1,
         .lut_type  = PL_LUT_NATIVE,
         .film_sim  = -1,
         /* libplacebo's own default curve, spline; --tone-map overrides. */

@@ -105,6 +105,11 @@ struct view_look {
      * it is a property of how the mosaic comes off. An int because that is
      * what a nuklear property wants. */
     int false_color;
+    /* Highlight reconstruction before the debayer, DESIGN.md 18: nonzero
+     * rebuilds what clipped instead of cutting every channel at the
+     * balanced clip. A row of the Debayer section for the same reason as
+     * the false colour, and an int because nuklear's checkbox wants one. */
+    int highlights;
 
     char lut_path[VIEW_MAX_PATH];
     /* The embedded film simulation, or -1 for none. Mutually exclusive
@@ -149,6 +154,7 @@ struct view_pipeline_look {
     float ei, exposure, ambience;
     enum CRAWDebayer debayer;
     int false_color;            /* passes, 0 when the stage did not run */
+    bool highlights;            /* whether the highlight reconstruction ran */
     float chroma;               /* chroma denoise strength, 0 when it did not run */
     /* The strength the pass actually ran at, 0 when it did not: a toggle
      * while paused has to put the frame through again. */
@@ -1448,10 +1454,12 @@ float view_total_gain(const struct view_state *st);
 
 /* The highest value the pipeline can produce, in nits: diffuse white times
  * the gain and the exposure bias, times the headroom the camera matrix adds
- * for a fully saturated clipped pixel. This is the ceiling libplacebo is
- * told about; peak detection measures the real per-frame peak below it. On
- * the non-raw path there is no such calculation and libplacebo's own
- * inference is reported instead. */
+ * for a fully saturated clipped pixel, times, with the highlights rebuilt,
+ * the stop the white balance gains leave above the clip (DESIGN.md 18.4;
+ * a strongly coloured blown area can be rebuilt higher still). This is the
+ * ceiling libplacebo is told about; peak detection measures the real
+ * per-frame peak instead. On the non-raw path there is no such calculation
+ * and libplacebo's own inference is reported instead. */
 float view_peak_ceiling(const struct view_state *st);
 
 /* Whether the selected export colour space is scene referred, which is the

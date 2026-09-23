@@ -2699,6 +2699,9 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         nk_property_int(ctx, "#false colour passes", 0, &lk->false_color,
                         CRAW_FALSE_COLOR_MAX_PASSES, 1, 0.05f);
         nk_slider_int(ctx, 0, &lk->false_color, CRAW_FALSE_COLOR_MAX_PASSES, 1);
+        /* Highlight reconstruction, DESIGN.md 18: how the mosaic's clipped
+         * samples come off, before the debayer, so a row here too. */
+        nk_checkbox_label(ctx, "rebuild clipped highlights", &lk->highlights);
         view_section_end(ctx);
     }
 

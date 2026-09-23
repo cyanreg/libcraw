@@ -2955,6 +2955,326 @@ done:
     return ret;
 }
 
+/* ------------------------------------------------ highlight reconstruction */
+
+/* The highlight scene of DESIGN.md 18.5, in the balanced camera RGB a
+ * perfect debayer would produce: two Gaussian blobs of constant chroma on
+ * a dim gradient. The first peaks at G = 1.4 with R and B below their
+ * clips, so only G clips and the truth of what the stage has to rebuild is
+ * known; the second peaks at G = 4.0, so its core is blown in every
+ * channel. A pixel belongs to a blob wherever the blob's G is above 0.05
+ * and to the background elsewhere, rather than the two being added, so the
+ * chroma the field is built from is exactly the blob's. */
+#define TEST_HL_PART_X 64.0f
+#define TEST_HL_FULL_X 184.0f
+#define TEST_HL_Y      80.0f
+
+static const float test_hl_part[3] = { 1.30f, 1.0f, 0.90f };
+static const float test_hl_full[3] = { 1.10f, 1.0f, 1.05f };
+
+static void test_hl_truth(int x, int y, float rgb[3])
+{
+    float fx = (float)x / (float)(TEST_W - 1);
+    float fy = (float)y / (float)(TEST_H - 1);
+    float dp = ((float)x - TEST_HL_PART_X) * ((float)x - TEST_HL_PART_X) +
+               ((float)y - TEST_HL_Y) * ((float)y - TEST_HL_Y);
+    float df = ((float)x - TEST_HL_FULL_X) * ((float)x - TEST_HL_FULL_X) +
+               ((float)y - TEST_HL_Y) * ((float)y - TEST_HL_Y);
+    float gp = 1.4f * expf(-dp / (2.0f * 22.0f * 22.0f));
+    float gf = 4.0f * expf(-df / (2.0f * 18.0f * 18.0f));
+
+    if (gf >= 0.05f && gf >= gp) {
+        for (int c = 0; c < 3; c++)
+            rgb[c] = test_hl_full[c] * gf;
+    } else if (gp >= 0.05f) {
+        for (int c = 0; c < 3; c++)
+            rgb[c] = test_hl_part[c] * gp;
+    } else {
+        rgb[0] = 0.02f + 0.02f * fx;
+        rgb[1] = 0.02f + 0.02f * fy;
+        rgb[2] = 0.03f + 0.01f * (fx + fy);
+    }
+}
+
+/* Inverted to raw codes the way the sensor would record it: everything past
+ * the white level saturates there, and the same deterministic +-8 count
+ * noise as the other scenes rides on top, plateau included, as the codec's
+ * does on a real clip. `scale` dims the whole scene, which with a small
+ * enough value leaves nothing clipped at all. */
+static void test_hl_gen_mosaic(uint16_t *m, float scale)
+{
+    for (int y = 0; y < TEST_H; y++) {
+        for (int x = 0; x < TEST_W; x++) {
+            int s = (y & 1) * 2 + (x & 1);
+            int c = (s == 0) ? 0 : (s == 3) ? 2 : 1;
+            float rgb[3], u;
+            int iv;
+
+            test_hl_truth(x, y, rgb);
+            u = CRAW_MIN(rgb[c] * scale / test_wb[c], 1.0f);
+            iv = (int)lrintf((TEST_BLACK + u * (TEST_WHITE - TEST_BLACK)) * 65535.0f);
+            iv += (int)(test_hash((uint32_t)(y * TEST_W + x) * 2654435761u) % 17u) - 8;
+            iv = iv < 0 ? 0 : (iv > 65535 ? 65535 : iv);
+
+            m[y * TEST_W + x] = (uint16_t)iv;
+        }
+    }
+}
+
+/* u of DESIGN.md 18.2 for one sample, as the stage computes it. */
+static float test_hl_u(const uint16_t *m, int x, int y)
+{
+    float raw = m[y * TEST_W + x] * (1.0f / 65535.0f);
+    return CRAW_MAX((raw - TEST_BLACK) * (1.0f / (TEST_WHITE - TEST_BLACK)), 0.0f);
+}
+
+/* Whether every sample in the 3x3 around (x, y) whose channel is in `mask`
+ * (bit c for channel c) satisfies lo <= u < hi. */
+static bool test_hl_around(const uint16_t *m, int x, int y, int mask, float lo, float hi)
+{
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = x + dx, ny = y + dy;
+            int s = (ny & 1) * 2 + (nx & 1);
+            int c = (s == 0) ? 0 : (s == 3) ? 2 : 1;
+            float u;
+
+            if (nx < 0 || ny < 0 || nx >= TEST_W || ny >= TEST_H || !(mask & (1 << c)))
+                continue;
+            u = test_hl_u(m, nx, ny);
+            if (!(u >= lo && u < hi))
+                return false;
+        }
+    }
+    return true;
+}
+
+/* The definition on the CPU, DESIGN.md 18.5: what the reference's rebuilt
+ * mosaic must be on the highlight scene. */
+static int test_hl_definition(const uint16_t *m, const CRAWProfile *identity)
+{
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    float *v = malloc(npix * sizeof(*v));
+    double worst_keep = 0.0, worst_part = 0.0, sum[3] = { 0 }, core_min = 1e9;
+    int n_part = 0, n_core[3] = { 0 }, n_lower = 0;
+    int ret = -1;
+
+    if (!v)
+        return -1;
+    if (craw_ref_highlights(m, TEST_W, TEST_H, TEST_W, identity, test_wb, v) < 0) {
+        fprintf(stderr, "craw_ref_highlights failed\n");
+        goto done;
+    }
+
+    for (int y = 0; y < TEST_H; y++) {
+        for (int x = 0; x < TEST_W; x++) {
+            int s = (y & 1) * 2 + (x & 1);
+            int c = (s == 0) ? 0 : (s == 3) ? 2 : 1;
+            float u = test_hl_u(m, x, y);
+            double xb = (double)u * test_wb[c];
+            double out = v[y * TEST_W + x];
+            float rgb[3];
+
+            /* Below the ramp nothing moves beyond the fp16 store. */
+            if (u < 0.92f)
+                worst_keep = CRAW_MAX(worst_keep, fabs(out - xb) / CRAW_MAX(xb, 1e-3));
+
+            /* A clipped sample is never lowered. */
+            if (u >= 0.92f && out < xb * (1.0 - 1.0 / 1024.0))
+                n_lower++;
+
+            /* The first blob's G, clipped with R and B untouched around it:
+             * rebuilt to the scene's own G. */
+            test_hl_truth(x, y, rgb);
+            if (c == 1 && x < 128 && u >= 0.98f && test_hl_around(m, x, y, 5, 0.0f, 0.92f)) {
+                worst_part = CRAW_MAX(worst_part, fabs(out - rgb[1]) / rgb[1]);
+                n_part++;
+            }
+
+            /* The second blob's core, saturated in every channel over the
+             * whole 3x3 (the noise leaves the plateau within 1.3e-4 of the
+             * white level): the plateau of 18.2, in the blob's colour. */
+            if (x >= 128 && test_hl_around(m, x, y, 7, 0.999f, 2.0f)) {
+                sum[c] += out;
+                n_core[c]++;
+                core_min = CRAW_MIN(core_min, out / test_wb[c]);
+            }
+        }
+    }
+
+    {
+        double r = sum[0] / n_core[0], g = sum[1] / n_core[1], b = sum[2] / n_core[2];
+        /* The lowest level at which the blob's colour clears every clip. */
+        double want = CRAW_MAX(CRAW_MAX(test_wb[0] / test_hl_full[0], 1.0),
+                               test_wb[2] / test_hl_full[2]);
+
+        printf("  highlights definition: unclipped kept to %.1e, %d sites of G-only clip "
+               "rebuilt to %.2f%% of the truth, blown core (%d/%d/%d sites) R/G %.4f "
+               "(want %.2f), B/G %.4f (want %.2f), G %.4f (want %.4f), lowest %.4f of "
+               "its clip, %d samples lowered\n",
+               worst_keep, n_part, 100.0 * worst_part, n_core[0], n_core[1], n_core[2],
+               r / g, test_hl_full[0], b / g, test_hl_full[2], g, want, core_min, n_lower);
+
+        if (!(worst_keep <= 1.0 / 2048.0) || n_part < 200 || !(worst_part <= 0.02) ||
+            n_core[1] < 100 || !(fabs(r / g / test_hl_full[0] - 1.0) <= 0.03) ||
+            !(fabs(b / g / test_hl_full[2] - 1.0) <= 0.03) || !(fabs(g / want - 1.0) <= 0.03) ||
+            !(core_min >= 0.999) || n_lower) {
+            fprintf(stderr, "the rebuilt mosaic does not do what DESIGN.md 18.2 says\n");
+            goto done;
+        }
+    }
+
+    ret = 0;
+
+done:
+    free(v);
+    return ret;
+}
+
+/* DESIGN.md 18.5: the definition on the CPU, both ways of switching the
+ * stage off, a scene with nothing clipped, and the GPU against the
+ * reference on the highlight scene with MHC and RCD. Leaves the highlight
+ * scene in `src`. */
+static int test_highlights(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                           CRAWTestImage *src, CRAWTestImage *dst, float *gpu, float *ref)
+{
+    static const enum CRAWDebayer methods[] = { CRAW_DEBAYER_MHC, CRAW_DEBAYER_RCD };
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    uint16_t *m = NULL;
+    float *plain = NULL;
+    double ms = 0.0;
+    int ret = -1;
+
+    m = malloc(npix * sizeof(*m));
+    plain = malloc(npix * 4 * sizeof(*plain));
+    if (!m || !plain)
+        goto done;
+
+    test_hl_gen_mosaic(m, 1.0f);
+    if (test_hl_definition(m, identity) < 0)
+        goto done;
+
+    if (craw_testdev_image_upload(td, src, m, npix * sizeof(*m)) < 0)
+        goto done;
+
+    /* Off both ways, bit for bit: the flag on a frame of a pipeline built
+     * without the stage, and a pipeline built with it on a frame without
+     * the flag. Neither dispatches anything the plain chain does not. */
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_W;
+    pp.height = TEST_H;
+    pp.debayer = CRAW_DEBAYER_RCD;
+    pp.out_space = CRAW_CS_XYZ_D65;
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+    if (test_run_config(td, ctx, src, dst, &pp, &fp, plain, NULL, NULL, &ms) < 0)
+        goto done;
+
+    for (int off = 0; off < 2; off++) {
+        pp.flags = off ? 0 : CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION;
+        fp.flags = off ? CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION : 0;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+        if (memcmp(gpu, plain, npix * 4 * sizeof(*gpu))) {
+            fprintf(stderr, "highlights %s changed the frame\n",
+                    off ? "flagged on a pipeline without the stage" : "unflagged");
+            goto done;
+        }
+    }
+    printf("  highlights off both ways: bit for bit the plain chain\n");
+
+    for (size_t mi = 0; mi < CRAW_ARRAY_ELEMS(methods); mi++) {
+        enum CRAWDebayer method = methods[mi];
+        const char *mname = test_method_name(method);
+        double tol = method == CRAW_DEBAYER_RCD ? 1.5e-2 : 1e-2;
+        double err, cross;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = method;
+        pp.out_space = CRAW_CS_XYZ_D65;
+        pp.flags = CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION;
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.flags = CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
+
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+        if (craw_ref_process(m, TEST_W, TEST_H, TEST_W, &pp, &fp, ref) < 0) {
+            fprintf(stderr, "highlights: craw_ref_process failed\n");
+            goto done;
+        }
+        err = test_max_rel(gpu, ref, npix);
+
+        /* How far the stage moved the picture: G alone goes from the clip
+         * at 1.0 to 1.4 at the first blob's peak. */
+        fp.flags = 0;
+        if (craw_ref_process(m, TEST_W, TEST_H, TEST_W, &pp, &fp, plain) < 0)
+            goto done;
+        cross = test_max_abs(gpu, plain, npix);
+
+        printf("  highlights %-8s: max rel %.3e (tol %.1e), max abs %.3e, %.3f against "
+               "the clipped chain, %.3f ms\n", mname, err, tol, test_max_abs(gpu, ref, npix),
+               cross, ms);
+        if (!(err <= tol)) {
+            fprintf(stderr, "highlights on %s differ by %.3e relative, tolerance %.1e\n",
+                    mname, err, tol);
+            goto done;
+        }
+        if (!(cross > 0.3)) {
+            fprintf(stderr, "a rebuilt %s frame is only %.3f from the clipped one; the pass "
+                    "cannot have run\n", mname, cross);
+            goto done;
+        }
+    }
+
+    /* Nothing clipped: the stage is the fp16 rounding of the mosaic, which
+     * the debayer's own bound of DESIGN.md 11 covers. */
+    test_hl_gen_mosaic(m, 0.2f);
+    if (craw_testdev_image_upload(td, src, m, npix * sizeof(*m)) < 0)
+        goto done;
+
+    for (size_t mi = 0; mi < CRAW_ARRAY_ELEMS(methods); mi++) {
+        enum CRAWDebayer method = methods[mi];
+        double tol = method == CRAW_DEBAYER_RCD ? 5e-3 : 2e-3;
+        double err;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = method;
+        pp.out_space = CRAW_CS_XYZ_D65;
+        pp.flags = CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION;
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, plain, NULL, NULL, &ms) < 0)
+            goto done;
+        fp.flags = CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+
+        err = test_max_abs(gpu, plain, npix);
+        printf("  highlights %-8s with nothing clipped: max abs %.3e against the plain "
+               "chain (tol %.1e)\n", test_method_name(method), err, tol);
+        if (!(err <= tol)) {
+            fprintf(stderr, "highlights moved an unclipped %s frame by %.3e\n",
+                    test_method_name(method), err);
+            goto done;
+        }
+    }
+
+    ret = 0;
+
+done:
+    free(plain);
+    free(m);
+    return ret;
+}
+
 /* ----------------------------------------------------------- real frame */
 
 static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile)
@@ -3205,6 +3525,46 @@ static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfi
         }
     }
 
+    /* And the highlight reconstruction on the plain RCD chain, DESIGN.md
+     * 18.5, timed. The relative bound of section 11: the rebuilt highlights
+     * sit above the old clip, where fp16 is worth more in absolute terms. */
+    {
+        double cross, err_abs, err_rel;
+
+        pp.flags = CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION;
+        fp.false_color_passes = 0;
+        fp.denoise_chroma_strength = 0.0f;
+        fp.flags = CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
+
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, gpu, NULL, NULL, &ms);
+        if (ret < 0)
+            goto done;
+
+        fp.flags = 0;
+        ret = craw_ref_process(mosaic, FRAME_W, FRAME_H, FRAME_W, &pp, &fp, ref);
+        if (ret < 0)
+            goto done;
+        cross = test_max_rel(gpu, ref, npix);
+
+        fp.flags = CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
+        ret = craw_ref_process(mosaic, FRAME_W, FRAME_H, FRAME_W, &pp, &fp, ref);
+        if (ret < 0)
+            goto done;
+
+        err_abs = test_max_abs(gpu, ref, npix);
+        err_rel = test_max_rel(gpu, ref, npix);
+        printf("  rcd + highlights on %dx%d: %.2f ms, max rel %.3e (tol %.1e), max abs %.3e, "
+               "%.3e relative against the clipped chain\n", FRAME_W, FRAME_H, ms, err_rel,
+               TEST_DENOISE_REAL_TOL, err_abs, cross);
+
+        if (!(err_rel <= TEST_DENOISE_REAL_TOL)) {
+            fprintf(stderr, "highlights on the real frame differ by %.3e relative, "
+                    "tolerance %.1e\n", err_rel, TEST_DENOISE_REAL_TOL);
+            ret = -1;
+            goto done;
+        }
+    }
+
 done:
     if (ret < 0)
         fprintf(stderr, "real frame run failed: %d\n", ret);
@@ -3403,6 +3763,10 @@ int main(void)
         goto done;
 
     if (test_lens(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
+
+    /* Replaces the scene in `src`; test_gamut() uploads its own. */
+    if (test_highlights(&td, ctx, &identity, &src, &dst, gpu, ref) < 0)
         goto done;
 
     if (test_gamut(&td, ctx, &profile, &src, &dst, gpu, ref) < 0)

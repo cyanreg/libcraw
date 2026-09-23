@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
 #include <craw/pipeline.h>
 
@@ -28,6 +29,10 @@
 #include "chroma_down.spv.h"
 #include "chroma_blur.spv.h"
 #include "chroma_up.spv.h"
+#include "highlight_field.spv.h"
+#include "highlight_pull.spv.h"
+#include "highlight_push.spv.h"
+#include "highlight_fill.spv.h"
 
 /* Every debayer pass shares this block; it mirrors CRAWPrepPushBuf in
  * lib/shaders/common.glsl field for field. Scalar layout gives every member
@@ -37,18 +42,52 @@
  * inv_range is 1 / (white - black) rather than the white level itself: the
  * prep of DESIGN.md 4.1 divides by the range at every one of the up to 49
  * samples an RCD invocation reads, and a reciprocal computed once on the
- * host costs at most an ulp against the tolerances of section 11. */
+ * host costs at most an ulp against the tolerances of section 11.
+ *
+ * `clip` is 1.0, the balanced clip of 4.1, except on the mosaic the
+ * highlight reconstruction of DESIGN.md 18 rebuilt, which is read with an
+ * identity prep and no clip at all. */
 typedef struct CRAWPrepPush {
     int32_t size[2];
     float   black[4];
     float   inv_range[4];
     float   wb[4];        /* as-shot gains in [0..2], [3] unused */
+    float   clip;
 } CRAWPrepPush;
 
-static_assert(sizeof(CRAWPrepPush) == 56, "CRAWPrepPush layout");
+static_assert(sizeof(CRAWPrepPush) == 60, "CRAWPrepPush layout");
 static_assert(offsetof(CRAWPrepPush, black) == 8, "CRAWPrepPush layout");
 static_assert(offsetof(CRAWPrepPush, inv_range) == 24, "CRAWPrepPush layout");
 static_assert(offsetof(CRAWPrepPush, wb) == 40, "CRAWPrepPush layout");
+static_assert(offsetof(CRAWPrepPush, clip) == 56, "CRAWPrepPush layout");
+
+/* Mirrors CRAWHighlightPushBuf in lib/shaders/highlight.glsl, which the
+ * colour field's level 0 and the fill share: the prep's constants without
+ * its clip, and the field's size. */
+typedef struct CRAWHighlightPush {
+    int32_t size[2];      /* mosaic */
+    int32_t fsize[2];     /* field level 0, ceil(size / 4) */
+    float   black[4];
+    float   inv_range[4];
+    float   wb[4];        /* the frame's gains in [0..2], [3] unused */
+} CRAWHighlightPush;
+
+static_assert(sizeof(CRAWHighlightPush) == 64, "CRAWHighlightPush layout");
+static_assert(offsetof(CRAWHighlightPush, fsize) == 8, "CRAWHighlightPush layout");
+static_assert(offsetof(CRAWHighlightPush, black) == 16, "CRAWHighlightPush layout");
+static_assert(offsetof(CRAWHighlightPush, wb) == 48, "CRAWHighlightPush layout");
+
+/* Mirrors CRAWHighlightLevelPushBuf in lib/shaders/highlight.glsl, for one
+ * step of the pull or the push between two adjacent levels. */
+typedef struct CRAWHighlightLevelPush {
+    int32_t fine[2];
+    int32_t coarse[2];
+    int32_t top;          /* push: `coarse` is the top level, still sums */
+} CRAWHighlightLevelPush;
+
+static_assert(sizeof(CRAWHighlightLevelPush) == 20, "CRAWHighlightLevelPush layout");
+static_assert(offsetof(CRAWHighlightLevelPush, coarse) == 8, "CRAWHighlightLevelPush layout");
+static_assert(offsetof(CRAWHighlightLevelPush, top) == 16, "CRAWHighlightLevelPush layout");
 
 /* Mirrors CRAWDenoisePushBuf in lib/shaders/denoise_nlm.comp.glsl. The
  * transform constants are all derived from the frame's (a, b) on the host,
@@ -218,6 +257,13 @@ static uint32_t craw_fc_shared_bytes(uint32_t wg)
 #define CRAW_CD_RADIUS 4
 #define CRAW_CD_MIN_SIZE (4 * (CRAW_CD_RADIUS + 1))
 
+/* The highlight reconstruction's colour field, DESIGN.md 18.2: one texel
+ * per 4x4 block of the mosaic at level 0, and levels halved (rounding up)
+ * until one is 1x1. Sixteen levels reach a frame 131072 pixels on its
+ * longer side. */
+#define CRAW_HL_BLOCK      4
+#define CRAW_HL_MAX_LEVELS 16
+
 #define CRAW_AWB_HIST_ENTRIES (CRAW_AWB_HIST_BINS * CRAW_AWB_HIST_BINS)
 #define CRAW_AWB_HIST_BYTES   (CRAW_AWB_HIST_ENTRIES * (uint32_t)sizeof(uint32_t))
 
@@ -231,6 +277,7 @@ struct CRAWPipeline {
     bool has_lens;
     bool has_fc;
     bool has_chroma;
+    bool has_hl;
 
     /* One of `debayer` or the three RCD passes is created, never both.
      * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
@@ -246,6 +293,10 @@ struct CRAWPipeline {
     CRAWVkShader chroma_down;
     CRAWVkShader chroma_blur;
     CRAWVkShader chroma_up;
+    CRAWVkShader hl_field;
+    CRAWVkShader hl_pull;
+    CRAWVkShader hl_push;
+    CRAWVkShader hl_fill;
 
     CRAWVkImage inter;   /* camera RGB, RGBA16F */
     CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
@@ -257,6 +308,10 @@ struct CRAWPipeline {
     CRAWVkImage chroma_q;  /* chroma denoise: quarter resolution (d_r, d_b, G) */
     CRAWVkImage chroma_qf; /* the same, differences filtered */
     CRAWVkImage linear;  /* lens: the colour stage's output, out_format */
+    CRAWVkImage hl_mosaic;  /* highlights: the rebuilt mosaic, R16F, balanced */
+    CRAWVkImage hl_level[CRAW_HL_MAX_LEVELS]; /* highlights: the colour field
+                                               * and its pyramid, RGBA32F */
+    uint32_t nb_hl_levels;
 
     CRAWVkBuffer hist_count;
     CRAWVkBuffer hist_weight;
@@ -422,6 +477,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     p->has_lens = !!(params->flags & CRAW_PIPELINE_FLAG_LENS);
     p->has_fc = !!(params->flags & CRAW_PIPELINE_FLAG_FALSE_COLOR);
     p->has_chroma = !!(params->flags & CRAW_PIPELINE_FLAG_CHROMA_DENOISE);
+    p->has_hl = !!(params->flags & CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION);
     p->qsize[0] = (int32_t)((params->width + 3) / 4);
     p->qsize[1] = (int32_t)((params->height + 3) / 4);
     p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
@@ -483,6 +539,62 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                                    craw_denoise_nlm_spv_data, craw_denoise_nlm_spv_len,
                                    craw_bind_images, 2, sizeof(CRAWDenoisePush), wgdn,
                                    spec, 4);
+        if (ret < 0)
+            goto fail;
+    }
+
+    if (p->has_hl) {
+        uint32_t lw = (params->width + CRAW_HL_BLOCK - 1) / CRAW_HL_BLOCK;
+        uint32_t lh = (params->height + CRAW_HL_BLOCK - 1) / CRAW_HL_BLOCK;
+
+        /* The rebuilt mosaic holds balanced values above 1.0, which no
+         * UNORM encoding of the raw range can. fp16 rounds by at most
+         * 2^-11 relative, at least seven times below the sensor's own
+         * noise at any level (it is 7.4 / sqrt(u) times smaller), and the intermediate after the debayer is fp16
+         * anyway. DESIGN.md 18.3. */
+        ret = craw_vk_image_create(ctx, &p->hl_mosaic, params->width, params->height,
+                                   VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+        if (ret < 0)
+            goto fail;
+
+        /* The colour field and its pyramid, down to 1x1. */
+        while (1) {
+            if (p->nb_hl_levels == CRAW_HL_MAX_LEVELS) {
+                craw_log(ctx, CRAW_LOG_ERROR, "Frame too large for the highlight field's pyramid\n");
+                ret = CRAW_ERROR(EINVAL);
+                goto fail;
+            }
+            ret = craw_vk_image_create(ctx, &p->hl_level[p->nb_hl_levels], lw, lh,
+                                       VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+            if (ret < 0)
+                goto fail;
+            p->nb_hl_levels++;
+            if (lw == 1 && lh == 1)
+                break;
+            lw = (lw + 1) / 2;
+            lh = (lh + 1) / 2;
+        }
+
+        ret = craw_pipeline_shader(p, &p->hl_field, "highlight_field",
+                                   craw_highlight_field_spv_data, craw_highlight_field_spv_len,
+                                   craw_bind_images, 2, sizeof(CRAWHighlightPush), wg2d, spec, 1);
+        if (ret < 0)
+            goto fail;
+        ret = craw_pipeline_shader(p, &p->hl_pull, "highlight_pull",
+                                   craw_highlight_pull_spv_data, craw_highlight_pull_spv_len,
+                                   craw_bind_images, 2, sizeof(CRAWHighlightLevelPush), wg2d,
+                                   spec, 1);
+        if (ret < 0)
+            goto fail;
+        ret = craw_pipeline_shader(p, &p->hl_push, "highlight_push",
+                                   craw_highlight_push_spv_data, craw_highlight_push_spv_len,
+                                   craw_bind_images, 2, sizeof(CRAWHighlightLevelPush), wg2d,
+                                   spec, 1);
+        if (ret < 0)
+            goto fail;
+        ret = craw_pipeline_shader(p, &p->hl_fill, "highlight_fill",
+                                   craw_highlight_fill_spv_data, craw_highlight_fill_spv_len,
+                                   craw_bind_images, 3, sizeof(CRAWHighlightPush), wg2d, spec, 1);
         if (ret < 0)
             goto fail;
     }
@@ -654,10 +766,11 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
-    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s\n",
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s\n",
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
              p->awb ? ", awb histogram" : "",
              p->has_denoise ? ", denoise" : "",
+             p->has_hl ? ", highlight reconstruction" : "",
              p->has_fc ? (wgfc == CRAW_FC_WG_MAX ? ", false colour" : ", false colour (small tile)") : "",
              p->has_chroma ? ", chroma denoise" : "",
              p->has_lens ? ", lens" : "");
@@ -706,6 +819,14 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->chroma_blur);
     if (p->chroma_up.pipeline)
         craw_vk_shader_free(ctx, &p->chroma_up);
+    if (p->hl_field.pipeline)
+        craw_vk_shader_free(ctx, &p->hl_field);
+    if (p->hl_pull.pipeline)
+        craw_vk_shader_free(ctx, &p->hl_pull);
+    if (p->hl_push.pipeline)
+        craw_vk_shader_free(ctx, &p->hl_push);
+    if (p->hl_fill.pipeline)
+        craw_vk_shader_free(ctx, &p->hl_fill);
 
     if (p->inter.image)
         craw_vk_image_free(ctx, &p->inter);
@@ -723,6 +844,11 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_image_free(ctx, &p->chroma_qf);
     if (p->linear.image)
         craw_vk_image_free(ctx, &p->linear);
+    if (p->hl_mosaic.image)
+        craw_vk_image_free(ctx, &p->hl_mosaic);
+    for (uint32_t i = 0; i < p->nb_hl_levels; i++)
+        if (p->hl_level[i].image)
+            craw_vk_image_free(ctx, &p->hl_level[i]);
 
     if (p->hist_count.buf)
         craw_vk_buffer_free(ctx, &p->hist_count);
@@ -752,6 +878,7 @@ static int craw_pipeline_prep_push(CRAWPipeline *p, const CRAWProfile *prof,
 {
     *pp = (CRAWPrepPush) {
         .size = { (int32_t)p->params.width, (int32_t)p->params.height },
+        .clip = 1.0f,
     };
 
     for (int i = 0; i < 4; i++) {
@@ -908,6 +1035,99 @@ static void craw_pipeline_dispatch(CRAWPipeline *p, VkCommandBuffer cmd, const C
     craw_vk_shader_dispatch(p->ctx, cmd, sh, gx, gy, gz);
 }
 
+/* The highlight reconstruction of DESIGN.md 18: the colour field's level 0
+ * from `mosaic`, the pull up the pyramid, the push back down it, and the
+ * fill into the rebuilt mosaic. `pp` is the prep the debayer would have
+ * applied to `mosaic`; the stage applies the same black, range and gains,
+ * without the clip. */
+static void craw_pipeline_record_highlights(CRAWPipeline *p, VkCommandBuffer cmd,
+                                            CRAWVkImage *mosaic, const CRAWPrepPush *pp)
+{
+    CRAWContext *ctx = p->ctx;
+    CRAWVkDescWrite writes[3];
+    CRAWHighlightPush hp;
+    CRAWHighlightLevelPush lp;
+    const uint32_t n = p->nb_hl_levels;
+
+    hp = (CRAWHighlightPush) {
+        .size  = { pp->size[0], pp->size[1] },
+        .fsize = { (int32_t)p->hl_level[0].width, (int32_t)p->hl_level[0].height },
+    };
+    memcpy(hp.black, pp->black, sizeof(hp.black));
+    memcpy(hp.inv_range, pp->inv_range, sizeof(hp.inv_range));
+    memcpy(hp.wb, pp->wb, sizeof(hp.wb));
+
+    craw_vk_image_barrier(ctx, cmd, &p->hl_level[0], VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    craw_vk_desc_image(&writes[0], 0, mosaic);
+    craw_vk_desc_image(&writes[1], 1, &p->hl_level[0]);
+    craw_pipeline_dispatch(p, cmd, &p->hl_field, writes, 2, &hp, sizeof(hp),
+                           p->hl_level[0].width, p->hl_level[0].height, 1);
+
+    /* Pull: every level the sums of the one below it. */
+    for (uint32_t l = 0; l + 1 < n; l++) {
+        CRAWVkImage *fine = &p->hl_level[l], *coarse = &p->hl_level[l + 1];
+
+        craw_vk_image_barrier(ctx, cmd, fine, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        craw_vk_image_barrier(ctx, cmd, coarse, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        lp = (CRAWHighlightLevelPush) {
+            .fine   = { (int32_t)fine->width, (int32_t)fine->height },
+            .coarse = { (int32_t)coarse->width, (int32_t)coarse->height },
+        };
+        craw_vk_desc_image(&writes[0], 0, fine);
+        craw_vk_desc_image(&writes[1], 1, coarse);
+        craw_pipeline_dispatch(p, cmd, &p->hl_pull, writes, 2, &lp, sizeof(lp),
+                               coarse->width, coarse->height, 1);
+    }
+
+    /* Push: every level, from the one under the top down to level 0, takes
+     * what it lacks from the level above, which is already a colour except
+     * at the top. Each level is rewritten in place by invocations that each
+     * touch only their own texel. */
+    for (uint32_t l = n - 1; l-- > 0;) {
+        CRAWVkImage *fine = &p->hl_level[l], *coarse = &p->hl_level[l + 1];
+
+        craw_vk_image_barrier(ctx, cmd, coarse, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        craw_vk_image_barrier(ctx, cmd, fine, VK_IMAGE_LAYOUT_GENERAL,
+                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        lp = (CRAWHighlightLevelPush) {
+            .fine   = { (int32_t)fine->width, (int32_t)fine->height },
+            .coarse = { (int32_t)coarse->width, (int32_t)coarse->height },
+            .top    = l + 2 == n,
+        };
+        craw_vk_desc_image(&writes[0], 0, coarse);
+        craw_vk_desc_image(&writes[1], 1, fine);
+        craw_pipeline_dispatch(p, cmd, &p->hl_push, writes, 2, &lp, sizeof(lp),
+                               fine->width, fine->height, 1);
+    }
+
+    craw_vk_image_barrier(ctx, cmd, &p->hl_level[0], VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+    craw_vk_image_barrier(ctx, cmd, &p->hl_mosaic, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    craw_vk_desc_image(&writes[0], 0, mosaic);
+    craw_vk_desc_image(&writes[1], 1, &p->hl_level[0]);
+    craw_vk_desc_image(&writes[2], 2, &p->hl_mosaic);
+    /* One invocation per quad. */
+    craw_pipeline_dispatch(p, cmd, &p->hl_fill, writes, 3, &hp, sizeof(hp),
+                           p->params.width / 2, p->params.height / 2, 1);
+
+    craw_vk_image_barrier(ctx, cmd, &p->hl_mosaic, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+}
+
 int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                          const CRAWImage *src, const CRAWImage *dst,
                          const CRAWFrameParams *fp)
@@ -925,7 +1145,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     CRAWFalseColorPush fcp;
     CRAWChromaPush cdp;
     enum CRAWColorSpace out_space;
-    bool denoise, lens, false_color, chroma;
+    bool denoise, lens, false_color, chroma, highlights;
     float m_out[3][3], scale;
     uint32_t w, h;
     int ret;
@@ -1108,6 +1328,22 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         mosaic = &p->clean;
+    }
+
+    /* The rebuilt mosaic replaces whichever the debayer would have read,
+     * and already holds what the prep would have made of it, gains
+     * included; the debayer's prep becomes the identity with no clip, so
+     * the rebuilt highlights reach the colour stage above 1.0. */
+    highlights = p->has_hl && (fp->flags & CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION);
+    if (highlights) {
+        craw_pipeline_record_highlights(p, cmd, mosaic, &pp);
+        mosaic = &p->hl_mosaic;
+        for (int i = 0; i < 4; i++) {
+            pp.black[i] = 0.0f;
+            pp.inv_range[i] = 1.0f;
+            pp.wb[i] = 1.0f;
+        }
+        pp.clip = FLT_MAX;
     }
 
     craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,

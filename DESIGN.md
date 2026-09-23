@@ -15,7 +15,10 @@ In:
 - Bayer input, RGGB only (other phases are plumbed as a specialization
   constant but rejected until tested), 16-bit UNORM samples.
 - Black/white normalization, as-shot white balance, clip at the white
-  balanced clip point.
+  balanced clip point, or instead highlight reconstruction: the clipped
+  channels of every sensel rebuilt from the channels that did not clip and
+  the colour of the unclipped light around the blown area, before the
+  debayer, optional, per frame. Section 18.
 - Three debayer methods: bilinear, Malvar-He-Cutler (MHC), and a
   ratio-corrected directional method (RCD).
 - Colour stage: re-balance to a chosen illuminant, camera matrix, gain,
@@ -39,8 +42,7 @@ In:
 - CPU reference of every stage, tests comparing it against the GPU.
 
 Out, deliberately, with a slot reserved: temporal denoising (section 14.7
-says how it attaches), scaling, learned debayer, highlight reconstruction beyond the
-clip, OCIO-generated transforms, LUTs, other CFA phases, and ARRIRAW and
+says how it attaches), scaling, learned debayer, OCIO-generated transforms, LUTs, other CFA phases, and ARRIRAW and
 BRAW profiles. Vignetting is out too, and unlike distortion it is out for
 good on this camera: the optical_correction record carries no shading
 term, because Panasonic applies shading correction in the camera before the
@@ -100,6 +102,13 @@ Quarter resolution chroma images (internal, only with
 ceil(H/4), the block means of (R - G, B - G, G) and the same with the
 differences filtered. Section 14.4.
 
+Rebuilt mosaic (internal, only with
+`CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION`): `VK_FORMAT_R16_SFLOAT`,
+full resolution, balanced and unclipped, written by the highlight
+reconstruction and read by the debayer in place of the mosaic. Its colour
+field: RGBA32F, one texel per 4x4 block, and a pyramid down to 1x1.
+Section 18.
+
 Linear image (internal, only with `CRAW_PIPELINE_FLAG_LENS`): the output
 format, holding what the colour stage produced before the lens warp reads
 it. Section 16.3.
@@ -120,6 +129,13 @@ Filters the mosaic in the raw domain and hands the debayer a denoised
 mosaic in the same encoding. Defined in section 14; nothing else in this
 section changes when it runs.
 
+### 4.0b Highlight reconstruction (optional, before the debayer)
+
+Reads the mosaic (the denoised one when 4.0 ran) and writes a rebuilt
+one, balanced and unclipped, in which every clipped channel has been
+estimated from what did not clip; the debayer reads it with the prep of
+4.1 reduced to the identity. Defined in section 18.
+
 ### 4.1 Prep (fused into the debayer loads)
 
 For a sample at site `s` with channel `c(s)`:
@@ -132,16 +148,18 @@ For a sample at site `s` with channel `c(s)`:
 `wb_asshot` is a misnomer kept for the shader field: it is
 `CRAWColorParams.wb` evaluated for the frame's own wb_mode and illuminant.
 The clip at 1.0 after white balance keeps blown highlights neutral under
-that illuminant; it is the placeholder for highlight reconstruction. Note
+that illuminant. The highlight reconstruction of section 18 replaces this
+whole step when it runs: the debayer then reads the rebuilt mosaic, which
+already holds the balanced values, with a prep of black 0, range 1, gains
+1 and no clip. Note
 the clip point differs per channel in raw units. An earlier revision
 balanced with the as-shot gains and re-balanced in the colour stage; that
 turned every clipped lamp the colour of the gain ratio, so the debayer
 output is now tied to the frame's white balance and a grade-time change
 re-runs it, which costs a few milliseconds.
 
-The debayer operates on `v`. A sample is "clipped" when
-`raw >= white_level[s] - 1/1024`; this mask is not used by this version but
-must be cheap to add.
+The debayer operates on `v`. What counts as clipped, and how softly, is
+section 18.2's business.
 
 ### 4.2 Debayer
 
@@ -651,7 +669,8 @@ for containers without them.
 - Buffers for histograms are storage buffers with device addresses; the
   readback buffer is host visible and cached.
 - The pipeline records, per frame: barrier src to GENERAL/compute read,
-  [fill histogram buffers], [denoise pass], debayer passes, [awb
+  [fill histogram buffers], [denoise pass], [highlight field, pull and
+  push over its pyramid, fill], debayer passes, [awb
   histogram], colour pass, [lens pass], [copy histogram to readback], and a
   final barrier that returns dst to the caller's stated layout. With the
   lens pass the colour pass writes the internal linear image and the lens
@@ -659,7 +678,9 @@ for containers without them.
   the colour pass writes dst and no lens pass is recorded at all. The denoise pass
   dispatches one workgroup slice per CFA plane over a half resolution grid
   (`gl_WorkGroupID.z` selects the plane) and the debayer then reads its
-  output image instead of the caller's source.
+  output image instead of the caller's source. The highlight
+  reconstruction reads whichever of the two the debayer would have read
+  and the debayer then reads the rebuilt mosaic instead.
 - Push constant structs are defined once in `lib/pipeline.c` and mirrored
   in GLSL with `layout(push_constant, scalar)`; keep them in the same
   order and pad explicitly.
@@ -690,7 +711,12 @@ for containers without them.
   twice the plain chain's absolute error, plus the checks of section 17.5 that it ran,
   that both ways of switching it off reproduce the plain chain, that a
   single site spike loses its colour by the amount the definition predicts
-  and that G is untouched bit for bit. lavapipe is acceptable for these
+  and that G is untouched bit for bit. The highlight reconstruction is
+  held to the relative bounds above, on a scene of its own, plus the
+  checks of section 18.5 that the definition rebuilds what it says it
+  does, that both ways of switching it off are the plain chain bit for bit
+  and that an unclipped frame moves by no more than its mosaic's fp16
+  rounding. lavapipe is acceptable for these
   tests; it exposes everything required.
 - `test_pipeline`, gamut compression (section 8.1), in three parts. The
   operator alone, on the CPU: the thresholds and power against the
@@ -2752,3 +2778,333 @@ unchanged bit for bit. With `CRAW_TEST_FRAME` the real frame runs RCD
 with the maximum number of passes, timed, and is held to twice the plain
 chain's absolute error against the reference rather than to the relative
 bound of section 11, for the reason 17.3 ends with.
+
+## 18. Highlight reconstruction
+
+### 18.1 What the clip throws away
+
+Every sensel saturates at the same raw level whatever its colour filter.
+On the S1II that level is the frame header's white level, 63743: a
+histogram of the raw codes of any frame with a blown area has a spike
+there in all four sites, and the ProRes RAW codec smears it into a
+plateau, 0.993 to 1.009 of the sensor range in the HQ flavour and 0.98 to
+1.03 in the other one. After the white balance gains of 4.1 the channels
+therefore clip at different levels: on the camera's as-shot pair G clips
+at 1.0, B at 1.668 and R at 2.025.
+
+The clip of 4.1 cuts all three at 1.0. That keeps a blown area neutral,
+which is its purpose, and it throws away everything R and B still
+measured above G's clip. On P1000352.MOV, an overcast sky through a
+window, G is clipped over 17% of the frame and R over 5%: across most of
+the sky R and B still carry the clouds, and the clip turns it into a flat
+grey plane. Where every channel has clipped the plateau is flat at 1.0 and
+has no colour, and a tone mapper renders it as a flat white shape with a
+hard outline. Unclipped, the same sky is magenta: G stops at 1.0 while R
+and B carry on.
+
+This stage rebuilds the clipped channels of every sensel from the
+channels that did not clip at that place and from the colour of the
+unclipped light around the blown area, and lets the result exceed 1.0.
+
+The ideas are old and published: estimating a clipped channel from the
+unclipped ones through the colour of the neighbourhood is what
+darktable's "inpaint opposed" and RawTherapee's "colour propagation"
+methods do (both described in their manuals), and filling holes in an
+image by pulling a pyramid of weighted averages up and pushing it back
+down is Gortler, Grzeszczuk, Szeliski and Cohen's pull-push ("The
+Lumigraph", SIGGRAPH 1996). No code from either program is used; the
+definitions below are complete in themselves.
+
+### 18.2 Definition
+
+Constants:
+
+    U_LO    = 0.92    start of the clip ramp, as a fraction of the sensor range
+    U_HI    = 0.98    end of the ramp: a sample above it is clipped
+    EPS     = 1e-4    floor under a balanced value before a logarithm
+    LOG_MAX = 2.0     bound on a logarithmic colour ratio
+    W_SAT   = 1.0     field weight at which a texel ignores the coarser level
+
+The ramp sits below the codec's plateau: a sample the codec pulled down to
+0.98 of the range is still fully clipped, and one at 0.92 is still fully
+trusted.
+
+Per site s at (x, y), with c = c(s) its channel and `wb` the gains the
+prep of 4.1 would apply:
+
+    u = max((raw - black_level[s]) / (white_level[s] - black_level[s]), 0)
+    x = u * wb[c]                           balanced, not clipped
+    a = smoothstep(U_LO, U_HI, u)           how clipped the site is, 0 to 1
+
+with smoothstep(e0, e1, v) = t^2 (3 - 2t), t = clamp((v - e0) / (e1 - e0), 0, 1).
+
+**The colour field.** One texel per 4x4 block of sites, the block (bx, by)
+covering x in [4 bx, 4 bx + 3] and y in [4 by, 4 by + 3]; the grid is
+ceil(W/4) x ceil(H/4) and the last column or row of blocks may hold only
+half its quads (W and H are even, so a block always holds whole quads).
+Each quad, the 2x2 sites with an even top left corner, gives
+
+    R, G, B = x of its R site, the mean of its two G sites, x of its B site
+    a_q     = the largest a over the sites of this quad and of the eight
+              quads around it (those that exist; none outside the frame)
+    m_q     = min(the largest u of its four sites, 1)
+    w_q     = (1 - a_q) * m_q^2
+    r_q     = clamp(ln(max(R, EPS) / max(G, EPS)), -LOG_MAX, LOG_MAX)
+    b_q     = the same with B
+
+and the texel holds `(S_r, S_b, W) = (sum w_q r_q, sum w_q b_q, sum w_q)`
+over its quads, summed top row first, left to right.
+
+A clipped quad has no weight, and neither has any quad touching one. The
+ring of unclipped quads around a clipped area reads off colour, always
+towards green and cyan: the median ln(R/G) of the quads one quad away from
+a clip, against those two to twenty away, is 0.46 lower around the lamp of
+P1000387 (its reflector's rings are unclipped gaps one or two sensels wide
+between clipped lines, all of them in that ring), and ln(B/G) 0.10 lower at
+the edge of the sky of P1001259; from two quads out the bias is below 0.03
+on every clip measured. Taken into the field, that ring painted the lamp's
+rebuilt rings saturated cyan. Whether it is the codec, crosstalk or the
+optics was not settled; the one quad of margin removes it.
+
+The m_q^2 makes the colour that fills a
+blown area the colour of the brightest unclipped light around it — the
+glow around a lamp, the band of sky beside the clipped part of the sky —
+and not of whatever dark object happens to border it. It is the argument
+behind the bright reading of the white balance estimator (section 7).
+
+**Pull.** Level 0 is that grid. Level l + 1 has ceil(n / 2) texels along
+each axis that level l has n along, and each of its texels holds the sum,
+component by component, of the level l texels (2i, 2j), (2i + 1, 2j),
+(2i, 2j + 1) and (2i + 1, 2j + 1) that exist, added in that order. Levels
+are built until one is 1x1; a 5760x3040 frame has twelve, 1440x760 down.
+
+**Push.** From the top down every texel gets a colour `c`, the pair of
+logarithmic ratios (ln R/G, ln B/G) of the light there:
+
+    top level:  c = (S_r, S_b) / W, or (0, 0) when W = 0
+    level l:    c_up = level l + 1's c, bilinear at ((i + 0.5) / 2 - 0.5, (j + 0.5) / 2 - 0.5)
+                t    = min(W / W_SAT, 1)
+                c    = c_up + t * ((S_r, S_b) / W - c_up),  or c_up when W = 0
+
+Bilinear sampling, here and in the fill below: with p the position,
+i0 = floor(p) and f = p - i0 on each axis, the four texels at i0 and
+i0 + 1 with each index clamped into the level, mixed along x first and
+then along y.
+
+This is pull-push hole filling with one change: the pull sums the weights
+instead of capping them at every level, so the brightness weighting
+survives into the coarse levels a large blown area is filled from. A
+texel whose own block has enough unclipped light keeps its own colour, one
+with none takes the coarser level's, and so on up: every blown area ends
+up in the colour of the nearest bright unclipped light, at whatever scale
+it has to reach for it.
+
+**Fill.** Every site with a = 0 keeps x. At a site with a > 0:
+
+    (lr, lb)  = level 0's c, bilinear at (qx / 2 - 0.25, qy / 2 - 0.25),
+                the centre of the site's quad (qx, qy) = (x >> 1, y >> 1)
+    lrho      = (lr, 0, lb)                  ln of the light's ratios to G
+
+and for each of the two channels k other than c, over its sites in the
+3x3 around the site (borders mirrored as in section 3; at an R or B site
+G is at the four edge neighbours and the opposite colour at the four
+corners, at a G site one colour is at the horizontal pair and the other at
+the vertical pair):
+
+    m_k = mean of their x
+    a_k = 1 - the largest of their a
+    l_k = ln(max(m_k, EPS)) - lrho[k]
+
+then, with l_c = ln(max(x, EPS)) - lrho[c] and the other two channels
+numbered 1 and 2,
+
+    A      = a_1 + a_2
+    L_full = exp(max(l_c, l_1, l_2))
+    L_part = exp((a_1 l_1 + a_2 l_2) / A),  or L_full when A = 0
+    L      = L_full + min(A, 1) * (L_part - L_full)
+    out    = x + a * max(L * exp(lrho[c]) - x, 0)
+
+The field says what colour the light is at the site, and L is its level:
+each channel is L times its ratio, `x_k = L * exp(lrho[k])`. The channels
+that did not clip measure L; L_part is their geometric mean, weighted by
+how unclipped each one is. Where none is left every channel is only known
+from below, `x_k >= m_k`, and L_full is the lowest level at which the
+field's colour satisfies all three bounds. The clipped channel then gets
+its share of L, never less than it measured, and the ramp blends that in:
+a sample below U_LO is left alone and one above U_HI is entirely rebuilt.
+
+The bounds of the *other* clipped channels deliberately do not raise
+L_part. When they disagree with the unclipped channels the local colour
+is not the field's colour, and raising L to satisfy them would push the
+rebuilt channel above what the measurement allows; each clipped channel is
+instead held to its own bound only, by the final max.
+
+What it produces on a neutral highlight brightening past the clip, with
+the S1II's as-shot gains: G clips at 1.0 and is rebuilt from R and B up to
+1.668, where B clips; from R alone up to 2.025, where R clips; and above
+that the area is a plateau at 2.025 in every channel. The picture gains
+the stop the gains leave between G's clip and R's, and an area blown in
+every channel is flat at 2.025 in the colour of its surroundings instead
+of at 1.0 in no colour at all.
+
+### 18.3 Where it sits
+
+After the raw denoise of 14.3, whose output it reads when that runs (the
+denoise's highlight guard leaves clipped samples alone and the unclipped
+light the field is built from is the cleaner for it), and before the
+debayer, which then reads the rebuilt mosaic in place of the caller's.
+The rebuilt mosaic is `VK_FORMAT_R16_SFLOAT`, full resolution, and holds
+`out`: the black level, the range and the gains are already in it and
+nothing is clipped, so the debayer's prep of 4.1 becomes the identity
+(black 0, range 1, gains 1, no clip).
+
+On the mosaic and not after the debayer, because a debayer run on clipped
+data has already smeared the clip across every edge of a blown area, into
+channels and pixels that were never clipped, and no repair afterwards can
+tell those apart. On the rebuilt mosaic the debayer sees continuous data
+across the edge.
+
+Everything downstream sees values above 1.0 in the camera RGB
+intermediate. The auto white balance histogram's 0.98 test (4.4) still
+excludes them; the colour stage has never clipped; the output extends
+further above the old clip point, which at base ISO on the S1II sits at
+23 times diffuse white.
+
+A frame with no clipped sample goes through the stage as the fp16
+rounding of its mosaic: at most 2^-11 relative, the rounding the fp16
+intermediate of section 3 applies anyway, and 7.4 / sqrt(u) times below
+the sensor's noise at u with the S1II's model of section 14.2, so at
+least seven times below it anywhere.
+
+### 18.4 Dispatches, cost and API
+
+Four shaders: `highlight_field` (one invocation per 4x4 block, reading the
+8x8 sites the block's quads and their neighbours cover), `highlight_pull`
+and `highlight_push` (one dispatch per pair of levels each way, eleven of
+each at 5.8K), and `highlight_fill` (one invocation per quad, reading the
+4x4 sites its four stencils cover, and storing its four samples straight
+through without touching the field when none of them is clipped). The
+push rewrites each level in place: every invocation reads and writes only
+its own texel of the finer level, and the coarser one was finished by the
+previous dispatch. The field is RGBA32F because the pull's sums over a
+whole frame need fp32's range and precision; level 0 is 1440x760 at 5.8K
+and the pyramid adds a third, 23.3 MB in all, plus 35.0 MB for the rebuilt
+mosaic.
+
+Measured with `cineraw --bench` over 30 frames of P1000352.MOV on the 6900
+XT, RCD and lens correction: 5.98 ms a frame without the stage, 6.42 ms
+with it. Skipping one pass at a time puts 0.12 ms on the field, 0.03 ms
+on the pull, 0.10 ms on the push (its eleven barriers, mostly) and 0.13 ms
+on the fill; the rest is the debayer reading R16F. A single cold
+submission right after the pipeline is created, as the test times it,
+takes 2 ms more than that.
+
+`CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION` builds the stage and
+`CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION` switches it per frame; an
+unflagged frame dispatches nothing the plain chain does not and is bit for
+bit the plain chain. A flag rather than a strength, because there is
+nothing to dial: a rebuilt channel is the estimate or the clip. The CLI
+spelling is `--highlights on|off` in both tools, on by default, and
+cineview's Debayer section carries the same switch; it is a correction,
+like the lens, rather than a look. cineview raises the peak it tells
+libplacebo about by the largest gain over the smallest, the plateau a
+neutral area blown in every channel is rebuilt to; libplacebo's peak
+detection replaces that with the measured peak anyway (it only clamps a
+measured peak to PQ's 10000 nits, not to the stated one).
+
+### 18.5 Testing
+
+`test_pipeline` on a scene of its own: two Gaussian blobs of constant
+chroma on a dim gradient, the first peaking at G = 1.4 with R and B below
+their clips, the second at G = 4.0 and blown in every channel at its core,
+inverted to raw codes that saturate at the white level with the usual
++-8 counts of noise on top, plateau included. On the CPU, the reference's
+rebuilt mosaic: every sample below the ramp is its balanced value to
+within the fp16 store (4.8e-4 relative); the 540 G sites clipped with
+their R and B neighbours untouched are rebuilt to within 0.11% of the
+scene's own G (bound 2%); the blown core, saturated in every channel over
+the whole 3x3, comes out at R/G 1.1048 and B/G 1.0470 against the blob's
+1.10 and 1.05 and at G 1.833 against the 1.841 of 18.2's plateau (bound 3%
+each), with no sample below its clip; no clipped sample is ever lowered.
+On the GPU: both ways of switching the stage off are the plain chain bit
+for bit; MHC and RCD match the reference within the relative bounds of
+section 11 (2.2e-3 and 2.4e-3 measured) and sit 1.12 away from the clipped
+chain, so the pass cannot have silently not run; and the same scene
+dimmed until nothing clips moves by 9.8e-4 at most, the fp16 rounding of
+the mosaic, within the debayers' own absolute bounds. With
+`CRAW_TEST_FRAME` the real frame runs RCD with the stage and is held to
+the relative bound of section 11: 6.4e-3 on P1000387 and 3.4e-3 on
+P1000352.
+
+### 18.6 Measured against the truth
+
+A clip cannot say what its blown highlights should have been, so the
+definition was measured on frames whose highlights did not clip, pushed
+over the clip on purpose: the frame's u multiplied by k, everything above
+1.0 set to 1.0 plus the HQ codec's plateau noise (0.3%), the stage run,
+and the result compared quad by quad with the frame's own values times k.
+Quads within two quads of anything the original frame had clipped are left
+out of the comparison, because there the "truth" is itself clipped. Median
+absolute errors in natural log units, green-magenta being half the sum of
+the errors in ln R/G and ln B/G, warm-cool half their difference, and the
+level the error in ln G; each against what the clip of 4.1 gives:
+
+    frame, k                 quads   green-magenta   warm-cool    level
+    P1001493 lake, 2.5    part 0.92%   0.016 (0.017)  0.000 (0.044) 0.024 (0.158)
+                          full 0.003%  0.013 (0.014)  0.084 (0.046) 0.092 (0.755)
+    P1000123 sunset, 4    part 2.05%   0.024 (0.084)  0.028 (0.359) 0.027 (0.402)
+                          full 0.22%   0.031 (0.086)  0.129 (0.377) 0.050 (1.113)
+    P1001497 beach, 3     part 0.67%   0.018 (0.029)  0.000 (0.079) 0.022 (0.211)
+                          full 0.016%  0.019 (0.052)  0.034 (0.086) 0.065 (0.797)
+    P1001123 night, 12    part 0.08%   0.107 (0.160)  0.015 (0.203) 0.065 (0.313)
+                          full 0.054%  0.074 (0.154)  0.071 (0.225) 0.408 (1.338)
+
+(part: clipped in one or two channels; full: in all three.) Where a
+channel survives, the level comes back to within 2% to 7% and the colour
+to within what the unclipped neighbours already say; where none does the
+level is, by construction, the lowest the colour allows, and misses by
+5% to 33% in the median, low almost everywhere, instead of by 53% to
+74%. The night street's lamps are the hard case: small sources, their
+colour known only from a thin halo.
+
+One alternative was measured and rejected: taking the green-magenta
+component of the light's colour from the camera's Planckian locus (which
+in this camera's balanced log space is the line ln R/G + ln B/G = 0 to
+within 0.02 from 2000 K to 11500 K) instead of from the field, on the
+argument that skies and light sources lie on it. Its green-magenta error
+was larger than the field's on every row above, three to four times on
+the sunset, and its level error larger on five rows of eight; the three
+it won (the lake twice and the beach's blown core) it won by 0.004 to
+0.011.
+
+A second alternative was measured for the blown areas alone: shrinking
+the field's log colour by a factor s towards neutral wherever no channel
+survives, on the argument that the colour of a light source is closer to
+the white balance than the colour of what it lights. Median colour error
+(the distance in ln R/G, ln B/G) and level error on the blown quads of
+the four frames:
+
+    s        lake           sunset         beach          night
+    0      0.076 0.051    0.545 0.406    0.154 0.100    0.395 0.637
+    0.5    0.093 0.070    0.194 0.308    0.080 0.069    0.208 0.589
+    0.75   0.105 0.082    0.069 0.161    0.063 0.061    0.162 0.503
+    1      0.122 0.092    0.189 0.050    0.064 0.065    0.158 0.408
+
+Neutral is the worst choice by far on the sunset and the night street,
+and 0.75 trades a quarter less colour error for a third more level error
+on average, so the field's colour stands as it is. It does not always
+win: the blown core of P1000387's lamp is rebuilt warm (R/G 1.20, B/G
+0.78) from the warm glow on the housing around it, while the white
+balance estimator's bright reading puts the lamp itself near 5600 K, i.e.
+close to neutral under the clip's 5500 K. The frame does not record which
+is right.
+
+Estimating the clipped channel through the field's colour takes only the
+field's green-magenta component where both other channels survive: with
+R and B measured and G unknown, the output keeps the measured R/B and
+takes (ln R/G + ln B/G) / 2 from the field. A field whose colour is off
+only along the locus, warmer or cooler than the truth, therefore costs
+nothing there. On P1000352's sky, which is clipped over most of the frame
+and whose nearest unclipped light is the warm band along the horizon,
+the rebuilt sky still shows lavender and pink patches of the kind the
+green-magenta column measures.

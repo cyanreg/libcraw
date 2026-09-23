@@ -72,7 +72,12 @@ ready for a `--tables` file. `--false-colour PASSES` runs one to five passes of 
 median and a blur over the colour differences after the debayer,
 RawTherapee's false colour suppression steps, which turn the coloured
 dots that rain glints and other sub-pixel highlights leave into neutral
-ones and touch nothing else. `--crop X,Y,W,H` writes one rectangle of the output while
+ones and touch nothing else. Clipped highlights are rebuilt before the
+debayer by default: every channel that clipped is estimated from the
+channels that did not clip around it and from the colour of the unclipped
+light around the blown area, and may exceed the old clip point, so a sky
+where only green clipped keeps its clouds instead of turning flat grey
+(DESIGN.md 18); `--highlights off` clips as before. `--crop X,Y,W,H` writes one rectangle of the output while
 the pipeline still runs on the whole frame, which is how a 5.8K frame gets
 looked at 1:1 without a 5.8K file.
 
@@ -204,7 +209,8 @@ The "Debayer" section picks the method and carries the false colour
 suppression row: the number of median and blur passes over the colour
 differences after the debayer, zero to five, which is what stops a wet street from
 shimmering in colour as the rain hits it; `--false-colour PASSES` sets it
-from the command line. The "Denoise" section sets the raw stage's strength and reports the
+from the command line. Its "rebuild clipped highlights" switch, on by
+default, is the highlight reconstruction; `--highlights on|off` sets it. The "Denoise" section sets the raw stage's strength and reports the
 noise model it found for the clip's own ISO — that stage stays off when
 the camera has none, which the section says rather than leaving you
 guessing — and the chroma amount, the luma-guided smoothing of the
@@ -220,7 +226,8 @@ line reads `3/7 P1000347.MOV [hevc video, gpu]`. The clips need not match —
 ProRes RAW and already developed, different sizes, stereo or four-channel or
 no audio at all — and a switch keeps every setting exactly as it was: the
 white balance mode and a manual CCT, the exposure index and bias, debayer
-and its false colour passes, denoise, lens correction and its fit, the
+and its false colour passes and highlight switch, denoise, lens correction
+and its fit, the
 export's colour space, size,
 pixel format, audio mode and threads, the two export file paths once typed,
 the film simulation, the tone map, the adjustments, the grain, every

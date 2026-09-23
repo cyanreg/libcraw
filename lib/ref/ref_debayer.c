@@ -55,7 +55,8 @@ static void craw_ref_prep(const uint16_t *bayer, uint32_t width,
 
             /* Clipping after the white balance keeps a blown highlight
              * neutral instead of letting the channel with the largest gain
-             * run away; this is where highlight reconstruction will go. */
+             * run away. The highlight reconstruction of DESIGN.md 18
+             * replaces this whole function when it runs. */
             v[(size_t)y * width + x] = CRAW_MIN(t, 1.0f);
         }
     }
@@ -417,26 +418,33 @@ int craw_ref_debayer_wb(const uint16_t *bayer, uint32_t width, uint32_t height,
 
     craw_ref_prep(bayer, width, height, stride, profile, wb, v);
 
-    switch (method) {
-    case CRAW_DEBAYER_BILINEAR:
-        craw_ref_bilinear(v, width, height, rgb);
-        ret = 0;
-        break;
-    case CRAW_DEBAYER_MHC:
-        craw_ref_mhc(v, width, height, rgb);
-        ret = 0;
-        break;
-    case CRAW_DEBAYER_RCD:
-        ret = craw_ref_rcd(v, width, height, rgb);
-        break;
-    default:
-        ret = CRAW_ERROR(EINVAL);
-        break;
-    }
+    ret = craw_ref_debayer_mosaic(v, width, height, method, rgb);
 
     free(v);
 
     return ret;
+}
+
+int craw_ref_debayer_mosaic(const float *v, uint32_t width, uint32_t height,
+                            enum CRAWDebayer method, float *rgb)
+{
+    if (!v || !rgb)
+        return CRAW_ERROR(EINVAL);
+    if (width < 2 || height < 2 || (width & 1) || (height & 1))
+        return CRAW_ERROR(EINVAL);
+
+    switch (method) {
+    case CRAW_DEBAYER_BILINEAR:
+        craw_ref_bilinear(v, width, height, rgb);
+        return 0;
+    case CRAW_DEBAYER_MHC:
+        craw_ref_mhc(v, width, height, rgb);
+        return 0;
+    case CRAW_DEBAYER_RCD:
+        return craw_ref_rcd(v, width, height, rgb);
+    default:
+        return CRAW_ERROR(EINVAL);
+    }
 }
 
 int craw_ref_debayer(const uint16_t *bayer, uint32_t width, uint32_t height,
