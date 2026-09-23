@@ -575,6 +575,9 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
             lh = (lh + 1) / 2;
         }
 
+        /* The field pass keeps the clip state of the quads its workgroup
+         * covers in a shared tile sized for a square workgroup of at most
+         * 16, which is what wg2d is. */
         ret = craw_pipeline_shader(p, &p->hl_field, "highlight_field",
                                    craw_highlight_field_spv_data, craw_highlight_field_spv_len,
                                    craw_bind_images, 2, sizeof(CRAWHighlightPush), wg2d, spec, 1);

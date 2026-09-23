@@ -18,6 +18,7 @@
 #define CRAW_HL_EPS     1e-4f
 #define CRAW_HL_LOG_MAX 2.0f
 #define CRAW_HL_W_SAT   1.0f
+#define CRAW_HL_DILATE  3
 
 /* Channel each quad site carries, RGGB: R, Gr, Gb, B. */
 static const int craw_hl_site_chan[4] = { 0, 1, 1, 2 };
@@ -209,8 +210,8 @@ int craw_ref_highlights(const uint16_t *bayer, uint32_t width, uint32_t height,
     }
 
     /* Level 0: each block's quads, top row first, left to right, each
-     * judged clipped by the largest a over itself and its eight
-     * neighbouring quads. */
+     * judged clipped by the largest a over the quads within CRAW_HL_DILATE
+     * of it. */
     for (int by = 0; by < lv[0].h; by++) {
         for (int bx = 0; bx < lv[0].w; bx++) {
             float acc[3] = { 0.0f, 0.0f, 0.0f };
@@ -225,8 +226,8 @@ int craw_ref_highlights(const uint16_t *bayer, uint32_t width, uint32_t height,
                     if (qx >= qw || qy >= qh)
                         continue;
 
-                    for (int dy = -1; dy <= 1; dy++) {
-                        for (int dx = -1; dx <= 1; dx++) {
+                    for (int dy = -CRAW_HL_DILATE; dy <= CRAW_HL_DILATE; dy++) {
+                        for (int dx = -CRAW_HL_DILATE; dx <= CRAW_HL_DILATE; dx++) {
                             int nx = qx + dx, ny = qy + dy;
                             if (nx < 0 || ny < 0 || nx >= qw || ny >= qh)
                                 continue;

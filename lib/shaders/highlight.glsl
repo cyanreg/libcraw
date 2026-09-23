@@ -16,6 +16,8 @@ const float CRAW_HL_U_HI    = 0.98;
 const float CRAW_HL_EPS     = 1e-4;
 const float CRAW_HL_LOG_MAX = 2.0;
 const float CRAW_HL_W_SAT   = 1.0;
+/* How many quads around a clipped one the colour field leaves out. */
+const int   CRAW_HL_DILATE  = 3;
 
 #ifdef CRAW_HL_LEVELS
 

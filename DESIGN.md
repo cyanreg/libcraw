@@ -2824,6 +2824,7 @@ Constants:
     EPS     = 1e-4    floor under a balanced value before a logarithm
     LOG_MAX = 2.0     bound on a logarithmic colour ratio
     W_SAT   = 1.0     field weight at which a texel ignores the coarser level
+    MARGIN  = 3       quads around a clipped one that the colour field leaves out
 
 The ramp sits below the codec's plateau: a sample the codec pulled down to
 0.98 of the range is still fully clipped, and one at 0.92 is still fully
@@ -2845,8 +2846,9 @@ half its quads (W and H are even, so a block always holds whole quads).
 Each quad, the 2x2 sites with an even top left corner, gives
 
     R, G, B = x of its R site, the mean of its two G sites, x of its B site
-    a_q     = the largest a over the sites of this quad and of the eight
-              quads around it (those that exist; none outside the frame)
+    a_q     = the largest a over the sites of the 7x7 quads centred on this
+              one, i.e. within MARGIN quads of it (those that exist; none
+              outside the frame)
     m_q     = min(the largest u of its four sites, 1)
     w_q     = (1 - a_q) * m_q^2
     r_q     = clamp(ln(max(R, EPS) / max(G, EPS)), -LOG_MAX, LOG_MAX)
@@ -2855,16 +2857,34 @@ Each quad, the 2x2 sites with an even top left corner, gives
 and the texel holds `(S_r, S_b, W) = (sum w_q r_q, sum w_q b_q, sum w_q)`
 over its quads, summed top row first, left to right.
 
-A clipped quad has no weight, and neither has any quad touching one. The
-ring of unclipped quads around a clipped area reads off colour, always
-towards green and cyan: the median ln(R/G) of the quads one quad away from
-a clip, against those two to twenty away, is 0.46 lower around the lamp of
-P1000387 (its reflector's rings are unclipped gaps one or two sensels wide
-between clipped lines, all of them in that ring), and ln(B/G) 0.10 lower at
-the edge of the sky of P1001259; from two quads out the bias is below 0.03
-on every clip measured. Taken into the field, that ring painted the lamp's
+A clipped quad has no weight, and neither has any quad within three
+quads of one. Two things put the margin there. The ring of unclipped quads
+touching a clipped area reads off colour, always towards green and cyan:
+the median ln(R/G) of the quads one quad away from a clip, against those
+two to twenty away, is 0.46 lower around the lamp of P1000387 (its
+reflector's rings are unclipped gaps one or two sensels wide between
+clipped lines, all of them in that ring), and ln(B/G) 0.10 lower at the
+edge of the sky of P1001259; from two quads out the bias is below 0.03 on
+every clip measured. Taken into the field, that ring painted the lamp's
 rebuilt rings saturated cyan. Whether it is the codec, crosstalk or the
-optics was not settled; the one quad of margin removes it.
+optics was not settled. And a small light's field is made of the few
+brightest unclipped pixels around it, which are its lateral chromatic
+aberration fringe and its flare: noisy, different on every side, and
+different in every frame. In an area blown in every channel the level is
+set by the smallest ratio (L_full below divides by it), so that noise came
+out as flicker, the rebuilt core of a lamp jumping between cream and
+orange and by up to a quarter in level from one frame to the next. Measured on the 22
+blown lights of the first twelve frames of P1001123.MOV, a night street,
+followed from frame to frame, as the median (and 90th percentile) change
+of the rebuilt core between consecutive frames, in natural log units of
+the level and of the colour (the distance in ln R/G, ln B/G):
+
+    margin (quads)      1              2              3              4
+    level          0.028 (0.220)  0.014 (0.074)  0.005 (0.054)  0.004 (0.070)
+    colour         0.114 (0.316)  0.029 (0.090)  0.008 (0.062)  0.007 (0.083)
+
+Three is where both stop improving. Against the truth of 18.6 the margin
+costs little either way; the numbers there are the three-quad ones.
 
 The m_q^2 makes the colour that fills a
 blown area the colour of the brightest unclipped light around it — the
@@ -2978,8 +2998,11 @@ least seven times below it anywhere.
 
 ### 18.4 Dispatches, cost and API
 
-Four shaders: `highlight_field` (one invocation per 4x4 block, reading the
-8x8 sites the block's quads and their neighbours cover), `highlight_pull`
+Four shaders: `highlight_field` (one invocation per 4x4 block; the
+workgroup first puts the largest a of every quad it covers, and of the
+three quads of margin around them, into a shared tile of at most 38x38,
+and each block then reads its 7x7 windows from there rather than 256
+samples of its own), `highlight_pull`
 and `highlight_push` (one dispatch per pair of levels each way, eleven of
 each at 5.8K), and `highlight_fill` (one invocation per quad, reading the
 4x4 sites its four stencils cover, and storing its four samples straight
@@ -2992,12 +3015,11 @@ and the pyramid adds a third, 23.3 MB in all, plus 35.0 MB for the rebuilt
 mosaic.
 
 Measured with `cineraw --bench` over 30 frames of P1000352.MOV on the 6900
-XT, RCD and lens correction: 5.98 ms a frame without the stage, 6.42 ms
-with it. Skipping one pass at a time puts 0.12 ms on the field, 0.03 ms
-on the pull, 0.10 ms on the push (its eleven barriers, mostly) and 0.13 ms
-on the fill; the rest is the debayer reading R16F. A single cold
-submission right after the pipeline is created, as the test times it,
-takes 2 ms more than that.
+XT, RCD and lens correction: 6.00 ms a frame without the stage, 6.33 ms
+with it. Leaving the field pass out saves 0.03 ms of that; the first
+version, with one quad of margin read sample by sample instead of the
+shared tile, cost 0.44 ms. A single cold submission right after the
+pipeline is created, as the test times it, takes 2 ms more than that.
 
 `CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION` builds the stage and
 `CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION` switches it per frame; an
@@ -3021,10 +3043,10 @@ inverted to raw codes that saturate at the white level with the usual
 +-8 counts of noise on top, plateau included. On the CPU, the reference's
 rebuilt mosaic: every sample below the ramp is its balanced value to
 within the fp16 store (4.8e-4 relative); the 540 G sites clipped with
-their R and B neighbours untouched are rebuilt to within 0.11% of the
+their R and B neighbours untouched are rebuilt to within 0.09% of the
 scene's own G (bound 2%); the blown core, saturated in every channel over
-the whole 3x3, comes out at R/G 1.1048 and B/G 1.0470 against the blob's
-1.10 and 1.05 and at G 1.833 against the 1.841 of 18.2's plateau (bound 3%
+the whole 3x3, comes out at R/G 1.1062 and B/G 1.0478 against the blob's
+1.10 and 1.05 and at G 1.831 against the 1.841 of 18.2's plateau (bound 3%
 each), with no sample below its clip; no clipped sample is ever lowered.
 On the GPU: both ways of switching the stage off are the plain chain bit
 for bit; MHC and RCD match the reference within the relative bounds of
@@ -3033,7 +3055,7 @@ chain, so the pass cannot have silently not run; and the same scene
 dimmed until nothing clips moves by 9.8e-4 at most, the fp16 rounding of
 the mosaic, within the debayers' own absolute bounds. With
 `CRAW_TEST_FRAME` the real frame runs RCD with the stage and is held to
-the relative bound of section 11: 6.4e-3 on P1000387 and 3.4e-3 on
+the relative bound of section 11: 3.2e-3 on P1000387 and 3.3e-3 on
 P1000352.
 
 ### 18.6 Measured against the truth
@@ -3050,20 +3072,20 @@ the errors in ln R/G and ln B/G, warm-cool half their difference, and the
 level the error in ln G; each against what the clip of 4.1 gives:
 
     frame, k                 quads   green-magenta   warm-cool    level
-    P1001493 lake, 2.5    part 0.92%   0.016 (0.017)  0.000 (0.044) 0.024 (0.158)
-                          full 0.003%  0.013 (0.014)  0.084 (0.046) 0.092 (0.755)
-    P1000123 sunset, 4    part 2.05%   0.024 (0.084)  0.028 (0.359) 0.027 (0.402)
-                          full 0.22%   0.031 (0.086)  0.129 (0.377) 0.050 (1.113)
-    P1001497 beach, 3     part 0.67%   0.018 (0.029)  0.000 (0.079) 0.022 (0.211)
-                          full 0.016%  0.019 (0.052)  0.034 (0.086) 0.065 (0.797)
-    P1001123 night, 12    part 0.08%   0.107 (0.160)  0.015 (0.203) 0.065 (0.313)
-                          full 0.054%  0.074 (0.154)  0.071 (0.225) 0.408 (1.338)
+    P1001493 lake, 2.5    part 0.92%   0.010 (0.017)  0.000 (0.044) 0.013 (0.158)
+                          full 0.003%  0.014 (0.014)  0.055 (0.046) 0.085 (0.755)
+    P1000123 sunset, 4    part 2.05%   0.018 (0.084)  0.026 (0.359) 0.024 (0.402)
+                          full 0.22%   0.030 (0.086)  0.142 (0.377) 0.053 (1.113)
+    P1001497 beach, 3     part 0.67%   0.020 (0.029)  0.000 (0.079) 0.026 (0.211)
+                          full 0.016%  0.021 (0.052)  0.050 (0.086) 0.074 (0.797)
+    P1001123 night, 12    part 0.08%   0.109 (0.160)  0.018 (0.203) 0.064 (0.313)
+                          full 0.054%  0.059 (0.154)  0.117 (0.225) 0.530 (1.338)
 
 (part: clipped in one or two channels; full: in all three.) Where a
-channel survives, the level comes back to within 2% to 7% and the colour
+channel survives, the level comes back to within 1% to 7% and the colour
 to within what the unclipped neighbours already say; where none does the
 level is, by construction, the lowest the colour allows, and misses by
-5% to 33% in the median, low almost everywhere, instead of by 53% to
+5% to 41% in the median, low almost everywhere, instead of by 53% to
 74%. The night street's lamps are the hard case: small sources, their
 colour known only from a thin halo.
 
@@ -3072,10 +3094,10 @@ component of the light's colour from the camera's Planckian locus (which
 in this camera's balanced log space is the line ln R/G + ln B/G = 0 to
 within 0.02 from 2000 K to 11500 K) instead of from the field, on the
 argument that skies and light sources lie on it. Its green-magenta error
-was larger than the field's on every row above, three to four times on
-the sunset, and its level error larger on five rows of eight; the three
-it won (the lake twice and the beach's blown core) it won by 0.004 to
-0.011.
+was larger than the field's on every row above but one, where it tied,
+three to four times larger on the sunset, and its level error larger on
+six rows of eight; the two it won, the blown cores of the lake and the
+beach, it won by 0.026 and 0.014.
 
 A second alternative was measured for the blown areas alone: shrinking
 the field's log colour by a factor s towards neutral wherever no channel
@@ -3086,15 +3108,15 @@ the four frames:
 
     s        lake           sunset         beach          night
     0      0.076 0.051    0.545 0.406    0.154 0.100    0.395 0.637
-    0.5    0.093 0.070    0.194 0.308    0.080 0.069    0.208 0.589
-    0.75   0.105 0.082    0.069 0.161    0.063 0.061    0.162 0.503
-    1      0.122 0.092    0.189 0.050    0.064 0.065    0.158 0.408
+    0.5    0.071 0.065    0.186 0.305    0.083 0.075    0.275 0.621
+    0.75   0.076 0.071    0.070 0.157    0.075 0.068    0.234 0.589
+    1      0.082 0.085    0.206 0.053    0.088 0.074    0.197 0.530
 
 Neutral is the worst choice by far on the sunset and the night street,
-and 0.75 trades a quarter less colour error for a third more level error
+and 0.75 trades a fifth less colour error for a fifth more level error
 on average, so the field's colour stands as it is. It does not always
-win: the blown core of P1000387's lamp is rebuilt warm (R/G 1.20, B/G
-0.78) from the warm glow on the housing around it, while the white
+win: the blown core of P1000387's lamp is rebuilt warm (R/G 1.22, B/G
+0.80) from the warm glow on the housing around it, while the white
 balance estimator's bright reading puts the lamp itself near 5600 K, i.e.
 close to neutral under the clip's 5500 K. The frame does not record which
 is right.
