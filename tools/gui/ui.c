@@ -218,6 +218,8 @@ static struct nk_font *view_font_load(struct view_state *st,
     return font;
 }
 
+static void view_ui_toggle_style(struct nk_context *ctx);
+
 int view_ui_open(struct view_state *st, void *sdl_window)
 {
     struct view_gpu *g = &st->gpu;
@@ -264,6 +266,7 @@ int view_ui_open(struct view_state *st, void *sdl_window)
      * covered, and those are where its src-alpha blend against a cleared
      * target is not exactly premultiplied. */
     view_nk->style.window.fixed_background = nk_style_item_color(nk_rgba(24, 24, 28, 255));
+    view_ui_toggle_style(view_nk);
 
     return 0;
 }
@@ -455,6 +458,27 @@ static void view_grey_end(struct view_state *st, struct nk_context *ctx, bool on
  * state has to be readable without reading anything. */
 #define VIEW_SWITCH_ON  nk_rgb(122, 182, 255)
 #define VIEW_SWITCH_OFF nk_rgb(104, 104, 112)
+
+/* Checkboxes and radio buttons in the same language as the switches: off
+ * is an empty dark well with the switch's grey outline, on is the
+ * switch's lit colour inside it. nuklear's default draws a set box as a
+ * dark hole in a grey square and an unset one as the plain grey square,
+ * which reads the wrong way round. */
+static void view_ui_toggle_style(struct nk_context *ctx)
+{
+    struct nk_style_toggle *t[2] = { &ctx->style.checkbox, &ctx->style.option };
+
+    for (int i = 0; i < 2; i++) {
+        t[i]->normal        = nk_style_item_color(nk_rgb(30, 30, 36));
+        t[i]->hover         = nk_style_item_color(nk_rgb(48, 48, 56));
+        t[i]->active        = t[i]->hover;
+        t[i]->border        = 1.0f;
+        t[i]->border_color  = VIEW_SWITCH_OFF;
+        t[i]->padding       = nk_vec2(3.0f, 3.0f);
+        t[i]->cursor_normal = nk_style_item_color(VIEW_SWITCH_ON);
+        t[i]->cursor_hover  = nk_style_item_color(VIEW_SWITCH_ON);
+    }
+}
 
 /* The body's indent, which is the one thing a tree does to the panel that
  * has no call of its own: `sign` +1 on the way in and -1 on the way out, so
