@@ -297,6 +297,112 @@ void view_pick_click(struct view_state *st, int px, int py)
     st->playing = false;
 }
 
+/* The spot white balance of a developed clip. There is no colour stage to
+ * undo: the patch is read back as the linear light libplacebo's LINEAR
+ * stage holds, in the clip's own primaries and before the correction, and
+ * mapped onto the clip's own locus (videowb.c), which lives in exactly
+ * those numbers. The clip test is against the source's peak, where its
+ * channels clip; the dark test is the floor without a noise model, in the
+ * same units, where 1.0 is diffuse white. */
+static int view_pick_run_video(struct view_state *st)
+{
+    float rgba[VIEW_PICK_SIZE * VIEW_PICK_SIZE * 4], peak;
+    const int total = VIEW_PICK_SIZE * VIEW_PICK_SIZE;
+    int x0, y0, kept = 0, clipped = 0, dark = 0, ret;
+    enum pl_color_primaries prim;
+    double sum[3] = { 0 }, mean[3];
+    CRAWIlluminant illum;
+    CRAWProfile p;
+
+    if (!st->have_frame || !view_gpu_source_space(&st->gpu, &prim, &peak) ||
+        !view_vwb_profile(st, prim, &p)) {
+        fprintf(stderr, "--wb pick: there is no picture to pick on\n");
+        snprintf(st->pick.refused, sizeof(st->pick.refused), "no picture");
+        return 0;
+    }
+
+    x0 = CRAW_CLAMP(st->pick.x - VIEW_PICK_SIZE / 2, 0,
+                    (int)st->gpu.width - VIEW_PICK_SIZE);
+    y0 = CRAW_CLAMP(st->pick.y - VIEW_PICK_SIZE / 2, 0,
+                    (int)st->gpu.height - VIEW_PICK_SIZE);
+
+    ret = view_gpu_read_linear(&st->gpu, x0, y0, VIEW_PICK_SIZE, VIEW_PICK_SIZE,
+                               rgba);
+    if (ret < 0)
+        return ret;
+
+    for (int i = 0; i < total; i++) {
+        const float *px = &rgba[4 * i];
+        float hi = CRAW_MAX(CRAW_MAX(px[0], px[1]), px[2]);
+        float lo = CRAW_MIN(CRAW_MIN(px[0], px[1]), px[2]);
+
+        if (!(hi < VIEW_PICK_CLIP * peak)) {
+            clipped++;
+            continue;
+        }
+        if (!(lo >= VIEW_PICK_FLOOR)) {
+            dark++;
+            continue;
+        }
+        for (int c = 0; c < 3; c++)
+            sum[c] += px[c];
+        kept++;
+    }
+
+    if (kept * VIEW_PICK_MIN_FRACTION < total) {
+        snprintf(st->pick.refused, sizeof(st->pick.refused), "%s",
+                 clipped >= dark ? "clipped" : "too dark");
+        view_log(st, "pick: frame %" PRId64 " at %d,%d, patch %dx%d at %d,%d: "
+                     "refused, %s (%d of %d kept: %d clipped at %.3f, %d below "
+                     "%.5f)\n",
+                 st->index, st->pick.x, st->pick.y, VIEW_PICK_SIZE,
+                 VIEW_PICK_SIZE, x0, y0, st->pick.refused, kept, total, clipped,
+                 VIEW_PICK_CLIP * peak, dark, VIEW_PICK_FLOOR);
+        return 0;
+    }
+
+    for (int c = 0; c < 3; c++)
+        mean[c] = sum[c] / kept;
+
+    ret = craw_profile_neutral_to_illuminant(&p, (float)(mean[0] / mean[1]),
+                                             (float)(mean[2] / mean[1]), &illum);
+    if (ret < 0) {
+        fprintf(stderr, "craw_profile_neutral_to_illuminant failed: %d\n", ret);
+        snprintf(st->pick.refused, sizeof(st->pick.refused), "no locus");
+        return 0;
+    }
+
+    view_log(st, "pick: frame %" PRId64 " at %d,%d, patch %dx%d at %d,%d: "
+                 "%d of %d kept (%d clipped, %d dark), linear R/G %.4f B/G %.4f "
+                 "-> %.0f K tint %+.4f (recorded %d K)\n",
+             st->index, st->pick.x, st->pick.y, VIEW_PICK_SIZE, VIEW_PICK_SIZE,
+             x0, y0, kept, total, clipped, dark, mean[0] / mean[1],
+             mean[2] / mean[1], illum.cct, illum.tint, st->dec.wb_kelvin);
+
+    st->look.manual = illum;
+    st->look.wb = VIEW_WB_MANUAL;
+    st->sections.wb = true;
+
+    /* The check, with -v: the patch under the correction that was found
+     * has to come out neutral. It is the matrix the LINEAR stage is given,
+     * on the mean that was read, so what it checks is the locus mapping and
+     * its inverse, not the render. */
+    if (st->cfg.verbose) {
+        pl_matrix3x3 m;
+        float v[3] = { (float)mean[0], (float)mean[1], (float)mean[2] };
+
+        if (view_vwb_correction(st, prim, &illum, &m)) {
+            pl_matrix3x3_apply(&m, v);
+            view_log(st, "pick: check: under %.0f K tint %+.4f the patch reads "
+                         "R/G %.4f B/G %.4f (%+.2f%% / %+.2f%%)\n",
+                     illum.cct, illum.tint, v[0] / v[1], v[2] / v[1],
+                     (v[0] / v[1] - 1.0f) * 100.0f, (v[2] / v[1] - 1.0f) * 100.0f);
+        }
+    }
+
+    return 0;
+}
+
 int view_pick_run(struct view_state *st)
 {
     struct view_pick_sample s;
@@ -306,13 +412,13 @@ int view_pick_run(struct view_state *st)
     st->pick.pending = false;
     st->pick.refused[0] = '\0';
 
-    /* Nothing to pick on: a developed clip has no white balance path yet,
-     * and the section that owns the button is not shown for one. From the
-     * command line it is worth a line. */
-    if (!st->dec.raw || !st->have_frame || !st->have_prof ||
+    if (!st->dec.raw)
+        return view_pick_run_video(st);
+
+    /* Nothing to pick on yet. From the command line it is worth a line. */
+    if (!st->have_frame || !st->have_prof ||
         !st->frame->buf[0] || st->frame->format != AV_PIX_FMT_VULKAN) {
-        fprintf(stderr, "--wb pick: this clip is already developed, there is "
-                        "no white balance to pick\n");
+        fprintf(stderr, "--wb pick: there is no picture to pick on\n");
         return 0;
     }
     if (!st->prof.nb_wb_knots) {

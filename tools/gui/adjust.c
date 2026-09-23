@@ -76,6 +76,9 @@ struct craw_adjust {
 
     struct pl_hook soft_hook;
     float soft;
+
+    struct pl_hook linear_hook;
+    float linear[9];                        /* column major, for GLSL */
 };
 
 /* GLSL takes a mat3 as three columns; pl_matrix3x3 is m[row][column]. */
@@ -223,6 +226,46 @@ const struct pl_hook *craw_adjust_softlight(craw_adjust *a, float strength)
     a->soft = strength;
 
     return &a->soft_hook;
+}
+
+/* -------------------------------------------------------- linear light */
+
+static struct pl_hook_res adjust_linear_fn(void *priv,
+                                           const struct pl_hook_params *hp)
+{
+    craw_adjust *a = priv;
+    const struct pl_shader_var vars[1] = {
+        { .var = pl_var_mat3("craw_m"), .data = a->linear, .dynamic = true },
+    };
+
+    if (hp->components < 3)
+        return (struct pl_hook_res) { .failed = true };
+
+    pl_shader sh = adjust_begin(hp);
+    if (!sh)
+        return (struct pl_hook_res) { .failed = true };
+
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
+            .description   = "craw linear light",
+            .input         = PL_SHADER_SIG_COLOR,
+            .output        = PL_SHADER_SIG_COLOR,
+            .variables     = vars,
+            .num_variables = 1,
+            .body          = "color.rgb = craw_m * color.rgb;\n",
+        }))
+        return (struct pl_hook_res) { .failed = true };
+
+    return adjust_finish(hp, sh);
+}
+
+const struct pl_hook *craw_adjust_linear(craw_adjust *a, const pl_matrix3x3 *m)
+{
+    if (!a || !m)
+        return NULL;
+
+    adjust_mat3(m, a->linear);
+
+    return &a->linear_hook;
 }
 
 /* ------------------------------------------------------------ vibrance */
@@ -467,6 +510,15 @@ craw_adjust *craw_adjust_create(pl_gpu gpu)
         .priv      = a,
         .hook      = adjust_soft_fn,
         .signature = 0x637261777366746CULL,     /* "crawsftl" */
+    };
+    /* Except this one, which is scene-referred and sits where the video
+     * exposure's mpv shader used to: see craw_adjust_linear(). */
+    a->linear_hook = (struct pl_hook) {
+        .stages    = PL_HOOK_LINEAR,
+        .input     = PL_HOOK_SIG_TEX,
+        .priv      = a,
+        .hook      = adjust_linear_fn,
+        .signature = 0x637261776C696E65ULL,     /* "crawline" */
     };
 
     return a;

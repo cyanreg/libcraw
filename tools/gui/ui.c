@@ -1621,17 +1621,40 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
     }
 }
 
+/* One section for both kinds of clip. A raw clip is balanced by libcraw
+ * from the sensor's ratios and the camera's tables; a developed one is
+ * rebalanced from the temperature it records, on a locus of its own in its
+ * own linear RGB (videowb.c), which gives it the same three modes, the same
+ * pick and the same two numbers in the same units. Only the developed one
+ * has a switch - a raw clip's balance is always applied - and it lights
+ * when anything here is touched. */
 static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
 {
     struct view_look *lk = &st->look;
+    const enum view_wb mode = lk->wb;
+    const CRAWIlluminant manual = lk->manual;
+    const float ambience = st->awb.params.ambience;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 3);
     if (nk_option_label(ctx, "As shot", lk->wb == VIEW_WB_AS_SHOT))
         lk->wb = VIEW_WB_AS_SHOT;
     if (nk_option_label(ctx, "Auto", lk->wb == VIEW_WB_AUTO))
         lk->wb = VIEW_WB_AUTO;
-    if (nk_option_label(ctx, "Manual", lk->wb == VIEW_WB_MANUAL))
+    /* Manual starts from the balance on screen, whichever mode put it
+     * there, so that picking it changes nothing until a number moves. */
+    if (nk_option_label(ctx, "Manual", lk->wb == VIEW_WB_MANUAL) &&
+        lk->wb != VIEW_WB_MANUAL) {
+        CRAWIlluminant cur;
+
+        /* In the rows' own resolution, whole Kelvin and a ten-thousandth
+         * of tint, so that the fields read what was picked up rather than
+         * 3099.99 and -0.00; the recorded temperature is whole already. */
+        if (view_wb_applied(st, &cur)) {
+            lk->manual.cct = roundf(cur.cct);
+            lk->manual.tint = roundf(cur.tint * 1e4f) / 1e4f + 0.0f;
+        }
         lk->wb = VIEW_WB_MANUAL;
+    }
 
     /* The spot white balance. The button arms it and the next click on the
      * picture samples, so while armed it is lit - its title and border in
@@ -1658,8 +1681,15 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
 
     switch (lk->wb) {
     case VIEW_WB_AS_SHOT:
-        nk_labelf(ctx, NK_TEXT_LEFT, "camera: %.0f K, gains %.4f / 1 / %.4f",
-                  st->prof.as_shot_cct, st->prof.as_shot_wb[0], st->prof.as_shot_wb[2]);
+        if (st->dec.raw)
+            nk_labelf(ctx, NK_TEXT_LEFT, "camera: %.0f K, gains %.4f / 1 / %.4f",
+                      st->prof.as_shot_cct, st->prof.as_shot_wb[0],
+                      st->prof.as_shot_wb[2]);
+        else if (st->dec.wb_kelvin > 0)
+            nk_labelf(ctx, NK_TEXT_LEFT, "camera: %d K", st->dec.wb_kelvin);
+        else
+            nk_label(ctx, "camera: none recorded, taken as the space's white",
+                     NK_TEXT_LEFT);
         break;
 
     case VIEW_WB_AUTO: {
@@ -1689,6 +1719,11 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
         nk_slider_float(ctx, -0.2f, &lk->manual.tint, 0.2f, 0.002f);
         break;
     }
+
+    if (!st->dec.raw &&
+        (lk->wb != mode || lk->manual.cct != manual.cct ||
+         lk->manual.tint != manual.tint || st->awb.params.ambience != ambience))
+        st->sections.wb = true;
 }
 
 static void view_panel_exposure(struct nk_context *ctx, struct view_state *st)
@@ -2633,14 +2668,13 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
     /* Every section from here down is a header - a switch and an expander -
      * and a body under it.
      *
-     * An already developed clip has no mosaic: there is nothing to balance
-     * and nothing to debayer, so those two sections are not offered at all.
-     * Neither has anything to bypass either - for a raw clip the balance is
-     * always applied and the mosaic always has to come off - so their
-     * headers carry the empty switch slot that keeps the column lined up
-     * and nothing else. */
-    if (st->dec.raw &&
-        view_section_header(ctx, st, VIEW_SEC_WB, "White balance", NULL, false)) {
+     * The white balance is offered for both kinds of clip, but only a
+     * developed clip's can be switched off: a raw clip's is always applied,
+     * so its header carries the empty switch slot that keeps the column
+     * lined up. A developed clip has no mosaic, so Debayer, Denoise and
+     * Lens are not offered for one at all. */
+    if (view_section_header(ctx, st, VIEW_SEC_WB, "White balance",
+                            st->dec.raw ? NULL : &st->sections.wb, false)) {
         view_panel_wb(ctx, st);
         view_section_end(ctx);
     }

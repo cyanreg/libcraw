@@ -209,4 +209,13 @@ const struct pl_hook *craw_adjust_vibrance(craw_adjust *a,
                                            const struct craw_vibrance_params *p);
 const struct pl_hook *craw_adjust_softlight(craw_adjust *a, float strength);
 
+/* The one hook that is not display-referred: `m` on every pixel at
+ * PL_HOOK_LINEAR, which is linear light in the source's own primaries -
+ * after the transfer function has been undone and before anything is
+ * scaled, mapped or tone mapped. A developed clip's exposure and white
+ * balance are both linear operations there, so they travel as one matrix,
+ * and since it is a uniform, moving either rebuilds nothing. Always
+ * returns the hook; the caller leaves an identity off the list. */
+const struct pl_hook *craw_adjust_linear(craw_adjust *a, const pl_matrix3x3 *m);
+
 #endif /* CINEVIEW_ADJUST_H */

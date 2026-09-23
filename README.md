@@ -135,13 +135,16 @@ Exposure off is a bias of zero at the as-shot index with the slider still
 where it was, Look off drops the film simulation or the `--lut` cube
 without unselecting it, Adjustments off drops soft light and vibrance, Film
 grain, Denoise and Lens off turn their stages off, and Crop is the same
-switch `c` is. White balance and Debayer have nothing to bypass and carry
-an empty slot so the titles stay in line. A lit switch always means the
-section is doing something:
-Exposure, Look and Adjustments start off and switch themselves on the
-moment one of their parameters is touched — a slider moved, a film
-simulation picked, `--exposure`, `--ei`, `--lut`, `--softlight` or
-`--vibrance` given — the way RawTherapee's tools do. `--denoise 0`, `--lens
+switch `c` is. Debayer has nothing to bypass, and neither has a raw clip's
+White balance, which is always applied; they carry an empty slot so the
+titles stay in line. A developed clip's White balance does have a switch,
+and off shows the picture balanced as the camera balanced it. A lit switch
+always means the section is doing something:
+Exposure, Look, Adjustments and a developed clip's White balance start off
+and switch themselves on the moment one of their parameters is touched — a
+slider moved, a film simulation picked, a white balance mode chosen or
+picked, `--exposure`, `--ei`, `--lut`, `--softlight`, `--vibrance` or a
+`--wb` other than `as-shot` given — the way RawTherapee's tools do. `--denoise 0`, `--lens
 off` and the absence of `--grain` start those three off, and `--bypass
 exposure,look,adjustments` pins the other three off whatever the other
 options set, which is how a headless export is handed the state the panel
@@ -165,9 +168,37 @@ the picture is in. `--wb pick:X,Y` is the same pick on the source pixel
 X,Y of the first frame the run develops — frame 0 in the window, the
 exported frame headless — and `-v` prints what it read and found, then
 checks it: the same patch under the picked illuminant read again, which
-comes out neutral to within a percent (the locus is sampled every 5
-mired, and what is left is the half step between samples), and picked
-again, which returns the same illuminant.
+comes out neutral to a few hundredths of a per cent, and picked again,
+which returns the same illuminant.
+
+A developed clip - HEVC, H.264, ProRes 422 - has the same section, the same
+three modes and the same pick, applied to a picture the camera has already
+balanced. The camera adapted the scene's white to the space's; which white
+it adapted from is the colour temperature the clip records - the maker
+note's, which on an auto clip is the one the camera settled on, or the
+XML's in Kelvin mode - taken as a point on the Planckian locus
+(`craw_planckian_xy()`). Under an illuminant of T Kelvin the camera
+therefore renders a neutral as the Planckian white of T adapted from the
+recorded white, and sampled from 2000 to 12000 K that is the clip's own
+white balance locus in the linear RGB of its primaries, handed to libcraw
+as a profile's white balance table: a temperature along it and a tint
+across it mean what they mean on a raw clip, in the same units, and the
+pick and the auto estimator run on it unchanged. Rebalancing to an
+illuminant is a Bradford adaptation (`craw_bradford_adaptation()`) from
+the colour the camera gave that illuminant's neutral to the space's white,
+one matrix at libplacebo's LINEAR stage together with the exposure; the
+recorded temperature is a knot of the locus and comes back as no
+correction at all, which is where Manual starts - picking it, on either
+kind of clip, starts from the balance on screen. The pick and the auto
+white balance read the picture back as the LINEAR stage holds it, before
+the correction and with an HLG signal's black level resolved against the
+window as the window's own render resolves it; the auto reading is a
+960x540 shrink collected a frame later, and while paused the same picture
+is read again until the track settles. A clip that records no temperature
+is taken as balanced for its space's white, so the numbers are relative
+to D65. A picture style's tone curve and saturation are not undone,
+because nothing records them: on anything but V-Log this is the correction
+a grading tool makes on a developed picture, not a development.
 
 The "Debayer" section picks the method and carries the false colour
 suppression row: the number of median and blur passes over the colour
@@ -194,8 +225,9 @@ export's colour space, size,
 pixel format, audio mode and threads, the two export file paths once typed,
 the film simulation, the tone map, the adjustments, the grain, every
 section's switch and the zoom. A setting a clip's kind
-cannot use is kept rather than dropped, so the white balance a raw clip was
-graded with is still there after a developed one. Only what is read from the
+cannot use is kept rather than dropped, so the debayer method and the lens
+correction a raw clip was graded with are still there after a developed
+one. Only what is read from the
 clip is read again: its tables and as-shot values, its crop, its lens
 records, its metadata. A file that cannot be opened is reported and leaves
 the viewer on the clip it is showing, and `--export` and `--export-video`

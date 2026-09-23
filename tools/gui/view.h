@@ -544,10 +544,22 @@ struct view_gpu {
     pl_tex map_tex[4];
     bool have_mapped;
 
-    /* Scene-linear exposure for the non-raw path, as an mpv user shader on
-     * the LINEAR hook. Regenerated when the value changes. */
-    const struct pl_hook *exposure_hook;
-    float exposure_hook_gain;
+    /* The non-raw path's linear light read back, in the source's own
+     * primaries and before any hook: what a developed clip's white balance
+     * is measured on (videowb.c). A renderer of its own, so that neither
+     * the window's peak detection nor an export's sees these renders.
+     * `linear_tex` is the spot pick's patch, read at once; `probe_tex` is
+     * the whole picture shrunk for the auto white balance, read into
+     * `probe_buf` without waiting and collected a frame later, which is
+     * the raw path's rhythm too. */
+    pl_renderer rr_probe;
+    pl_tex linear_tex;
+    pl_tex probe_tex;
+    pl_buf probe_buf;
+    int probe_w, probe_h;
+    bool probe_busy;
+    float *probe_rgba;
+    size_t probe_values;
 
     /* The nuklear overlay, composited by the renderer. One per slot, so the
      * backend's command buffer for a given index is never re-recorded while
@@ -718,6 +730,21 @@ struct view_awb {
      * seek's jump in pts is not elapsed time; fed the pts, the smoother
      * clamped the gap to a second and let one frame slew a second's worth. */
     double clock;
+};
+
+/* The auto white balance of a developed clip (videowb.c), whose estimates
+ * come from a read of the linear picture the device hands back a frame
+ * later. The estimate, the track and the smoother are struct view_awb's,
+ * shared with the raw path; this is only the bookkeeping of the reads. */
+struct view_vwb {
+    /* Bumped at every clip open, so that a read of the last clip's picture
+     * that lands after the switch is not taken for this one's. */
+    unsigned gen, probe_gen;
+    uint64_t probed_serial;     /* the gpu's pic_serial the last read was of */
+    /* The last read moved the track: the same picture is read again, which
+     * is how a paused picture converges. */
+    bool converging;
+    uint32_t *hist;             /* count, weight and bright weight, one allocation */
 };
 
 /* One frame to one file. The work is spread over the loop's iterations
@@ -1008,6 +1035,11 @@ struct view_sections {
     bool look;
     /* Off: no soft light and no vibrance, at whatever amounts they hold. */
     bool adjust;
+    /* Off: a developed clip is shown balanced as the camera balanced it,
+     * whatever mode and illuminant the section holds. A raw clip's balance
+     * is always applied and has no switch; this one starts off and
+     * switches on when the section is touched, like the three above. */
+    bool wb;
 
     /* The three start off and switch themselves on when one of their
      * parameters is touched, the way RawTherapee's tools do, so that a lit
@@ -1025,6 +1057,7 @@ struct view_state {
     struct view_decoder dec;
     struct view_audio audio;
     struct view_awb awb;
+    struct view_vwb vwb;
     struct view_export exp;
     struct view_video video;
     struct view_sync sync;
@@ -1250,6 +1283,31 @@ int  view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
 int  view_gpu_read_region(struct view_gpu *g, int x, int y, int w, int h,
                           uint16_t *rgba);
 
+/* The non-raw path's colour, for what is measured on it: the primaries of
+ * the mapped picture, the V-Log override included and anything the
+ * stream left unsaid filled in the way libplacebo fills it; and its peak
+ * in the linear units the two reads below come out in, where 1.0 is
+ * diffuse white. False with nothing mapped. */
+bool view_gpu_source_space(const struct view_gpu *g,
+                           enum pl_color_primaries *prim, float *peak);
+
+/* Reads the rectangle (x, y, w, h) of the mapped picture back as linear
+ * light in its own primaries, before any hook: w * h packed RGBA floats,
+ * at once. The spot white balance of a developed clip samples through
+ * this. */
+int  view_gpu_read_linear(struct view_gpu *g, int x, int y, int w, int h,
+                          float *rgba);
+
+/* The same read of the whole mapped picture, shrunk to fit 960x540 and
+ * started without waiting; view_gpu_probe_poll() collects it once the
+ * device is done - in practice a frame later - and hands back the RGBA
+ * floats, which the caller may scale in place, and their size. Start
+ * refuses while one is outstanding. Poll returns 1 with a result and 0
+ * while there is none yet, or with `wait`, 0 only when none was started. */
+int  view_gpu_probe_start(struct view_gpu *g);
+int  view_gpu_probe_poll(struct view_gpu *g, bool wait, float **rgba,
+                         int *w, int *h);
+
 /* The overlay texture nuklear draws into. On a resize the previous texture
  * and view are kept until view_gpu_ui_drop_old(), which must be called once
  * nuklear has rebuilt its framebuffers from the new view. */
@@ -1471,6 +1529,15 @@ int  view_replay_frame_flags(struct view_state *st, uint32_t flags);
 void view_log(const struct view_state *st, const char *fmt, ...)
               craw_printf_format(2, 3);
 
+/* One frame period of the clip, in seconds; 29.97 fps when it says none. */
+double view_frame_duration(const struct view_state *st);
+
+/* The illuminant the picture on screen is balanced for, in the clip's own
+ * terms - the raw profile's locus or the developed clip's - whichever mode
+ * put it there: what the Manual row starts from when it is picked. False
+ * when the clip has no locus to say it on. */
+bool view_wb_applied(const struct view_state *st, CRAWIlluminant *out);
+
 /* Decodes the next picture and runs it through the pipeline.
  * 0: a frame, 1: end of stream, 2: the frame was too late to be worth
  * processing and was dropped, so call again, 3: the reader has not caught
@@ -1565,6 +1632,42 @@ bool view_crop_disp_rect(const struct view_state *st, int *x, int *y,
 /* Where that rectangle lands on screen, in window pixels, through the same
  * transform the renderer is handed. False when there is nothing to draw. */
 bool view_crop_screen(const struct view_state *st, pl_rect2df *out);
+
+/* ---------------------------------------------------------- videowb.c */
+
+/* The developed clip's white balance locus in the primaries `prim`, as a
+ * profile carrying only a white balance table (videowb.c derives it). False
+ * when the clip's recorded white and the space leave fewer than two knots. */
+bool view_vwb_profile(const struct view_state *st, enum pl_color_primaries prim,
+                      CRAWProfile *p);
+
+/* The matrix, on linear RGB in `prim`, that rebalances the developed
+ * picture from the illuminant it records to `il`. */
+bool view_vwb_correction(const struct view_state *st, enum pl_color_primaries prim,
+                         const CRAWIlluminant *il, pl_matrix3x3 *out);
+
+/* The illuminant the camera balanced the mapped picture for, on the locus
+ * above: the recorded temperature with no tint, or wherever the space's
+ * white lands when nothing was recorded. */
+bool view_vwb_as_shot(const struct view_state *st, CRAWIlluminant *out);
+
+/* The illuminant a developed picture is being rebalanced to, and false
+ * when it is shown as the camera balanced it: the switch off, As shot, or
+ * Auto with no track yet. */
+bool view_vwb_target(const struct view_state *st, CRAWIlluminant *out);
+
+/* The LINEAR stage's matrix for a developed clip: the white balance, then
+ * the exposure gain. False when both are identities, and `out` is then the
+ * identity. */
+bool view_vwb_linear(const struct view_state *st, pl_matrix3x3 *out);
+
+/* The auto white balance's step: collects the last read of the linear
+ * picture - waiting for it with `wait`, which the frame step does so that
+ * an export gets the same track every time - puts it through the estimator
+ * and the smoother, and starts the next read, of a new picture or of the
+ * same one while the track is still moving. Does nothing unless the
+ * section is on and in Auto on a developed clip. */
+void view_vwb_step(struct view_state *st, bool wait);
 
 /* ------------------------------------------------------------- pick.c */
 

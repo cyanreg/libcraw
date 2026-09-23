@@ -126,6 +126,7 @@ if craw_tools_ffmpeg
             'gui/adjust.c',
             'gui/pick.c',
             'gui/pana.c',
+            'gui/videowb.c',
             'profiles.c',
             c_args: gui_args,
             include_directories: [ craw_inc ],

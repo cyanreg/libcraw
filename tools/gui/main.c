@@ -325,6 +325,34 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
     };
 }
 
+bool view_wb_applied(const struct view_state *st, CRAWIlluminant *out)
+{
+    const float *wb = st->prof.as_shot_wb;
+
+    if (!st->dec.raw)
+        return view_vwb_target(st, out) || view_vwb_as_shot(st, out);
+
+    if (!st->have_prof || st->prof.nb_wb_knots < 2)
+        return false;
+
+    if (st->look.wb == VIEW_WB_MANUAL) {
+        *out = st->look.manual;
+        return true;
+    }
+    if (st->look.wb == VIEW_WB_AUTO && st->awb.have_illum) {
+        *out = st->awb.illum;
+        return true;
+    }
+
+    /* As shot: the camera's own gains, put back on the profile's locus. A
+     * neutral's raw ratios are the reciprocals of the gains over green. */
+    if (!(wb[0] > 0.0f) || !(wb[2] > 0.0f))
+        return false;
+
+    return craw_profile_neutral_to_illuminant(&st->prof, wb[1] / wb[0],
+                                              wb[1] / wb[2], out) >= 0;
+}
+
 /* Field by field: the padding of a compound literal is nobody's promise,
  * so memcmp() would see changes that are not there. */
 bool view_pipeline_look_equal(const struct view_pipeline_look *a,
@@ -686,7 +714,7 @@ static void view_wall_restart(struct view_state *st, double pts)
     st->clk_have = false;
 }
 
-static double view_frame_duration(const struct view_state *st)
+double view_frame_duration(const struct view_state *st)
 {
     return st->dec.frame_rate.num ? 1.0 / av_q2d(st->dec.frame_rate) : 1.0 / 29.97;
 }
@@ -1500,6 +1528,12 @@ int view_step_frame(struct view_state *st)
         av_frame_unref(st->frame);
         st->sync.run_frames++;
 
+        /* The auto white balance reads the previous picture and starts on
+         * this one: a frame behind, like the raw path's histogram, and for
+         * the same reason waited for rather than polled, so that an export
+         * walks the same track every time. */
+        view_vwb_step(st, true);
+
         return 0;
     }
 
@@ -1574,6 +1608,11 @@ static int view_parse_wb(struct view_state *st, const char *arg)
         lk->wb = VIEW_WB_AS_SHOT;
         return 0;
     }
+
+    /* Anything but as-shot is a balance to apply, which on a developed
+     * clip is the section's switch; a raw clip has none. */
+    st->sections.wb = true;
+
     if (!strcmp(arg, "auto")) {
         lk->wb = VIEW_WB_AUTO;
         return 0;
@@ -1727,7 +1766,9 @@ static void view_usage(FILE *f)
 "                      \"pick white\" button on that pixel. The 24x24 patch\n"
 "                      around it is read back and the illuminant that makes\n"
 "                      it neutral becomes the manual white balance; -v\n"
-"                      prints what was found\n"
+"                      prints what was found. A developed clip is\n"
+"                      rebalanced from the temperature it records, and any\n"
+"                      MODE but as-shot switches its section on\n"
 "  --ei INDEX          working exposure index; the frame is scaled by\n"
 "                      INDEX / as-shot ISO\n"
 "  --exposure STOPS    exposure bias on top of --ei (default: 0)\n"
@@ -2464,6 +2505,9 @@ static void view_log_look(const struct view_state *st)
     case VIEW_WB_AUTO:   fprintf(stderr, "auto"); break;
     default:             fprintf(stderr, "as shot"); break;
     }
+    /* Only a developed clip's balance has a switch. */
+    if (!st->dec.raw && !st->sections.wb && lk->wb != VIEW_WB_AS_SHOT)
+        fprintf(stderr, " (bypassed)");
 
     if (lk->ei > 0.0f)
         fprintf(stderr, ", ei %.0f", lk->ei);
@@ -2584,6 +2628,8 @@ static int view_open_clip(struct view_state *st, int index, bool first)
 
     craw_awb_smoother_reset(st->awb.smoother);
     st->awb.have_illum = false;
+    st->vwb.gen++;
+    st->vwb.converging = false;
 
     st->lens.record = (CRAWLensCorrection) { 0 };
     st->lens.scale = 0.0f;
@@ -3290,6 +3336,13 @@ static int view_run_window(struct view_state *st)
             st->present_due = true;
         }
 
+        /* While paused, a developed clip's auto white balance reads the
+         * held picture again for as long as the track keeps moving; while
+         * playing, each new picture's step does it. */
+        if (!st->playing && !st->exp.active && !st->video.active &&
+            st->have_frame)
+            view_vwb_step(st, false);
+
         now = av_gettime_relative();
         /* What would make the window look different from what is on it.
          * The panel's own readouts move with the picture, so they need no
@@ -3501,6 +3554,7 @@ static void view_close(struct view_state *st)
     pl_lut_free(&st->preview);
     av_frame_free(&st->frame);
     craw_awb_smoother_free(&st->awb.smoother);
+    free(st->vwb.hist);
 
     view_ui_close(st);
     view_audio_close(&st->audio);

@@ -675,7 +675,9 @@ void view_gpu_close(struct view_gpu *g)
         view_gpu_unmap(g);
         for (int i = 0; i < 4; i++)
             pl_tex_destroy(g->gpu, &g->map_tex[i]);
-        pl_mpv_user_shader_destroy(&g->exposure_hook);
+        pl_tex_destroy(g->gpu, &g->linear_tex);
+        pl_tex_destroy(g->gpu, &g->probe_tex);
+        pl_buf_destroy(g->gpu, &g->probe_buf);
         for (int i = 0; i < VIEW_SLOTS; i++) {
             pl_tex_destroy(g->gpu, &g->slots[i].tex);
             pl_tex_destroy(g->gpu, &g->ui_tex[i]);
@@ -698,6 +700,11 @@ void view_gpu_close(struct view_gpu *g)
     }
 
     pl_renderer_destroy(&g->rr_export);
+    pl_renderer_destroy(&g->rr_probe);
+    free(g->probe_rgba);
+    g->probe_rgba = NULL;
+    g->probe_values = 0;
+    g->probe_busy = false;
     pl_renderer_destroy(&g->rr_compose);
     pl_renderer_destroy(&g->rr);
     pl_swapchain_destroy(&g->sw);
@@ -1258,6 +1265,218 @@ int view_gpu_read_region(struct view_gpu *g, int x, int y, int w, int h,
     return 0;
 }
 
+/* The mapped picture's colour as the window's render resolves it. For most
+ * sources that is only the gaps filled in, but an HLG signal is display
+ * relative: libplacebo takes its black level from the target, and the
+ * black lift that decides - applied per channel, in the signal - moves the
+ * ratios of everything dark. Reading the linear light back against any
+ * other target would measure a picture the LINEAR stage never holds. The
+ * window's target when there is a window, sRGB otherwise, which is what a
+ * still is written in; a video exported to an HDR space resolves an HLG
+ * source a little differently again, and is corrected as the window is. */
+static struct pl_color_space view_gpu_source_color(const struct view_gpu *g)
+{
+    struct pl_color_space src = g->mapped.color;
+    struct pl_color_space ref = g->pic_have_target ? g->pic_color
+                                                   : pl_color_space_srgb;
+
+    pl_color_space_infer_map(&src, &ref);
+
+    return src;
+}
+
+bool view_gpu_source_space(const struct view_gpu *g,
+                           enum pl_color_primaries *prim, float *peak)
+{
+    struct pl_color_space csp;
+
+    if (!g->have_mapped)
+        return false;
+
+    csp = view_gpu_source_color(g);
+
+    if (prim)
+        *prim = csp.primaries;
+    if (peak)
+        *peak = csp.hdr.max_luma / PL_COLOR_SDR_WHITE;
+
+    return true;
+}
+
+/* One render of the mapped picture, or the `crop` of it, into `tex` as
+ * linear light in the picture's own primaries. The source goes in resolved
+ * the way the window resolves it (view_gpu_source_color()), and the target
+ * carries that same luminance range, so nothing is tone mapped, and the
+ * same primaries, so nothing is gamut mapped: what lands is exactly what
+ * the LINEAR stage holds, which is where the white balance is applied. No
+ * hooks, no peak detection, no dither. */
+static bool view_gpu_linear_pass(struct view_gpu *g, const pl_rect2df *crop,
+                                 pl_tex tex)
+{
+    struct pl_render_params rp = pl_render_default_params;
+    struct pl_color_space csp = view_gpu_source_color(g);
+    struct pl_frame image = g->mapped, target;
+
+    if (!g->rr_probe)
+        g->rr_probe = pl_renderer_create(g->log, g->gpu);
+    if (!g->rr_probe)
+        return false;
+
+    image.color = csp;
+    if (crop)
+        image.crop = *crop;
+
+    target = (struct pl_frame) {
+        .num_planes = 1,
+        .planes[0] = {
+            .texture           = tex,
+            .components        = 3,
+            .component_mapping = { 0, 1, 2, -1 },
+        },
+        .repr = {
+            .sys    = PL_COLOR_SYSTEM_RGB,
+            .levels = PL_COLOR_LEVELS_PC,
+            .alpha  = PL_ALPHA_NONE,
+        },
+        .color = {
+            .primaries = csp.primaries,
+            .transfer  = PL_COLOR_TRC_LINEAR,
+            .hdr       = csp.hdr,
+        },
+    };
+
+    rp.peak_detect_params = NULL;
+    rp.dither_params = NULL;
+
+    return pl_render_image(g->rr_probe, &image, &target, &rp);
+}
+
+/* A float texture the probe renderer can draw into and the host can read
+ * back, kept at the size it was last asked for. */
+static bool view_gpu_float_tex(struct view_gpu *g, pl_tex *tex, int w, int h)
+{
+    pl_fmt fmt;
+
+    if (*tex && (*tex)->params.w == w && (*tex)->params.h == h)
+        return true;
+
+    pl_tex_destroy(g->gpu, tex);
+
+    fmt = pl_find_named_fmt(g->gpu, "rgba32f");
+    if (!fmt || !(fmt->caps & PL_FMT_CAP_RENDERABLE) ||
+        !(fmt->caps & PL_FMT_CAP_HOST_READABLE)) {
+        fprintf(stderr, "the GPU cannot render to a readable RGBA32F texture\n");
+        return false;
+    }
+
+    *tex = pl_tex_create(g->gpu, pl_tex_params(
+        .w = w,
+        .h = h,
+        .format = fmt,
+        .renderable = true,
+        .host_readable = true,
+    ));
+
+    return *tex != NULL;
+}
+
+int view_gpu_read_linear(struct view_gpu *g, int x, int y, int w, int h,
+                         float *rgba)
+{
+    pl_rect2df crop = { (float)x, (float)y, (float)(x + w), (float)(y + h) };
+
+    if (!g->have_mapped || !rgba || w <= 0 || h <= 0 || x < 0 || y < 0 ||
+        (uint32_t)(x + w) > g->width || (uint32_t)(y + h) > g->height)
+        return CRAW_ERROR(EINVAL);
+
+    if (!view_gpu_float_tex(g, &g->linear_tex, w, h))
+        return CRAW_ERROR(ENOTSUP);
+
+    if (!view_gpu_linear_pass(g, &crop, g->linear_tex) ||
+        !pl_tex_download(g->gpu, pl_tex_transfer_params(
+            .tex = g->linear_tex,
+            .ptr = rgba,
+        ))) {
+        fprintf(stderr, "cannot read the picture back in linear light\n");
+        return CRAW_ERROR(EIO);
+    }
+
+    return 0;
+}
+
+int view_gpu_probe_start(struct view_gpu *g)
+{
+    double scale;
+    int w, h;
+
+    if (!g->have_mapped || !g->width || !g->height)
+        return CRAW_ERROR(EINVAL);
+    if (g->probe_busy)
+        return CRAW_ERROR(EAGAIN);
+
+    scale = fmin(1.0, fmin(960.0 / g->width, 540.0 / g->height));
+    w = CRAW_MAX(1, (int)lrint(g->width * scale));
+    h = CRAW_MAX(1, (int)lrint(g->height * scale));
+
+    if (!view_gpu_float_tex(g, &g->probe_tex, w, h))
+        return CRAW_ERROR(ENOTSUP);
+
+    if (!g->probe_buf || g->probe_buf->params.size != (size_t)w * h * 16) {
+        pl_buf_destroy(g->gpu, &g->probe_buf);
+        g->probe_buf = pl_buf_create(g->gpu, pl_buf_params(
+            .size = (size_t)w * h * 16,
+            .host_readable = true,
+        ));
+        if (!g->probe_buf)
+            return CRAW_ERROR(ENOMEM);
+    }
+
+    if (!view_gpu_linear_pass(g, NULL, g->probe_tex) ||
+        !pl_tex_download(g->gpu, pl_tex_transfer_params(
+            .tex = g->probe_tex,
+            .buf = g->probe_buf,
+        )))
+        return CRAW_ERROR(EIO);
+
+    g->probe_w = w;
+    g->probe_h = h;
+    g->probe_busy = true;
+
+    return 0;
+}
+
+int view_gpu_probe_poll(struct view_gpu *g, bool wait, float **rgba,
+                        int *w, int *h)
+{
+    size_t values;
+
+    if (!g->probe_busy ||
+        pl_buf_poll(g->gpu, g->probe_buf, wait ? UINT64_MAX : 0))
+        return 0;
+
+    g->probe_busy = false;
+
+    values = (size_t)g->probe_w * g->probe_h * 4;
+    if (values > g->probe_values) {
+        float *p = realloc(g->probe_rgba, values * sizeof(*p));
+
+        if (!p)
+            return CRAW_ERROR(ENOMEM);
+        g->probe_rgba = p;
+        g->probe_values = values;
+    }
+
+    if (!pl_buf_read(g->gpu, g->probe_buf, 0, g->probe_rgba,
+                     values * sizeof(float)))
+        return CRAW_ERROR(EIO);
+
+    *rgba = g->probe_rgba;
+    *w = g->probe_w;
+    *h = g->probe_h;
+
+    return 1;
+}
+
 /* Asks, without blocking, whether the picture just submitted has finished
  * on the GPU, and records the first iteration at which it had. Only --trace
  * calls it, and only so that the file can say whether libcraw's work was
@@ -1352,49 +1571,6 @@ float view_gpu_infer_ceiling(const struct view_gpu *g)
     pl_color_space_infer(&csp);
 
     return csp.hdr.max_luma;
-}
-
-/* Exposure on the non-raw path has to happen in scene-linear light, which
- * is what libplacebo's LINEAR hook point is: after the transfer function has
- * been undone and before anything is scaled or tone mapped. The raw path
- * never uses this - libcraw applies exposure inside the colour stage. */
-static const struct pl_hook *view_exposure_hook(struct view_gpu *g, float gain)
-{
-    char shader[512];
-    int len;
-
-    if (gain == 1.0f) {
-        pl_mpv_user_shader_destroy(&g->exposure_hook);
-        g->exposure_hook_gain = 1.0f;
-        return NULL;
-    }
-
-    if (g->exposure_hook && g->exposure_hook_gain == gain)
-        return g->exposure_hook;
-
-    pl_mpv_user_shader_destroy(&g->exposure_hook);
-
-    len = snprintf(shader, sizeof(shader),
-        "//!HOOK LINEAR\n"
-        "//!BIND HOOKED\n"
-        "//!DESC cineview exposure\n"
-        "vec4 hook()\n"
-        "{\n"
-        "    vec4 color = HOOKED_texOff(0);\n"
-        "    color.rgb *= %f;\n"
-        "    return color;\n"
-        "}\n", (double)gain);
-
-    if (len < 0 || len >= (int)sizeof(shader))
-        return NULL;
-
-    g->exposure_hook = pl_mpv_user_shader_parse(g->gpu, shader, (size_t)len);
-    g->exposure_hook_gain = gain;
-
-    if (!g->exposure_hook)
-        fprintf(stderr, "cannot build the exposure shader\n");
-
-    return g->exposure_hook;
 }
 
 /* ------------------------------------------------------------ rendering */
@@ -1603,14 +1779,22 @@ static void view_render_params(struct view_state *st,
     rp->lut = !film && st->look.film_sim < 0 && view_look_active(st) ? st->lut : NULL;
     rp->lut_type = st->look.lut_space > 0 ? PL_LUT_CONVERSION : st->look.lut_type;
 
-    /* Only the non-raw path needs a shader for exposure; on the raw path
-     * libcraw has already applied it, and the scRGB scale below would be
-     * the wrong place for it anyway. */
+    /* Only the non-raw path has anything to do in linear light: the white
+     * balance and the exposure, as one matrix at libplacebo's LINEAR stage
+     * - after the transfer function is undone and before anything is
+     * scaled or tone mapped. On the raw path libcraw has already applied
+     * both, and the scRGB scale below would be the wrong place for either
+     * anyway. The matrix is a uniform of the hook, so it is what the
+     * signature below hashes, and an identity is not attached at all. */
     int nb_hooks = 0;
+    pl_matrix3x3 linear = pl_matrix3x3_identity;
+    bool have_linear = false;
     if (!st->dec.raw) {
-        const struct pl_hook *h = view_exposure_hook(&st->gpu,
-                                                     view_video_exposure(st));
-        if (h)
+        craw_adjust *aj = view_adjust_state(st, export_path);
+        const struct pl_hook *h;
+
+        have_linear = view_vwb_linear(st, &linear);
+        if (have_linear && aj && (h = craw_adjust_linear(aj, &linear)))
             hook[nb_hooks++] = h;
     }
 
@@ -1695,8 +1879,8 @@ static void view_render_params(struct view_state *st,
     *sig = view_hash(*sig, &st->adjustments,
                      offsetof(struct view_adjust, state));
     *sig = view_hash(*sig, &st->grain, offsetof(struct view_grain, hook));
-    *sig = view_hash(*sig, &st->gpu.exposure_hook_gain,
-                     sizeof(st->gpu.exposure_hook_gain));
+    *sig = view_hash(*sig, &have_linear, sizeof(have_linear));
+    *sig = view_hash(*sig, &linear, sizeof(linear));
     *sig = view_hash(*sig, &scene, sizeof(scene));
 }
 
