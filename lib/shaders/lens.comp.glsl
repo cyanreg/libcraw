@@ -1,7 +1,9 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
 /* Lens correction, DESIGN.md 16: a per-channel radial resampling warp on
- * the linear output of the colour stage.
+ * the camera RGB intermediate, whose channels are the ones the record's
+ * polynomials describe, ahead of the defringe that must see them
+ * registered.
  *
  * Destination to source. For each output pixel the normalized radius from
  * the optical centre is computed once, each channel's polynomial is
@@ -15,8 +17,8 @@
  * pass filter applied to the whole frame, and it would undo exactly the
  * detail RCD was chosen for.
  *
- * Alpha is read straight from the output pixel's own position, not warped:
- * the colour stage writes 1.0 and it stays exactly 1.0.
+ * Alpha is read straight from the output pixel's own position, not warped;
+ * the intermediate does not use it and the colour stage writes 1.0.
  *
  * With `keep_all` the frame is not filled: the output position is divided
  * by a scale worked out on the host so that the whole warped source fits
@@ -27,7 +29,7 @@
 
 #include "common.glsl"
 
-layout(binding = 0) readonly  uniform image2D src;   /* the colour stage's output */
+layout(binding = 0) readonly  uniform image2D src;   /* the camera RGB intermediate */
 layout(binding = 1) writeonly uniform image2D dst;
 
 /* Mirrors CRAWLensPush in lib/pipeline.c. */
@@ -126,8 +128,8 @@ void main()
                                all(lessThanEqual(sp[c], vec2(pc.size)));
         }
 
-        /* Black, not transparent: alpha is the output pixel's own, which
-         * the colour stage wrote as 1.0. */
+        /* Black, not transparent: alpha is the output pixel's own, and the
+         * colour stage writes 1.0 over it. */
         if (!inside) {
             imageStore(dst, p, vec4(0.0, 0.0, 0.0, imageLoad(src, p).a));
             return;

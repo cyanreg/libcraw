@@ -117,6 +117,7 @@ struct tool_cfg {
 
     uint32_t false_color;     /* median passes after the debayer, 0 = off */
     bool highlights;          /* rebuild clipped highlights, DESIGN.md 18 */
+    float defringe;           /* DESIGN.md 19, 0 = off */
 
     enum tool_lens lens;
 
@@ -295,6 +296,12 @@ static void tool_usage(FILE *f)
 "                      the blown area, and may exceed the balanced clip\n"
 "                      point, so a sky where only green clipped keeps its\n"
 "                      clouds and a blown lamp keeps its colour. DESIGN.md 18\n"
+"  --defringe STRENGTH\n"
+"                      pull the colour of pixels along strong edges back into\n"
+"                      the range the two sides of the edge span, 0 to 1\n"
+"                      (default: 1): the purple, blue and pink rims chromatic\n"
+"                      aberration leaves along lamps, windows and branches\n"
+"                      against the sky. 0 is off. DESIGN.md 19\n"
 "  --denoise STRENGTH[,CHROMA]\n"
 "                      raw domain denoising at this strength: 1.0 removes\n"
 "                      noise at the level the camera's noise model predicts,\n"
@@ -312,8 +319,8 @@ static void tool_usage(FILE *f)
 "                      clip's own pair with --noise-estimate\n"
 "  --lens on|off|keep  geometric lens correction from the frame's own\n"
 "                      com.panasonic.Semi-Pro.optical_correction record: a\n"
-"                      per-channel radial warp after the colour stage that\n"
-"                      takes the distortion out and the lateral chromatic\n"
+"                      per-channel radial warp after the debayer that takes\n"
+"                      the distortion out and the lateral chromatic\n"
 "                      aberration with it. The default is on for every frame\n"
 "                      that carries a record and off for every frame that\n"
 "                      does not, so a clip from another camera is untouched;\n"
@@ -870,6 +877,8 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
         pp.flags |= CRAW_PIPELINE_FLAG_FALSE_COLOR;
     if (cfg->highlights)
         pp.flags |= CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION;
+    if (cfg->defringe > 0.0f)
+        pp.flags |= CRAW_PIPELINE_FLAG_DEFRINGE;
     /* Only built once a frame has been seen to carry a record: a clip
      * without one never pays for the extra image. */
     if (lens)
@@ -1678,6 +1687,7 @@ enum {
     TOOL_OPT_DENOISE,
     TOOL_OPT_FALSE_COLOUR,
     TOOL_OPT_HIGHLIGHTS,
+    TOOL_OPT_DEFRINGE,
     TOOL_OPT_NOISE,
     TOOL_OPT_NOISE_EST,
     TOOL_OPT_LENS,
@@ -1708,6 +1718,7 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         { "denoise",        required_argument, NULL, TOOL_OPT_DENOISE   },
         { "false-colour",   required_argument, NULL, TOOL_OPT_FALSE_COLOUR },
         { "highlights",     required_argument, NULL, TOOL_OPT_HIGHLIGHTS },
+        { "defringe",       required_argument, NULL, TOOL_OPT_DEFRINGE },
         { "noise",          required_argument, NULL, TOOL_OPT_NOISE     },
         { "noise-estimate", no_argument,       NULL, TOOL_OPT_NOISE_EST },
         { "lens",           required_argument, NULL, TOOL_OPT_LENS      },
@@ -1728,6 +1739,9 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         /* A correction, like the lens: what clipped is rebuilt unless
          * --highlights off asks for the plain clip. */
         .highlights = true,
+        /* On with it: the fringes it takes out are the ones the rebuilt
+         * highlights stop hiding. */
+        .defringe = 1.0f,
     };
 
     while ((c = getopt_long(argc, argv, "o:vh", opts, NULL)) != -1) {
@@ -1863,6 +1877,15 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
             if ((ret = tool_lookup(tool_lenses, "--lens", optarg, &v)) < 0)
                 return ret;
             cfg->lens = (enum tool_lens)v;
+            break;
+        case TOOL_OPT_DEFRINGE:
+            if ((ret = tool_parse_double("--defringe", optarg, &d)) < 0)
+                return ret;
+            if (!(d >= 0.0 && d <= 1.0)) {
+                fprintf(stderr, "--defringe: expected 0 to 1, got %g\n", d);
+                return CRAW_ERROR(EINVAL);
+            }
+            cfg->defringe = (float)d;
             break;
         case TOOL_OPT_HIGHLIGHTS:
             if ((ret = tool_lookup(tool_switches, "--highlights", optarg, &v)) < 0)
@@ -2285,6 +2308,7 @@ have_device:
         fp.denoise_chroma_strength = cfg.chroma;
         fp.noise_override = cfg.noise;
         fp.false_color_passes = cfg.false_color;
+        fp.defringe_strength = cfg.defringe;
         fp.lens = lens;
 
         if (cfg.wb == TOOL_WB_FIXED) {

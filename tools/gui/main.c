@@ -312,6 +312,7 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
      * dispatched and the frame is clipped as it always was. */
     if (st->look.highlights)
         fp->flags |= CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
+    fp->defringe_strength = CRAW_CLAMP(st->look.defringe, 0.0f, 1.0f);
     /* By value: the record is this frame's own and the next frame's will be
      * different, so the parameters must not point at anything the panel
      * owns. An invalid one is the documented "leave this frame alone". */
@@ -342,6 +343,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .debayer    = st->look.debayer,
         .false_color = st->look.false_color,
         .highlights = st->look.highlights != 0,
+        .defringe   = CRAW_CLAMP(st->look.defringe, 0.0f, 1.0f),
         .chroma     = view_chroma_strength(st),
         .denoise    = view_denoise_strength(st),
         .lens       = view_lens_active(st),
@@ -389,6 +391,7 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->ei == b->ei && a->exposure == b->exposure &&
            a->ambience == b->ambience && a->debayer == b->debayer &&
            a->false_color == b->false_color && a->highlights == b->highlights &&
+           a->defringe == b->defringe &&
            a->chroma == b->chroma &&
            a->denoise == b->denoise && a->lens == b->lens &&
            a->lens_keep == b->lens_keep;
@@ -1822,10 +1825,16 @@ static void view_usage(FILE *f)
 "                      blown area, and may exceed the balanced clip, so a\n"
 "                      sky where only green clipped keeps its clouds. The\n"
 "                      Debayer section has the same switch\n"
+"  --defringe STRENGTH pull the colour of pixels along strong edges back into\n"
+"                      the range the two sides of the edge span, 0 to 1 (1 by\n"
+"                      default, 0 is off): the purple, blue and pink rims\n"
+"                      chromatic aberration leaves along lamps, windows and\n"
+"                      branches against the sky. The Debayer section has the\n"
+"                      same row\n"
 "  --lens on|off       geometric lens correction from each frame's own\n"
 "                      optical_correction record: a per-channel radial warp\n"
-"                      after the colour stage that takes the distortion out\n"
-"                      and the lateral chromatic aberration with it. On by\n"
+"                      after the debayer that takes the distortion out and\n"
+"                      the lateral chromatic aberration with it. On by\n"
 "                      default for a clip whose frames carry a record, and a\n"
 "                      no-op for one that does not; the Lens section says\n"
 "                      which it is and what the record does at the corner\n"
@@ -2035,6 +2044,7 @@ enum {
     VIEW_OPT_FALSE_COLOUR,
     VIEW_OPT_LENS,
     VIEW_OPT_HIGHLIGHTS,
+    VIEW_OPT_DEFRINGE,
     VIEW_OPT_LENS_FIT,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
@@ -2084,6 +2094,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "denoise",  required_argument, NULL, VIEW_OPT_DENOISE   },
         { "lens",     required_argument, NULL, VIEW_OPT_LENS      },
         { "highlights", required_argument, NULL, VIEW_OPT_HIGHLIGHTS },
+        { "defringe", required_argument, NULL, VIEW_OPT_DEFRINGE },
         { "lens-fit", required_argument, NULL, VIEW_OPT_LENS_FIT  },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
@@ -2159,6 +2170,13 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 st->lens.on = false;
             } else {
                 fprintf(stderr, "--lens: expected on or off, got `%s`\n", optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            break;
+        case VIEW_OPT_DEFRINGE:
+            st->look.defringe = strtof(optarg, &end);
+            if (end == optarg || *end || !(st->look.defringe >= 0.0f && st->look.defringe <= 1.0f)) {
+                fprintf(stderr, "--defringe: expected 0 to 1, got `%s`\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
             break;
@@ -2571,6 +2589,10 @@ static void view_log_look(const struct view_state *st)
     if (lk->false_color)
         fprintf(stderr, ", false colour x%d", lk->false_color);
     fprintf(stderr, ", highlights %s", lk->highlights ? "rebuilt" : "clipped");
+    if (lk->defringe > 0.0f)
+        fprintf(stderr, ", defringe %.2f", lk->defringe);
+    else
+        fprintf(stderr, ", defringe off");
 
     if (st->denoise.on && (st->denoise.strength > 0.0f || st->denoise.chroma > 0.0f))
         fprintf(stderr, ", denoise %.2f, chroma %.2f", st->denoise.strength,
@@ -3754,6 +3776,9 @@ int main(int argc, char **argv)
         /* On: rebuilding what clipped is a correction, like the lens, not
          * a look. */
         .highlights = 1,
+        /* On with it: the rims it takes out are the ones the rebuilt
+         * highlights stop hiding. */
+        .defringe  = 1.0f,
         .lut_type  = PL_LUT_NATIVE,
         .film_sim  = -1,
         /* libplacebo's own default curve, spline; --tone-map overrides. */

@@ -104,7 +104,7 @@ int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
 
             if (keep_all && !inside) {
                 /* Black, not transparent: alpha is still the output pixel's
-                 * own, which the colour stage wrote as 1.0. */
+                 * own, and the colour stage writes 1.0 over it. */
                 out[0] = out[1] = out[2] = 0.0f;
                 out[3] = src[((size_t)y * width + x) * 4 + 3];
                 continue;
@@ -138,8 +138,7 @@ int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
             }
 
             /* Alpha is not warped: it comes from the output pixel's own
-             * position, which is how the colour stage's 1.0 stays exactly
-             * 1.0 rather than the sum of sixteen weights. */
+             * position rather than being the sum of sixteen weights. */
             out[3] = src[((size_t)y * width + x) * 4 + 3];
         }
     }

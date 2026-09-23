@@ -53,13 +53,14 @@ enum CRAWDebayer {
  * See DESIGN.md 14. */
 #define CRAW_PIPELINE_FLAG_DENOISE (1 << 1)
 
-/* Build the lens correction pass. It costs an extra full resolution image
- * in the pipeline's output format, because the colour stage then writes
- * that instead of the caller's destination and the warp reads it. Once
- * created it is switched per frame with CRAWFrameParams.lens: a correction
- * with valid = false skips the warp entirely and the colour stage writes
- * the caller's destination as it always did, so such a frame is bit for
- * bit what a pipeline built without the flag produces. See DESIGN.md 16. */
+/* Build the lens correction pass, a per-channel warp of the camera RGB
+ * intermediate after the debayer. With the RCD debayer it costs no memory
+ * (it borrows RCD's auxiliary image, as the false colour pass does); with
+ * bilinear or MHC it costs one full resolution RGBA16F image, shared with
+ * the other passes that need one. Once created it is switched per frame
+ * with CRAWFrameParams.lens: a correction with valid = false skips the
+ * warp entirely, so such a frame is bit for bit what a pipeline built
+ * without the flag produces. See DESIGN.md 16. */
 #define CRAW_PIPELINE_FLAG_LENS (1 << 2)
 
 /* Build the false colour suppression pass, DESIGN.md 17: a 3x3 median
@@ -102,6 +103,19 @@ enum CRAWDebayer {
  * switched per frame with CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION, which
  * costs nothing when unset. */
 #define CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION (1 << 5)
+
+/* Build the defringe pass, DESIGN.md 19: near a strong edge, the colour of
+ * every pixel is pulled back into the range of colours found a few pixels
+ * away on either side of that edge, which takes out the purple, blue, cyan
+ * and pink rims that the lens's chromatic aberration leaves along bright
+ * edges and that highlight reconstruction no longer hides under the clip.
+ * The level of every pixel is kept, and a pixel whose colour is already in
+ * range is not touched. With the RCD debayer it costs no memory (it borrows
+ * RCD's auxiliary image, as the false colour pass does); with bilinear or
+ * MHC it costs one full resolution RGBA16F image, shared with the other
+ * passes that need one. Once built it is switched per frame with
+ * CRAWFrameParams.defringe_strength, which costs nothing when zero. */
+#define CRAW_PIPELINE_FLAG_DEFRINGE (1 << 6)
 
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
@@ -240,12 +254,19 @@ typedef struct CRAWFrameParams {
      * CRAW_PIPELINE_FLAG_LENS. See <craw/lens.h> and DESIGN.md 16. */
     CRAWLensCorrection lens;
 
+    /* Defringe, DESIGN.md 19: how far a fringe's colour is pulled back into
+     * the range its edge's two sides span, 0.0 to 1.0. 0.0, the default,
+     * skips the pass for this frame without rebuilding the pipeline; above
+     * 1.0 makes craw_pipeline_record() fail with CRAW_ERROR(EINVAL). Ignored
+     * unless the pipeline was created with CRAW_PIPELINE_FLAG_DEFRINGE. */
+    float defringe_strength;
+
     /* Padding to allow for future options. Must always be set to 0. The
      * `- 8` after the 64 is out_space, out_space_set and the alignment hole
-     * after it, and the two `- 4` are false_color_passes and
-     * denoise_chroma_strength, all taken out of the tail so that sizeof
-     * stays what it was. */
-    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8 - 4 - 4];
+     * after it, and the three `- 4` are false_color_passes,
+     * denoise_chroma_strength and defringe_strength, all taken out of the
+     * tail so that sizeof stays what it was. */
+    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8 - 4 - 4 - 4];
 } CRAWFrameParams;
 
 /* Fills `p` with defaults: RGGB, RCD, XYZ D65 output, RGBA16F, no flags.
@@ -255,7 +276,7 @@ CRAW_API void craw_pipeline_params_init(CRAWPipelineParams *p);
 /* Fills `fp` with defaults: as-shot white balance, the pipeline's own
  * output colour space, no exposure change, no denoising of either kind, no
  * noise model override, no highlight reconstruction, no false colour
- * suppression, no lens correction. The profile pointer is left NULL and
+ * suppression, no defringe, no lens correction. The profile pointer is left NULL and
  * must be set by the caller. */
 CRAW_API void craw_frame_params_init(CRAWFrameParams *fp);
 
@@ -275,13 +296,14 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
  *        clip or [highlight reconstruction, clipped channels rebuilt]
  *     -> debayer to full resolution camera RGB
  *     -> [false colour suppression, a median of the colour differences]
+ *     -> [per-channel lens correction warp]
+ *     -> [defringe, colour along strong edges held to what both sides have]
  *     -> [chroma denoise, the quarter resolution chroma band smoothed]
  *     -> [auto white balance histogram]
  *     -> white balance re-balance, camera matrix, gain and exposure
  *     -> XYZ to the frame's output space (CRAWFrameParams.out_space when
  *        it is set, else the pipeline's)
  *     -> [ACES 1.3 gamut compression, ACEScg output only]
- *     -> [per-channel lens correction warp, on the linear output]
  *   dst (out_format, same size)
  *
  * src and dst must not alias. Both must already be in their stated layouts

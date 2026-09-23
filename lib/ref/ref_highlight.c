@@ -45,48 +45,6 @@ static inline float craw_hl_smoothstep(float e0, float e1, float v)
     return t * t * (3.0f - 2.0f * t);
 }
 
-/* Round to the nearest fp16 value, ties to even, and back: the rebuilt
- * mosaic is R16F on the GPU. Only finite values below the fp16 maximum
- * reach here; the stage's own bounds keep them there. */
-static float craw_hl_to_half(float f)
-{
-    uint32_t b, sign, exp, mant, r;
-    int e;
-
-    memcpy(&b, &f, sizeof(b));
-    sign = b & 0x80000000u;
-    b &= 0x7FFFFFFFu;
-    exp = b >> 23;
-    e = (int)exp - 127;
-
-    if (b == 0)
-        return f;
-
-    if (e < -14) {
-        /* Subnormal in fp16: a fixed step of 2^-24. */
-        float step = 5.9604644775390625e-8f;
-        float a = fabsf(f) / step;
-        float q = nearbyintf(a) * step;
-        return sign ? -q : q;
-    }
-
-    /* Keep 10 of the 23 mantissa bits, rounding the other 13 to nearest,
-     * ties to even. */
-    mant = b & 0x7FFFFFu;
-    r = mant & 0x1FFFu;
-    mant >>= 13;
-    if (r > 0x1000u || (r == 0x1000u && (mant & 1u)))
-        mant++;
-    if (mant == 0x400u) {
-        mant = 0;
-        exp++;
-    }
-
-    b = sign | (exp << 23) | (mant << 13);
-    memcpy(&f, &b, sizeof(f));
-    return f;
-}
-
 /* One level of the colour field: (S_r, S_b, W) per texel while it is
  * summed, (c_r, c_b, W) once it has been pushed. */
 typedef struct CRAWHlLevel {
@@ -363,7 +321,7 @@ int craw_ref_highlights(const uint16_t *bayer, uint32_t width, uint32_t height,
                 res = xc + a * CRAW_MAX(L * expf(lrho[c]) - xc, 0.0f);
             }
 
-            out[o] = craw_hl_to_half(res);
+            out[o] = craw_ref_to_half(res);
         }
     }
 

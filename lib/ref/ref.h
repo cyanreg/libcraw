@@ -8,8 +8,60 @@
  * letter; when the shaders and this disagree, DESIGN.md decides. */
 
 #include <stdint.h>
+#include <string.h>
+#include <math.h>
 #include <craw/profile.h>
 #include <craw/pipeline.h>
+
+/* Round to the nearest fp16 value, ties to even, and back, for the stages
+ * whose GPU form stores an intermediate in fp16 (the rebuilt mosaic of
+ * DESIGN.md 18, the defringe's first pass of 19). Only finite values below
+ * the fp16 maximum may be given. */
+static inline float craw_ref_to_half(float f)
+{
+    uint32_t b, sign, exp, mant, r;
+    int e;
+
+    memcpy(&b, &f, sizeof(b));
+    sign = b & 0x80000000u;
+    b &= 0x7FFFFFFFu;
+    exp = b >> 23;
+    e = (int)exp - 127;
+
+    if (b == 0)
+        return f;
+
+    if (e < -14) {
+        /* Subnormal in fp16: a fixed step of 2^-24. */
+        float step = 5.9604644775390625e-8f;
+        float a = fabsf(f) / step;
+        float q = nearbyintf(a) * step;
+        return sign ? -q : q;
+    }
+
+    /* Keep 10 of the 23 mantissa bits, rounding the other 13 to nearest,
+     * ties to even. */
+    mant = b & 0x7FFFFFu;
+    r = mant & 0x1FFFu;
+    mant >>= 13;
+    if (r > 0x1000u || (r == 0x1000u && (mant & 1u)))
+        mant++;
+    if (mant == 0x400u) {
+        mant = 0;
+        exp++;
+    }
+
+    b = sign | (exp << 23) | (mant << 13);
+    memcpy(&f, &b, sizeof(f));
+    return f;
+}
+
+/* Defringe, DESIGN.md 19, in place on a camera RGB buffer of
+ * width*height*4 floats: along strong edges, the colour of each pixel held
+ * to the range the edge's two sides span, the level kept. `strength` must
+ * be in (0, 1]; zero is the caller's decision not to call. The first
+ * pass's quantities are rounded to fp16 as the GPU stores them. */
+int craw_ref_defringe(float *rgb, uint32_t width, uint32_t height, float strength);
 
 /* Raw domain denoise, DESIGN.md 14.3: reads the mosaic and writes a
  * denoised mosaic in the same 16-bit UNORM raw encoding, which is exactly
@@ -81,8 +133,8 @@ static inline enum CRAWColorSpace craw_ref_out_space(const CRAWPipelineParams *p
     return fp->out_space_set ? fp->out_space : params->out_space;
 }
 
-/* Lens correction, DESIGN.md 16: the per-channel radial warp of the linear
- * output. `src` and `dst` are width*height*4 floats and must not be the
+/* Lens correction, DESIGN.md 16: the per-channel radial warp of the camera
+ * RGB intermediate. `src` and `dst` are width*height*4 floats and must not be the
  * same buffer. A correction with valid = false is a copy, which is what
  * the pipeline's skipping the pass amounts to.
  *
@@ -93,17 +145,19 @@ int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
                   const CRAWLensCorrection *lc, bool keep_all, float *dst);
 
 /* Whole chain: [denoise,] [highlight reconstruction,] debayer, [false
- * colour,] [chroma denoise,] colour, [lens]. `out` receives
+ * colour,] [lens,] [defringe,] [chroma denoise,] colour. `out` receives
  * width*height*4 floats. The denoise runs when `params` carries
  * CRAW_PIPELINE_FLAG_DENOISE and `fp->denoise_strength` is positive, the
  * highlight reconstruction when it carries
  * CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION and `fp->flags`
- * CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION, the false colour suppression when it
+ * CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION, the defringe when it carries
+ * CRAW_PIPELINE_FLAG_DEFRINGE and `fp->defringe_strength` is positive, the
+ * false colour suppression when it
  * carries CRAW_PIPELINE_FLAG_FALSE_COLOR and `fp->false_color_passes` is
  * positive, the chroma denoise when it carries
  * CRAW_PIPELINE_FLAG_CHROMA_DENOISE and `fp->denoise_chroma_strength` is
  * positive, and the warp when it carries CRAW_PIPELINE_FLAG_LENS and
- * `fp->lens` is valid; all five are the conditions craw_pipeline_record()
+ * `fp->lens` is valid; all six are the conditions craw_pipeline_record()
  * applies. */
 int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
                      size_t stride, const CRAWPipelineParams *params,

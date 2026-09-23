@@ -153,10 +153,35 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
             goto done;
     }
 
-    /* On the intermediate, before anything reads it, DESIGN.md 17.3, and
-     * the chroma denoise after it, on what it left, 14.4. */
+    /* On the intermediate, before anything reads it: the false colour,
+     * DESIGN.md 17.3, the lens warp, 16.3, the defringe, 19.3, and the
+     * chroma denoise on what they left, 14.4. */
     if ((params->flags & CRAW_PIPELINE_FLAG_FALSE_COLOR) && fp->false_color_passes > 0) {
         ret = craw_ref_false_color(out, width, height, fp->false_color_passes);
+        if (ret < 0)
+            goto done;
+    }
+    /* The warp cannot run in place, so the intermediate is moved aside and
+     * the result written back over `out`. DESIGN.md 16.3: on the camera
+     * RGB, before the defringe. */
+    if ((params->flags & CRAW_PIPELINE_FLAG_LENS) && fp->lens.valid) {
+        size_t n = (size_t)width * height * 4;
+        float *moved = malloc(n * sizeof(*moved));
+
+        if (!moved) {
+            ret = CRAW_ERROR(ENOMEM);
+            goto done;
+        }
+
+        memcpy(moved, out, n * sizeof(*moved));
+        ret = craw_ref_lens(moved, width, height, &fp->lens,
+                            (fp->flags & CRAW_FRAME_FLAG_LENS_KEEP_ALL) != 0, out);
+        free(moved);
+        if (ret < 0)
+            goto done;
+    }
+    if ((params->flags & CRAW_PIPELINE_FLAG_DEFRINGE) && fp->defringe_strength > 0.0f) {
+        ret = craw_ref_defringe(out, width, height, fp->defringe_strength);
         if (ret < 0)
             goto done;
     }
@@ -167,25 +192,6 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
     }
 
     ret = craw_ref_color(out, width, height, fp, craw_ref_out_space(params, fp));
-    if (ret < 0)
-        goto done;
-
-    /* The warp cannot run in place, so the coloured frame is moved aside
-     * and the result written back over `out`. */
-    if ((params->flags & CRAW_PIPELINE_FLAG_LENS) && fp->lens.valid) {
-        size_t n = (size_t)width * height * 4;
-        float *linear = malloc(n * sizeof(*linear));
-
-        if (!linear) {
-            ret = CRAW_ERROR(ENOMEM);
-            goto done;
-        }
-
-        memcpy(linear, out, n * sizeof(*linear));
-        ret = craw_ref_lens(linear, width, height, &fp->lens,
-                            (fp->flags & CRAW_FRAME_FLAG_LENS_KEEP_ALL) != 0, out);
-        free(linear);
-    }
 
 done:
     free(clean);

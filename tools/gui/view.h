@@ -110,6 +110,9 @@ struct view_look {
      * balanced clip. A row of the Debayer section for the same reason as
      * the false colour, and an int because nuklear's checkbox wants one. */
     int highlights;
+    /* Defringe after the debayer, DESIGN.md 19: 0 to 1, 0 off. Its row
+     * sits under the highlights switch, whose rebuilt edges it cleans. */
+    float defringe;
 
     char lut_path[VIEW_MAX_PATH];
     /* The embedded film simulation, or -1 for none. Mutually exclusive
@@ -155,6 +158,7 @@ struct view_pipeline_look {
     enum CRAWDebayer debayer;
     int false_color;            /* passes, 0 when the stage did not run */
     bool highlights;            /* whether the highlight reconstruction ran */
+    float defringe;             /* defringe strength, 0 when it did not run */
     float chroma;               /* chroma denoise strength, 0 when it did not run */
     /* The strength the pass actually ran at, 0 when it did not: a toggle
      * while paused has to put the frame through again. */

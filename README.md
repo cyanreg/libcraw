@@ -77,7 +77,13 @@ debayer by default: every channel that clipped is estimated from the
 channels that did not clip around it and from the colour of the unclipped
 light around the blown area, and may exceed the old clip point, so a sky
 where only green clipped keeps its clouds instead of turning flat grey
-(DESIGN.md 18); `--highlights off` clips as before. `--crop X,Y,W,H` writes one rectangle of the output while
+(DESIGN.md 18); `--highlights off` clips as before. `--defringe STRENGTH`,
+0 to 1 and 1 by default, pulls the colour of every pixel along a strong
+edge back into the range of colours on the two sides of that edge,
+keeping its level: the purple, blue and pink rims the lens's chromatic
+aberration leaves along bright edges, which the rebuilt highlights no
+longer hide under a white clip, go, and a real colour edge is left alone
+(DESIGN.md 19); `--defringe 0` turns it off. `--crop X,Y,W,H` writes one rectangle of the output while
 the pipeline still runs on the whole frame, which is how a 5.8K frame gets
 looked at 1:1 without a 5.8K file.
 
@@ -210,7 +216,9 @@ suppression row: the number of median and blur passes over the colour
 differences after the debayer, zero to five, which is what stops a wet street from
 shimmering in colour as the rain hits it; `--false-colour PASSES` sets it
 from the command line. Its "rebuild clipped highlights" switch, on by
-default, is the highlight reconstruction; `--highlights on|off` sets it. The "Denoise" section sets the raw stage's strength and reports the
+default, is the highlight reconstruction; `--highlights on|off` sets it.
+The defringe row under it, 1 by default, is the defringe strength;
+`--defringe STRENGTH` sets it. The "Denoise" section sets the raw stage's strength and reports the
 noise model it found for the clip's own ISO — that stage stays off when
 the camera has none, which the section says rather than leaving you
 guessing — and the chroma amount, the luma-guided smoothing of the
@@ -226,7 +234,7 @@ line reads `3/7 P1000347.MOV [hevc video, gpu]`. The clips need not match —
 ProRes RAW and already developed, different sizes, stereo or four-channel or
 no audio at all — and a switch keeps every setting exactly as it was: the
 white balance mode and a manual CCT, the exposure index and bias, debayer
-and its false colour passes and highlight switch, denoise, lens correction
+and its false colour passes, highlight switch and defringe, denoise, lens correction
 and its fit, the
 export's colour space, size,
 pixel format, audio mode and threads, the two export file paths once typed,

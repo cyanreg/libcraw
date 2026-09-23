@@ -2726,6 +2726,10 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         /* Highlight reconstruction, DESIGN.md 18: how the mosaic's clipped
          * samples come off, before the debayer, so a row here too. */
         nk_checkbox_label(ctx, "rebuild clipped highlights", &lk->highlights);
+        /* Defringe, DESIGN.md 19, after the debayer like the false colour
+         * passes. */
+        nk_property_float(ctx, "#defringe", 0.0f, &lk->defringe, 1.0f, 0.05f, 0.01f);
+        nk_slider_float(ctx, 0.0f, &lk->defringe, 1.0f, 0.05f);
         view_section_end(ctx);
     }
 

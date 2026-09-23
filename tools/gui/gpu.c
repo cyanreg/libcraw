@@ -824,15 +824,16 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
     pp.out_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     /* All of them always built: the panel can switch to auto white
      * balance, to denoising, to false colour suppression, to highlight
-     * reconstruction or to lens correction at any time and a pipeline
+     * reconstruction, to defringe or to lens correction at any time and a pipeline
      * rebuild mid-clip would drop a frame. A denoise pass that is built but
      * left at strength 0 costs nothing measurable, a false colour pass at
-     * zero passes and an unflagged highlight reconstruction are not
-     * dispatched, and a lens pass handed a frame with no record drops out
+     * zero passes, a defringe at strength 0 and an unflagged highlight
+     * reconstruction are not dispatched, and a lens pass handed a frame with no record drops out
      * entirely, which is what makes them all live controls. */
     pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE |
                     CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_CHROMA_DENOISE |
-                    CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION | CRAW_PIPELINE_FLAG_LENS;
+                    CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION | CRAW_PIPELINE_FLAG_DEFRINGE |
+                    CRAW_PIPELINE_FLAG_LENS;
     /* Enough copies that the previous frame's histogram is still readable
      * while the current one is in flight, which is what lets the auto white
      * balance run without a per-frame stall. */
@@ -2536,7 +2537,8 @@ int view_gpu_direct_open(struct view_gpu *g)
     pp.out_format = VK_FORMAT_R32G32B32A32_SFLOAT;
     pp.flags      = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_FALSE_COLOR |
                     CRAW_PIPELINE_FLAG_CHROMA_DENOISE |
-                    CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION | CRAW_PIPELINE_FLAG_LENS;
+                    CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION | CRAW_PIPELINE_FLAG_DEFRINGE |
+                    CRAW_PIPELINE_FLAG_LENS;
 
     ret = craw_pipeline_create(g->ctx, &pp, &g->direct_pipe);
     if (ret < 0) {

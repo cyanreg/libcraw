@@ -34,11 +34,15 @@ In:
   strength. Section 14.4.
 - False colour suppression: a median and a blur of the colour differences
   after the debayer, one to five passes, optional, per frame. Section 17.
-- Geometric lens correction: a per-channel radial resampling warp on the
-  linear output, driven per frame by the camera's own
-  `com.panasonic.Semi-Pro.optical_correction` record, which the library
-  also parses (`<craw/lens.h>`). Optional, per-frame, and a no-op on a
-  frame that carries no record. Section 16.
+- Geometric lens correction: a per-channel radial resampling warp of the
+  camera RGB intermediate after the debayer, driven per frame by the
+  camera's own `com.panasonic.Semi-Pro.optical_correction` record, which
+  the library also parses (`<craw/lens.h>`). Optional, per-frame, and a
+  no-op on a frame that carries no record. Section 16.
+- Defringe: along strong edges, the colour of every pixel held to the
+  range of colours on the two sides of the edge, the level kept; takes out
+  the rims chromatic aberration leaves. Optional, per-frame strength.
+  Section 19.
 - CPU reference of every stage, tests comparing it against the GPU.
 
 Out, deliberately, with a slot reserved: temporal denoising (section 14.7
@@ -90,11 +94,13 @@ denoise stage and read by the debayer in its place. Section 14.1.
 Intermediate image (internal): `VK_FORMAT_R16G16B16A16_SFLOAT`, camera RGB
 after prep and debayer, alpha unused.
 
-Scratch intermediate (internal, only with `CRAW_PIPELINE_FLAG_FALSE_COLOR`
-or `CRAW_PIPELINE_FLAG_CHROMA_DENOISE`): the intermediate's format, a
-second image for the stages that cannot run in place; each writes it and
-the two swap roles, so what everything downstream reads is always the
-latest. With RCD it is RCD's own aux image, borrowed; with the other
+Scratch intermediate (internal, only with `CRAW_PIPELINE_FLAG_FALSE_COLOR`,
+`CRAW_PIPELINE_FLAG_LENS`, `CRAW_PIPELINE_FLAG_DEFRINGE` or
+`CRAW_PIPELINE_FLAG_CHROMA_DENOISE`): the intermediate's format, a second
+image for the stages that cannot run in place; each writes it and the two
+swap roles, so what everything downstream reads is always the latest. The
+defringe keeps its first pass there and writes the intermediate in place
+(19.3). With RCD it is RCD's own aux image, borrowed; with the other
 methods it is an image of its own. Section 17.3.
 
 Quarter resolution chroma images (internal, only with
@@ -108,10 +114,6 @@ full resolution, balanced and unclipped, written by the highlight
 reconstruction and read by the debayer in place of the mosaic. Its colour
 field: RGBA32F, one texel per 4x4 block, and a pyramid down to 1x1.
 Section 18.
-
-Linear image (internal, only with `CRAW_PIPELINE_FLAG_LENS`): the output
-format, holding what the colour stage produced before the lens warp reads
-it. Section 16.3.
 
 Output image: `VK_FORMAT_R16G16B16A16_SFLOAT` or `R32G32B32A32_SFLOAT`,
 linear light in the requested colour space, alpha 1.0.
@@ -171,7 +173,20 @@ Replaces the intermediate with a copy whose colour differences have been
 median filtered and blurred, G untouched. Defined in section 17; the
 histogram of 4.4 and the colour stage of 4.3 read the copy.
 
-### 4.2c Chroma denoise (optional, after 4.2b)
+### 4.2c Lens correction (optional, after 4.2b)
+
+A per-channel radial resampling warp of the intermediate, in the
+destination-to-source convention, driven by the frame's own record.
+Defined in section 16; everything after it, the histogram of 4.4
+included, reads the warped copy.
+
+### 4.2d Defringe (optional, after 4.2c)
+
+At every pixel near a strong edge in level, the colour clamped to the
+range the two sides of the edge span, the level kept; every other pixel
+untouched. Defined in section 19; in place in the intermediate.
+
+### 4.2e Chroma denoise (optional, after 4.2d)
 
 Replaces the intermediate with a copy whose quarter resolution chroma
 band has been smoothed by a luma-guided bilateral, G untouched. Defined
@@ -234,14 +249,6 @@ bin; at 1/8 resolution that needs a flat neutral covering a quarter of an
 BINS = 128, LOG_MIN = -2.5, LOG_MAX = 1.0 (see `craw/awb.h`). The buffers
 are zeroed by the pipeline at the start of each recording (vkCmdFillBuffer)
 and copied to a host-visible readback buffer at the end.
-
-### 4.5 Lens correction (optional, last)
-
-A per-channel radial resampling warp of the linear output, in the
-destination-to-source convention, driven by the frame's own record. Defined
-in section 16; nothing else in this section changes when it runs, and the
-auto white balance histogram of 4.4 is two stages ahead of it and is not
-affected at all.
 
 ## 5. Debayer definitions
 
@@ -670,12 +677,12 @@ for containers without them.
   readback buffer is host visible and cached.
 - The pipeline records, per frame: barrier src to GENERAL/compute read,
   [fill histogram buffers], [denoise pass], [highlight field, pull and
-  push over its pyramid, fill], debayer passes, [awb
-  histogram], colour pass, [lens pass], [copy histogram to readback], and a
-  final barrier that returns dst to the caller's stated layout. With the
-  lens pass the colour pass writes the internal linear image and the lens
-  pass writes dst; without it, or on a frame whose correction is invalid,
-  the colour pass writes dst and no lens pass is recorded at all. The denoise pass
+  push over its pyramid, fill], debayer passes, [false colour pass], [lens
+  pass], [defringe prep and clamp], [chroma down, blur and up], [awb
+  histogram], colour pass, [copy histogram to readback], and a final
+  barrier that returns dst to the caller's stated layout. The colour pass
+  always writes dst; a frame whose lens correction is invalid records no
+  lens pass at all. The denoise pass
   dispatches one workgroup slice per CFA plane over a half resolution grid
   (`gl_WorkGroupID.z` selects the plane) and the debayer then reads its
   output image instead of the caller's source. The highlight
@@ -716,7 +723,11 @@ for containers without them.
   checks of section 18.5 that the definition rebuilds what it says it
   does, that both ways of switching it off are the plain chain bit for bit
   and that an unclipped frame moves by no more than its mosaic's fp16
-  rounding. lavapipe is acceptable for these
+  rounding. The defringe is held to 1e-2 absolute against the reference
+  run on the GPU's own undefringed intermediate, on the real frame to a
+  count of pixels past that bound, plus the checks of section 19.5 that
+  the definition does what it says, that both ways of switching it off
+  are the plain chain bit for bit and that it ran. lavapipe is acceptable for these
   tests; it exposes everything required.
 - `test_pipeline`, gamut compression (section 8.1), in three parts. The
   operator alone, on the CPU: the thresholds and power against the
@@ -1553,8 +1564,9 @@ of operation as Adobe's colour noise reduction, the one setting a photo
 converter turns on for every file, and RawTherapee's wavelet chrominance
 denoise.
 
-Where it sits: after the false colour stage of section 17, on the camera
-RGB intermediate, before the histogram of 4.4 and the colour stage of 4.3,
+Where it sits: after the false colour stage of section 17, the lens warp
+of section 16 and the defringe of section 19, on the camera RGB
+intermediate, before the histogram of 4.4 and the colour stage of 4.3,
 which read what it leaves. The intermediate is always RGBA16F whatever
 the output space, G is the channel the sensor sampled twice as densely,
 and R - G and B - G are the colour differences the debayer built its
@@ -2235,38 +2247,58 @@ kernel's footprint, not for the sampling position.
 
 ### 16.3 Where the stage sits
 
-After the colour pass, on the linear output image, and last. Section 1
+On the camera RGB intermediate, after the debayer and the false colour
+stage of section 17 and before the defringe of section 19. Section 1
 originally reserved it as "a per-channel resampling warp after the debayer
-and before any scaling", and after the colour pass is the earliest point
-that is true of: the warp needs the three channels in the same image, which
-is anything after the debayer, and it must not run on the mosaic, where
-resampling a CFA would be meaningless. Running it after the colour pass
-rather than on the camera RGB intermediate also means it resamples the
-values the caller is going to look at — one interpolation, in the space the
-picture is finally in, instead of one before a matrix that would spread its
-error across channels.
+and before any scaling"; the warp needs the three channels in the same
+image, which is anything after the debayer, and it must not run on the
+mosaic, where resampling a CFA would be meaningless.
 
-With `CRAW_PIPELINE_FLAG_LENS` the colour pass writes an internal image and
-the warp writes the caller's destination; without the flag nothing changes
-and the colour pass writes the destination as it always did. The internal
-image is created in the pipeline's own `out_format`, so RGBA16F by default
-and RGBA32F when the caller asked for 32-bit output: a caller who asked for
-32 bits asked for them all the way, and an internal image is no place to
-quantize them away.
+The first version ran it after the colour pass, on the linear output, on
+the argument that it then resamples the values the caller is going to
+look at. That was wrong for the part of the record that matters most here.
+The record's three polynomials are the camera's: the lateral chromatic
+aberration is a property of the light each of the sensor's filters passes,
+so its correction belongs to the camera's R, G and B, and warping the
+output space's R, which is a mixture of all three, moves the camera's G
+and B inside it by R's amount (16.7). Nothing else pulls the other way: the
+common, distorting part of the three polynomials commutes with the colour
+pass, which is per pixel and linear up to the gamut compression, so where
+it runs changes nothing about it.
 
-Being last, it also runs after the gamut compression of section 8.1, and
-its Catmull-Rom kernel has negative lobes: at a hard edge it can put a
-small negative back into an ACEScg frame the colour stage had made clean.
-On P1000387 frame 0 that is 1 pixel in 17.5 M. Moving the compression after
-the warp would mean the lens shader knowing the output space and carrying
-the operator, for a residual that `CRAW_FRAME_FLAG_CLAMP_NEGATIVE` removes
-for nothing; it is documented here instead.
+It also has to come before the defringe. The defringe clamps the colour
+of an edge to what its two sides have, which aligns the three channels'
+edges at the level's edge; a warp that shifted R and B afterwards would
+pull them off it again, into a fringe of the opposite colour as wide as
+the correction. At the top left corner of P1001259.MOV, leaves against the
+sky, where the record separates R from B by about 2 px, the mean colour
+at the strong edges of a 500x300 crop (the distance in ln R/G, ln B/G)
+was 0.293 with the warp on the output and 0.274 with the defringe ahead of
+it, against 0.167 with the defringe run on the warped output; with the
+warp on the intermediate, ahead of the defringe, it is 0.205. The false
+colour stage stays ahead of the warp: its medians work on the sensor's
+own grid, where the debayer's single pixel errors are single pixels.
 
-The auto white balance histogram is not affected. It reads the *camera RGB*
-intermediate (section 4.4), two stages ahead of the warp, so it describes
-the frame the camera saw and not the frame the lens correction produced.
-That is the right way round: the estimator's locus is the camera's, and a
-geometric resample of the picture does not change what illuminant lit it.
+The warp cannot run in place, so it writes the second intermediate of
+section 3 and the two swap, like the false colour stage: RCD's aux image,
+or the pipeline's own scratch with the other methods. The colour pass then
+writes the caller's destination whatever the flags. Running on the fp16
+intermediate costs a caller who asked for RGBA32F output nothing it had:
+the intermediate the colour pass reads was fp16 before the warp too.
+
+Being ahead of the colour pass, the warp's overshoot now goes through the
+gamut compression of section 8.1 like everything else. Its Catmull-Rom
+kernel has negative lobes, and at a hard edge in the camera's channels
+that can still come out as a small negative in ACEScg: on P1000387 frame
+0 with cineraw's defaults, 25 pixels in 17.5 M have a negative component
+with the warp and without the defringe, against 14 without the warp, and
+none with both. `CRAW_FRAME_FLAG_CLAMP_NEGATIVE` removes the rest.
+
+The auto white balance histogram reads the intermediate after the warp
+(section 4.4). A geometric resample of the picture does not change what
+illuminant lit it; 16.8's black border is black in all three channels, so
+a block entirely inside it falls below the histogram's floor and one that
+straddles it keeps the ratios of its picture pixels.
 
 `CRAWFrameParams` carries a `CRAWLensCorrection` **by value**, not by
 pointer. The record is different on every frame of a clip that is zooming,
@@ -2390,7 +2422,11 @@ pipeline with `--lens off` against **5.943 / 5.960 / 5.947 / 5.932 ms**
 with the stage running, so the pass is **0.73 to 0.87 ms**, call it 0.8.
 The target was under 1.5 and the frame budget at 30p is 33. In cineview,
 which measures libcraw's own timestamps rather than the whole submission,
-the same frames read 5.3 to 6.2 ms with the stage on.
+the same frames read 5.3 to 6.2 ms with the stage on. Those were measured
+with the warp on the output; on the intermediate (16.3), over 30 frames
+of P1000352.MOV with the highlight reconstruction and the defringe off,
+it is 5.18 against 5.87 ms, 0.69 ms, and with RGBA32F output 5.47 against
+6.27 ms, 0.80 ms, where it used to read and write the 32-bit image.
 
 That is 49 image loads per pixel — sixteen taps for each of three channels
 plus one for alpha — on 17.5 million pixels, which only fits in 0.8 ms
@@ -2406,22 +2442,15 @@ A frame with no record costs nothing at all, because the pass is not
 recorded: measured at **0.037 ms** difference on the 256x160 test frame,
 i.e. inside the noise of the measurement.
 
-### 16.7 Channels after the colour stage, and what is not verified
+### 16.7 The channels, and what is not verified
 
-Two things about the lateral chromatic aberration are worth stating plainly,
-because neither is settled by anything here.
-
-**The record's channels are the camera's; the warp's channels are the output
-space's.** The stage runs after the colour pass (16.3), so it applies the R
-polynomial to the output image's R, which is a linear combination of the
-camera's R, G and B. For the radial distortion this is exact: the common
-part of the three polynomials is the same for every channel, so warping a
-mixture is warping each part by the same amount. For the *difference*
-between the channels it is not: correcting the camera's aberration properly
-would mean warping the camera channels and then applying the matrix.
-Whether that matters in practice depends on how diagonal the combined
-matrix is, and this version does not attempt to find out; the stage is
-where section 1 reserved it and where the distortion wants it.
+**The record's channels are the camera's, and so are the warp's.** The
+first version ran the stage after the colour pass and so applied the R
+polynomial to the output image's R, a linear combination of the camera's
+R, G and B. For the radial distortion that is exact, the common part of
+the three polynomials being the same for every channel; for the
+*difference* between them it is not, and the stage now warps the camera
+channels ahead of the matrix (16.3).
 
 **The aberration correction is not verified on a real frame.** On the
 synthetic frame it is exact: `test_pipeline` puts three deliberately
@@ -2441,6 +2470,27 @@ polynomial per channel, and whether the camera's numbers are the right ones
 for a real lens remains open — as does the channel ordering, which
 `tools/prr_lens.md` section 8 already lists as inferred rather than
 established.
+
+The corners say the correction is at least not wrong way round, and
+leave its size open. With the warp on the camera channels and the
+defringe off, the lateral part of the record scaled by a factor a
+(k_R and k_B moved to k_G + a (k - k_G)), the mean colour at the strong
+edges of the 1100x700 corners of three clips:
+
+    corner           a = 0    0.35    0.6     1      R, B swapped   negated
+    P1001259 TL      0.300   0.257   0.311   0.486       0.403       1.016
+    P1001259 BR      0.492   0.331   0.270   0.302
+    P1000352 BL      1.016   0.837   0.841   0.988
+    P1000352 BR      0.929   0.802   0.813   0.989
+
+(the swapped and negated columns on the 500x300 crop of 16.3, where a = 0
+reads 0.329 and a = 1 0.478). Negated or swapped is worse than no
+correction at all, so the order and the sign stand. But the best a is
+0.35 at one corner and 0.6 to 1 at the opposite one of the same frame,
+which is not what a record that is merely too large would do; a centre
+that is not where the record says, which the body's stabilisation would
+move from frame to frame, would. On P1001123, a night street, every
+column reads within 1% of the others: the corners' edges are noise.
 
 ### 16.8 Keeping everything, with black borders
 
@@ -2696,8 +2746,8 @@ is why the default is zero, as it is in every raw converter.
 Between the debayer and everything that reads the intermediate: the auto
 white balance histogram of 4.4 and the colour stage of 4.3 both read the
 filtered copy, so a road full of glints stops voting on the illuminant too.
-The copy is a second RGBA16F image, because no pass in this library reads
-an image it also writes. With RCD it is RCD's own aux image (section 5.3
+The copy is a second RGBA16F image, because a pass that reads its
+neighbours cannot write the image it reads. With RCD it is RCD's own aux image (section 5.3
 pass A writes it, pass C is its last reader, and nothing touches it again
 until the next frame's pass A), so the default pipeline pays no memory for
 the stage. Bilinear and MHC have no such image and get one, 140 MB at 5.8K.
@@ -3130,3 +3180,209 @@ nothing there. On P1000352's sky, which is clipped over most of the frame
 and whose nearest unclipped light is the warm band along the horizon,
 the rebuilt sky still shows lavender and pink patches of the kind the
 green-magenta column measures.
+
+## 19. Defringe
+
+### 19.1 The fringe
+
+A lens images the three colours slightly differently: shifted (lateral
+chromatic aberration, which section 16 corrects after the colour stage) and
+blurred by different amounts (axial chromatic aberration, which no warp can
+undo, and which is largest for whatever is out of focus). At a hard edge
+between something bright and something dark the three channels therefore
+cross the edge in slightly different places, and the pixels in between take
+a colour that neither side has: the purple rim of a branch against the
+sky, the blue line along the bottom of a lit window, the cyan and yellow
+edges of a street light.
+
+Highlight reconstruction (section 18) makes these more visible. The old
+clip of 4.1 flattened every channel above the balanced clip to 1.0, which
+turned the fringe at a blown edge white; kept, it is as coloured as the
+optics made it. On P1081807.MOV, a fluorescent tube close to the camera and
+out of focus, R's image of the tube is almost a pixel narrower than G's
+and B's is shifted by 0.7 px, and the rows along its long, nearly
+horizontal edge come out pink where R has reached its clip and G has not,
+in a staircase that follows the sensel rows.
+
+### 19.2 Definition
+
+On the camera RGB intermediate of section 3, per pixel:
+
+    Y  = (R + 2 G + B) / 4                         the Bayer-weighted level
+    c  = (ln(max(R, YMIN) / max(G, YMIN)), ln(max(B, YMIN) / max(G, YMIN)))
+    l  = ln(max(Y, YMIN) + Y0)
+    E  = |Sobel(l)| / 8                            edge strength, per pixel, in ln units
+
+with YMIN = 1e-3 and Y0 = 0.02 of the balanced clip, about half of diffuse
+white at base ISO, so that the log gradient of noise and of detail in the
+shadows is not an edge. Then at every pixel p:
+
+    En = the largest E over the 5x5 around p       near a strong edge
+    Yx = the largest Y over the 3x3 around p       and bright enough to matter
+    t  = strength * smoothstep(E_LO, E_HI, En) * smoothstep(B_LO, B_HI, Yx)
+
+with E_LO = 0.15, E_HI = 0.35, B_LO = 0.005 and B_HI = 0.02: the gate is
+fully open from half of diffuse white at base ISO, and Yx is the 3x3's
+largest so that a dark pixel on the dark side of a light's edge still
+counts. A pixel with t = 0 is left exactly as it was. Otherwise the edge
+normal n is the gradient of l smoothed over the 5x5, i.e. l convolved with
+the 7x7 kernel whose columns weigh (-1, -1, 0, 0, 0, 1, 1) and rows
+(1, 3, 4, 4, 4, 3, 1) for x (the transpose for y), normalized to unit
+length. Each side of the edge is sampled where the edge has ended:
+
+    for s = +1 and s = -1:
+        k_s = the k in D_MIN .. D_MAX whose pixel round(p + s k n) has the
+              smallest E, the nearer on a tie
+        S_s = the 3x3 mean of (Y, c) at p + s k_s n, bilinear between the
+              four integer positions around it
+
+with D_MIN = 2 and D_MAX = 6. A side whose Y is below DARK = 0.1 of the
+brighter side's counts as neutral: its colour is taken as c = (0, 0). The
+allowed range of c is [min, max] over the two sides, per component,
+widened by MARGIN = 0.03 on both ends, and
+
+    c' = c + t * (clamp(c, range) - c)
+    RGB' = Y * (e^c'r, 1, e^c'b) * 4 / (e^c'r + 2 + e^c'b)      Y kept
+
+A pixel whose c the clamp does not move is left exactly as it was.
+
+The rule is that the colour of a pixel on an edge must lie between the
+colours on the two sides of that edge. A pixel between a green leaf and a
+white sky is between green and white and is not touched; a pink pixel
+between a white tube and a grey wall is outside anything either side has
+and is pulled back to the nearest colour they span. Only pixels near an
+edge of at least E_LO in ln units per pixel are considered at all, which
+is several times the steepest colour edge of an ordinary scene (the orange
+paint on the road of P1081807 peaks at 0.03) and well below a lamp or a
+branch against the sky (0.6 to 1.5).
+
+The sides are found rather than placed. The fringe must not vote on its
+own colour, and the fringe of something out of focus, like the tube, is
+three to five pixels wide, so a side taken at a fixed three pixels lands
+inside it; one taken at a fixed six crosses a leaf four pixels wide and
+reads the sky beyond it. The point of least E along the normal, two to
+six pixels out, is where the edge has ended on that side, whichever of
+the two it is.
+
+A dark side is neutral rather than left out. Its measured colour is the
+bright side's light spilled into it by the blur, the fringe itself, and
+noise, so taking it lets the fringe vote after all; leaving it out would
+hold the dark pixels beside a red light to red, and tint them. Neutral is
+the colour of the illuminant once the white balance has run, which is
+what a dark surface next to a light most likely has: a grey pixel beside
+a red bar stays grey, since grey lies between red and neutral, and a blue
+rim beside a white lamp is pulled to white. What it costs is the real
+colour of a dark object beside a bright one, within the three pixels of
+the edge where the stage acts at all.
+
+The level is kept, in the debayer's own Bayer weighting. The fringe is a
+fault of colour; the level of the edge is the lens's blur of the scene
+and is right as it is, and keeping it means the stage can neither move an
+edge nor draw a halo in level. It also means the stage cannot repair a
+fault of level: where highlight reconstruction rebuilt the core of the
+tube one sensel row at a time, the rows keep their levels (19.6).
+
+### 19.3 Where it sits, and the two passes
+
+On the camera RGB intermediate after the false colour stage of section 17
+and the lens warp of section 16, and before the chroma denoise of 14.4,
+the histogram of 4.4 and the colour pass of 4.3, which read what it
+leaves. After the warp, because the warp re-registers the channels and a
+defringe ahead of it would align them at the level's edge only for the
+warp to pull them apart again (16.3). Before the chroma denoise, because
+that smooths colour over blocks of four pixels: a fringe it had spread
+would be wider than the side search reaches and paler, harder to tell
+from a real colour, and defringed first it is gone before it can be
+spread. On the camera RGB rather than the output, because there every
+channel is positive, neutral is c = (0, 0) whatever the output space, and
+Y is the weighting the debayer used.
+
+Two dispatches. `defringe_prep` writes (l, c, E) per pixel into the
+second intermediate of section 3 as RGBA16F; l stays within +-4, so its
+fp16 is good to 2^-9, 0.2% of Y, and c and E need no more. `defringe`
+then works in place on the intermediate: each invocation reads the first
+pass's image around its pixel and only its own texel of the intermediate,
+and writes that texel only if the clamp moved it, so every pixel the
+stage leaves alone is bit for bit what came in. Most pixels leave after
+the 5x5 of E. The reference in `lib/ref/ref_defringe.c` rounds the first
+pass's four values to fp16 as the GPU stores them.
+
+With RCD the second image is RCD's aux, and the stage costs no memory;
+with bilinear or MHC it is the pipeline's scratch, 140 MB at 5.8K, shared
+with the other stages that need it.
+
+### 19.4 Cost and API
+
+Measured with `cineraw --bench` over 30 frames of P1081807.MOV on the
+6900 XT, RCD, highlight reconstruction and lens correction on: 6.32 ms a
+frame without the stage, 7.37 ms with it. The first pass is about 0.76 ms
+of that, measured with the second made to return at once: a read and a
+write of an RGBA16F frame, 280 MB, is 0.55 ms at this card's bandwidth,
+and the nine logarithms per pixel of its Sobel read the 3x3 through the
+cache. The second pass, 25 loads for the gate at every pixel and the rest
+at the few percent near a strong edge, is 0.3 ms.
+
+`CRAW_PIPELINE_FLAG_DEFRINGE` builds the stage and
+`CRAWFrameParams.defringe_strength`, 0 to 1, switches it per frame: zero
+dispatches nothing and is the plain chain bit for bit, anything above one
+is EINVAL at record time. The strength scales t, so a half moves each
+colour halfway to its clamp. `craw_frame_params_init` leaves it at zero.
+The CLI spelling is `--defringe STRENGTH` in both tools, 1 by default,
+and cineview's Debayer section carries the same number under the
+highlights switch: it is on by default there because the highlight
+reconstruction, also on by default, is what uncovers the fringes it
+removes.
+
+### 19.5 Testing
+
+`test_pipeline` on a scene of its own, in balanced camera RGB inverted to
+raw codes with the usual +-8 counts of noise: a bright neutral bar (0.9
+on 0.03) whose R is imaged a pixel right and down and whose B a pixel left
+and up, the way a lens misregisters them; a saturated red bar (0.9, 0.08,
+0.06) on 0.01, a hard edge whose colour is real; and an orange and a grey
+half of equal Y side by side, a colour edge with no edge in level at all.
+On the CPU, through the reference RCD and the reference stage: the 836
+pixels within three of the neutral bar's outline carry colour up to 4.55
+before and 0.085 at the 99th percentile after (bound 0.12); the red bar's
+rim keeps its ln R/G, 2.289 before and after (it may not lose more than
+0.05); not a pixel of the orange and grey patch moves, nor one far from
+every edge; and no neutral pixel of the dark background comes out
+coloured. On the GPU: both ways of switching it off are the plain chain
+bit for bit; MHC and RCD match the reference run on the GPU's own
+undefringed intermediate to 4.2e-3 and 1.8e-3 (bound 1e-2) and sit 0.47
+and 0.52 away from the plain chain, so the pass cannot have silently not
+run; a strength of 1.5 is refused.
+
+Against the whole reference chain the same frames differ by 2.0e-2 and
+6.8e-3, and that is a comparison of the debayers: the side search is an
+argmin over fp16 values of E, and a debayer disagreement of a millesimal
+moves it at the corners of the scene, where the normal turns fast. For
+the same reason the real frame (with `CRAW_TEST_FRAME`) is held to a
+count rather than a maximum: on P1081807 frame 0 the stage moves 276241
+pixels, 1.6%, by up to 0.41, and against the reference on the same
+intermediate 22 of them differ by more than 1e-2 (at most one in a
+thousand of those moved is allowed), up to 0.12.
+
+### 19.6 On real frames
+
+GPU output through cineraw, the colour at the strong edges of each crop
+(the mean distance in ln R/G, ln B/G, BT.709) without and with the stage,
+and the share of the crop's pixels whose colour moved by more than 0.05:
+
+    crop                                      edge colour        moved
+    P1081807 tube, 380x100                    0.435 -> 0.174     11.7%
+    P1081807 road, 700x300                    no strong edge      0.0%
+    P1001259 leaves against the sky, 500x400  0.417 -> 0.262     25.8%
+    P1000352 window, 500x400                  no strong edge      0.0%
+    P1001123 railing under a lamp, 700x400    2.333 -> 0.290      0.5%
+    P1001123 lit window, 260x240              1.821 -> 0.855      2.8%
+
+The rainbow along the railing's specular line goes; the blue and purple
+rims of the lit window and the purple rims of the leaves go, the leaves
+keeping their green; the blue ends and most of the pink of the tube go.
+What stays in the tube is a staircase in level along its lit core, the
+rows that the highlight reconstruction rebuilt at different heights (18.2)
+because R reached its clip on some and not others; that is a fault of
+level and the stage keeps level. Fringes wider than D_MAX, the purple
+bloom around a strongly defocused highlight, are wider than the side
+search and stay.

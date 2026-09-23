@@ -522,6 +522,12 @@ static int test_check_histogram(const char *method, const uint32_t *gpu_count,
 #define TEST_FC_TOL_FACTOR   2.0
 #define TEST_FC_REAL_FACTOR  2.0
 
+/* The defringe stage against the reference on the same input. Almost
+ * every pixel agrees to an fp16 step; the exceptions are corners, where
+ * the edge's normal turns fast and an E one fp16 step apart picks a
+ * different side sample. DESIGN.md 19.5. */
+#define TEST_DF_TOL          1e-2
+
 /* The 3x3 [1 -2 1; -2 4 -2; 1 -2 1] / 6 high pass of one CFA plane has
  * unit gain on white noise variance and none at all on a bilinear signal,
  * so its median absolute value over a flat patch is 0.6745 noise standard
@@ -3275,9 +3281,295 @@ done:
     return ret;
 }
 
+/* ---------------------------------------------------------------- defringe */
+
+/* A smooth box: 1 inside [x0, x1] x [y0, y1], 0 outside, with a linear ramp
+ * a pixel and a half wide on every side. */
+static float test_df_box(float x, float y, float x0, float x1, float y0, float y1)
+{
+    float ax = CRAW_CLAMP(CRAW_MIN(x - x0, x1 - x) / 1.5f + 0.5f, 0.0f, 1.0f);
+    float ay = CRAW_CLAMP(CRAW_MIN(y - y0, y1 - y) / 1.5f + 0.5f, 0.0f, 1.0f);
+    return ax * ay;
+}
+
+/* The defringe scene of DESIGN.md 19.5, in balanced camera RGB: a bright
+ * neutral bar whose R is imaged a pixel right and down and whose B a pixel
+ * left and up, the way a lens misregisters them; a saturated red bar on
+ * black, a hard edge whose colour is real; and an orange and a grey half of
+ * equal level, a colour edge with no edge in level at all. */
+static void test_df_truth(int x, int y, float rgb[3])
+{
+    static const float shift[3][2] = { { 1.0f, 1.0f }, { 0.0f, 0.0f }, { -1.0f, -1.0f } };
+    const float bg = 0.03f;
+
+    for (int c = 0; c < 3; c++) {
+        float b = test_df_box((float)x - shift[c][0], (float)y - shift[c][1], 40, 110, 30, 70);
+        rgb[c] = bg + (0.9f - bg) * b;
+    }
+
+    if (x >= 136 && x <= 210 && y >= 20 && y <= 80) {
+        static const float red[3] = { 0.9f, 0.08f, 0.06f };
+        float b = test_df_box((float)x, (float)y, 140, 200, 30, 70);
+        for (int c = 0; c < 3; c++)
+            rgb[c] = 0.01f + (red[c] - 0.01f) * b;
+    }
+
+    if (y >= 100 && y <= 150 && x >= 20 && x <= 240) {
+        static const float orange[3] = { 0.8f, 0.4f, 0.1f }, grey[3] = { 0.425f, 0.425f, 0.425f };
+        for (int c = 0; c < 3; c++)
+            rgb[c] = x < 128 ? orange[c] : grey[c];
+    }
+}
+
+static void test_df_gen_mosaic(uint16_t *m)
+{
+    for (int y = 0; y < TEST_H; y++) {
+        for (int x = 0; x < TEST_W; x++) {
+            int s = (y & 1) * 2 + (x & 1);
+            int c = (s == 0) ? 0 : (s == 3) ? 2 : 1;
+            float rgb[3];
+            int iv;
+
+            test_df_truth(x, y, rgb);
+            iv = (int)lrintf((TEST_BLACK + rgb[c] / test_wb[c] * (TEST_WHITE - TEST_BLACK)) * 65535.0f);
+            iv += (int)(test_hash((uint32_t)(y * TEST_W + x) * 2654435761u) % 17u) - 8;
+            m[y * TEST_W + x] = (uint16_t)CRAW_CLAMP(iv, 0, 65535);
+        }
+    }
+}
+
+static int test_cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+static double test_df_chroma(const float *px)
+{
+    double r = log(CRAW_MAX(px[0], 1e-3) / CRAW_MAX(px[1], 1e-3));
+    double b = log(CRAW_MAX(px[2], 1e-3) / CRAW_MAX(px[1], 1e-3));
+    return hypot(r, b);
+}
+
+/* The definition on the CPU, DESIGN.md 19.5. */
+static int test_df_definition(const uint16_t *m, const CRAWProfile *identity)
+{
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    float *before = malloc(npix * 4 * sizeof(*before)), *after = malloc(npix * 4 * sizeof(*after));
+    double fringe_before = 0.0, *fringe_after = NULL, red_before = 0.0, red_after = 0.0;
+    int nf = 0, nred = 0, moved_orange = 0, moved_far = 0, tinted = 0;
+    int ret = -1;
+
+    fringe_after = malloc(npix * sizeof(*fringe_after));
+    if (!before || !after || !fringe_after)
+        goto done;
+    if (craw_ref_debayer(m, TEST_W, TEST_H, TEST_W, identity, CRAW_DEBAYER_RCD, before) < 0)
+        goto done;
+    memcpy(after, before, npix * 4 * sizeof(*after));
+    if (craw_ref_defringe(after, TEST_W, TEST_H, 1.0f) < 0) {
+        fprintf(stderr, "craw_ref_defringe failed\n");
+        goto done;
+    }
+
+    for (int y = 0; y < TEST_H; y++) {
+        for (int x = 0; x < TEST_W; x++) {
+            const float *b = &before[((size_t)y * TEST_W + x) * 4];
+            const float *a = &after[((size_t)y * TEST_W + x) * 4];
+            bool moved = memcmp(a, b, 4 * sizeof(*a)) != 0;
+            float yb = (b[0] + 2.0f * b[1] + b[2]) * 0.25f;
+            /* Distance to the fringed bar's outline. */
+            int dx = CRAW_MIN(abs(x - 40), abs(x - 110)), dy = CRAW_MIN(abs(y - 30), abs(y - 70));
+            bool in_x = x >= 36 && x <= 114, in_y = y >= 26 && y <= 74;
+            bool near_bar = (in_x && in_y) && (dx <= 3 || dy <= 3);
+
+            if (near_bar && yb > 0.1f) {
+                fringe_before = CRAW_MAX(fringe_before, test_df_chroma(b));
+                fringe_after[nf++] = test_df_chroma(a);
+            }
+
+            /* The red bar's own edge pixels keep their colour. */
+            if (x >= 138 && x <= 202 && y >= 28 && y <= 72 && yb > 0.1f &&
+                (CRAW_MIN(abs(x - 140), abs(x - 200)) <= 2 || CRAW_MIN(abs(y - 30), abs(y - 70)) <= 2)) {
+                red_before += log(CRAW_MAX(b[0], 1e-3) / CRAW_MAX(b[1], 1e-3));
+                red_after += log(CRAW_MAX(a[0], 1e-3) / CRAW_MAX(a[1], 1e-3));
+                nred++;
+            }
+
+            if (y >= 104 && y <= 146 && x >= 24 && x <= 236 && moved)
+                moved_orange++;
+
+            /* Far from every edge nothing moves. */
+            if ((y <= 18 || (x >= 216 && y <= 90)) && moved)
+                moved_far++;
+
+            /* No neutral pixel of the dark background takes a colour. */
+            if (yb < 0.06f && !(y >= 96 && y <= 154) && test_df_chroma(b) < 0.05 &&
+                test_df_chroma(a) > 0.08)
+                tinted++;
+        }
+    }
+
+    {
+        double *v = fringe_after, p99;
+        qsort(v, (size_t)nf, sizeof(*v), test_cmp_double);
+        p99 = v[(size_t)(0.99 * (nf - 1))];
+        red_before /= nred;
+        red_after /= nred;
+
+        printf("  defringe definition: fringed bar's rim %d px, colour up to %.3f before, "
+               "99th percentile %.3f after (bound 0.12); red bar's rim ln R/G %.3f -> %.3f; "
+               "orange/grey edge %d px moved, far from every edge %d, neutral dark pixels "
+               "tinted %d\n", nf, fringe_before, p99, red_before, red_after, moved_orange,
+               moved_far, tinted);
+
+        if (!(fringe_before > 0.3) || !(p99 <= 0.12) || !(red_after >= red_before - 0.05) ||
+            moved_orange || moved_far || tinted) {
+            fprintf(stderr, "the defringe does not do what DESIGN.md 19.2 says\n");
+            goto done;
+        }
+    }
+    ret = 0;
+
+done:
+    free(fringe_after);
+    free(before);
+    free(after);
+    return ret;
+}
+
+/* DESIGN.md 19.5: the definition on the CPU, both ways of switching the
+ * stage off, the GPU against the reference with MHC and RCD, and a
+ * strength above one refused. Leaves the defringe scene in `src`. */
+static int test_defringe(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                         CRAWTestImage *src, CRAWTestImage *dst, float *gpu, float *ref)
+{
+    static const enum CRAWDebayer methods[] = { CRAW_DEBAYER_MHC, CRAW_DEBAYER_RCD };
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    uint16_t *m = malloc(npix * sizeof(*m));
+    float *plain = malloc(npix * 4 * sizeof(*plain));
+    double ms = 0.0;
+    int ret = -1;
+
+    if (!m || !plain)
+        goto done;
+
+    test_df_gen_mosaic(m);
+    if (test_df_definition(m, identity) < 0)
+        goto done;
+    if (craw_testdev_image_upload(td, src, m, npix * sizeof(*m)) < 0)
+        goto done;
+
+    /* Off both ways, bit for bit. */
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_W;
+    pp.height = TEST_H;
+    pp.debayer = CRAW_DEBAYER_RCD;
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+    if (test_run_config(td, ctx, src, dst, &pp, &fp, plain, NULL, NULL, &ms) < 0)
+        goto done;
+    for (int off = 0; off < 2; off++) {
+        pp.flags = off ? 0 : CRAW_PIPELINE_FLAG_DEFRINGE;
+        fp.defringe_strength = off ? 1.0f : 0.0f;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+        if (memcmp(gpu, plain, npix * 4 * sizeof(*gpu))) {
+            fprintf(stderr, "defringe %s changed the frame\n",
+                    off ? "on a pipeline without the stage" : "at strength 0");
+            goto done;
+        }
+    }
+    printf("  defringe off both ways: bit for bit the plain chain\n");
+
+    /* The stage against the reference run on the GPU's own undefringed
+     * frame: with identity colour the destination is the intermediate
+     * itself. Against the whole reference chain the comparison would be of
+     * the debayers: the side search is an argmin over fp16 E, and the
+     * debayer's own disagreement of a millesimal moves it at a corner. */
+    for (size_t mi = 0; mi < CRAW_ARRAY_ELEMS(methods); mi++) {
+        enum CRAWDebayer method = methods[mi];
+        double err, cross, chain;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.debayer = method;
+        pp.flags = CRAW_PIPELINE_FLAG_DEFRINGE;
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, plain, NULL, NULL, &ms) < 0)
+            goto done;
+        fp.defringe_strength = 1.0f;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+        if (craw_ref_process(m, TEST_W, TEST_H, TEST_W, &pp, &fp, ref) < 0) {
+            fprintf(stderr, "defringe: craw_ref_process failed\n");
+            goto done;
+        }
+        chain = test_max_abs(gpu, ref, npix);
+        memcpy(ref, plain, npix * 4 * sizeof(*ref));
+        if (craw_ref_defringe(ref, TEST_W, TEST_H, 1.0f) < 0) {
+            fprintf(stderr, "defringe: craw_ref_defringe failed\n");
+            goto done;
+        }
+        err = test_max_abs(gpu, ref, npix);
+        cross = test_max_abs(gpu, plain, npix);
+
+        printf("  defringe %-8s: max abs %.3e (tol %.1e) on the same input, %.3e against the "
+               "reference chain, %.3f against the plain chain, %.3f ms\n",
+               test_method_name(method), err, TEST_DF_TOL, chain, cross, ms);
+        if (!(err <= TEST_DF_TOL)) {
+            fprintf(stderr, "defringe on %s differs by %.3e, tolerance %.1e\n",
+                    test_method_name(method), err, TEST_DF_TOL);
+            goto done;
+        }
+        if (!(cross > 0.05)) {
+            fprintf(stderr, "a defringed %s frame is only %.3f from the plain one; the pass "
+                    "cannot have run\n", test_method_name(method), cross);
+            goto done;
+        }
+    }
+
+    /* More than all the way is an error, not a clamp. */
+    {
+        CRAWPipeline *pipe = NULL;
+        struct test_run run;
+        int rec;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.flags = CRAW_PIPELINE_FLAG_DEFRINGE;
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.defringe_strength = 1.5f;
+        if (craw_pipeline_create(ctx, &pp, &pipe) < 0)
+            goto done;
+        run = (struct test_run) { .pipe = pipe, .src = src, .dst = dst, .fp = &fp };
+        rec = craw_testdev_run(td, test_record, &run);
+        craw_pipeline_free(&pipe);
+        if (rec != CRAW_ERROR(EINVAL)) {
+            fprintf(stderr, "a defringe strength of 1.5 returned %d, wanted %d\n", rec,
+                    CRAW_ERROR(EINVAL));
+            goto done;
+        }
+    }
+
+    ret = 0;
+
+done:
+    free(plain);
+    free(m);
+    return ret;
+}
+
 /* ----------------------------------------------------------- real frame */
 
-static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile)
+static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile,
+                           const CRAWProfile *identity)
 {
     const char *path = getenv("CRAW_TEST_FRAME");
     const size_t npix = (size_t)FRAME_W * FRAME_H;
@@ -3565,6 +3857,60 @@ static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfi
         }
     }
 
+    /* And the defringe stage, DESIGN.md 19.5: timed on the plain RCD
+     * chain, then held, as on the synthetic frame, against the reference
+     * run on the GPU's own undefringed intermediate. `ref` takes that
+     * intermediate and is defringed in place. A real frame has edges at
+     * every angle and corners everywhere, so a few side searches go the
+     * other way: held to a count of pixels past the tolerance, not to the
+     * largest difference. */
+    {
+        double err, cross, total_ms;
+        size_t moved = 0, beyond = 0;
+
+        pp.flags = CRAW_PIPELINE_FLAG_DEFRINGE;
+        fp.flags = 0;
+        fp.defringe_strength = 1.0f;
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, gpu, NULL, NULL, &total_ms);
+        if (ret < 0)
+            goto done;
+
+        fp.profile = identity;
+        fp.defringe_strength = 0.0f;
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, ref, NULL, NULL, &ms);
+        if (ret < 0)
+            goto done;
+        fp.defringe_strength = 1.0f;
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, gpu, NULL, NULL, &ms);
+        if (ret < 0)
+            goto done;
+        fp.profile = profile;
+
+        cross = test_max_abs(gpu, ref, npix);
+        for (size_t i = 0; i < npix; i++)
+            moved += memcmp(&gpu[i * 4], &ref[i * 4], 3 * sizeof(*gpu)) != 0;
+
+        ret = craw_ref_defringe(ref, FRAME_W, FRAME_H, 1.0f);
+        if (ret < 0)
+            goto done;
+        err = test_max_abs(gpu, ref, npix);
+        for (size_t i = 0; i < npix * 4; i += 4)
+            beyond += fabsf(gpu[i] - ref[i]) > TEST_DF_TOL || fabsf(gpu[i + 1] - ref[i + 1]) > TEST_DF_TOL ||
+                      fabsf(gpu[i + 2] - ref[i + 2]) > TEST_DF_TOL;
+
+        printf("  rcd + defringe on %dx%d: %.2f ms, %zu px moved (%.2f%%) by up to %.3e; on "
+               "the same intermediate %zu px past %.0e (at most %zu), max abs %.3e\n", FRAME_W,
+               FRAME_H, total_ms, moved, 100.0 * (double)moved / (double)npix, cross, beyond,
+               TEST_DF_TOL, moved / 1000, err);
+
+        if (beyond > moved / 1000 || !moved) {
+            fprintf(stderr, "defringe on the real frame differs at %zu px by more than %.0e, "
+                    "of %zu moved\n", beyond, TEST_DF_TOL, moved);
+            ret = -1;
+            goto done;
+        }
+    }
+
 done:
     if (ret < 0)
         fprintf(stderr, "real frame run failed: %d\n", ret);
@@ -3765,14 +4111,16 @@ int main(void)
     if (test_lens(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
         goto done;
 
-    /* Replaces the scene in `src`; test_gamut() uploads its own. */
+    /* Both replace the scene in `src`; test_gamut() uploads its own. */
     if (test_highlights(&td, ctx, &identity, &src, &dst, gpu, ref) < 0)
+        goto done;
+    if (test_defringe(&td, ctx, &identity, &src, &dst, gpu, ref) < 0)
         goto done;
 
     if (test_gamut(&td, ctx, &profile, &src, &dst, gpu, ref) < 0)
         goto done;
 
-    if (test_real_frame(&td, ctx, &profile) < 0)
+    if (test_real_frame(&td, ctx, &profile, &identity) < 0)
         goto done;
 
     printf("test_pipeline: OK\n");
