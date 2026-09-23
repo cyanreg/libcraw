@@ -273,6 +273,22 @@ static void craw_test_locus(void)
         CHECK_NEAR(il.tint, 0.0, 2e-3, "round trip tint of %g K", cct);
     }
 
+    /* The two mappings are each other's inverse off the locus too, at any
+     * tint: the tint moves a neutral along the green direction and nothing
+     * else, and the mapping back measures along the same direction. */
+    for (double cct = 2300.0; cct < 11000.0; cct += 911.0) {
+        for (double tint = -0.15; tint <= 0.15; tint += 0.05) {
+            CRAWIlluminant want = { .cct = (float)cct, .tint = (float)tint };
+
+            ret = craw_profile_illuminant_to_neutral(&p, &want, &rg, &bg);
+            CHECK(ret == 0, "illuminant_to_neutral failed: %d", ret);
+            ret = craw_profile_neutral_to_illuminant(&p, rg, bg, &il);
+            CHECK(ret == 0, "neutral_to_illuminant failed: %d", ret);
+            CHECK_NEAR(il.cct, cct, 0.05, "cct of %g K tint %+g", cct, tint);
+            CHECK_NEAR(il.tint, tint, 1e-5, "tint of %g K tint %+g", cct, tint);
+        }
+    }
+
     /* A neutral moved off the locus by a known tint comes back with that
      * tint, and still at the temperature it was moved from. */
     for (int i = 0; i < 2; i++) {
@@ -496,12 +512,81 @@ static void craw_test_colorspaces(void)
     CHECK(ret == CRAW_ERROR(EINVAL), "an unknown space must fail, got %d", ret);
 }
 
+/* The locus against the one Planckian radiator every colour table carries,
+ * CIE illuminant A at 2856 K, and the tabulated 5000 K and 6500 K points.
+ * Krystek's approximation is good to about 1e-4 in uv - it measures 1.1e-4
+ * at 5000 K - and y moves three times as far as v does, so the tolerance
+ * is in xy what that is; a just noticeable difference is ten times it. */
+static void craw_test_planckian(void)
+{
+    static const struct { float cct; double x, y; } pts[] = {
+        { 2856.0f, 0.44757, 0.40745 },
+        { 5000.0f, 0.34510, 0.35162 },
+        { 6500.0f, 0.31352, 0.32363 },
+    };
+    float xy[2], lo[2], hi[2];
+    int ret;
+
+    for (int i = 0; i < (int)(sizeof(pts) / sizeof(pts[0])); i++) {
+        ret = craw_planckian_xy(pts[i].cct, xy);
+        CHECK(ret == 0, "craw_planckian_xy(%.0f) failed: %d", pts[i].cct, ret);
+        CHECK_NEAR(xy[0], pts[i].x, 5e-4, "x at %.0f K", pts[i].cct);
+        CHECK_NEAR(xy[1], pts[i].y, 5e-4, "y at %.0f K", pts[i].cct);
+    }
+
+    /* Clamped, not extrapolated. */
+    craw_planckian_xy(15000.0f, lo);
+    craw_planckian_xy(40000.0f, hi);
+    CHECK(lo[0] == hi[0] && lo[1] == hi[1], "40000 K must clamp to 15000 K");
+
+    ret = craw_planckian_xy(NAN, xy);
+    CHECK(ret == CRAW_ERROR(EINVAL), "a NaN temperature must fail, got %d", ret);
+}
+
+/* The published D65 to D50 Bradford matrix (Lindbloom), the whites exact
+ * both ways, and the identity for one white. */
+static void craw_test_bradford(void)
+{
+    static const float d65[2] = { 0.312727f, 0.329023f };
+    static const float d50[2] = { 0.345669f, 0.358496f };
+    static const float want[3][3] = {
+        {  1.0478112f, 0.0228866f, -0.0501270f },
+        {  0.0295424f, 0.9904844f, -0.0170491f },
+        { -0.0092345f, 0.0150436f,  0.7521316f },
+    };
+    float m[3][3], w[3], out[3];
+    int ret;
+
+    ret = craw_bradford_adaptation(d65, d50, m);
+    CHECK(ret == 0, "craw_bradford_adaptation failed: %d", ret);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            CHECK_NEAR(m[i][j], want[i][j], 2e-4, "D65 to D50 [%d][%d]", i, j);
+
+    w[0] = d65[0] / d65[1];
+    w[1] = 1.0f;
+    w[2] = (1.0f - d65[0] - d65[1]) / d65[1];
+    for (int i = 0; i < 3; i++)
+        out[i] = m[i][0] * w[0] + m[i][1] * w[1] + m[i][2] * w[2];
+    CHECK_NEAR(out[0], d50[0] / d50[1], 1e-5, "D65 white to D50 X");
+    CHECK_NEAR(out[1], 1.0, 1e-5, "D65 white to D50 Y");
+    CHECK_NEAR(out[2], (1.0 - d50[0] - d50[1]) / d50[1], 1e-5, "D65 white to D50 Z");
+
+    ret = craw_bradford_adaptation(d65, d65, m);
+    CHECK(ret == 0, "craw_bradford_adaptation to itself failed: %d", ret);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            CHECK_NEAR(m[i][j], i == j ? 1.0 : 0.0, 1e-6, "identity [%d][%d]", i, j);
+}
+
 int main(void)
 {
     craw_test_validate();
     craw_test_eval();
     craw_test_locus();
     craw_test_colorspaces();
+    craw_test_planckian();
+    craw_test_bradford();
 
     if (failures) {
         printf("test_profile: %d failure(s)\n", failures);

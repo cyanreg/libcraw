@@ -169,9 +169,13 @@ CRAW_API int craw_profile_eval(const CRAWProfile *p, enum CRAWWbMode mode,
                                CRAWColorParams *out);
 
 /* Maps the raw response of a neutral surface (ratios R/G and B/G before
- * any white balance) to the nearest point of the profile's locus. Fills
- * out->cct with that point and out->tint with the signed residual.
- * Requires a white balance table with at least two knots. */
+ * any white balance) to the point of the profile's locus it lies from along
+ * the green direction, which is the direction a tint is measured in (see
+ * CRAWIlluminant). Fills out->cct with that point and out->tint with the
+ * signed distance, so that craw_profile_illuminant_to_neutral() gives the
+ * ratios back exactly wherever the table reaches; a point past either end
+ * of the locus goes to that end. Requires a white balance table with at
+ * least two knots. */
 CRAW_API int craw_profile_neutral_to_illuminant(const CRAWProfile *p,
                                                 float raw_rg, float raw_bg,
                                                 CRAWIlluminant *out);
@@ -225,5 +229,20 @@ CRAW_API int craw_colorspace_from_xyz_d65(enum CRAWColorSpace cs, float m[3][3])
  * between two output spaces, e.g. the ACEScg the pipeline rendered into
  * back out to the ACES2065-1 an archive wants. */
 CRAW_API int craw_colorspace_to_xyz_d65(enum CRAWColorSpace cs, float m[3][3]);
+
+/* The CIE 1931 xy chromaticity of a Planckian radiator at `cct` Kelvin,
+ * which is what a correlated colour temperature names when nothing else
+ * is said. Krystek's rational approximation of the locus in CIE 1960 uv,
+ * within about 1e-4 of the integrated locus from 1000 K to 15000 K, a
+ * tenth of a just noticeable difference; `cct` is clamped to that range. */
+CRAW_API int craw_planckian_xy(float cct, float xy[2]);
+
+/* The row-major matrix that adapts CIE XYZ relative to the white `src` to
+ * XYZ relative to the white `dst`, both CIE 1931 xy: von Kries in the
+ * Bradford cone space, the adaptation ACES and DNG specify and the one the
+ * ACES spaces above are reached with. It maps `src` at unit luminance onto
+ * `dst` at unit luminance exactly. */
+CRAW_API int craw_bradford_adaptation(const float src[2], const float dst[2],
+                                      float m[3][3]);
 
 #endif /* CRAW_PROFILE_H */

@@ -268,3 +268,52 @@ int craw_colorspace_to_xyz_d65(enum CRAWColorSpace cs, float m[3][3])
 
     return 0;
 }
+
+int craw_planckian_xy(float cct, float xy[2])
+{
+    double t, u, v, d;
+
+    if (!xy || !isfinite(cct))
+        return CRAW_ERROR(EINVAL);
+
+    t = fmin(fmax((double)cct, 1000.0), 15000.0);
+
+    /* Krystek 1985, "An algorithm to calculate correlated colour
+     * temperature", Color Research & Application 10(1). */
+    u = (0.860117757 + 1.54118254e-4 * t + 1.28641212e-7 * t * t) /
+        (1.0 + 8.42420235e-4 * t + 7.08145163e-7 * t * t);
+    v = (0.317398726 + 4.22806245e-5 * t + 4.20481691e-8 * t * t) /
+        (1.0 - 2.89741816e-5 * t + 1.61456053e-7 * t * t);
+
+    /* CIE 1960 uv to 1931 xy. */
+    d = 2.0 * u - 8.0 * v + 4.0;
+    xy[0] = (float)(3.0 * u / d);
+    xy[1] = (float)(2.0 * v / d);
+
+    return 0;
+}
+
+int craw_bradford_adaptation(const float src[2], const float dst[2],
+                             float m[3][3])
+{
+    double s[2], d[2], cat[3][3];
+    int ret;
+
+    if (!src || !dst || !m)
+        return CRAW_ERROR(EINVAL);
+
+    for (int i = 0; i < 2; i++) {
+        s[i] = src[i];
+        d[i] = dst[i];
+    }
+    if (!(s[1] > 0.0) || !(d[1] > 0.0))
+        return CRAW_ERROR(EINVAL);
+
+    ret = craw_bradford(s, d, cat);
+    if (ret < 0)
+        return ret;
+
+    craw_mat3_store(cat, m);
+
+    return 0;
+}

@@ -351,17 +351,28 @@ polyline through `(ln(1/wb[R]), ln(1/wb[B]))` of the wb knots, linear in
 Kelvin between knots to match the vendor decoder. It is sampled so that
 every knot is itself a sample and each knot interval is split into a whole
 number of equal steps of at most 5 mired; a uniform global grid would miss
-the knots and bias the table's own entries. For a raw neutral `(ln rg, ln bg)`
-take the nearest sample; `cct` is its Kelvin value; `tint` is the dot
-product of the residual (point minus sample) with `(-1, -1)/sqrt(2)`.
-`craw_profile_illuminant_to_neutral` is the inverse:
-`rg = (1/wb_R(cct)) * exp(-tint/sqrt(2))`, `bg` likewise.
+the knots and bias the table's own entries. A tint moves a neutral along
+`(-1, -1)/sqrt(2)` and nothing else, so for a raw neutral `(ln rg, ln bg)`
+the locus point is the one it lies from along that direction: walking the
+samples from warm to cool, the first pair between which the residual
+(point minus locus) changes sign across it - its dot product with `(1, -1)`
+- brackets the point, and bisection in mired on the interpolated gains
+finds it. `cct` is that point's Kelvin value and `tint` the dot product of
+the residual with `(-1, -1)/sqrt(2)`, which is then the whole residual; a
+point past either end goes to that end. The nearest sample would not do:
+its residual is perpendicular to the locus, which is the green direction
+only where the locus happens to cross it at a right angle, and the rest of
+the residual is lost when it becomes a tint (on the S1M2 table, 2300 K at
+tint -0.15 came back as 2269 K at -0.1475). `craw_profile_illuminant_to_neutral`
+is the exact inverse: `rg = (1/wb_R(cct)) * exp(-tint/sqrt(2))`, `bg`
+likewise.
 
 ## 7. Auto white balance estimator
 
 Inputs: histogram, profile, `CRAWAwbParams`. Per bin with count > 0, the
-bin centre is a candidate point. Compute its nearest locus sample as in
-section 6 and its distance `d`. Bins with `d < band` are in the zone.
+bin centre is a candidate point. Compute its locus point as in section 6
+and its distance `d` from it, which is the size of its tint. Bins with
+`d < band` are in the zone.
 Two readings are taken from the same bins with different weights:
 
 - zone: `w = weight_bin * exp(-(d / sigma)^2)`, every neutral-looking
@@ -432,6 +443,16 @@ BT.2020 R(0.708,0.292) G(0.170,0.797) B(0.131,0.046); P3-D65
 R(0.680,0.320) G(0.265,0.690) B(0.150,0.060); V-Gamut R(0.730,0.280)
 G(0.165,0.840) B(0.100,-0.030); AP0 R(0.7347,0.2653) G(0.0,1.0)
 B(0.0001,-0.0770); AP1 R(0.713,0.293) G(0.165,0.830) B(0.128,0.044).
+
+`craw_planckian_xy()` is the chromaticity a correlated colour temperature
+names: Krystek's rational approximation of the Planckian locus in CIE 1960
+uv (1000 K to 15000 K, about 1e-4 in uv from the integrated locus),
+converted to xy. `craw_bradford_adaptation()` is the von Kries adaptation in
+the Bradford cone space between two whites, the one the ACES spaces above
+are reached with, made public so that a caller can move a picture between
+whites the way the library does; it matches the published D65 to D50
+matrix to 2e-4. cineview uses the two for the white balance of an already
+developed clip, whose recorded temperature is a point on that locus.
 
 `craw_colorspace_to_xyz_d65()` is the other direction, built from the same
 primaries and the same adaptation and inverted from the same double

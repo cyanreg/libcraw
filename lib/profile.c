@@ -251,79 +251,115 @@ int craw_profile_eval(const CRAWProfile *p, enum CRAWWbMode mode,
     return 0;
 }
 
-/* Walks the locus and returns the sample closest to (lx, ly), which are the
- * logarithms of a neutral's raw R/G and B/G.
- *
- * The locus is the polyline through the white balance knots in that plane,
- * resampled at CRAW_LOCUS_STEP_MIRED. Every knot is itself a sample and
- * each knot interval is split into a whole number of steps of at most that
- * size: a neutral measured exactly at a knot has to map back to that knot's
- * Kelvin, otherwise the quantization of the resampling (about 150 K at
- * 5500 K) would show up as a bias against the container's own tables.
- *
- * `res` receives the residual, point minus sample. */
-static int craw_locus_nearest(const CRAWProfile *p, double lx, double ly,
-                              double *cct_out, double res[2])
+/* How far (lx, ly) - the logarithms of a neutral's raw R/G and B/G - is
+ * from the locus at `cct` across the green direction: the residual, point
+ * minus locus, dotted with (1, -1). Zero where the point lies from the
+ * locus along (1, 1), the only direction a tint moves a neutral. */
+static double craw_locus_across(const CRAWProfile *p, double lx, double ly,
+                                double cct, double res[2])
 {
-    double best = INFINITY, best_cct = 0.0, best_res[2] = { 0.0, 0.0 };
+    double wb[3];
+
+    craw_wb_at(p, cct, wb);
+    res[0] = lx + log(wb[0]);
+    res[1] = ly + log(wb[2]);
+
+    return res[0] - res[1];
+}
+
+/* Finds the point of the locus that (lx, ly) lies from along the green
+ * direction, and the residual from it, which is then along that direction
+ * too: exactly the displacement craw_profile_illuminant_to_neutral() gives
+ * a tint, so the two functions invert each other wherever the locus
+ * reaches. The nearest point would not do that - its residual is
+ * perpendicular to the locus, which is only the green direction where the
+ * locus happens to run at right angles to it, and whatever part of the
+ * residual is not along green is lost when it becomes a tint.
+ *
+ * The locus is walked from warm to cool at the knots and in steps of at
+ * most CRAW_LOCUS_STEP_MIRED between them, for the first sample pair the
+ * crossing lies between, and the crossing is then found by bisection on
+ * the profile's own interpolation of the gains. Every knot is a sample, so
+ * a neutral measured at a knot maps back to that knot's Kelvin. A point
+ * beyond either end, across the green direction, goes to that end. */
+static int craw_locus_green(const CRAWProfile *p, double lx, double ly,
+                            double *cct_out, double res[2])
+{
+    double a_cct = 0.0, a_g = 0.0, b_cct = 0.0, m_a, m_b;
+    bool have_a = false, found = false;
 
     if (!p)
         return CRAW_ERROR(EINVAL);
     if (p->nb_wb_knots < 2)
         return CRAW_ERROR(ENOTSUP);
 
-    for (uint32_t i = 0; i + 1 < p->nb_wb_knots; i++) {
-        const CRAWWbKnot *ka = &p->wb_knots[i];
-        const CRAWWbKnot *kb = &p->wb_knots[i + 1];
-        double cct_a = ka->cct;
-        double cct_b = kb->cct;
-        double mired_a = 1e6 / cct_a;
-        double mired_b = 1e6 / cct_b;
-        double span = mired_a - mired_b;
-        int steps = (int)ceil(span / CRAW_LOCUS_STEP_MIRED);
+    for (uint32_t i = 0; i < p->nb_wb_knots && !found; i++) {
+        const bool last = i + 1 == p->nb_wb_knots;
+        const double mired_a = 1e6 / p->wb_knots[i].cct;
+        const double span = last ? 0.0 : mired_a - 1e6 / p->wb_knots[i + 1].cct;
+        int steps = last ? 1 : (int)ceil(span / CRAW_LOCUS_STEP_MIRED);
 
         if (steps < 1)
             steps = 1;
 
-        /* [knot i, knot i + 1), the last knot is added after the loop. */
+        /* [knot i, knot i + 1), and the last knot on its own. */
         for (int j = 0; j < steps; j++) {
-            double mired = mired_a - span * ((double)j / steps);
-            double cct = 1e6 / mired;
-            double f = (cct - cct_a) / (cct_b - cct_a);
-            double wb_r, wb_b, dx, dy, d2;
+            double cct = 1e6 / (mired_a - span * ((double)j / steps));
+            double g = craw_locus_across(p, lx, ly, cct, res);
 
-            f = CRAW_CLAMP(f, 0.0, 1.0);
-            wb_r = ka->wb[0] + ((double)kb->wb[0] - ka->wb[0]) * f;
-            wb_b = ka->wb[2] + ((double)kb->wb[2] - ka->wb[2]) * f;
-
-            dx = lx + log(wb_r);
-            dy = ly + log(wb_b);
-            d2 = dx * dx + dy * dy;
-            if (d2 < best) {
-                best = d2;
-                best_cct = cct;
-                best_res[0] = dx;
-                best_res[1] = dy;
+            if (g == 0.0) {
+                *cct_out = cct;
+                return 0;
             }
+            if (have_a && (g > 0.0) != (a_g > 0.0)) {
+                b_cct = cct;
+                found = true;
+                break;
+            }
+
+            a_cct = cct;
+            a_g = g;
+            have_a = true;
         }
     }
 
-    {
-        const CRAWWbKnot *k = &p->wb_knots[p->nb_wb_knots - 1];
-        double dx = lx + log((double)k->wb[0]);
-        double dy = ly + log((double)k->wb[2]);
-        double d2 = dx * dx + dy * dy;
+    /* No crossing: the point is past an end of the locus, across the green
+     * direction, and goes to the end it is nearer to in that measure. */
+    if (!found) {
+        double r_warm[2], r_cool[2];
+        double warm = p->wb_knots[0].cct;
+        double cool = p->wb_knots[p->nb_wb_knots - 1].cct;
+        bool w = fabs(craw_locus_across(p, lx, ly, warm, r_warm)) <=
+                 fabs(craw_locus_across(p, lx, ly, cool, r_cool));
 
-        if (d2 < best) {
-            best_cct = k->cct;
-            best_res[0] = dx;
-            best_res[1] = dy;
+        *cct_out = w ? warm : cool;
+        res[0] = w ? r_warm[0] : r_cool[0];
+        res[1] = w ? r_warm[1] : r_cool[1];
+        return 0;
+    }
+
+    /* Halved in mired, the way the samples were spaced; sixty halvings of
+     * a five mired interval are past the double's own resolution. */
+    m_a = 1e6 / a_cct;
+    m_b = 1e6 / b_cct;
+    for (int k = 0; k < 60; k++) {
+        double m = 0.5 * (m_a + m_b);
+        double g = craw_locus_across(p, lx, ly, 1e6 / m, res);
+
+        if (g == 0.0) {
+            m_a = m_b = m;
+            break;
+        }
+        if ((g > 0.0) == (a_g > 0.0)) {
+            m_a = m;
+            a_g = g;
+        } else {
+            m_b = m;
         }
     }
 
-    *cct_out = best_cct;
-    res[0] = best_res[0];
-    res[1] = best_res[1];
+    *cct_out = 1e6 / (0.5 * (m_a + m_b));
+    craw_locus_across(p, lx, ly, *cct_out, res);
 
     return 0;
 }
@@ -341,8 +377,8 @@ int craw_profile_neutral_to_illuminant(const CRAWProfile *p,
         !isfinite(raw_rg) || !isfinite(raw_bg))
         return CRAW_ERROR(EINVAL);
 
-    ret = craw_locus_nearest(p, log((double)raw_rg), log((double)raw_bg),
-                             &cct, res);
+    ret = craw_locus_green(p, log((double)raw_rg), log((double)raw_bg),
+                           &cct, res);
     if (ret < 0)
         return ret;
 
