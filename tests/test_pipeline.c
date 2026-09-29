@@ -4705,6 +4705,139 @@ done:
     return ret;
 }
 
+/* ------------------------------------------------------------ profiling */
+
+/* CRAW_PIPELINE_FLAG_PROFILE, DESIGN.md 21: every pass of the chain once,
+ * the output bit for bit what the same pipeline without the flag writes,
+ * and the readback naming every pass in the order it ran with the number of
+ * times it did. */
+static int test_profiling(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                          CRAWTestImage *src, CRAWTestImage *dst, float *gpu)
+{
+    static const struct {
+        const char *name;
+        uint32_t count;   /* 0: the highlight pyramid's levels less one */
+    } want[] = {
+        { "denoise_nlm", 1 }, { "highlight_field", 1 }, { "highlight_pull", 0 },
+        { "highlight_push", 0 }, { "highlight_fill", 1 }, { "rcd_dir", 1 },
+        { "rcd_green", 1 }, { "rcd_rb_rb", 1 }, { "rcd_rb_g", 1 }, { "false_color", 1 },
+        { "lens", 1 }, { "defringe_prep", 1 }, { "defringe", 1 }, { "chroma_down", 1 },
+        { "chroma_blur", 1 }, { "chroma_up", 1 }, { "sharpen_prep", 1 }, { "sharpen", 2 },
+        { "sharpen_last", 1 }, { "awb_hist", 1 }, { "color", 1 },
+    };
+    const size_t nwant = sizeof(want) / sizeof(want[0]);
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    CRAWStageTime st[32];
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    CRAWPipeline *pipe = NULL;
+    struct test_run run;
+    float *plain = malloc(npix * 4 * sizeof(*plain));
+    uint32_t levels = 1;
+    double ms = 0.0, sum = 0.0;
+    int n, ret = -1;
+
+    if (!plain)
+        goto done;
+
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_W;
+    pp.height = TEST_H;
+    pp.debayer = CRAW_DEBAYER_RCD;
+    pp.flags = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE |
+               CRAW_PIPELINE_FLAG_LENS | CRAW_PIPELINE_FLAG_FALSE_COLOR |
+               CRAW_PIPELINE_FLAG_CHROMA_DENOISE | CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION |
+               CRAW_PIPELINE_FLAG_DEFRINGE | CRAW_PIPELINE_FLAG_SHARPEN;
+
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+    fp.flags = CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
+    fp.noise_override = (CRAWNoiseModel) { .a = (float)TEST_NOISE_A, .b = (float)TEST_NOISE_B };
+    fp.denoise_strength = 1.0f;
+    fp.false_color_passes = 2;
+    fp.lens = test_lens_synth;
+    fp.defringe_strength = 1.0f;
+    fp.denoise_chroma_strength = 0.5f;
+    fp.sharpen_radius = 0.8f;
+    fp.sharpen_iterations = 3;
+    fp.sharpen_contrast = 1.0f;
+
+    if (test_run_config(td, ctx, src, dst, &pp, &fp, plain, NULL, NULL, &ms) < 0)
+        goto done;
+
+    /* A pipeline without the flag has nothing to read back. */
+    if (craw_pipeline_create(ctx, &pp, &pipe) < 0)
+        goto done;
+    if (craw_pipeline_get_stage_times(pipe, st, 32) != CRAW_ERROR(EINVAL)) {
+        fprintf(stderr, "stage times on a pipeline without CRAW_PIPELINE_FLAG_PROFILE\n");
+        goto done;
+    }
+    craw_pipeline_free(&pipe);
+
+    pp.flags |= CRAW_PIPELINE_FLAG_PROFILE;
+    if (craw_pipeline_create(ctx, &pp, &pipe) < 0)
+        goto done;
+    if (craw_pipeline_get_stage_times(pipe, st, 32) != CRAW_ERROR(EINVAL)) {
+        fprintf(stderr, "stage times before any recording\n");
+        goto done;
+    }
+
+    run = (struct test_run) { .pipe = pipe, .src = src, .dst = dst, .fp = &fp };
+    if (craw_testdev_run_timed(td, test_record, &run, &ms) < 0)
+        goto done;
+    {
+        uint16_t *half = malloc(npix * 4 * sizeof(*half));
+
+        if (!half || craw_testdev_image_download(td, dst, half, npix * 4 * sizeof(*half)) < 0) {
+            free(half);
+            goto done;
+        }
+        for (size_t i = 0; i < npix * 4; i++)
+            gpu[i] = test_half_to_float(half[i]);
+        free(half);
+    }
+    if (memcmp(gpu, plain, npix * 4 * sizeof(*gpu))) {
+        fprintf(stderr, "profiling changed the frame\n");
+        goto done;
+    }
+
+    /* 256x160 is a 64x40 field, halved down to 1x1. */
+    for (uint32_t lw = (TEST_W + 3) / 4, lh = (TEST_H + 3) / 4; lw > 1 || lh > 1; levels++) {
+        lw = (lw + 1) / 2;
+        lh = (lh + 1) / 2;
+    }
+
+    n = craw_pipeline_get_stage_times(pipe, NULL, 0);
+    if (n != (int)nwant || craw_pipeline_get_stage_times(pipe, st, 32) != n) {
+        fprintf(stderr, "%d passes timed, expected %zu\n", n, nwant);
+        goto done;
+    }
+    for (size_t i = 0; i < nwant; i++) {
+        uint32_t count = want[i].count ? want[i].count : levels - 1;
+
+        if (strcmp(st[i].name, want[i].name) || st[i].count != count ||
+            !(st[i].ms >= 0.0) || !(st[i].ms < ms + 1.0)) {
+            fprintf(stderr, "pass %zu: %s x%u in %.3f ms, expected %s x%u\n", i,
+                    st[i].name, st[i].count, st[i].ms, want[i].name, count);
+            goto done;
+        }
+        sum += st[i].ms;
+    }
+    if (!(sum > 0.0) || craw_pipeline_get_stage_times_n(pipe, 1, st, 32) != CRAW_ERROR(EINVAL)) {
+        fprintf(stderr, "stage times: %.3f ms in all, or a recording that was never made\n", sum);
+        goto done;
+    }
+    printf("  profiling: %d passes, %.3f ms of %.3f ms, output bit for bit the unprofiled one\n",
+           n, sum, ms);
+
+    ret = 0;
+
+done:
+    craw_pipeline_free(&pipe);
+    free(plain);
+    return ret;
+}
+
 /* ----------------------------------------------------------- real frame */
 
 static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile,
@@ -5330,6 +5463,9 @@ int main(void)
     if (craw_testdev_image_upload(&td, &src, mosaic, npix * sizeof(*mosaic)) < 0)
         goto done;
     if (test_sharpen(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
+
+    if (test_profiling(&td, ctx, &identity, &src, &dst, gpu) < 0)
         goto done;
 
     if (test_gamut(&td, ctx, &profile, &src, &dst, gpu, ref) < 0)

@@ -63,7 +63,7 @@ The options that matter most:
 
     cineraw --wb auto -v --frames 30 clip.MOV        estimate the illuminant
     cineraw --wb 5600:0.02 --ei 400 -o out_%05d.png clip.MOV
-    cineraw --bench --frames 60 clip.MOV             GPU and decode timing
+    cineraw --bench --frames 60 clip.MOV             GPU time per pass, decode timing
     cineraw --denoise 1.0 --crop 2750,1450,1000,1000 -o c_%d.png clip.MOV
     cineraw --noise-estimate --frames 10 flatfield.MOV   fit the noise model
 
@@ -105,6 +105,14 @@ noise (1 by default; with `--denoise` on, 0.5 sharpens more texture and
 none of the noise that is left), DESIGN.md 20. `--crop X,Y,W,H` writes one rectangle of the output while
 the pipeline still runs on the whole frame, which is how a 5.8K frame gets
 looked at 1:1 without a 5.8K file.
+
+`--bench` prints the GPU and decode time of every frame and, at the
+end, a table of every pass of the pipeline with its average and median
+GPU time over the run, from `CRAW_PIPELINE_FLAG_PROFILE` and
+`craw_pipeline_get_stage_times()`. The software decode leaves the GPU idle
+between frames, so the frames run on a cold GPU and a player's back to
+back frames are faster; the passes still compare with each other and from
+run to run (DESIGN.md 21).
 
 `--wb` takes `as-shot`, `auto` or `CCT[:TINT]`; `--ei` re-rates the clip
 at a working exposure index, `--exposure` adds a bias in stops; `--encode`

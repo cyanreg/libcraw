@@ -365,7 +365,12 @@ static void tool_usage(FILE *f)
 "                      sheet of white paper filling the frame) for a\n"
 "                      calibration, and check that the printed fit error is\n"
 "                      small and the read noise plausible before believing it\n"
-"  --bench             per frame GPU and decode time, plus the averages\n"
+"  --bench             per frame GPU and decode time, plus the averages,\n"
+"                      and a table of every pass's GPU time, average and\n"
+"                      median over the run. The software decode keeps the\n"
+"                      GPU idle between frames, so every frame runs on a\n"
+"                      cold GPU: the passes compare with each other, but a\n"
+"                      player's warm frames are faster (DESIGN.md 21)\n"
 "  --stats             per frame min/mean/p50/p99/max of the output's Y\n"
 "                      (XYZ output) or G channel\n"
 "  --tables FILE       load the per-CCT tables from a text file of\n"
@@ -913,6 +918,8 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
      * without one never pays for the extra image. */
     if (lens)
         pp.flags |= CRAW_PIPELINE_FLAG_LENS;
+    if (cfg->bench)
+        pp.flags |= CRAW_PIPELINE_FLAG_PROFILE;
 
     ret = craw_pipeline_create(g->ctx, &pp, &g->pipe);
     if (ret < 0) {
@@ -1089,6 +1096,141 @@ static void tool_noise_run_report(struct tool_noise_run *r, const CRAWProfile *p
     printf("  in 16-bit code values: a = %.4f per code value, read noise = %.2f\n",
            (double)(r->a[r->nb / 2] * range * 65535.0f),
            sqrt((double)r->b[r->nb / 2]) * (double)range * 65535.0);
+}
+
+/* ------------------------------------------------------ per pass times */
+
+/* --bench: every pass's GPU time frame by frame, and the whole recording's,
+ * for the table at the end. A pass that ran on only some frames (the lens
+ * warp on a clip whose first frames carry no record) is averaged over the
+ * frames it ran on. */
+struct tool_series {
+    double *v;
+    size_t nb, cap;
+};
+
+struct tool_pass {
+    char name[32];
+    uint32_t count;               /* dispatches in the last frame it ran on */
+    struct tool_series ms;
+};
+
+struct tool_prof {
+    struct tool_pass *pass;
+    size_t nb_passes;
+    struct tool_series sum;       /* the passes, summed per frame */
+    struct tool_series whole;     /* the recording, barriers and all */
+};
+
+static int tool_series_push(struct tool_series *s, double v)
+{
+    if (s->nb == s->cap) {
+        size_t cap = s->cap ? 2 * s->cap : 64;
+        double *nv = realloc(s->v, cap * sizeof(*nv));
+
+        if (!nv)
+            return CRAW_ERROR(ENOMEM);
+        s->v = nv;
+        s->cap = cap;
+    }
+    s->v[s->nb++] = v;
+
+    return 0;
+}
+
+static int tool_double_cmp(const void *x, const void *y)
+{
+    double a = *(const double *)x, c = *(const double *)y;
+    return a < c ? -1 : (a > c ? 1 : 0);
+}
+
+/* Sorts the series in place, which the table is the last reader of. */
+static void tool_series_stats(struct tool_series *s, double *avg, double *median)
+{
+    double sum = 0.0;
+
+    *avg = *median = 0.0;
+    if (!s->nb)
+        return;
+
+    for (size_t i = 0; i < s->nb; i++)
+        sum += s->v[i];
+    qsort(s->v, s->nb, sizeof(*s->v), tool_double_cmp);
+
+    *avg = sum / (double)s->nb;
+    *median = s->nb & 1 ? s->v[s->nb / 2] : 0.5 * (s->v[s->nb / 2 - 1] + s->v[s->nb / 2]);
+}
+
+static int tool_prof_push(struct tool_prof *pr, CRAWPipeline *pipe, double whole_ms)
+{
+    CRAWStageTime st[64];
+    double sum = 0.0;
+    int n, ret;
+
+    n = craw_pipeline_get_stage_times(pipe, st, CRAW_ARRAY_ELEMS(st));
+    if (n < 0)
+        return n;
+
+    for (int i = 0; i < CRAW_MIN(n, (int)CRAW_ARRAY_ELEMS(st)); i++) {
+        size_t j;
+
+        for (j = 0; j < pr->nb_passes; j++)
+            if (!strcmp(pr->pass[j].name, st[i].name))
+                break;
+        if (j == pr->nb_passes) {
+            struct tool_pass *np = realloc(pr->pass, (j + 1) * sizeof(*np));
+
+            if (!np)
+                return CRAW_ERROR(ENOMEM);
+            pr->pass = np;
+            pr->pass[j] = (struct tool_pass) { 0 };
+            snprintf(pr->pass[j].name, sizeof(pr->pass[j].name), "%s", st[i].name);
+            pr->nb_passes++;
+        }
+
+        pr->pass[j].count = st[i].count;
+        ret = tool_series_push(&pr->pass[j].ms, st[i].ms);
+        if (ret < 0)
+            return ret;
+        sum += st[i].ms;
+    }
+
+    ret = tool_series_push(&pr->sum, sum);
+    if (ret < 0)
+        return ret;
+
+    return tool_series_push(&pr->whole, whole_ms);
+}
+
+static void tool_prof_report(struct tool_prof *pr)
+{
+    double avg, med;
+
+    if (!pr->sum.nb)
+        return;
+
+    printf("\nGPU time per pass over %zu frames, each run cold: the software decode\n"
+           "idles the GPU between frames, so a warm player's frames are faster.\n",
+           pr->sum.nb);
+    printf("  %-20s %10s %10s %10s\n", "pass", "dispatches", "avg ms", "median ms");
+    for (size_t i = 0; i < pr->nb_passes; i++) {
+        tool_series_stats(&pr->pass[i].ms, &avg, &med);
+        printf("  %-20s %10u %10.3f %10.3f\n", pr->pass[i].name, pr->pass[i].count, avg, med);
+    }
+    tool_series_stats(&pr->sum, &avg, &med);
+    printf("  %-20s %10s %10.3f %10.3f\n", "sum of the passes", "", avg, med);
+    tool_series_stats(&pr->whole, &avg, &med);
+    printf("  %-20s %10s %10.3f %10.3f\n", "whole recording", "", avg, med);
+}
+
+static void tool_prof_free(struct tool_prof *pr)
+{
+    for (size_t i = 0; i < pr->nb_passes; i++)
+        free(pr->pass[i].ms.v);
+    free(pr->pass);
+    free(pr->sum.v);
+    free(pr->whole.v);
+    *pr = (struct tool_prof) { 0 };
 }
 
 /* Brings the output image back as interleaved float RGBA, decoding fp16 on
@@ -2050,6 +2192,7 @@ int main(int argc, char **argv)
     struct tool_buffers buf = { 0 };
     struct tool_awb awb = { 0 };
     struct tool_noise_run noise_run = { 0 };
+    struct tool_prof prof_run = { 0 };
     CRAWContextOptions ctx_opts = { 0 };
     CRAWProfile base, prof;
     AVFrame *frame = NULL;
@@ -2438,6 +2581,14 @@ have_device:
             goto fail;
         }
 
+        if (cfg.bench) {
+            ret = tool_prof_push(&prof_run, gpu.pipe, gpu_ms);
+            if (ret < 0) {
+                fprintf(stderr, "cannot read the pass timings: %d\n", ret);
+                goto fail;
+            }
+        }
+
         gpu_ms_total += gpu_ms;
         decode_ms_total += decode_ms;
         /* The first frame pays for opening the file and starting the
@@ -2524,6 +2675,7 @@ have_device:
             printf(" (%.1f ms without the first frame's start-up)",
                    decode_ms_warm / (double)(processed - 1));
         printf("\n");
+        tool_prof_report(&prof_run);
     }
 
     ret = 0;
@@ -2531,6 +2683,7 @@ have_device:
 fail:
     free(noise_run.a);
     free(noise_run.b);
+    tool_prof_free(&prof_run);
     tool_buffers_free(&buf);
     av_frame_free(&frame);
     craw_awb_smoother_free(&awb.smoother);

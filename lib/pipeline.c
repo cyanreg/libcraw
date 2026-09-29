@@ -423,6 +423,23 @@ struct CRAWPipeline {
     CRAWLensCorrection keep_lc;
     float keep_scale;
     bool have_keep_scale;
+
+    /* Profiling, CRAW_PIPELINE_FLAG_PROFILE and DESIGN.md 21: a timestamp
+     * pair per dispatch, in CRAW_PIPELINE_PROFILE_SLOTS runs of 2 * prof_max
+     * queries, one run per recording in rotation. prof_sh holds which
+     * shader each pair timed, prof_max entries per slot, and prof_nb how
+     * many pairs each slot's recording wrote. prof_ts and prof_agg are
+     * scratch for the readback. */
+    VkQueryPool prof_pool;
+    uint32_t prof_max;
+    uint32_t prof_slot;
+    uint32_t prof_nb[CRAW_PIPELINE_PROFILE_SLOTS];
+    const CRAWVkShader **prof_sh;
+    uint64_t prof_recorded;
+    uint64_t prof_mask;
+    double prof_period;       /* ns per tick */
+    uint64_t *prof_ts;
+    CRAWStageTime *prof_agg;
 };
 
 static const CRAWVkBinding craw_bind_images[4] = {
@@ -542,6 +559,84 @@ static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *n
     };
 
     return craw_vk_shader_create(p->ctx, sh, &desc);
+}
+
+/* The most dispatches one recording of this pipeline can make: every pass
+ * it was built with, the highlight pyramid at its depth and the most
+ * sharpening iterations a frame may ask for. */
+static uint32_t craw_pipeline_max_dispatches(const CRAWPipeline *p)
+{
+    uint32_t n = 1;                         /* colour */
+
+    n += p->rcd ? 4 : 1;                    /* debayer */
+    if (p->has_denoise || p->has_temporal)
+        n += 1;
+    if (p->has_hl)
+        n += 2 + 2 * (p->nb_hl_levels - 1); /* field, pull, push, fill */
+    if (p->has_fc)
+        n += 1;
+    if (p->has_lens)
+        n += 1;
+    if (p->has_df)
+        n += 2;
+    if (p->has_chroma)
+        n += 3;
+    if (p->has_sh)
+        n += 1 + CRAW_SHARPEN_MAX_ITERATIONS;
+    if (p->awb)
+        n += 1;
+
+    return n;
+}
+
+/* CRAW_PIPELINE_FLAG_PROFILE: the query pool and the host side of it. */
+static int craw_pipeline_profile_init(CRAWPipeline *p)
+{
+    CRAWContext *ctx = p->ctx;
+    VkQueueFamilyProperties *qf;
+    uint32_t nb_qf = 0, bits;
+    VkResult res;
+
+    ctx->fn.GetPhysicalDeviceQueueFamilyProperties(ctx->phys_device, &nb_qf, NULL);
+    if (ctx->queue_family_index >= nb_qf)
+        return CRAW_ERROR(EINVAL);
+    qf = calloc(nb_qf, sizeof(*qf));
+    if (!qf)
+        return CRAW_ERROR(ENOMEM);
+    ctx->fn.GetPhysicalDeviceQueueFamilyProperties(ctx->phys_device, &nb_qf, qf);
+    bits = qf[ctx->queue_family_index].timestampValidBits;
+    free(qf);
+
+    if (!bits) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Profiling needs timestamps, and queue family %u "
+                 "has none\n", ctx->queue_family_index);
+        return CRAW_ERROR(ENOTSUP);
+    }
+
+    p->prof_mask = bits >= 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+    p->prof_period = ctx->props.properties.limits.timestampPeriod;
+    p->prof_max = craw_pipeline_max_dispatches(p);
+
+    p->prof_sh = calloc((size_t)CRAW_PIPELINE_PROFILE_SLOTS * p->prof_max, sizeof(*p->prof_sh));
+    p->prof_ts = calloc(2 * (size_t)p->prof_max, sizeof(*p->prof_ts));
+    p->prof_agg = calloc(p->prof_max, sizeof(*p->prof_agg));
+    if (!p->prof_sh || !p->prof_ts || !p->prof_agg)
+        return CRAW_ERROR(ENOMEM);
+
+    VkQueryPoolCreateInfo info = {
+        .sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType  = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = CRAW_PIPELINE_PROFILE_SLOTS * 2 * p->prof_max,
+    };
+    res = ctx->fn.CreateQueryPool(ctx->device, &info, ctx->alloc, &p->prof_pool);
+    if (res != VK_SUCCESS) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Unable to create the profiling query pool: %s\n",
+                 craw_vk_ret2str(res));
+        p->prof_pool = VK_NULL_HANDLE;
+        return craw_vk_ret2err(res);
+    }
+
+    return 0;
 }
 
 int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
@@ -983,7 +1078,13 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
-    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s%s%s%s\n",
+    if (params->flags & CRAW_PIPELINE_FLAG_PROFILE) {
+        ret = craw_pipeline_profile_init(p);
+        if (ret < 0)
+            goto fail;
+    }
+
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s%s%s%s%s\n",
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
              p->awb ? ", awb histogram" : "",
              p->has_temporal ? ", temporal denoise" : "",
@@ -993,7 +1094,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
              p->has_df ? ", defringe" : "",
              p->has_chroma ? ", chroma denoise" : "",
              p->has_lens ? ", lens" : "",
-             p->has_sh ? ", sharpen" : "");
+             p->has_sh ? ", sharpen" : "",
+             p->prof_pool ? ", profiled" : "");
 
     *pipe = p;
     return 0;
@@ -1099,6 +1201,12 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         if (p->hist_readback[i].buf)
             craw_vk_buffer_free(ctx, &p->hist_readback[i]);
     }
+
+    if (p->prof_pool)
+        ctx->fn.DestroyQueryPool(ctx->device, p->prof_pool, ctx->alloc);
+    free(p->prof_sh);
+    free(p->prof_ts);
+    free(p->prof_agg);
 
     free(p);
     *pipe = NULL;
@@ -1334,16 +1442,36 @@ static int craw_pipeline_lens_push(CRAWPipeline *p, const CRAWLensCorrection *lc
 }
 
 /* `gz` is 1 for every pass; the denoise dispatches its four CFA planes as
- * four times the columns of workgroups instead. */
+ * four times the columns of workgroups instead.
+ *
+ * With profiling on, the dispatch sits between two timestamps written once
+ * everything before each has left the compute stage: the first when the
+ * previous pass is done, the second when this one is. Off, it is one
+ * well predicted branch per dispatch. DESIGN.md 21. */
 static void craw_pipeline_dispatch(CRAWPipeline *p, VkCommandBuffer cmd, const CRAWVkShader *sh,
                                    CRAWVkDescWrite *writes, uint32_t nb_writes,
                                    const void *push, uint32_t push_size,
                                    uint32_t gx, uint32_t gy, uint32_t gz)
 {
+    uint32_t q = UINT32_MAX;
+
+    if (p->prof_pool && p->prof_nb[p->prof_slot] < p->prof_max) {
+        uint32_t i = p->prof_nb[p->prof_slot]++;
+
+        p->prof_sh[p->prof_slot * p->prof_max + i] = sh;
+        q = 2 * (p->prof_slot * p->prof_max + i);
+        p->ctx->fn.CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                      p->prof_pool, q);
+    }
+
     craw_vk_shader_bind(p->ctx, cmd, sh);
     craw_vk_shader_push_desc(p->ctx, cmd, sh, writes, nb_writes);
     craw_vk_shader_push_const(p->ctx, cmd, sh, push, push_size);
     craw_vk_shader_dispatch(p->ctx, cmd, sh, gx, gy, gz);
+
+    if (q != UINT32_MAX)
+        p->ctx->fn.CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                      p->prof_pool, q + 1);
 }
 
 /* The highlight reconstruction of DESIGN.md 18: the colour field's level 0
@@ -1649,6 +1777,17 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
 
     craw_vk_image_wrap(&src_img, src);
     craw_vk_image_wrap(&dst_img, dst);
+
+    /* Nothing can fail from here on, so the slot this recording times is
+     * taken now: its queries are reset in this command buffer, ahead of
+     * the timestamps that rewrite them, which query commands on one queue
+     * are ordered by without a barrier. */
+    if (p->prof_pool) {
+        p->prof_slot = (uint32_t)(p->prof_recorded % CRAW_PIPELINE_PROFILE_SLOTS);
+        p->prof_nb[p->prof_slot] = 0;
+        ctx->fn.CmdResetQueryPool(cmd, p->prof_pool, 2 * p->prof_slot * p->prof_max,
+                                  2 * p->prof_max);
+    }
 
     craw_vk_image_barrier(ctx, cmd, &src_img, VK_IMAGE_LAYOUT_GENERAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -2029,6 +2168,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
 
+    if (p->prof_pool)
+        p->prof_recorded++;
+
     /* The recording is made; only now does the temporal state move. The
      * set this one read is what a replay of it reads. A next frame without
      * the pass leaves nothing for the frame after it, while a replay
@@ -2087,4 +2229,63 @@ int craw_pipeline_get_awb_histogram_n(CRAWPipeline *p, uint32_t frames_back,
 int craw_pipeline_get_awb_histogram(CRAWPipeline *p, CRAWAwbHistogram *out)
 {
     return craw_pipeline_get_awb_histogram_n(p, 0, out);
+}
+
+int craw_pipeline_get_stage_times_n(CRAWPipeline *p, uint32_t frames_back,
+                                    CRAWStageTime *out, uint32_t max)
+{
+    CRAWContext *ctx;
+    uint32_t slot, nb, nb_agg = 0;
+    VkResult res;
+
+    if (!p || (max && !out))
+        return CRAW_ERROR(EINVAL);
+
+    ctx = p->ctx;
+    if (!p->prof_pool) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Pipeline was created without CRAW_PIPELINE_FLAG_PROFILE\n");
+        return CRAW_ERROR(EINVAL);
+    }
+    if (frames_back >= CRAW_PIPELINE_PROFILE_SLOTS || frames_back >= p->prof_recorded)
+        return CRAW_ERROR(EINVAL);
+
+    slot = (uint32_t)((p->prof_recorded - 1 - frames_back) % CRAW_PIPELINE_PROFILE_SLOTS);
+    nb = p->prof_nb[slot];
+    if (!nb)
+        return 0;
+
+    /* No WAIT_BIT: a submission that has not completed is the caller's
+     * mistake, and it should hear about it rather than block on it. */
+    res = ctx->fn.GetQueryPoolResults(ctx->device, p->prof_pool, 2 * slot * p->prof_max,
+                                      2 * nb, 2 * nb * sizeof(*p->prof_ts), p->prof_ts,
+                                      sizeof(*p->prof_ts), VK_QUERY_RESULT_64_BIT);
+    if (res == VK_NOT_READY)
+        return CRAW_ERROR(EAGAIN);
+    if (res != VK_SUCCESS)
+        return craw_vk_ret2err(res);
+
+    for (uint32_t i = 0; i < nb; i++) {
+        const char *name = p->prof_sh[slot * p->prof_max + i]->name;
+        uint64_t ticks = (p->prof_ts[2 * i + 1] - p->prof_ts[2 * i]) & p->prof_mask;
+        double ms = (double)ticks * p->prof_period / 1e6;
+        uint32_t j;
+
+        for (j = 0; j < nb_agg; j++)
+            if (!strcmp(p->prof_agg[j].name, name))
+                break;
+        if (j == nb_agg)
+            p->prof_agg[nb_agg++] = (CRAWStageTime) { .name = name };
+        p->prof_agg[j].count++;
+        p->prof_agg[j].ms += ms;
+    }
+
+    if (max)
+        memcpy(out, p->prof_agg, CRAW_MIN(max, nb_agg) * sizeof(*out));
+
+    return (int)nb_agg;
+}
+
+int craw_pipeline_get_stage_times(CRAWPipeline *p, CRAWStageTime *out, uint32_t max)
+{
+    return craw_pipeline_get_stage_times_n(p, 0, out, max);
 }

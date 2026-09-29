@@ -4048,3 +4048,94 @@ the ninetieth percentile, never past the brightest pixel of its 3x3, on
 the rims of lights far above white. Two things are not done: an estimate of the radius from the frame itself, for
 which the edge fit of 20.1 is the obvious start, and any attempt to make
 the five iterations of playback look like twenty.
+
+## 21. Profiling and cost
+
+### 21.1 Timing every dispatch
+
+`CRAW_PIPELINE_FLAG_PROFILE` gives the pipeline a timestamp query pool and
+has every dispatch it records wrapped in a pair of timestamps, both written
+at `VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT`: the first once everything
+recorded before it has left the compute stage, i.e. once the previous pass
+has finished, the second once this one has. All dispatches go through one
+function in `lib/pipeline.c`, so that is the only place that knows; without
+the flag there is no pool and the function costs one predicted branch.
+
+The pool holds `CRAW_PIPELINE_PROFILE_SLOTS` (4) recordings, each a run of
+two queries per dispatch the pipeline can make: every pass it was built
+with, the highlight pyramid at its depth and `CRAW_SHARPEN_MAX_ITERATIONS`
+sharpening iterations. A recording resets its run in its own command
+buffer ahead of the timestamps, which needs no barrier (query commands on
+one queue are ordered among themselves), and remembers which shader each
+pair timed. `craw_pipeline_get_stage_times()` reads the last recording's
+run once the caller's fence has signalled, without `WAIT_BIT` (a
+submission that has not completed is an `EAGAIN`, not a hang), and folds
+the dispatches of one shader into one entry: its name, the number of
+dispatches and their summed time, in the order the passes first ran. The
+`_n` variant reads a recording up to three back, for a player that keeps
+several in flight, exactly as the histogram's does.
+
+What the numbers are: the GPU time of each pass alone, barriers excluded.
+The sum of the passes against a pair of timestamps around the whole
+recording is what the barriers and the launches between passes cost,
+under 0.2 ms on the full chain. Timing each dispatch serialises the two
+that could overlap, the histogram and the colour pass, so a profiled
+recording can be marginally slower than an unprofiled one; the output is
+the same bit for bit (`test_pipeline` checks both).
+
+`cineraw --bench` builds its pipeline with the flag and prints, after the
+per frame lines, every pass with its dispatches per frame and its average
+and median time over the run, then the sum of the passes and the whole
+recording. It runs cold: the software decode takes 170 ms to 500 ms a
+frame, the GPU drops its clocks in between, and every frame starts on an
+idle GPU. The passes are comparable with each other and from run to run,
+but a player whose frames arrive back to back is faster: by up to a third
+on the passes the shader core bounds (the denoise, RCD's first pass, the
+sharpening), by next to nothing on the ones memory bounds (below).
+
+### 21.2 The full chain, measured
+
+P1000387 (ISO 1000, 5760x3040) and P1094724 from the card, both with the
+lens record on every frame, through `--denoise 1,0.5,0.8 --highlights on
+--false-colour 1 --defringe 1 --sharpen 0.8,20` (the reach of a 0.8 px
+Gaussian is 3), 30 frames, on the RX 6900 XT under RADV (Mesa 26.3),
+wave64, with the GPU shared with other work. "Warm" is the same chain on
+one frame of P1000387 recorded 30 times back to back with RGBA32F output
+and the histogram on (a scratch harness, not in the tree), median. The
+bytes are the images each pass reads and writes once, at 17.5 Mpx; a pass
+is called bandwidth bound when those bytes over its warm time come within
+reach of the 450 GB/s the card sustains out of memory, more where the
+128 MB Infinity Cache still holds what the previous pass wrote.
+
+    pass              n    cold 387  cold 724   warm     MB    GB/s  bound by
+    denoise_nlm       1      3.90      3.91     2.61    245     94   LDS: 49 x 9 patch reads a sample
+    highlight_field   1      0.12      0.12     0.11     53    473   bandwidth
+    highlight_pull   11      0.09      0.08     0.08      -      -   launches, 7 us each
+    highlight_push   11      0.06      0.05     0.05      -      -   launches
+    highlight_fill    1      0.14      0.14     0.12     88    754   bandwidth (cache)
+    rcd_dir           1      1.48      1.48     1.19    175    147   texture fetch: 49 image loads a pixel
+    rcd_green         1      0.48      0.48     0.51    210    416   bandwidth
+    rcd_rb_rb         1      0.88      0.88     0.88    280    318   bandwidth, half the lanes idle
+    rcd_rb_g          1      0.84      0.85     0.85    385    455   bandwidth, half the lanes idle
+    false_color       1      0.94      0.94     0.83    280    337   bandwidth and LDS
+    lens              1      0.76      0.77     0.71    280    396   texture fetch: 49 image loads a pixel
+    defringe_prep     1      0.64      0.64     0.65    280    432   bandwidth
+    defringe          1      0.50      0.55     0.49    150    305   texture fetch: 25 loads for the 5x5 max
+    chroma_down       1      0.66      0.66     0.65    149    228   access pattern: 16 loads an invocation
+    chroma_blur       1      0.16      0.16     0.14      9      -   ALU: 81 exp a quarter texel
+    chroma_up         1      0.51      0.52     0.52    298    577   bandwidth
+    sharpen_prep      1      0.81      0.81     0.81    175    217   access pattern: 8 loads an invocation
+    sharpen          19      7.34      7.36     6.56    105    304   LDS and barriers, 0.345 ms each
+    sharpen_last      1      0.67      0.68     0.63      -      -   LDS and the mask
+    awb_hist          -        -         -      0.38    140    368   bandwidth, 64 loads an invocation
+    color             1      0.47      0.48     0.74    280    594   bandwidth (RGBA32F out: 420 MB)
+    sum of passes           21.45     21.56    19.49
+    whole recording         21.52     21.63    19.64
+
+Half the frame time is two stages: the sharpening's iterations, a third of
+it, and the raw denoise, an eighth. Both are bound by shared memory, not
+by memory: an iteration of the sharpening moves 105 MB in 0.35 ms and the
+denoise 245 MB in 2.6 ms. RCD's first pass and the lens warp are bound by
+the texture units' rate of image loads, 49 a pixel each. The rest is
+bandwidth, where subgroup operations cannot help and only moving fewer
+bytes can.

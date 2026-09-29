@@ -155,6 +155,23 @@ enum CRAWDebayer {
 #define CRAW_SHARPEN_MAX_RADIUS     2.0f
 #define CRAW_SHARPEN_MAX_ITERATIONS 100
 
+/* Time every dispatch the pipeline records, for
+ * craw_pipeline_get_stage_times(): a pair of GPU timestamps around each one,
+ * in a query pool the pipeline owns that holds the last
+ * CRAW_PIPELINE_PROFILE_SLOTS recordings. Without the flag no pool exists
+ * and a recording is exactly what it is on a pipeline that never heard of
+ * profiling. With it every dispatch starts after the one before it has
+ * finished, which the barriers between passes mostly demand anyway; the
+ * auto white balance histogram and the colour pass, which could overlap,
+ * no longer do, so the recording as a whole can take a little longer.
+ * Needs timestamps on the queue family the context was created with
+ * (timestampValidBits above zero); craw_pipeline_create() fails with
+ * CRAW_ERROR(ENOTSUP) on one without. DESIGN.md 21. */
+#define CRAW_PIPELINE_FLAG_PROFILE (1 << 9)
+
+/* How many recordings' timings a profiling pipeline keeps. */
+#define CRAW_PIPELINE_PROFILE_SLOTS 4
+
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
 typedef struct CRAWPipelineParams {
@@ -463,5 +480,33 @@ CRAW_API int craw_pipeline_get_awb_histogram(CRAWPipeline *pipe,
  * submission that recording belongs to must have completed. */
 CRAW_API int craw_pipeline_get_awb_histogram_n(CRAWPipeline *pipe, uint32_t frames_back,
                                                CRAWAwbHistogram *out);
+
+/* One pass of a profiled recording, CRAW_PIPELINE_FLAG_PROFILE. */
+typedef struct CRAWStageTime {
+    /* The pass's shader, "rcd_dir", "denoise_nlm", "sharpen" and so on.
+     * Owned by the pipeline and valid until it is freed. */
+    const char *name;
+    uint32_t count;   /* dispatches of it in the recording */
+    double   ms;      /* their GPU time, summed */
+} CRAWStageTime;
+
+/* The GPU time of every pass of the last recording, one entry per pass in
+ * the order the passes first ran: a pass dispatched more than once (the
+ * sharpening's iterations, the highlight pyramid's levels) is one entry
+ * with its dispatches summed. Returns how many entries the recording has,
+ * of which the first `max` are written to `out` (which may be NULL when
+ * `max` is 0). Only valid once the submission that recording belongs to
+ * has completed; before that it fails with CRAW_ERROR(EAGAIN). Fails with
+ * CRAW_ERROR(EINVAL) on a pipeline created without
+ * CRAW_PIPELINE_FLAG_PROFILE. The times do not include the barriers
+ * between passes; the gap between their sum and a timestamp pair around
+ * the whole recording is what those cost. */
+CRAW_API int craw_pipeline_get_stage_times(CRAWPipeline *pipe, CRAWStageTime *out,
+                                           uint32_t max);
+
+/* The same for the recording made `frames_back` recordings ago, 0 to
+ * CRAW_PIPELINE_PROFILE_SLOTS - 1, whose submission must have completed. */
+CRAW_API int craw_pipeline_get_stage_times_n(CRAWPipeline *pipe, uint32_t frames_back,
+                                             CRAWStageTime *out, uint32_t max);
 
 #endif /* CRAW_PIPELINE_H */
