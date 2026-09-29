@@ -10,11 +10,28 @@
  *
  * Only whole blocks are sampled: a frame whose width or height is not a
  * multiple of 8 ignores the remainder, which is what the CPU builder in
- * craw_awb_histogram_from_rgb() does with the same 8x8 grid. */
+ * craw_awb_histogram_from_rgb() does with the same 8x8 grid.
+ *
+ * A block is a quad of four invocations, each reading two columns of it
+ * row by row, so that the loads of a subgroup are runs of a row rather
+ * than 64 loads per invocation scattered over a block each, which took
+ * 0.39 ms at 5.8K in the full chain where this takes 0.31 (DESIGN.md 21).
+ * The quad's first
+ * invocation gathers the others' pixels with quad broadcasts (DPP) and
+ * sums the 64 row by row, left to right, the order they were summed in
+ * before; it alone does the atomics. A subgroup is a row of eight blocks,
+ * and a workgroup as many rows as it has subgroups: the host builds it in
+ * full subgroups of 32 and invocations are placed by their subgroup and
+ * lane. The atomics are three per block, 0.8 million a frame, and were
+ * never what bound the pass, so a reduction across the subgroup before
+ * them would buy nothing. */
 
 /* GL_GOOGLE_include_directive is a preprocessor-only extension (it emits
- * no SPIR-V capability); the build passes -I for it. */
+ * no SPIR-V capability); the build passes -I for it. The subgroup
+ * extensions are the basic and quad operations lib/craw.c checks for. */
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_quad : require
 
 #include "common.glsl"
 
@@ -47,18 +64,30 @@ const float CRAW_AWB_MAX_WEIGHT = 0.5;
 
 void main()
 {
-    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(b, pc.blocks)))
-        return;
+    int lane = int(gl_SubgroupInvocationID);
+    int k = lane & 3;
+    ivec2 b = ivec2(int(gl_WorkGroupID.x) * (int(gl_SubgroupSize) / 4) + lane / 4,
+                    int(gl_WorkGroupID.y) * int(gl_NumSubgroups) + int(gl_SubgroupID));
+    bool live = all(lessThan(b, pc.blocks));
 
     /* The mean of the block, i.e. a 4x4 arrangement of complete CFA quads,
-     * so the mean is not biased towards any channel by the debayer. */
-    ivec2 o = b * 8;
+     * so the mean is not biased towards any channel by the debayer. This
+     * invocation's two columns first; every invocation then takes part in
+     * the broadcasts. */
+    ivec2 o = b * 8 + ivec2(2 * k, 0);
+    vec3 px[8][2];
+    for (int j = 0; j < 8; j++)
+        for (int i = 0; i < 2; i++)
+            px[j][i] = live ? imageLoad(src, o + ivec2(i, j)).rgb : vec3(0.0);
+
     vec3 sum = vec3(0.0);
     for (int j = 0; j < 8; j++)
         for (int i = 0; i < 8; i++)
-            sum += imageLoad(src, o + ivec2(i, j)).rgb;
+            sum += subgroupQuadBroadcast(px[j][i & 1], i >> 1);
     vec3 m = sum * (1.0 / 64.0);
+
+    if (!live || k != 0)
+        return;
 
     if (max(max(m.r, m.g), m.b) >= CRAW_AWB_CLIP || m.g < CRAW_AWB_BLACK)
         return;

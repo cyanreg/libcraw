@@ -1170,9 +1170,18 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     }
 
     if (p->awb) {
-        ret = craw_pipeline_shader(p, &p->awb_hist, "awb_hist",
-                                   craw_awb_hist_spv_data, craw_awb_hist_spv_len,
-                                   craw_bind_awb, 4, sizeof(CRAWAwbPush), wg2d, NULL, 0);
+        /* A subgroup of 32 is a row of eight blocks, and the workgroup a
+         * stack of them (see the shader), in full subgroups since the
+         * shader places its invocations by subgroup and lane. */
+        {
+            uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                                   ctx->caps.max_subgroup_size);
+
+            ret = craw_pipeline_shader_sg(p, &p->awb_hist, "awb_hist",
+                                          craw_awb_hist_spv_data, craw_awb_hist_spv_len,
+                                          craw_bind_awb, 4, sizeof(CRAWAwbPush),
+                                          CRAW_MAX(wg2d * wg2d / sg, 1u), sg, NULL, 0);
+        }
         if (ret < 0)
             goto fail;
 
@@ -2217,8 +2226,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                             &p->hist_weight, 0, CRAW_AWB_HIST_BYTES);
         craw_vk_desc_buffer(&writes[3], 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                             &p->hist_bright, 0, CRAW_AWB_HIST_BYTES);
+        /* Four invocations a block across, a block a subgroup down. */
         craw_pipeline_dispatch(p, cmd, &p->awb_hist, writes, 4, &ap, sizeof(ap),
-                               (uint32_t)p->blocks[0], (uint32_t)p->blocks[1], 1);
+                               (uint32_t)p->blocks[0] * 4, (uint32_t)p->blocks[1], 1);
     }
 
     craw_vk_image_barrier(ctx, cmd, &dst_img, VK_IMAGE_LAYOUT_GENERAL,
