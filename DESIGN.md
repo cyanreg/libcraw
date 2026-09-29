@@ -3686,15 +3686,30 @@ spread. On the camera RGB rather than the output, because there every
 channel is positive, neutral is c = (0, 0) whatever the output space, and
 Y is the weighting the debayer used.
 
-Two dispatches. `defringe_prep` writes (l, c, E) per pixel into the
-second intermediate of section 3 as RGBA16F; l stays within +-4, so its
-fp16 is good to 2^-9, 0.2% of Y, and c and E need no more. `defringe`
-then works in place on the intermediate: each invocation reads the first
-pass's image around its pixel and only its own texel of the intermediate,
-and writes that texel only if the clamp moved it, so every pixel the
-stage leaves alone is bit for bit what came in. Most pixels leave after
-the 5x5 of E. The reference in `lib/ref/ref_defringe.c` rounds the first
-pass's four values to fp16 as the GPU stores them.
+Two passes, which were two dispatches. The first writes (l, c, E) per
+pixel as fp16; l stays within +-4, so its fp16 is good to 2^-9, 0.2% of
+Y, and c and E need no more. The second reads the first's values around
+its pixel and moves its pixel's colour or leaves it alone, so every pixel
+the stage leaves alone is bit for bit what came in. Most pixels leave
+after the 5x5 of E. The reference in `lib/ref/ref_defringe.c` rounds the
+first pass's four values to fp16 as the GPU stores them.
+
+The first pass used to write the second intermediate of section 3 as an
+RGBA16F image, which the second read back around every pixel and then
+wrote the intermediate in place. Now (section 21) both are one dispatch,
+`defringe.comp.glsl`: a 32x32 workgroup (wave32) loads its tile of the
+intermediate with an apron of nine, keeps l in fp32 and works out the
+first pass's values on the apron of eight inside it into shared memory,
+rounded to fp16 the way the RGBA16F image stored them (toward zero on
+RDNA2, as in 5.3), and each invocation then treats its pixel from shared
+memory and writes it, moved or not, to the second image, which becomes
+the intermediate as with the stages that cannot run in place. The side
+search reaches six pixels along the normal and the side means two more,
+which is the apron of eight, and the Sobel one more for l; a position
+outside the frame holds what the first pass computed at the one inside
+it that mirrors there. On the real frame the output is the two passes'
+bit for bit, but for one pixel of 17.5 million when the lens warp runs
+first, moved by 6e-4 of itself: the side search is an argmin (19.5).
 
 The second image is the pipeline's scratch, 140 MB at 5.8K, shared with
 the other stages that need it (it was RCD's aux with RCD, until RCD's
@@ -3710,6 +3725,14 @@ write of an RGBA16F frame, 280 MB, is 0.55 ms at this card's bandwidth,
 and the nine logarithms per pixel of its Sobel read the 3x3 through the
 cache. The second pass, 25 loads for the gate at every pixel and the rest
 at the few percent near a strong edge, is 0.3 ms.
+
+In one dispatch (19.3) the stage reads the intermediate once and writes
+the second image once. Back to back at 5.8K, the two passes took 1.20 ms
+and the one takes 0.90 (0.92 in wave64, 0.99 at 32x16, 1.19 at 16x16:
+the aprons of nine are 4.5 times the pixels of a 16x16 tile and 2.4 times
+those of a 32x32 one, and every pixel of an apron costs a load and three
+logarithms). Its tiles take 37.6 KB of shared memory; a device with less,
+or with fewer than 1024 invocations to a workgroup, gets a smaller tile.
 
 `CRAW_PIPELINE_FLAG_DEFRINGE` builds the stage and
 `CRAWFrameParams.defringe_strength`, 0 to 1, switches it per frame: zero

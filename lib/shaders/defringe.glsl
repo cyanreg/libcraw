@@ -1,6 +1,6 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-/* Shared by the two defringe passes of DESIGN.md 19: the constants of 19.2
+/* Shared by the defringe of DESIGN.md 19 and its tests: the constants of 19.2
  * and the push constant block. Include after common.glsl. */
 
 #ifndef CRAW_DEFRINGE_GLSL

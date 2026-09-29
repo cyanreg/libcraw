@@ -32,7 +32,6 @@
 #include "highlight_pull.spv.h"
 #include "highlight_push.spv.h"
 #include "highlight_fill.spv.h"
-#include "defringe_prep.spv.h"
 #include "defringe.spv.h"
 #include "sharpen_prep.spv.h"
 #include "sharpen.spv.h"
@@ -315,6 +314,16 @@ static uint32_t craw_rcd_shared_bytes(uint32_t wx, uint32_t wy)
     return (a5 + a4 + 4 * a3 + 3 * a2 + a1) * (uint32_t)sizeof(float);
 }
 
+/* The shared memory of the defringe's tiles on a workgroup of wx x wy,
+ * mirroring lib/shaders/defringe.comp.glsl: l with an apron of 9, the
+ * first pass's c and (l, c, E) in fp16 with one of 8. */
+static uint32_t craw_df_shared_bytes(uint32_t wx, uint32_t wy)
+{
+    uint32_t a9 = (wx + 18) * (wy + 18), a8 = (wx + 16) * (wy + 16);
+
+    return (a9 + 3 * a8) * (uint32_t)sizeof(float);
+}
+
 static uint32_t craw_fc_tile(uint32_t wg)
 {
     return wg + 4 * CRAW_FALSE_COLOR_MAX_PASSES;
@@ -396,7 +405,6 @@ struct CRAWPipeline {
     CRAWVkShader hl_pull;
     CRAWVkShader hl_push;
     CRAWVkShader hl_fill;
-    CRAWVkShader df_prep;
     CRAWVkShader df;
     CRAWVkShader sh_prep;
     /* Sharpening: [1] is the last iteration, and one of each per reach. */
@@ -639,7 +647,7 @@ static uint32_t craw_pipeline_max_dispatches(const CRAWPipeline *p)
     if (p->has_lens)
         n += 1;
     if (p->has_df)
-        n += 2;
+        n += 1;
     if (p->has_chroma)
         n += 3;
     if (p->has_sh)
@@ -1011,14 +1019,29 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     }
 
     if (p->has_df) {
-        ret = craw_pipeline_shader(p, &p->df_prep, "defringe_prep",
-                                   craw_defringe_prep_spv_data, craw_defringe_prep_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWDefringePush), wg2d, NULL, 0);
-        if (ret < 0)
-            goto fail;
-        ret = craw_pipeline_shader(p, &p->df, "defringe",
-                                   craw_defringe_spv_data, craw_defringe_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWDefringePush), wg2d, NULL, 0);
+        /* The aprons are nine pixels wide, so the tile is as big as the
+         * device allows, up to 32x32 in wave32, which of the shapes tried
+         * was the fastest: 0.90 ms at 5.8K against 0.92 in wave64, 0.99 at
+         * 32x16 and 1.19 at 16x16. Its tiles take 37.6 KB there; a device
+         * with less shared memory or fewer invocations gets a smaller one. */
+        const VkPhysicalDeviceLimits *lim = &ctx->props.properties.limits;
+        uint32_t wx = 2 * wg2d, wy = 2 * wg2d;
+        uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                               ctx->caps.max_subgroup_size);
+
+        while (wy > 4 && (craw_df_shared_bytes(wx, wy) > shared_max ||
+                          wx * wy > lim->maxComputeWorkGroupInvocations ||
+                          wx > lim->maxComputeWorkGroupSize[0] ||
+                          wy > lim->maxComputeWorkGroupSize[1])) {
+            if (wy >= wx)
+                wy /= 2;
+            else
+                wx /= 2;
+        }
+        ret = craw_pipeline_shader_wh(p, &p->df, "defringe",
+                                      craw_defringe_spv_data, craw_defringe_spv_len,
+                                      craw_bind_images, 2, sizeof(CRAWDefringePush), wx, wy,
+                                      wx % sg ? 0 : sg, NULL, 0);
         if (ret < 0)
             goto fail;
     }
@@ -1254,8 +1277,6 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->hl_push);
     if (p->hl_fill.pipeline)
         craw_vk_shader_free(ctx, &p->hl_fill);
-    if (p->df_prep.pipeline)
-        craw_vk_shader_free(ctx, &p->df_prep);
     if (p->df.pipeline)
         craw_vk_shader_free(ctx, &p->df);
     if (p->sh_prep.pipeline)
@@ -2067,30 +2088,22 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     }
 
     if (defringe) {
-        /* DESIGN.md 19: l, c and E into the second image, then the clamp in
-         * place, each invocation touching only its own texel of the
-         * intermediate, so the two images keep their roles. */
+        /* DESIGN.md 19: the first pass's values in shared memory and the
+         * clamp in one dispatch, every pixel into the second image, which
+         * then becomes the intermediate as with the stages above. */
         craw_vk_image_barrier(ctx, cmd, other, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_image(&writes[1], 1, other);
-        craw_pipeline_dispatch(p, cmd, &p->df_prep, writes, 2, &dfp, sizeof(dfp), w, h, 1);
+        craw_pipeline_dispatch(p, cmd, &p->df, writes, 2, &dfp, sizeof(dfp), w, h, 1);
 
         craw_vk_image_barrier(ctx, cmd, other, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        craw_vk_image_barrier(ctx, cmd, inter, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_vk_desc_image(&writes[0], 0, other);
-        craw_vk_desc_image(&writes[1], 1, inter);
-        craw_pipeline_dispatch(p, cmd, &p->df, writes, 2, &dfp, sizeof(dfp), w, h, 1);
-
-        craw_vk_image_barrier(ctx, cmd, inter, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        CRAWVkImage *t = inter;
+        inter = other;
+        other = t;
     }
 
     if (chroma) {

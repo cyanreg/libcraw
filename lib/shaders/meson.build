@@ -39,7 +39,6 @@ craw_shader_names = [
     'highlight_pull',
     'highlight_push',
     'highlight_fill',
-    'defringe_prep',
     'defringe',
     'sharpen_prep',
     'sharpen',

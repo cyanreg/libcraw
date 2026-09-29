@@ -4720,7 +4720,7 @@ static int test_profiling(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfil
     } want[] = {
         { "denoise_nlm", 1 }, { "highlight_field", 1 }, { "highlight_pull", 0 },
         { "highlight_push", 0 }, { "highlight_fill", 1 }, { "rcd", 1 }, { "false_color", 1 },
-        { "lens", 1 }, { "defringe_prep", 1 }, { "defringe", 1 }, { "chroma_down", 1 },
+        { "lens", 1 }, { "defringe", 1 }, { "chroma_down", 1 },
         { "chroma_blur", 1 }, { "chroma_up", 1 }, { "sharpen_prep", 1 }, { "sharpen", 2 },
         { "sharpen_last", 1 }, { "awb_hist", 1 }, { "color", 1 },
     };
