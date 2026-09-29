@@ -2069,6 +2069,34 @@ out:
 
 /* ---------------------------------------------------------------- the run */
 
+int view_encode_preroll(struct view_state *st, const AVFrame *f,
+                        const CRAWFrameParams *fp)
+{
+    struct view_encode *e = st->video.e;
+    int ret;
+
+    /* Only on the way to the first frame: the output is opened once that
+     * has landed, and every frame after it is the next one. */
+    if (!e || !st->video.active || !e->direct || e->opened)
+        return 0;
+
+    /* An abandoned pre-roll: the display's pipeline starts again at the
+     * target, and so does this one, by being built again, empty, when the
+     * output is opened. */
+    if (!f) {
+        view_gpu_direct_close(e->g);
+        return 0;
+    }
+
+    /* Built now rather than when the output is opened, which would be
+     * too late for these frames; view_enc_setup() finds it there. */
+    ret = view_gpu_direct_open(e->g);
+    if (ret < 0)
+        return ret;
+
+    return view_gpu_direct_preroll(e->g, f, fp);
+}
+
 /* The extension the selection writes by default. The family names its own
  * container - QuickTime for the codecs a camera writes, Matroska for the
  * archival ones it does not, MP4 for x264 - because a .mov with FFV1 in it
@@ -2633,29 +2661,28 @@ static int view_enc_walk(struct view_encode *e, struct view_state *st,
 {
     int ret;
 
-    if (st->have_frame && st->index == want) {
-        /* An export starts the temporal denoise afresh at its first frame
-         * (DESIGN.md 14.7), whatever the picture on screen was averaged
-         * with, so that the same range exported twice is the same file and
-         * the direct path's own pipeline, which starts empty, averages the
-         * same frames. A first frame that has to be sought gets that from
-         * the seek. */
-        if (!e->sought) {
-            e->sought = true;
-            if (view_temporal_strength(st) > 0.0f) {
-                ret = view_replay_frame_flags(st, CRAW_FRAME_FLAG_TEMPORAL_RESET);
-                if (ret < 0)
-                    return ret;
-            }
+    /* One seek, at the start: every frame after it is the next one. An
+     * export starts the temporal denoise afresh ahead of its first frame
+     * (DESIGN.md 14.7), whatever the picture on screen was averaged with,
+     * so that the same range exported twice is the same file: with the
+     * pass on, the first frame is sought even when it is the picture on
+     * screen, and the seek develops the frames before it from nothing,
+     * through the direct path's own pipeline as well as the display's
+     * (view_encode_preroll()), so that the two average the same frames. */
+    if (!e->sought) {
+        e->sought = true;
+        if (!st->have_frame || st->index != want ||
+            view_temporal_strength(st) > 0.0f) {
+            st->seek_to = want;
+            st->seek_cold = true;
         }
-        return 2;
     }
 
-    /* One seek, at the start: every frame after it is the next one. */
-    if (!e->sought) {
-        st->seek_to = want;
-        e->sought = true;
-    }
+    /* Until the seek has landed, the picture on screen is the one it left,
+     * whatever its number. */
+    if (st->seek_to < 0 && st->seek_target < 0 &&
+        st->have_frame && st->index == want)
+        return 2;
 
     do {
         ret = view_step_frame(st);

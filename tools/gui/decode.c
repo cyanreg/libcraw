@@ -1112,6 +1112,20 @@ static int view_reader_get(struct view_decoder *d, AVPacket *pkt,
     return ret;
 }
 
+bool view_decoder_wait(struct view_decoder *d, int ms)
+{
+    struct view_reader *r = &d->reader;
+    bool ready;
+
+    SDL_LockMutex(r->lock);
+    if (!r->count && !r->eof && !r->quit)
+        SDL_WaitConditionTimeout(r->ready, r->lock, ms);
+    ready = r->count || r->eof;
+    SDL_UnlockMutex(r->lock);
+
+    return ready;
+}
+
 /* Moves up to `budget` packets from the reader into the decoder. Returns
  * the number moved, 0 when the queue is dry, or a negative error. */
 static int view_decoder_feed(struct view_decoder *d, int budget)

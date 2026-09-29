@@ -1635,12 +1635,29 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
      * bar stays, because dragging to a frame is the one thing keys are bad
      * at. */
     if (total > 1) {
+        bool held = ctx->input.mouse.buttons[NK_BUTTON_LEFT].down != 0;
+
         pos = (int)CRAW_CLAMP(st->index, 0, total - 1);
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
         if (nk_slider_int(ctx, 0, &pos, (int)(total - 1), 1) &&
             pos != (int)st->index) {
             st->seek_to = pos;
             st->need_frame = true;
+            st->scrubbing = held;
+        }
+
+        /* A drag is a stream of seeks, and each would pay for the temporal
+         * denoise's pre-roll (view_step_frame()), which halves the rate the
+         * picture follows the knob at. They start the average cold
+         * instead, and the frame the knob is let go on is sought once
+         * more, with its pre-roll. */
+        if (st->scrubbing && !held) {
+            st->scrubbing = false;
+            if (st->seek_to < 0 && view_temporal_strength(st) > 0.0f) {
+                st->seek_to = st->index;
+                st->seek_cold = true;
+                st->need_frame = true;
+            }
         }
     }
 }

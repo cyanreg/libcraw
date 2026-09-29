@@ -970,8 +970,11 @@ static VkImageView view_src_view(struct view_gpu *g, VkImage image, VkFormat fmt
     return view;
 }
 
-int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
-                     const CRAWFrameParams *fp, struct view_timing *tm)
+/* The raw path's one submission, for a picture (view_gpu_process()) or for
+ * a pre-roll frame (view_gpu_preroll()). */
+static int view_gpu_develop(struct view_gpu *g, const AVFrame *frame,
+                            const CRAWFrameParams *fp, struct view_timing *tm,
+                            bool preroll)
 {
     int64_t t0 = av_gettime_relative();
     AVHWFramesContext *fc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
@@ -997,7 +1000,10 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
 
     /* The only fence this waits on belongs to the slot about to be reused,
      * which was submitted VIEW_SLOTS frames ago and has normally long since
-     * retired. Frame N is never waited for before N + 1 is recorded. */
+     * retired. Frame N is never waited for before N + 1 is recorded. A
+     * pre-roll is the exception: its frames all go into this one slot, so
+     * each waits for the one before it, and the picture after them for the
+     * last. */
     if (sl->busy) {
         int64_t tw = av_gettime_relative();
 
@@ -1005,11 +1011,15 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
                             UINT64_MAX) != VK_SUCCESS)
             return CRAW_ERROR(EIO);
 
-        tm->fence += (double)(av_gettime_relative() - tw) / 1000.0;
-        if (g->rec)
-            g->rec->fence_ms += (double)(av_gettime_relative() - tw) / 1000.0;
+        if (!preroll) {
+            tm->fence += (double)(av_gettime_relative() - tw) / 1000.0;
+            if (g->rec)
+                g->rec->fence_ms += (double)(av_gettime_relative() - tw) / 1000.0;
+        }
         sl->busy = false;
 
+        /* A pre-roll frame writes no timestamps, so a slot it last used has
+         * none to give and the averages below are left alone. */
         if (vkGetQueryPoolResults(g->vk->device, g->queries, (uint32_t)(2 * g->slot),
                                   2, sizeof(ts), ts, sizeof(ts[0]),
                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
@@ -1079,8 +1089,12 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
      * the frames context lock is held. */
     vkfc->lock_frame(fc, vkf);
 
-    vkCmdWriteTimestamp2(sl->cmd, VK_PIPELINE_STAGE_2_NONE, g->queries,
-                         (uint32_t)(2 * g->slot));
+    /* Not for a pre-roll frame: the panel's pass times are of the
+     * pictures, and a pre-roll frame is developed without the stages after
+     * the raw one (main.c). */
+    if (!preroll)
+        vkCmdWriteTimestamp2(sl->cmd, VK_PIPELINE_STAGE_2_NONE, g->queries,
+                             (uint32_t)(2 * g->slot));
 
     VkImageMemoryBarrier2 to_general = {
         .sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
@@ -1119,8 +1133,9 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
         goto release;
     }
 
-    vkCmdWriteTimestamp2(sl->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g->queries,
-                         (uint32_t)(2 * g->slot + 1));
+    if (!preroll)
+        vkCmdWriteTimestamp2(sl->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, g->queries,
+                             (uint32_t)(2 * g->slot + 1));
 
     if (vkEndCommandBuffer(sl->cmd) != VK_SUCCESS) {
         vkfc->unlock_frame(fc, vkf);
@@ -1177,9 +1192,11 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
     if (ret >= 0)
         sl->busy = true;
 
-    tm->submit += (double)(av_gettime_relative() - t0) / 1000.0;
-    if (g->rec)
-        g->rec->t_submit = av_gettime_relative();
+    if (!preroll) {
+        tm->submit += (double)(av_gettime_relative() - t0) / 1000.0;
+        if (g->rec)
+            g->rec->t_submit = av_gettime_relative();
+    }
 
     /* The contract the hwcontext documents: the value we signalled becomes
      * the value the next user has to wait on, and the layout is whatever we
@@ -1209,12 +1226,30 @@ release:
     if (ret < 0)
         return ret;
 
+    /* A pre-roll frame is not a picture: the slot stays the next one to
+     * record into, the one on screen stays on screen, and nothing that
+     * counts pictures sees it. */
+    if (preroll)
+        return 0;
+
     g->display_slot = g->slot;
     g->slot = (g->slot + 1) % VIEW_SLOTS;
     g->submitted++;
     g->pic_serial++;
 
     return 0;
+}
+
+int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
+                     const CRAWFrameParams *fp, struct view_timing *tm)
+{
+    return view_gpu_develop(g, frame, fp, tm, false);
+}
+
+int view_gpu_preroll(struct view_gpu *g, const AVFrame *frame,
+                     const CRAWFrameParams *fp)
+{
+    return view_gpu_develop(g, frame, fp, NULL, true);
 }
 
 int view_gpu_wait_prev(struct view_gpu *g, struct view_timing *tm)
@@ -2575,20 +2610,17 @@ fail:
     return ret;
 }
 
-int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
-                          enum CRAWColorSpace space, int x, int y, int w, int h,
-                          float *rgba, double *gpu_ms, double *dl_ms)
+/* One pass of the export's pipeline into its texture, waited for. */
+static int view_gpu_direct_record(struct view_gpu *g, const AVFrame *frame,
+                                  const CRAWFrameParams *fp)
 {
-    const AVFrame *frame = st->frame;
     AVHWFramesContext *fc;
     AVVulkanFramesContext *vkfc;
     AVVkFrame *vkf;
     const VkFormat *vkfmt;
     VkImageView src_view;
-    CRAWFrameParams fp;
     CRAWImage src, dst;
     uint64_t hold;
-    int64_t t0;
     int ret;
 
     if (!g->direct_pipe)
@@ -2608,17 +2640,6 @@ int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
     if (src_view == VK_NULL_HANDLE)
         return CRAW_ERROR(ENOMEM);
 
-    view_frame_params(st, &fp);
-    /* The one thing that differs from the frame on screen: where the colour
-     * stage lands. No CRAW_FRAME_FLAG_CLAMP_NEGATIVE - an archive keeps
-     * what the camera matrix produced, negatives included - and no
-     * NO_GAMUT_COMPRESSION either, so ACEScg carries the same reference
-     * gamut compression the hand-off does and the file holds the numbers
-     * the screen was shown. */
-    fp.out_space     = space;
-    fp.out_space_set = true;
-    fp.flags        &= ~(uint32_t)CRAW_FRAME_FLAG_CLAMP_NEGATIVE;
-
     src = (CRAWImage) {
         .image  = vkf->img[0],
         .view   = src_view,
@@ -2635,8 +2656,6 @@ int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
         .width  = g->direct_w,
         .height = g->direct_h,
     };
-
-    t0 = av_gettime_relative();
 
     hold = g->out_value + 1;
     if (!pl_vulkan_hold_ex(g->gpu, pl_vulkan_hold_params(
@@ -2691,7 +2710,7 @@ int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
         .pImageMemoryBarriers    = &to_general,
     });
 
-    ret = craw_pipeline_record(g->direct_pipe, g->direct_cmd, &src, &dst, &fp);
+    ret = craw_pipeline_record(g->direct_pipe, g->direct_cmd, &src, &dst, fp);
     if (ret < 0) {
         vkfc->unlock_frame(fc, vkf);
         vkEndCommandBuffer(g->direct_cmd);
@@ -2778,6 +2797,31 @@ release:
     if (ret >= 0)
         g->out_value = hold + 1;
 
+    return ret;
+}
+
+int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
+                          enum CRAWColorSpace space, int x, int y, int w, int h,
+                          float *rgba, double *gpu_ms, double *dl_ms)
+{
+    CRAWFrameParams fp;
+    int64_t t0;
+    int ret;
+
+    view_frame_params(st, &fp);
+    /* The one thing that differs from the frame on screen: where the colour
+     * stage lands. No CRAW_FRAME_FLAG_CLAMP_NEGATIVE - an archive keeps
+     * what the camera matrix produced, negatives included - and no
+     * NO_GAMUT_COMPRESSION either, so ACEScg carries the same reference
+     * gamut compression the hand-off does and the file holds the numbers
+     * the screen was shown. */
+    fp.out_space     = space;
+    fp.out_space_set = true;
+    fp.flags        &= ~(uint32_t)CRAW_FRAME_FLAG_CLAMP_NEGATIVE;
+
+    t0 = av_gettime_relative();
+
+    ret = view_gpu_direct_record(g, st->frame, &fp);
     if (ret < 0)
         return ret;
 
@@ -2802,6 +2846,12 @@ release:
         *dl_ms = (double)(av_gettime_relative() - t0) / 1000.0;
 
     return 0;
+}
+
+int view_gpu_direct_preroll(struct view_gpu *g, const AVFrame *frame,
+                            const CRAWFrameParams *fp)
+{
+    return view_gpu_direct_record(g, frame, fp);
 }
 
 /* ------------------------------------------------------------- the UI tex */

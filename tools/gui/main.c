@@ -1392,6 +1392,30 @@ static int view_awb_step(struct view_state *st)
     return 0;
 }
 
+/* The profile a frame is developed with: the camera's tables and the
+ * frame's own side data. */
+static int view_frame_profile(struct view_state *st, const AVFrame *f)
+{
+    int ret;
+
+    st->prof = st->base;
+    ret = view_profile_from_frame(&st->prof, f);
+    if (ret < 0)
+        return ret;
+
+    /* The same exposure model cineraw uses: the frame gain times the
+     * working index over the as-shot ISO, times the bias in stops. */
+    if (!(st->prof.as_shot_ei > 0.0f))
+        st->prof.as_shot_ei = st->dec.meta_as_shot_ei;
+    if (view_exposure_ei(st) > 0.0f)
+        st->prof.exposure_index = view_exposure_ei(st);
+    else if (!(st->prof.exposure_index > 0.0f))
+        st->prof.exposure_index = st->prof.as_shot_ei;
+    st->have_prof = true;
+
+    return 0;
+}
+
 /* The raw path from the held picture to a submitted pipeline pass: the
  * profile from the frame's side data, the exposure model, the parameters
  * from the look, the pass itself and the auto white balance step that reads
@@ -1405,20 +1429,9 @@ static int view_process_frame(struct view_state *st, uint32_t flags, bool replay
     bool reset;
     int ret;
 
-    st->prof = st->base;
-    ret = view_profile_from_frame(&st->prof, st->frame);
+    ret = view_frame_profile(st, st->frame);
     if (ret < 0)
         return ret;
-
-    /* The same exposure model cineraw uses: the frame gain times the
-     * working index over the as-shot ISO, times the bias in stops. */
-    if (!(st->prof.as_shot_ei > 0.0f))
-        st->prof.as_shot_ei = st->dec.meta_as_shot_ei;
-    if (view_exposure_ei(st) > 0.0f)
-        st->prof.exposure_index = view_exposure_ei(st);
-    else if (!(st->prof.exposure_index > 0.0f))
-        st->prof.exposure_index = st->prof.as_shot_ei;
-    st->have_prof = true;
 
     /* The whole decoded frame: the decoder was told not to crop, so this is
      * the camera's entire readout and every sensel of it is developed. What
@@ -1520,11 +1533,217 @@ int view_replay_frame(struct view_state *st)
     return view_replay_frame_flags(st, 0);
 }
 
+/* ------------------------------------------------------------ the pre-roll */
+
+/* A decoded picture's place on the clip's timeline, in seconds. */
+static double view_frame_pts(const struct view_state *st, const AVFrame *f)
+{
+    const AVStream *vs = st->dec.fmt->streams[st->dec.stream_index];
+    int64_t start = vs->start_time != AV_NOPTS_VALUE ? vs->start_time : 0;
+    int64_t pts = f->pts != AV_NOPTS_VALUE ? f->pts : 0;
+
+    return (double)(pts - start) * av_q2d(st->dec.time_base);
+}
+
+static int view_seek_decoder(struct view_state *st, int64_t frame)
+{
+    int ret = view_decoder_seek(&st->dec, frame);
+
+    if (ret < 0)
+        return ret;
+
+    /* A rebuilt decoder brings a whole new frame pool with it. */
+    if (st->dec.frames_reset) {
+        view_gpu_drop_src_views(&st->gpu);
+        st->dec.frames_reset = false;
+    }
+
+    return 0;
+}
+
+/* Whether a jump warms the temporal average before its target: the pass
+ * is set to run, on a raw clip whose frames can be counted. Before a
+ * clip's first picture there is no frame profile to ask for the noise
+ * model, so the camera's table is asked at the clip's ISO, which is what
+ * that picture will find. */
+static bool view_preroll_wanted(const struct view_state *st)
+{
+    CRAWNoiseModel nm;
+
+    if (!st->dec.raw || !st->dec.frame_rate.num ||
+        !st->denoise.on || !(st->denoise.temporal > 0.0f))
+        return false;
+    if (st->have_prof)
+        return view_temporal_strength(st) > 0.0f;
+
+    return craw_profile_noise_eval(&st->base, st->dec.meta_as_shot_ei, &nm) >= 0;
+}
+
+/* One frame ahead of a seek's target, developed for the temporal state it
+ * leaves and nothing else. The state is the raw stage's (DESIGN.md 14.7):
+ * what it holds follows from the mosaic, the noise model, the spatial
+ * strength and alpha_max, and from nothing after the stage, so the passes
+ * there are left out - the sharpening at a paused picture's full count
+ * above all, which costs more than the rest of the pipeline together.
+ * `reset` starts the average at this frame. A scene-referred export on its
+ * way to its first frame gets the frame through its own pipeline too. */
+static int view_preroll_frame(struct view_state *st, const AVFrame *f,
+                              int64_t index, bool reset)
+{
+    CRAWFrameParams fp;
+    int ret;
+
+    if (f->format != AV_PIX_FMT_VULKAN)
+        return CRAW_ERROR(ENOTSUP);
+
+    ret = view_frame_profile(st, f);
+    if (ret < 0)
+        return ret;
+
+    ret = view_gpu_ensure(&st->gpu, (uint32_t)f->width, (uint32_t)f->height,
+                          st->look.debayer);
+    if (ret < 0)
+        return ret;
+
+    view_frame_params(st, &fp);
+    fp.denoise_chroma_strength = 0.0f;
+    fp.false_color_passes = 0;
+    fp.defringe_strength = 0.0f;
+    fp.lens = (CRAWLensCorrection) { 0 };
+    fp.sharpen_iterations = 0;
+    fp.flags &= ~(uint32_t)(CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION |
+                            CRAW_FRAME_FLAG_LENS_KEEP_ALL);
+    if (reset)
+        fp.flags |= CRAW_FRAME_FLAG_TEMPORAL_RESET;
+
+    ret = view_gpu_preroll(&st->gpu, f, &fp);
+    if (ret < 0)
+        return ret;
+
+    ret = view_encode_preroll(st, f, &fp);
+    if (ret < 0)
+        return ret;
+
+    st->denoise.reset = false;
+    st->denoise.have_last = true;
+    st->denoise.last = index;
+
+    return 0;
+}
+
+/* Develops the frames from `first` up to the seek's target `want` through
+ * the pipeline without showing any of them, the first starting the average
+ * again, and then decodes the target itself into st->frame and sets
+ * `held`, for view_step_frame() to develop in place of decoding one: a
+ * target left to the next step could be starved by the reader, which the
+ * pre-roll has just run dry, and the audio would set off without it. A
+ * picture just past the target that turns up in its place is held the
+ * same way, as the step's landing check would take it.
+ *
+ * Nothing else about the seek sees the pre-roll: no picture is presented
+ * or counted, the audio is still parked at the target and the clock only
+ * starts once the target is there, the auto white balance reads the
+ * target's histogram a frame later as it would have, and the slots stay
+ * as they were (view_gpu_preroll()). It waits for the medium, which is
+ * what makes it slow when it is: the packets are read ahead on the reader
+ * thread, and the seek has only just emptied its queue.
+ *
+ * One that cannot finish - a frame that will not decode, the end of the
+ * clip, a medium that stops delivering, the device refusing a pass - is
+ * abandoned: the decoder is sent to the target again and the target starts
+ * the average itself, as every seek did before there was a pre-roll. Only
+ * a medium that stops once the frames before the target are all in leaves
+ * the average warm and the target to the next step. Negative only when the
+ * seek back fails. */
+static int view_preroll(struct view_state *st, int64_t first, int64_t want,
+                        bool *held)
+{
+    AVFrame *f = av_frame_alloc();
+    CRAWLensCorrection lens;
+    int64_t t0 = av_gettime_relative(), idle = t0, index, at = first - 1;
+    const char *why = "out of memory";
+    int done = 0, stale = 0, ret;
+
+    *held = false;
+    if (!f)
+        goto abandon;
+
+    while (1) {
+        ret = view_decoder_next(&st->dec, f);
+        if (ret == 2) {
+            if (av_gettime_relative() - idle > VIEW_PREROLL_PATIENCE_MS * 1000) {
+                why = "the medium stopped delivering";
+                if (at == want - 1)
+                    break;
+                goto abandon;
+            }
+            view_decoder_wait(&st->dec, 100);
+            continue;
+        }
+        if (ret) {
+            why = ret > 0 ? "the clip ended" : "a frame did not decode";
+            goto abandon;
+        }
+        idle = av_gettime_relative();
+
+        index = (int64_t)llrint(view_frame_pts(st, f) * av_q2d(st->dec.frame_rate));
+
+        /* What a decoder flushed after the end of the stream can still hand
+         * back from before the seek, the same thing view_step_frame()
+         * checks a landing for. */
+        if (index < first || index > want + 8) {
+            av_frame_unref(f);
+            if (++stale > 8) {
+                why = "the decoder kept handing back frames from elsewhere";
+                goto abandon;
+            }
+            continue;
+        }
+
+        if (index >= want) {
+            av_frame_unref(st->frame);
+            av_frame_move_ref(st->frame, f);
+            *held = true;
+            break;
+        }
+
+        /* The ring hands each record out once; this one is spoken for. */
+        view_decoder_lens(&st->dec, f->pts, &lens);
+
+        ret = view_preroll_frame(st, f, index, !done);
+        av_frame_unref(f);
+        if (ret < 0) {
+            why = "the pipeline refused a frame";
+            goto abandon;
+        }
+        done++;
+        at = index;
+    }
+
+    av_frame_free(&f);
+    view_log(st, "preroll: %d frames before %" PRId64 ", %.1f ms%s%s%s\n", done, want,
+             (double)(av_gettime_relative() - t0) / 1000.0,
+             *held ? "" : "; the target is not in yet (", *held ? "" : why,
+             *held ? "" : ")");
+
+    return 0;
+
+abandon:
+    av_frame_free(&f);
+    view_log(st, "preroll: abandoned after %d frames before %" PRId64 " (%s); "
+                 "the target starts the average\n", done, want, why);
+    st->denoise.reset = true;
+    view_encode_preroll(st, NULL, NULL);
+
+    return view_seek_decoder(st, want);
+}
+
 int view_step_frame(struct view_state *st)
 {
     AVStream *vs;
     CRAWLensCorrection prev_lens;
-    int64_t start, pts, t0;
+    bool held = false;
+    int64_t t0;
     int ret;
 
     /* There is no clip open, which only happens when a switch could not
@@ -1537,22 +1756,37 @@ int view_step_frame(struct view_state *st)
     if (st->seek_to >= 0) {
         /* Replaying the picture already on screen, which is how a grade
          * change repaints while paused, is not a move in time and must not
-         * throw the illuminant track away. */
-        bool jump = !st->have_frame || st->seek_to != st->index;
+         * throw the illuminant track away. An export's first frame is a
+         * jump even then (encode.c). */
+        bool jump = st->seek_cold || !st->have_frame || st->seek_to != st->index;
         int64_t want = st->seek_to;
+        int64_t first = want;
 
         double target = st->dec.frame_rate.num
                       ? (double)st->seek_to / av_q2d(st->dec.frame_rate) : 0.0;
 
-        ret = view_decoder_seek(&st->dec, st->seek_to);
+        /* The temporal denoise's state does not survive a jump: it is last
+         * frame's picture sample by sample, and after a jump no sample is
+         * where it was. A loop back to the start is a jump like any other.
+         * The average then starts again VIEW_PREROLL frames ahead of the
+         * target rather than at it, and the frames between are developed
+         * and not shown (view_preroll()), so that the target comes out as
+         * the next frame of an average that has had time to settle instead
+         * of the first of one that has none. The first frame of a clip has
+         * nothing before it, and the seeks of a knob being dragged go
+         * without (ui.c). */
+        if (jump && !st->scrubbing && view_preroll_wanted(st))
+            first = CRAW_MAX(want - VIEW_PREROLL, 0);
         st->seek_to = -1;
+        st->seek_cold = false;
+
+        ret = view_seek_decoder(st, first);
         if (ret < 0)
             return ret;
 
         /* Both readers go with the seek: the audio fades out, drops
          * everything in front of the target and arms the new run. */
         view_audio_seek(&st->audio, target);
-        view_wall_restart(st, target);
         view_gpu_reset_peak(&st->gpu, false);
         st->sync.run_frames = 0;
         st->seek_target = jump ? want : -1;
@@ -1564,30 +1798,31 @@ int view_step_frame(struct view_state *st)
          * back to it. */
         st->pts = target;
 
-        /* A rebuilt decoder brings a whole new frame pool with it. */
-        if (st->dec.frames_reset) {
-            view_gpu_drop_src_views(&st->gpu);
-            st->dec.frames_reset = false;
-        }
-        st->seek_tries = 0;
-
         /* The auto track survives a seek: the clip is one scene, and the
          * smoother's own clamp on the time step already limits how far one
          * frame can pull it. Only the stale estimate is dropped, the one
          * whose histogram was read a frame behind and belongs to the
-         * picture the seek left. The temporal denoise's state does not
-         * survive it: it is last frame's picture sample by sample, and
-         * after a jump no sample is where it was. A loop back to the start
-         * is a jump like any other. */
+         * picture the seek left. */
         if (jump) {
             st->awb.skip = 1;
             st->denoise.reset = true;
         }
+
+        if (first < want) {
+            ret = view_preroll(st, first, want, &held);
+            if (ret < 0)
+                return ret;
+        }
+
+        /* Only now, so that the time the pre-roll took is not taken for
+         * time the picture has fallen behind: the audio is parked at the
+         * target until the run loop starts it again. */
+        view_wall_restart(st, target);
     }
 
     t0 = av_gettime_relative();
     st->dec.read_ms = 0.0;
-    ret = view_decoder_next(&st->dec, st->frame);
+    ret = held ? 0 : view_decoder_next(&st->dec, st->frame);
     st->decode_ms = (double)(av_gettime_relative() - t0) / 1000.0;
     st->timing.read += st->dec.read_ms;
     st->timing.decode += st->decode_ms - st->dec.read_ms;
@@ -1624,9 +1859,7 @@ int view_step_frame(struct view_state *st)
             st->lens.scale = 0.0f;
     }
 
-    start = vs->start_time != AV_NOPTS_VALUE ? vs->start_time : 0;
-    pts = st->frame->pts != AV_NOPTS_VALUE ? st->frame->pts : 0;
-    st->pts = (double)(pts - start) * av_q2d(st->dec.time_base);
+    st->pts = view_frame_pts(st, st->frame);
     st->index = st->dec.frame_rate.num
               ? (int64_t)llrint(st->pts * av_q2d(st->dec.frame_rate))
               : st->index + 1;
@@ -1642,6 +1875,9 @@ int view_step_frame(struct view_state *st)
         st->have_frame = true;
         av_frame_unref(st->frame);
         st->sync.run_frames++;
+        /* Nothing to check a landing against on this path: the picture
+         * that comes out is where the seek went. */
+        st->seek_target = -1;
 
         /* The auto white balance reads the previous picture and starts on
          * this one: a frame behind, like the raw path's histogram, and for
@@ -1909,6 +2145,9 @@ static void view_usage(FILE *f)
 "                      frame's wherever the two agree within the model's\n"
 "                      noise: the most of the previous frame a sample\n"
 "                      keeps, 0.8 being about five frames of a static shot.\n"
+"                      A seek or an export first develops the five frames\n"
+"                      before the one it starts on, unseen, so that the\n"
+"                      average has settled there.\n"
 "                      A STRENGTH of 0 with a CHROMA or TEMPORAL above it\n"
 "                      turns the section on with the spatial filter off\n"
 "  --highlights on|off rebuild clipped highlights before the debayer (on by\n"
@@ -2846,6 +3085,8 @@ static int view_open_clip(struct view_state *st, int index, bool first)
     st->seek_to = -1;
     st->seek_target = -1;
     st->seek_tries = 0;
+    st->seek_cold = false;
+    st->scrubbing = false;
     st->need_frame = true;
     st->warm = false;
     st->loops_done = 0;

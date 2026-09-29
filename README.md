@@ -251,18 +251,23 @@ smoothing of the quarter resolution chroma band after the debayer, which
 needs no model; a strength of 0 leaves the spatial filter out, so the
 other two can be looked at alone. `--denoise STRENGTH[,CHROMA[,TEMPORAL]]`
 sets the switch and all three amounts from the command line. The temporal
-average starts again after a seek, at the loop point, on a new clip and at
-the first frame of a video export, and a grade changed while paused
-develops the frame on screen from the same history it was first developed
-from. The "Sharpen" section is the capture sharpening, off until its
-switch is lit: the radius, the iteration count and the contrast threshold
-of `cineraw --sharpen`, 0.8, 20 and 1 until changed. The count is what a
-paused picture and every exported frame get; while the clip plays the pass
-runs at most five iterations, which is what fits the frame time, and
-pausing puts the picture through again at the full count. On a camera with
-no noise model the contrast row greys out and everything is sharpened.
-`--sharpen RADIUS[,ITERATIONS[,CONTRAST]]` sets the switch and the numbers
-from the command line.
+average starts again on a new clip, at the loop point and after a seek,
+but not at the frame the seek lands on: the five frames before it are
+developed first, unseen, so that the picture is about as clean as if the
+clip had been played to it, at about a tenth of a second a seek. A video
+export does the same before its first frame, and so does a still of a
+frame that is not on screen; while the scrub bar's knob is held its seeks
+skip it, and the frame it is let go on is developed again with it. A
+grade changed while paused develops the frame on screen from the same
+history it was first developed from. The "Sharpen" section is the capture
+sharpening, off until its switch is lit: the radius, the iteration count
+and the contrast threshold of `cineraw --sharpen`, 0.8, 20 and 1 until
+changed. The count is what a paused picture and every exported frame get;
+while the clip plays the pass runs at most five iterations, which is what
+fits the frame time, and pausing puts the picture through again at the
+full count. On a camera with no noise model the contrast row greys out and
+everything is sharpened. `--sharpen RADIUS[,ITERATIONS[,CONTRAST]]` sets
+the switch and the numbers from the command line.
 With four mono audio tracks the last two are taken as the stereo pair
 (`--audio-map` overrides). `cineview -h` lists the options.
 

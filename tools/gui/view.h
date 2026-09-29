@@ -942,7 +942,9 @@ struct view_denoise {
      * whatever breaks the run of frames - a seek to another frame, the loop
      * back to the start, a new clip, the start of a video export - and
      * taken by the next frame developed, which then starts the average
-     * again. `last` is the frame the last new development was of, so that
+     * again: after a seek that is the first of the frames the seek
+     * develops ahead of its target (VIEW_PREROLL). `last` is the frame the
+     * last new development was of, pre-roll frames included, so that
      * developing it again, however that comes about, replays it instead of
      * averaging it with itself. */
     bool reset;
@@ -960,6 +962,24 @@ struct view_denoise {
      * ways, which is why the readout has to check. */
     double ms_on, ms_off;
 };
+
+/* The frames a jump develops ahead of its target while the temporal
+ * denoise runs, DESIGN.md 14.7: the first from nothing, the rest as the
+ * next frames, none of them shown, so that the target is the sixth frame
+ * of an average rather than the first. The average reaches back about
+ * 1 / (1 - alpha_max) frames, five at the 0.8 the section is meant to be
+ * used at, and five frames leave the one they started from a weight of
+ * 0.8^5 = 0.33 in the target's state; on P1094353 a range exported from
+ * frame 30 then flickers from its first frame as much as the whole clip
+ * does there. A higher alpha_max is warmed only partly. Each frame is a
+ * decode and a pass without the stages after the raw one, and the whole
+ * pre-roll, the target's own decode with it, took 70 to 170 ms a jump in
+ * the window at 5.8K on the 6900 XT, 82 ms the median of 63. */
+#define VIEW_PREROLL 5
+
+/* How long a pre-roll waits for the medium to hand it the next packet
+ * before it gives up and lets the target start the average itself. */
+#define VIEW_PREROLL_PATIENCE_MS 1000
 
 /* Geometric lens correction, as the panel holds it. The correction itself
  * is the frame's own - it changes every frame while the lens zooms or
@@ -1169,6 +1189,14 @@ struct view_state {
     int64_t seek_to;            /* >= 0: seek before the next decode */
     int64_t seek_target;        /* the frame a seek is still looking for */
     int seek_tries;
+    /* The seek at seek_to is a jump, with the temporal denoise's pre-roll,
+     * even when its target is the picture on screen: an export's first
+     * frame (encode.c), and the frame the scrub bar's knob was let go on
+     * (ui.c). */
+    bool seek_cold;
+    /* The scrub bar's knob is held: its seeks come as a stream and start
+     * the average cold, without a pre-roll. */
+    bool scrubbing;
 
     struct pl_custom_lut *lut;
     char lut_error[128];
@@ -1249,6 +1277,16 @@ void view_gpu_new_clip(struct view_gpu *g, bool raw);
 int  view_gpu_process(struct view_gpu *g, const AVFrame *frame,
                       const CRAWFrameParams *fp, struct view_timing *tm);
 
+/* The same for a frame developed only for the temporal state it leaves,
+ * ahead of a seek's target (DESIGN.md 14.7): recorded into the slot the
+ * next picture will use, which is never the one on screen, and not counted
+ * as a picture - the slot does not move, the picture on screen stays, the
+ * pass is not timed and nothing is charged to the frame's timing. Each
+ * such frame waits for the one before it, and the next picture for the
+ * last. */
+int  view_gpu_preroll(struct view_gpu *g, const AVFrame *frame,
+                      const CRAWFrameParams *fp);
+
 /* Waits for the submission before the last one, which is what the auto
  * white balance histogram of the previous frame needs. Normally returns at
  * once: that frame has had a whole frame period to retire. */
@@ -1328,6 +1366,11 @@ int  view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
                            enum CRAWColorSpace space, int x, int y, int w, int h,
                            float *rgba, double *gpu_ms, double *dl_ms);
 
+/* A pre-roll frame through that pipeline, with the parameters the display's
+ * got, for its temporal state alone: nothing is read back. */
+int  view_gpu_direct_preroll(struct view_gpu *g, const AVFrame *frame,
+                             const CRAWFrameParams *fp);
+
 /* Reads the rectangle (x, y, w, h) of the picture on screen back from the
  * display slot's own RGBA16F texture, as the texels libcraw wrote: w * h
  * packed RGBA halves, rows tightly packed. Waits for that slot's
@@ -1379,10 +1422,16 @@ void view_decoder_close(struct view_decoder *d);
 /* Once per program, after the last clip: the XML parser's globals. */
 void view_decoder_cleanup(void);
 
-/* 0: a frame, 1: end of stream, negative: an error. */
+/* 0: a frame, 1: end of stream, 2: the reader has nothing queued yet,
+ * negative: an error. */
 int  view_decoder_next(struct view_decoder *d, AVFrame *frame);
 
 int  view_decoder_seek(struct view_decoder *d, int64_t frame_index);
+
+/* Blocks until the reader has a packet queued or has reached the end of
+ * the file, for at most `ms` milliseconds; false when it still has
+ * neither. Only a seek's pre-roll waits on the medium like this. */
+bool view_decoder_wait(struct view_decoder *d, int ms);
 
 /* Mean queue depth since the last call, as the reader itself saw it. */
 double view_decoder_queued(struct view_decoder *d);

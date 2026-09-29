@@ -2006,17 +2006,56 @@ moved the indices all the same, and the caller should reset.
 
 What breaks the run is the caller's to say, and cineview says it on a seek
 to another frame, the loop back to the start, a new clip, and the first
-frame of a video export, which is developed with a reset even when it is
-the picture on screen, so that the same range exported twice is the same
-file and the export's own pipeline, which starts empty, averages the same
-frames as the display's. A frame the player drops to keep up is not a
-break: the next one is still the next frame of the same scene, further on,
-and the pass takes what moved as motion. A development of the frame last
-developed is a replay whether it comes from a grade change, a white pick
-or a seek to the picture already on screen. A still export of the frame
-on screen is the picture on screen; of any other frame, a seek and a
-start from nothing, except that a frame up to eight ahead is reached by
-developing the frames between, which carries the average forward.
+frame of a video export, which is sought even when it is the picture on
+screen, so that the same range exported twice is the same file. It does
+not start the average at the frame a seek lands on, though, which would
+make the picture after every seek, and the first frames of every export,
+the noisiest of their run: a jump starts it five frames earlier and
+develops those frames without showing them, the first with the reset and
+the rest as next frames, and the target is then the sixth frame of an
+average rather than the first. Five is 1 / (1 - alpha_max) at the 0.8 the
+section is meant for, the average's reach, and leaves the frame it
+started from a weight of 0.8^5 = 0.33 in the target's state; a higher
+alpha_max is warmed only partly. It is a constant, `VIEW_PREROLL`, not a
+setting. A frame of the pre-roll is developed for its state and nothing
+else: the passes after the raw stage, which cannot change the state, are
+left out (the target comes out bit for bit the same as after a pre-roll
+with them, 20 iterations of sharpening among them), it is recorded into
+the output slot the next picture will use, which is never the one on
+screen, without moving the slot on, and it is not timed, counted, read
+for the white balance or shown. The seek decodes its target before it
+returns, and the clock only starts after that, so the audio is not sent
+off ahead of a picture the pre-roll made late. A scene-referred export
+puts the same frames through its own pipeline, which is built for them
+rather than when the output is opened, so the two average the same
+frames. A pre-roll that cannot finish - a frame that does not decode,
+the end of the clip, a medium that delivers nothing for a second - is
+abandoned, the decoder is sent to the target again and the target starts
+the average, as every seek did before: an injected failure gives a still
+and a scene-referred range bit for bit the ones the viewer wrote before
+there was a pre-roll. While the scrub bar's knob is held its seeks come
+as a stream and go without, since each would pay for a pre-roll and the
+picture would follow the knob at half the rate (7 positions on a drag
+that shows 13 without); the frame it is let go on is sought once more,
+with one. The first frame of a clip has nothing before it.
+
+The pre-roll took 70 to 170 ms a jump in the window at 5.8K on the 6900 XT,
+82 ms the median of 63 and the slowest with other work on the GPU, the
+target's own decode included: six decodes and five passes that the device
+runs one after another, the wait for the medium no more than 10 ms of it.
+The raw path has no software decode to cap it for: a raw clip without the
+Vulkan hwaccel does not open at all (decode.c), so every frame of a
+pre-roll is a decode on the device and none of them can cost what a
+decode on the CPU would.
+
+A frame the player drops to keep up is not a break: the next one is still
+the next frame of the same scene, further on, and the pass takes what
+moved as motion. A development of the frame last developed is a replay
+whether it comes from a grade change, a white pick or a seek to the
+picture already on screen. A still export of the frame on screen is the
+picture on screen; of any other frame, a seek and its pre-roll, except
+that a frame up to eight ahead is reached by developing the frames
+between, which carries the average forward.
 
 A scene change detector — the fraction of samples whose patch distance
 exceeds the threshold, handed back like the AWB histogram — was designed
@@ -2191,6 +2230,23 @@ clip's: the table's a with the clip's b reads 1.43e-3. Through cineview's
 video export of the panel alone, the display look, the difference is
 0.043 off and 0.0103 with the spatial filter, and with both 0.0071, 0.0060
 and 0.0054 over the first frames and 0.0050 to 0.0056 after them.
+
+The viewer's pre-roll, on the same two clips with the clip's own model
+(given to cineview as a `--tables` noise knot), spatial 1 and temporal
+0.8. A still of P1094353's frame 40 against the same frame developed after
+all forty before it, which is what playing to it gives: started cold, the
+sRGB still is 512 16-bit codes away on average and the lower panel's
+high-pass noise is 1.071 of the warm frame's; after the pre-roll 182 codes
+and 0.997. Eight frames of pre-roll bring the difference to 111 codes and
+ten to 80, for proportionally more time. The scene-referred frames 30 to
+34 against the same frames of an export of 0 to 34: an RMS difference of
+6.58e-3 at frame 30 started cold and 1.99e-3 after the pre-roll, 2.01e-3
+and 0.81e-3 by frame 34, and the median frame to frame difference of G
+from 30 to 31 is 1.31e-3 cold, 0.96e-3 after the pre-roll and 0.98e-3 in
+the whole clip. On P1094352, frames 60 to 64 with the walkers in them,
+5.78e-3 and 1.27e-3 at frame 60 and 1.87e-3 and 0.51e-3 at 64. Exported
+twice, or with its first frame already on screen, a range is the same to
+the bit.
 
 ## 15. Soft light and vibrance
 

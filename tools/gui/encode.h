@@ -39,6 +39,8 @@
 struct view_state;
 struct view_encode;
 struct view_preset_sel;
+struct AVFrame;
+struct CRAWFrameParams;
 
 /* What one run is asked for. The size, the sound and the threads are the
  * selection's, which are export settings like the rest of them. */
@@ -141,6 +143,15 @@ int  view_encode_begin(struct view_state *st, const struct view_encode_opts *o);
  * to do or nothing to do yet, 1 when the file is finished, negative on an
  * error. `st->video.active` is cleared either way. */
 int  view_encode_step(struct view_state *st);
+
+/* A frame the seek to the first frame of the range develops ahead of it
+ * for the temporal denoise's state (main.c), which a scene-referred run's
+ * own pipeline has to take in as well: the pipeline is built for it if it
+ * is not yet. NULL for `f` says the pre-roll was abandoned and the display
+ * starts the average at the first frame, which this pipeline then does
+ * too. Does nothing for any other run or once the output is open. */
+int  view_encode_preroll(struct view_state *st, const struct AVFrame *f,
+                         const struct CRAWFrameParams *fp);
 
 /* Stops a run early, writing what has been encoded so far. */
 void view_encode_cancel(struct view_state *st);
