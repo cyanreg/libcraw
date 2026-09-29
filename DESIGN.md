@@ -2810,6 +2810,16 @@ budget ever gets tight — the source footprint of a 16x16 output tile is a
 16x16 source tile plus a three pixel halo, wherever the warp has moved it —
 but at 0.8 ms it would be optimizing the wrong stage.
 
+Both were tried in the round of section 21, back to back at 5.8K with a
+60 mm record. The alpha load was not free: the warp now writes the 1.0
+every debayer puts there and every stage keeps, and the pass went from
+0.77 ms to 0.70. The tile (the box of every tap of a workgroup's pixels,
+found with subgroup minimums and maximums and a shared atomic per
+subgroup, loaded once and read 48 times a pixel) took it to 0.68, which
+was not worth its hundred lines: the loads were never the bound, the
+cache having absorbed them as said above, and the pass is the one read
+and one write of the frame plus the taps' arithmetic.
+
 A frame with no record costs nothing at all, because the pass is not
 recorded: measured at **0.037 ms** difference on the 256x160 test frame,
 i.e. inside the noise of the measurement.

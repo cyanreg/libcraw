@@ -17,8 +17,11 @@
  * pass filter applied to the whole frame, and it would undo exactly the
  * detail RCD was chosen for.
  *
- * Alpha is read straight from the output pixel's own position, not warped;
- * the intermediate does not use it and the colour stage writes 1.0.
+ * Alpha is written as 1.0, not warped: it is 1.0 throughout the
+ * intermediate, which every debayer writes and every stage after it
+ * keeps, and the colour stage writes 1.0 over it anyway. Reading it back
+ * at the pixel's own position, as the warp used to, was a 140 MB read of
+ * its own at 5.8K and a tenth of the pass.
  *
  * With `keep_all` the frame is not filled: the output position is divided
  * by a scale worked out on the host so that the whole warped source fits
@@ -128,10 +131,9 @@ void main()
                                all(lessThanEqual(sp[c], vec2(pc.size)));
         }
 
-        /* Black, not transparent: alpha is the output pixel's own, and the
-         * colour stage writes 1.0 over it. */
+        /* Black, not transparent. */
         if (!inside) {
-            imageStore(dst, p, vec4(0.0, 0.0, 0.0, imageLoad(src, p).a));
+            imageStore(dst, p, vec4(0.0, 0.0, 0.0, 1.0));
             return;
         }
 
@@ -150,7 +152,7 @@ void main()
         }
     }
 
-    o.a = imageLoad(src, p).a;
+    o.a = 1.0;
 
     imageStore(dst, p, o);
 }
