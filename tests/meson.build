@@ -35,10 +35,20 @@ craw_testdev_dep = declare_dependency(
 )
 
 # CPU-only tests
-foreach t : [ 'test_profile', 'test_ref_debayer', 'test_awb' ]
+foreach t : [ 'test_ref_debayer', 'test_awb' ]
     exe = executable(t, t + '.c', dependencies: [ craw_static_dep ], link_language: 'cpp')
     test(t, exe, timeout: 120)
 endforeach
+
+# test_profile also checks the tools' built-in S1M2 noise table, so it
+# builds tools/profiles.c in, which needs nothing but libcraw.
+exe = executable('test_profile',
+    'test_profile.c',
+    '../tools/profiles.c',
+    include_directories: include_directories('../tools'),
+    dependencies: [ craw_static_dep ],
+    link_language: 'cpp')
+test('test_profile', exe, timeout: 120)
 
 # The ProRes RAW lens record parser. CPU only, and its frame comes from
 # tests/data, so it always runs. libavformat is asked for again here rather

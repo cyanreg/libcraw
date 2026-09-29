@@ -37,21 +37,37 @@ static_assert(sizeof(CRAWNoiseEstimate) == 64, "CRAWNoiseEstimate size");
 int craw_noise_model_eval(const CRAWNoiseKnot *knots, uint32_t nb_knots,
                           float iso, CRAWNoiseModel *out)
 {
+    const CRAWNoiseKnot *lo, *hi;
     uint32_t i;
-    float t, la, lb;
+    float t, la, lb, g;
 
     if (!knots || !nb_knots || !out)
         return CRAW_ERROR(EINVAL);
 
-    if (!(iso > 0.0f) || iso <= knots[0].iso) {
-        *out = (CRAWNoiseModel) { .a = knots[0].a, .b = knots[0].b };
+    lo = &knots[0];
+    hi = &knots[nb_knots - 1];
+
+    /* No exposure index to scale by: the lowest knot, as it always was. */
+    if (!(iso > 0.0f) || !isfinite(iso)) {
+        *out = (CRAWNoiseModel) { .a = lo->a, .b = lo->b };
         return 0;
     }
-    if (iso >= knots[nb_knots - 1].iso) {
-        *out = (CRAWNoiseModel) {
-            .a = knots[nb_knots - 1].a,
-            .b = knots[nb_knots - 1].b,
-        };
+
+    /* Outside the table the model moves the way a gain moves it, which is
+     * what an exposure index is on a sensor that writes its raw after the
+     * gain. The shot term is the signal's own count scaled by the gain, so
+     * a ~ iso. The read term is two noises, one ahead of the gain, which
+     * the gain squares, and one after it, which the gain does not touch:
+     * b = b0 + c * iso^2. At the top of a table the first is nearly all of
+     * b, so above it b ~ iso^2; towards the bottom b tends to b0, so below
+     * it b is kept. DESIGN.md 14.2 has the S1M2's numbers for both. */
+    if (iso <= lo->iso) {
+        *out = (CRAWNoiseModel) { .a = lo->a * (iso / lo->iso), .b = lo->b };
+        return 0;
+    }
+    if (iso >= hi->iso) {
+        g = iso / hi->iso;
+        *out = (CRAWNoiseModel) { .a = hi->a * g, .b = hi->b * g * g };
         return 0;
     }
 
@@ -60,11 +76,14 @@ int craw_noise_model_eval(const CRAWNoiseKnot *knots, uint32_t nb_knots,
             break;
     }
 
-    /* Both terms follow power laws in the sensor's gain, so the straight
-     * line to interpolate along is log against log. A knot with a zero
-     * term has no logarithm; there the neighbouring knot's own zero is the
-     * only sensible answer, and the term is interpolated linearly instead
-     * so that it reaches zero continuously. */
+    /* Between knots both terms follow power laws in the sensor's gain, so
+     * the straight line to interpolate along is log against log. That also
+     * bridges a change of gain mode, where the table steps instead of
+     * following one law, without pretending to know where in the interval
+     * the camera switches. A knot with a zero term has no logarithm; there
+     * the neighbouring knot's own zero is the only sensible answer, and the
+     * term is interpolated linearly instead so that it reaches zero
+     * continuously. */
     if (!(knots[i + 1].iso > knots[i].iso)) {
         *out = (CRAWNoiseModel) { .a = knots[i].a, .b = knots[i].b };
         return 0;

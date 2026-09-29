@@ -35,26 +35,47 @@ static const CRAWMatrixKnot s1m2_matrix_knots[] = {
     { 15000.0f, { { 0.7218f, 0.1263f, 0.1023f }, { 0.3158f, 0.7991f, -0.1149f }, { 0.0023f,  0.1176f, 0.9692f } } },
 };
 
-/* Sensor noise model, DESIGN.md 14.2, fitted with craw_noise_estimate()
- * on frame 0 of the ProRes RAW clips this camera has produced so far:
- * seven at ISO 1000 (P1000387, P1093870, P1093961, P1093970, P1093971,
- * P1094127, P1094644) and one at ISO 1250 (P1030266). Six of the seven
- * agreed on a to within +-7% and their median is the knot; the seventh is
- * a scene with fine texture in every bin and was discarded. b is a floor:
- * none of the clips has a region dark enough to resolve it, and it only
- * matters below u = b / a, about five code values above black.
+/* Sensor noise model, DESIGN.md 14.2, fitted with `cineraw --noise-estimate
+ * --frames 10` on every ProRes RAW clip on disk that records an ISO other
+ * than 1000 and on fourteen that record 1000, 42 from ISO 640 to 12800. A
+ * clip counts if its fit error is at most 15%, the fit keeps at least 90%
+ * of its bins and a moves by at most 16% over the ten frames; its b counts
+ * only if the fit resolved one (a read noise above half a code value: the
+ * frame has shadows). Each knot is the median over the clips that count,
+ * at 1000 with the frame 0 fits of four clips no longer on disk:
  *
- * Two knots is not a characterization. The camera writes the same
- * GainFactor at every ISO, which suggests a fixed analog gain with ISO as
- * metadata, in which case `a` barely moves; the two knots here are
- * consistent with that and equally consistent with a weak power law. The
- * ISO series will decide. Until then craw_noise_model_eval() clamps
- * outside this range rather than extrapolating, so a high-ISO clip is
- * under-denoised, never over-denoised, and --denoise or --noise is the way
- * to correct it. */
+ *     640    P1000111
+ *     1000   P1000387 P1001123 P1094715 P1094725 P1094729 P1094753
+ *            P1094844, and P1093870 P1093961 P1093971 P1094127
+ *     1250   P1030266 P1094731
+ *     1600   P1000255
+ *     2000   P1000167 P1000168
+ *     3200   P1094724 P1094727 P1094738
+ *     10000  P1000165 P1001122 P1094352 P1094353
+ *     12800  P1000164 P1000170 P1094756 P1094757
+ *
+ * P1094764 (4000) and P1094754 (8000) have no shadows and so no b; their
+ * a sits 0.3% and 12% below the table there. Sixteen clips, textured
+ * scenes and scenes that move, were discarded.
+ *
+ * From 1000 up the camera is one gain mode, the GainFactor 23.04 in every
+ * clip: a goes as ISO^0.96, 12e-9 * ISO within 10%, and b as
+ * 6.1e-10 + 2.3e-16 * ISO^2, a read noise of 1.6 code values after the
+ * gain and 9.6e-4 * ISO before it. ISO 640 is another mode (GainFactor
+ * 14.51): the same a as 1000 and 22 times the b, in all three 640 clips;
+ * where between 640 and 1000 the camera switches no clip says.
+ * Outside the table craw_noise_model_eval() carries on along that law: a
+ * with the ISO both ways, b with its square above 12800 and unchanged
+ * below 640. --noise overrides the whole table. */
 static const CRAWNoiseKnot s1m2_noise_knots[] = {
-    { 1000.0f, 1.30e-5f, 1.0e-9f },
-    { 1250.0f, 1.46e-5f, 1.1e-9f },
+    {   640.0f, 1.27e-5f, 1.72e-8f },
+    {  1000.0f, 1.32e-5f, 7.8e-10f },
+    {  1250.0f, 1.58e-5f, 9.7e-10f },
+    {  1600.0f, 2.11e-5f, 1.22e-9f },
+    {  2000.0f, 2.41e-5f, 1.92e-9f },
+    {  3200.0f, 3.83e-5f, 2.05e-9f },
+    { 10000.0f, 1.18e-4f, 2.65e-8f },
+    { 12800.0f, 1.51e-4f, 3.82e-8f },
 };
 
 struct tool_builtin_profile {

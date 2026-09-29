@@ -68,11 +68,12 @@ typedef struct CRAWNoiseKnot {
  *
  * Both a and b follow power laws in the sensor gain, so the interpolation
  * is linear in log(iso) of log(a) and log(b), i.e. a power law between
- * knots. Outside the table the nearest knot is used unchanged rather than
- * extrapolated: an extrapolated model is a guess, and a model that is too
- * small only means the stage denoises less than it could, which the
- * strength parameter can correct, while one that is too large destroys
- * detail. A zero b is carried through as zero.
+ * knots. Outside the table the model is carried on the way the gain
+ * carries it: a in proportion to iso on both sides; b as iso squared above
+ * the last knot, where the read noise ahead of the gain is nearly all of
+ * it, and unchanged below the first, where the read noise after the gain
+ * is most of it. A zero b is carried through as zero, and an iso that is
+ * not positive and finite gets the first knot. See DESIGN.md 14.2.
  *
  * Fails with CRAW_ERROR(EINVAL) if the table is empty. */
 CRAW_API int craw_noise_model_eval(const CRAWNoiseKnot *knots, uint32_t nb_knots,
@@ -116,9 +117,11 @@ typedef struct CRAWNoiseEstimate {
     float fit_rms;
 
     /* sqrt(b) expressed as 16-bit code values, which is the read noise in
-     * the units a sensor is usually quoted in. Above roughly 10 the frame
-     * almost certainly has no region dark enough to measure b and what was
-     * fitted is scene texture. */
+     * the units a sensor is usually quoted in. At a low exposure index,
+     * above roughly 10 the frame almost certainly has no region dark
+     * enough to measure b and what was fitted is scene texture; the real
+     * value grows with the index (10 at ISO 10000 on the S1M2, DESIGN.md
+     * 14.2). Exactly 0 means the frame has no shadows to measure b in. */
     float read_noise_lsb;
 
     /* Padding to allow for future fields. */

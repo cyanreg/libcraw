@@ -23,7 +23,12 @@ ARRIRAW and BRAW are planned.
   moved is left to the spatial filter, which then keeps more of the
   detail. About 0.6 ms more.
 - A sensor noise model, variance = a * signal + b by exposure index, held
-  in the camera profile, with a calibrator that fits it to a clip.
+  in the camera profile, with a calibrator that fits it to a clip. The
+  S1II's is measured on its own clips from ISO 640 to 12800 and carried past
+  both ends the way a gain moves it (a with the ISO, the read noise ahead
+  of the gain with its square), so the denoise, its temporal average and
+  the sharpening all know how noisy an ISO 10000 night shot is
+  (DESIGN.md 14.2).
 - Camera profiles with per-CCT white balance and matrix tables, as-shot
   exact and re-balance modes, CCT plus tint illuminant model.
 - Colour: camera matrix, gain, exposure, output to XYZ D65, BT.709,

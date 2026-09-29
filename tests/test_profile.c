@@ -1,14 +1,18 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
 /* Profile evaluation, locus mapping and output colour space matrices,
- * against the values in DESIGN.md sections 8 and 9. */
+ * against the values in DESIGN.md sections 8 and 9, and the noise model's
+ * evaluation and the S1M2 table of section 14.2. */
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <craw/noise.h>
 #include <craw/profile.h>
+
+#include "profiles.h"
 
 static int failures;
 
@@ -579,6 +583,167 @@ static void craw_test_bradford(void)
             CHECK_NEAR(m[i][j], i == j ? 1.0 : 0.0, 1e-6, "identity [%d][%d]", i, j);
 }
 
+#define CHECK_REL(got, want, rel, ...) \
+    CHECK_NEAR(got, want, (rel) * fabs((double)(want)), __VA_ARGS__)
+
+/* The evaluation rules of DESIGN.md 14.2 on a made-up table: the knots
+ * themselves, a power law between them, a ~ iso on both sides of the
+ * table, b ~ iso^2 above it and b kept below it, continuity where the
+ * rules meet, and the first knot when there is no exposure index. */
+static void craw_test_noise_eval(void)
+{
+    static const CRAWNoiseKnot kn[] = {
+        {  400.0f, 1.0e-5f, 4.0e-8f },
+        { 1600.0f, 2.0e-5f, 1.0e-9f },
+        { 6400.0f, 8.0e-5f, 1.6e-8f },
+    };
+    static const CRAWNoiseKnot zero_b[] = {
+        { 100.0f, 1.0e-5f, 0.0f    },
+        { 400.0f, 4.0e-5f, 4.0e-9f },
+    };
+    const uint32_t nb = CRAW_ARRAY_ELEMS(kn);
+    CRAWNoiseModel m, m2;
+    int ret;
+
+    for (uint32_t i = 0; i < nb; i++) {
+        ret = craw_noise_model_eval(kn, nb, kn[i].iso, &m);
+        CHECK(ret == 0, "eval at knot %u failed: %d", i, ret);
+        CHECK_REL(m.a, kn[i].a, 1e-5, "a at the knot at %.0f", kn[i].iso);
+        CHECK_REL(m.b, kn[i].b, 1e-5, "b at the knot at %.0f", kn[i].iso);
+    }
+
+    /* Halfway in log(iso) is the geometric mean of both terms, and a
+     * quarter of the way the power law's own value. */
+    craw_noise_model_eval(kn, nb, 800.0f, &m);
+    CHECK_REL(m.a, sqrt(1.0e-5 * 2.0e-5), 1e-5, "a halfway from 400 to 1600");
+    CHECK_REL(m.b, sqrt(4.0e-8 * 1.0e-9), 1e-5, "b halfway from 400 to 1600");
+    craw_noise_model_eval(kn, nb, 1600.0f * sqrt(2.0), &m);
+    CHECK_REL(m.a, 2.0e-5 * pow(4.0, 0.25), 1e-5, "a a quarter of the way to 6400");
+    CHECK_REL(m.b, 1.0e-9 * pow(16.0, 0.25), 1e-5, "b a quarter of the way to 6400");
+
+    /* Above the table: a ~ iso, b ~ iso^2. */
+    craw_noise_model_eval(kn, nb, 25600.0f, &m);
+    CHECK_REL(m.a, 8.0e-5 * 4.0, 1e-5, "a four times past the last knot");
+    CHECK_REL(m.b, 1.6e-8 * 16.0, 1e-5, "b four times past the last knot");
+
+    /* Below it: a ~ iso, b kept. */
+    craw_noise_model_eval(kn, nb, 100.0f, &m);
+    CHECK_REL(m.a, 1.0e-5 * 0.25, 1e-5, "a a quarter of the first knot");
+    CHECK_REL(m.b, 4.0e-8, 1e-5, "b a quarter of the first knot");
+
+    /* No step where interpolation hands over to extrapolation. */
+    for (int e = 0; e < 2; e++) {
+        float iso = e ? kn[nb - 1].iso : kn[0].iso;
+
+        craw_noise_model_eval(kn, nb, iso * 0.999f, &m);
+        craw_noise_model_eval(kn, nb, iso * 1.001f, &m2);
+        CHECK_REL(m2.a, m.a, 3e-3, "a across the knot at %.0f", iso);
+        CHECK_REL(m2.b, m.b, 5e-3, "b across the knot at %.0f", iso);
+    }
+
+    /* Without an exposure index there is nothing to scale by. */
+    {
+        const float bad[] = { 0.0f, -100.0f, NAN, INFINITY };
+
+        for (int i = 0; i < (int)CRAW_ARRAY_ELEMS(bad); i++) {
+            ret = craw_noise_model_eval(kn, nb, bad[i], &m);
+            CHECK(ret == 0 && m.a == kn[0].a && m.b == kn[0].b,
+                  "iso %g must give the first knot", (double)bad[i]);
+        }
+    }
+
+    /* A zero read term has no logarithm: linear to it inside the table,
+     * zero below it. */
+    craw_noise_model_eval(zero_b, 2, 200.0f, &m);
+    CHECK_REL(m.a, 2.0e-5, 1e-5, "a with a zero b knot");
+    CHECK_REL(m.b, 2.0e-9, 1e-5, "b interpolated linearly to a zero b");
+    craw_noise_model_eval(zero_b, 2, 50.0f, &m);
+    CHECK(m.b == 0.0f, "a zero b stays zero below the table, got %g", (double)m.b);
+
+    /* A single knot extrapolates both ways. */
+    craw_noise_model_eval(kn, 1, 800.0f, &m);
+    CHECK_REL(m.a, 2.0e-5, 1e-5, "a from a one knot table");
+    CHECK_REL(m.b, 1.6e-7, 1e-5, "b from a one knot table");
+
+    ret = craw_noise_model_eval(kn, 0, 800.0f, &m);
+    CHECK(ret == CRAW_ERROR(EINVAL), "an empty table must fail, got %d", ret);
+}
+
+/* The built-in S1M2 table of tools/profiles.c against the measurements of
+ * DESIGN.md 14.2: sorted, a ~ 12e-9 * iso from 1000 up and b on
+ * 6.1e-10 + 2.3e-16 * iso^2 there, the ISO 640 mode's step, the ISO 10000
+ * clip's own fit, and a model that never falls as the index rises. */
+static void craw_test_noise_s1m2(void)
+{
+    CRAWProfile p;
+    CRAWNoiseModel m, prev = { 0.0f, 0.0f }, lo, hi;
+    const CRAWNoiseKnot *kn;
+    float prev_iso = 0.0f;
+    uint32_t nb;
+    int ret;
+
+    craw_test_profile_init(&p);
+    ret = craw_tool_profile_apply_builtin(&p, "s1m2");
+    CHECK(ret == 0, "the s1m2 built-in failed: %d", ret);
+    CHECK(craw_profile_validate(&p) == 0, "the s1m2 built-in must validate");
+
+    kn = p.noise_knots;
+    nb = p.nb_noise_knots;
+    CHECK(nb >= 2 && nb <= CRAW_PROFILE_MAX_NOISE_KNOTS, "%u noise knots", nb);
+
+    for (uint32_t i = 0; i < nb; i++) {
+        CHECK(kn[i].a > 0.0f && kn[i].b > 0.0f, "knot %.0f has a zero term", kn[i].iso);
+        if (i)
+            CHECK(kn[i].iso > kn[i - 1].iso, "knots out of order at %.0f", kn[i].iso);
+        if (kn[i].iso < 1000.0f)
+            continue;
+
+        CHECK_REL(kn[i].a / kn[i].iso, 12e-9, 0.12, "a / iso at %.0f", kn[i].iso);
+        CHECK(kn[i].b > (6.1e-10 + 2.3e-16 * kn[i].iso * kn[i].iso) / 1.5 &&
+              kn[i].b < (6.1e-10 + 2.3e-16 * kn[i].iso * kn[i].iso) * 1.5,
+              "b at %.0f is %g, off the law", kn[i].iso, (double)kn[i].b);
+    }
+
+    /* ISO 640 is the other gain mode: the a of 1000, twenty times the b. */
+    craw_noise_model_eval(kn, nb, 640.0f, &lo);
+    craw_noise_model_eval(kn, nb, 1000.0f, &hi);
+    CHECK_REL(lo.a, hi.a, 0.1, "a at 640 against 1000");
+    CHECK(lo.b > 10.0f * hi.b, "b at 640 %g against 1000 %g", (double)lo.b, (double)hi.b);
+
+    /* P1094353's own fit, which DESIGN.md 14.7 and 20.6 measured with. */
+    p.as_shot_ei = 10000.0f;
+    ret = craw_profile_noise_eval(&p, 0.0f, &m);
+    CHECK(ret == 0, "the profile eval at 10000 failed: %d", ret);
+    CHECK_REL(m.a, 1.19e-4, 0.05, "a at ISO 10000");
+    CHECK_REL(m.b, 2.95e-8, 0.15, "b at ISO 10000");
+    CHECK(m.a > 8.0f * hi.a, "a at 10000 must be the gain's, not a clamp's");
+
+    /* Past the top, the law: twice the index, twice a, four times b. */
+    craw_noise_model_eval(kn, nb, kn[nb - 1].iso, &lo);
+    craw_noise_model_eval(kn, nb, 2.0f * kn[nb - 1].iso, &hi);
+    CHECK_REL(hi.a, 2.0 * lo.a, 1e-5, "a at twice the last knot");
+    CHECK_REL(hi.b, 4.0 * lo.b, 1e-5, "b at twice the last knot");
+
+    /* Monotonic from 100 to 102400: a never falls, nor does b from 1000,
+     * where the one gain mode starts. */
+    for (int s = 0; s <= 100; s++) {
+        float iso = 100.0f * powf(2.0f, 10.0f * (float)s / 100.0f);
+
+        craw_noise_model_eval(kn, nb, iso, &m);
+        CHECK(m.a > 0.0f && isfinite(m.a) && m.b > 0.0f && isfinite(m.b),
+              "model at %.0f: %g %g", iso, (double)m.a, (double)m.b);
+        if (s) {
+            CHECK(m.a >= prev.a, "a falls at %.0f: %g after %g", iso,
+                  (double)m.a, (double)prev.a);
+            if (prev_iso >= 1000.0f)
+                CHECK(m.b >= prev.b, "b falls at %.0f: %g after %g", iso,
+                      (double)m.b, (double)prev.b);
+        }
+        prev = m;
+        prev_iso = iso;
+    }
+}
+
 int main(void)
 {
     craw_test_validate();
@@ -587,6 +752,8 @@ int main(void)
     craw_test_colorspaces();
     craw_test_planckian();
     craw_test_bradford();
+    craw_test_noise_eval();
+    craw_test_noise_s1m2();
 
     if (failures) {
         printf("test_profile: %d failure(s)\n", failures);

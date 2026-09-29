@@ -1271,13 +1271,25 @@ The model lives in the profile as a table by exposure index
 (`CRAWNoiseKnot`, up to 16 knots, sorted ascending), evaluated by
 `craw_noise_model_eval()`. Interpolation is linear in log(iso) of log(a)
 and log(b), i.e. a power law between knots, because both terms are power
-laws in the sensor's gain. Outside the table the nearest knot is used
-**unchanged, not extrapolated**: a model that is too small under-denoises,
-which the strength parameter can correct, while one that is too large
-destroys detail that cannot be recovered. The lookup uses the frame's
-as-shot exposure index, not its working one — rating a clip at a different
-index scales the picture afterwards, it does not change how the sensels
-were read.
+laws in the sensor's gain. Outside the table the model is **extrapolated
+the way a gain moves it**: a in proportion to the index on both sides, b
+as the square of the index above the last knot and unchanged below the
+first. The read term is two noises, one ahead of the gain, which the gain
+squares, and one after it, which the gain does not touch, so
+b = b0 + c * iso^2; at the top of a table the first is nearly all of b and
+at the bottom the second is most of it. The S1M2's measurements below
+follow that law, within their scatter, over the whole of its main gain
+mode. An exposure index that is not positive gets the first knot.
+
+The table used to hold the nearest knot unchanged instead, on the argument
+that a model too small only under-denoises, which the strength can
+correct. That stopped being true once the temporal average (14.7) and the
+sharpening mask (20) read the model too: the first takes noise it was not
+told about for motion and averages next to nothing, the second takes it for
+texture and sharpens it, and with two knots at 1000 and 1250 an ISO 10000
+clip was eight times short. The lookup uses the frame's as-shot exposure
+index, not its working one — rating a clip at a different index scales the
+picture afterwards, it does not change how the sensels were read.
 
 #### Calibration
 
@@ -1315,47 +1327,116 @@ the per-frame fit and then the median over the clip, formatted as a
 decide whether to believe it: `fit_rms`, the relative error of the model
 over the bins it kept, which is 10-15% on a real scene and should be a few
 percent on a flat field; and `read_noise_lsb`, sqrt(b) in 16-bit code
-values, which above roughly 10 means the frame has no region dark enough
-to measure b and what was fitted there is scene texture.
+values, which at a low index above roughly 10 means the frame has no region
+dark enough to measure b and what was fitted there is scene texture. The
+real read noise rises with the index (below), to about 10 at ISO 10000 and
+12 at 12800 on this camera, so the bound scales with it. The other failure
+is the opposite one: a frame with no shadows at all fits b = 0, a read
+noise of 0.00, which is no measurement of b.
 
 #### Panasonic DC-S1M2, measured
 
-Frame 0 of every ProRes RAW clip this camera has produced so far:
+`cineraw --noise-estimate --frames 10` on every ProRes RAW clip on disk that
+records an ISO other than 1000, 28 of them from ISO 640 to 12800, and on
+fourteen at 1000; per clip, the median over the ten frames. A clip counts
+if its fit error is at most 15%, the fit keeps at least 90% of its bins and
+a moves by at most 16% over the ten frames (it does in a scene that
+moves); its b
+counts only if the fit resolved one, a read noise above half a code value.
+At ISO 1000 the frame 0 fits of four clips no longer on disk from the
+earlier table count as well (starred). The clips that count:
 
-    clip       ISO    a          b          bins  fit   read noise
-    P1093961   1000   1.2225e-5  0          36    10.3%  0.00
-    P1094127   1000   1.2923e-5  2.24e-10   29    12.4%  0.95
-    P1093971   1000   1.3016e-5  0          23     5.0%  0.00
-    P1093870   1000   1.3154e-5  0          37    12.6%  0.00
-    P1000387   1000   1.3322e-5  5.23e-10   17    13.9%  1.45
-    P1094644   1000   1.4028e-5  0          80    15.9%  0.00
-    P1030266   1250   1.4578e-5  1.08e-9    29    13.0%  2.09
+    clip       ISO    a          b          fit    read noise
+    P1000111     640  1.2749e-5  1.719e-8   13.1%   8.32
+    P1094715    1000  1.1699e-5  7.81e-10    3.1%   1.77
+    P1094753    1000  1.1762e-5  9.86e-10    5.8%   1.99
+    P1093961*   1000  1.2225e-5  -          10.3%   0.00
+    P1094127*   1000  1.2923e-5  2.24e-10   12.4%   0.95
+    P1093971*   1000  1.3016e-5  -           5.0%   0.00
+    P1093870*   1000  1.3154e-5  -          12.6%   0.00
+    P1000387    1000  1.3302e-5  5.31e-10   14.0%   1.46
+    P1094725    1000  1.3499e-5  -           9.8%   0.00
+    P1094729    1000  1.3600e-5  -           9.2%   0.00
+    P1001123    1000  1.5830e-5  1.20e-9    10.8%   2.20
+    P1094844    1000  1.6053e-5  -          14.1%   0.00
+    P1030266    1250  1.4941e-5  9.68e-10   12.7%   1.98
+    P1094731    1250  1.6695e-5  -           4.4%   0.00
+    P1000255    1600  2.1129e-5  1.22e-9     9.2%   2.22
+    P1000167    2000  2.2271e-5  2.47e-9     3.5%   3.16
+    P1000168    2000  2.5992e-5  1.37e-9     5.4%   2.35
+    P1094738    3200  3.4042e-5  2.02e-10    4.7%   0.90
+    P1094727    3200  3.8290e-5  2.80e-9     5.6%   3.36
+    P1094724    3200  3.9979e-5  2.05e-9    10.0%   2.87
+    P1094764    4000  4.7596e-5  -           2.4%   0.00
+    P1094754    8000  8.3590e-5  -           9.7%   0.00
+    P1000165   10000  1.1557e-4  2.37e-8     1.5%   9.77
+    P1094352   10000  1.1721e-4  3.00e-8    13.3%  10.99
+    P1001122   10000  1.1868e-4  5.03e-9     4.5%   4.50
+    P1094353   10000  1.1928e-4  2.93e-8    13.3%  10.87
+    P1000170   12800  1.4693e-4  5.22e-8     6.5%  14.50
+    P1094757   12800  1.4743e-4  3.28e-8     4.3%  11.49
+    P1000164   12800  1.5518e-4  4.37e-8     1.6%  13.27
+    P1094756   12800  1.5630e-4  2.99e-8     3.0%  10.98
 
-    rejected, texture in every bin:
-    P1094643   1000   2.7935e-5  0         107    24.8%  0.00
-    P1093969   1000   3.7812e-5  8.20e-7    50     8.8% 57.50
-    P1093970   1000   6.7972e-5  0          34    11.7%  0.00
+Sixteen did not count: P1000110 and P1000123 at 640; P1094740, P1094744,
+P1094797, P1094823 and P1094854 at 1000 (fit errors of 18 to 24%, a third
+to seven tenths of the bins kept), P1094763 and P1094770 there too (a
+moving by 26 and 28%); P1094366, P1094367 and P1094758 at 1250, P1030111 at
+2500, P1094765 at 4000, P1000436 at 6400 and P1000376 at 10000, on the fit.
+Every one of them reads an a above the median at its ISO (the law below at
+2500 and 6400), by 7% to 3.2 times: texture only ever adds. P1094644 of the
+earlier table misses the fit rule too, at 15.9%, and its three rejects stay
+out; one of those, P1093970, a = 6.8e-5 at a fit error of 11.7% and a
+plausible read noise, is caught by neither statistic, which is why a knot
+is a median over clips and not one clip's fit.
 
-Six of the seven ISO 1000 clips agree to within +-7% of their median,
-1.3085e-5, which is the knot. The three rejected ones are scenes with fine
-texture at every level; the first is caught by its fit error and the second
-by an impossible read noise, and the third by neither, which is exactly why
-the shipped table is a median over clips and not one clip's fit. The b
-column is a floor: none of these clips has a region dark enough to resolve
-it, and it only matters below u = b/a, about five code values above black.
-The shipped knots are
+Per ISO, the medians:
 
-    1000 K:  a = 1.30e-5,  b = 1.0e-9     (sqrt(b) = 2.0 code values)
-    1250 K:  a = 1.46e-5,  b = 1.1e-9
+    ISO     a          a / ISO    b          clips (a, b)
+      640   1.27e-5    19.9e-9    1.72e-8    1, 1
+     1000   1.32e-5    13.2e-9    7.8e-10   11, 5
+     1250   1.58e-5    12.6e-9    9.7e-10    2, 1
+     1600   2.11e-5    13.2e-9    1.22e-9    1, 1
+     2000   2.41e-5    12.1e-9    1.92e-9    2, 2
+     3200   3.83e-5    12.0e-9    2.05e-9    3, 3
+     4000   4.76e-5    11.9e-9    -          1, 0
+     8000   8.36e-5    10.4e-9    -          1, 0
+    10000   1.18e-4    11.8e-9    2.65e-8    4, 4
+    12800   1.51e-4    11.8e-9    3.82e-8    4, 4
 
-Two knots is not a characterization. The camera writes the same GainFactor
-(23.04) at every ISO, which points at a fixed analog gain with ISO carried
-as metadata; the two knots are consistent with that (a moving by 12% for a
-25% ISO change) and equally consistent with a weak power law. The planned
-ISO series — 640, 1000, 3200, 12800 on white paper filling the frame —
-decides it, and `--noise-estimate` on those clips produces the table lines
-directly. Until then the clamp keeps a high-ISO clip under-denoised rather
-than over-denoised, and `--noise A,B` is the override.
+From ISO 1000 up this is one gain mode — every one of those clips carries
+the same GainFactor, 23.04 — and the two terms follow
+
+    a = 12e-9 * ISO                    (ISO^0.96 fitted; every knot within 10%)
+    b = 6.1e-10 + 2.3e-16 * ISO^2      (17% rms over the medians)
+
+The shot term goes as the index: ISO is a gain applied before the file is
+written, a rising 8.9 times from 1000 to 10000. The read term is the usual
+pair, 1.6 code values after the gain, which no index changes, and 9.6e-4 *
+ISO code values ahead of it, which the gain carries: 0.96 at 1000 and 9.6
+at 10000. At 1000 the first is three quarters of b and at 12800 the second
+is 98% of it, which is why b rises 34 times from 1000 to 10000 and not 100;
+it is the floor, not a second native ISO. a / ISO holds, the GainFactor
+holds and b stays on its law all the way from 1000 to 12800, so there is
+no mode change inside that range.
+
+ISO 640 is the other mode. Its GainFactor is 14.51, the 23.04 of the rest
+times 640/1000 to within 2%; its a is ISO 1000's (1.27e-5 against
+1.32e-5), not two thirds of it, and its b is 22 times ISO 1000's, 8.3
+code values, in all three 640 clips (1.60e-8 to 1.72e-8, the two whose
+texture disqualified their a included). Where between 640 and 1000 the
+camera switches no clip says: the table interpolates the two knots as a
+power law, which puts ISO 800 at a = 1.30e-5, b = 3.7e-9, and an ISO 800
+clip would settle it.
+
+The knots are the medians at every ISO with both terms measured: 640,
+1000, 1250, 1600, 2000, 3200, 10000 and 12800. The two with a alone check
+the interpolation: at 4000 the table gives 4.77e-5 and P1094764 reads 0.3%
+below it, at 8000 9.47e-5 and P1094754 12% below. Above 12800 the
+evaluation follows the law out (b0 is 2% of b there, so b ~ iso^2 is the
+law to that), and below 640 it scales a and keeps b. P1094353's own fit
+at 10000 was 1.19e-4, 2.95e-8, and the table gives 1.18e-4, 2.65e-8.
+`--noise A,B` still overrides all of it.
 
 One property of this camera's files worth recording: the four residual
 operators tried during calibration (the 3x3 above, a lag-1 difference, a
@@ -2049,7 +2130,8 @@ pass without a noise model is ENOTSUP.
 
 P1094353, a phone booth at night, locked off, ISO 10000, with the model
 fitted to the clip itself (`--noise 1.19e-4,2.95e-8`; the profile's table
-ends at the 1250 knot, eight times too small in a here). A flat metal
+then ended at the 1250 knot, eight times too small in a here, and now
+gives 1.18e-4, 2.65e-8, below). A flat metal
 panel, 600x290 pixels of the linear BT.709 output at a mean G of 0.035,
 the residual after a quadratic surface over frames 20 to 29, the frame to
 frame difference, and how much of the panel's fine detail survives (the
@@ -2093,15 +2175,22 @@ static foliage beside the walkers goes from a frame difference of 3.02e-3
 to 0.80e-3 with the spatial filter and 0.45e-3 with both.
 
 The model matters more here than to the spatial filter. cineview takes it
-from the profile's table, which for this ISO 10000 clip is the 1250 knot:
-the pass sees every frame's noise as motion and an export's frame to frame
-difference does not fall at all (0.032 on every frame of 10 to 25). On
-P1000387 (ISO 1000, the table's own knot) an export of frames 5 to 20
+from the profile's table, which for this ISO 10000 clip used to be the
+1250 knot: the pass saw every frame's noise as motion and an export's frame
+to frame difference did not fall at all (0.032 on every frame of 10 to 25).
+On P1000387 (ISO 1000, the table's own knot) an export of frames 5 to 20
 goes from a frame difference of 0.0020 with the spatial filter alone to
 0.0013, 0.0011, 0.0009 and 0.0007 by the end with both, through the
 display's pipeline, and from 0.00111 to 0.00075 and then 0.00040 through
-the scene-referred exporter's. The ISO series of 14.2 is
-what makes the pass work at every ISO in the viewer.
+the scene-referred exporter's. The ISO series of 14.2 is what makes the
+pass work at every ISO in the viewer. With its table and no override the
+panel above reads, spatial at 1 and temporal at 0.8, a frame difference of
+1.50e-3 against 1.41e-3 with the clip's own fit and 1.27e-2 with the old
+1250 knot (off, 1.30e-2). Most of the gap is the table's b, 10% under the
+clip's: the table's a with the clip's b reads 1.43e-3. Through cineview's
+video export of the panel alone, the display look, the difference is
+0.043 off and 0.0103 with the spatial filter, and with both 0.0071, 0.0060
+and 0.0054 over the first frames and 0.0050 to 0.0056 after them.
 
 ## 15. Soft light and vibrance
 
@@ -3999,7 +4088,7 @@ unsharpened frame reads:
     P1000387 dark flat patch, noise          x1.008        x1.015
       the same, raw denoise at 1             x1.000        x1.000
     P1094352 dark trees, ISO 10000, noise    x1.001        x1.002
-      with the table's clamped model         x1.092        x1.187
+      with the old table's 1250 knot         x1.092        x1.187
 
 The detail comes out: edges lose two fifths of their spread, the sign's text
 and the edges of the lit panel in P1094352 are crisp at 1:1, and a flat
@@ -4021,14 +4110,27 @@ the model's and a lower threshold is safe: at 0.5 the flat patch and the
 wood are untouched and the hair gains 13%, at 0.25 the flat patch's noise
 rises 1%.
 
-The last row of the first table is the open problem. The noise table of
-section 14.2 has knots at ISO 1000 and 1250 only, and above them it holds
-the last knot, which is the right failure for the denoise (too little) and
+The last row of the first table was the open problem. The noise table of
+section 14.2 had knots at ISO 1000 and 1250 only and held the last knot
+above them, which is the right failure for the denoise (too little) and
 the wrong one for the mask: this clip's own fit is a = 1.18e-4, eight
-times the knot, the mask reads its noise at nearly three times the
-modelled level, and 20 iterations raise it 19%. P1094738 at ISO 3200 is 2.3
-times the knot. The planned ISO series fixes both stages at once; until
-then `--noise`, which the mask uses as the denoise does, is the remedy.
+times the knot, the mask read its noise at nearly three times the
+modelled level, and 20 iterations raised it 19%. P1094738 at ISO 3200 was
+2.3 times the knot. The ISO series of 14.2 fixed both stages at once: the
+table now gives this ISO 1.18e-4, 2.65e-8, and with nothing but the table
+the same measure reads, 5 and 20 iterations, on two flat patches of the
+dark trees (240x360 at 4680,240 and 180x300 at 5220,660; own fit and 1250
+knot for comparison, on the same patches)
+
+    table of 14.2         x1.002  x1.004
+    the clip's own fit    x1.002  x1.003
+    the 1250 knot         x1.12   x1.26
+
+and on P1094353's flat panel of 14.7 x1.004 and x1.007 (own fit x1.003
+and x1.006, 1250 knot x1.22 and x1.50). The 1250 knot also pulled the
+dark patches' level down by a tenth at 20 iterations; the table leaves it
+where it was. `--noise`, which the mask uses as the denoise does, is still
+the override.
 
 Lights, over the edges of more than 20:1 contrast, the dark side's moat
 of 20.2 at the tenth percentile and the bright side's peak one to four
