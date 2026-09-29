@@ -45,6 +45,7 @@ craw_shader_names = [
     'defringe',
     'sharpen_prep',
     'sharpen',
+    'sharpen_rows',
 ]
 
 spv_embed = files('../../tools/spv_embed.py')

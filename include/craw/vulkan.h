@@ -48,6 +48,12 @@
  *   - VkPhysicalDeviceVulkan14Features: pushDescriptor
  *   - VkPhysicalDeviceFeatures: shaderStorageImageWriteWithoutFormat,
  *     shaderStorageImageReadWithoutFormat, shaderStorageImageExtendedFormats
+ *   - subgroup operations in compute shaders, Vulkan 1.1 core but reported
+ *     rather than enabled (VkPhysicalDeviceSubgroupProperties, or
+ *     VkPhysicalDeviceVulkan11Properties): basic and shuffle relative.
+ *     They are not part of this struct, having nothing to enable;
+ *     craw_vulkan_check_device() and craw_context_create() refuse a
+ *     device without them.
  * The feature structs below are for documentation and for callers that
  * chain them verbatim into their VkDeviceCreateInfo; libcraw validates the
  * live device itself via vkGetPhysicalDeviceFeatures2 in

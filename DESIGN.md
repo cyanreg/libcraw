@@ -3867,9 +3867,11 @@ first reading d as its estimate and each writing the plane the one before
 it did not; the last is a second pipeline of the same shader
 (specialization constant 5) that writes no plane but applies the clamp,
 the mask and rho to the intermediate in place, each invocation to its own
-texel only, and does not write a texel whose rho is 1.
+texel only, and does not write a texel whose rho is 1. The iterations
+before the last are `sharpen_rows.comp.glsl` wherever the device can run
+it, below; it computes the same numbers in another order of work.
 
-One dispatch per iteration: the workgroup loads its tile of the estimate
+The tiled iteration (`sharpen.comp.glsl`): the workgroup loads its tile of the estimate
 with an apron of 2R and of d with R (3 at least, for the mask), blurs the
 estimate along x and y over the part of the tile R inside its edge, takes
 the ratio there, and blurs the ratio down to its own pixels, all in shared
@@ -3904,6 +3906,36 @@ outputs to an invocation, 0.37 ms. Of the last, the loads and stores are
 0.16 ms, which at 105 MB an iteration is what the card's memory and cache
 deliver, and the blurs the rest.
 
+The streamed iteration (`sharpen_rows.comp.glsl`) does the blurs without
+shared memory. One subgroup of 32 owns a vertical strip of the planes,
+4 x 32 columns wide and 32 output rows tall, and walks down it a row at
+a time, each lane holding four adjacent columns. Along x a blur takes the
+R columns it needs past the lane's own from the neighbouring lanes with
+`subgroupShuffleUp/Down`, which in wave32 on RDNA is one `ds_swizzle`
+each: the lanes' crossbar, no shared memory traffic and no barrier.
+Along y the last 2R + 1 rows of each x blur stay in registers, a ring
+indexed by row modulo 2R + 1 whose loop is unrolled by its depth
+(`GL_EXT_control_flow_attributes`, since NIR would otherwise leave the
+ring's indices dynamic and lower them to selects), so nothing moves as
+the strip advances. Row y of u enters, b and q leave for row y - R and u'
+for row y - 2R; the first 4R rows of a strip fill the rings, and 2R
+columns on either side are computed and thrown away, as the tiles'
+aprons are. Every sum is the tiled shader's in the same order, and the
+store the same rounding, so the two write the same bits: the chain's
+output with either is identical, and the tests read the same errors.
+
+Wave32 is chosen, not left to the driver: in wave64 a constant shuffle
+is three `ds_bpermute` and the iteration took 0.21 ms instead of 0.14
+(before the unroll). The strip height is a plateau from 28 to 56 rows,
+0.119 to 0.120 ms, and falls off below and above (0.129 at 16, 0.132 at
+76), from the rows spent filling the rings on one side and too few
+subgroups for 160 SIMDs on the other. A load issued a row ahead made it
+slower (0.130 ms, the extra registers cost occupancy): the shader is
+bound by its VALU, a row of four columns taking about as many cycles as
+it has instructions, not by memory. A device whose subgroups cannot be 32 gets the
+nearest size it has; one whose strip would then have no room for output
+(below 8 lanes at R = 6) keeps the tiled shader for that reach.
+
 ### 20.4 Cost, the iteration count, and the API
 
 Per iteration, and the rest of the stage (the luma pass, and the last
@@ -3916,7 +3948,18 @@ another agent's runs shared the GPU:
     ms         0.24   0.26   0.37   0.41-0.48   0.57-0.63   0.74
 
 and about 0.9 ms for the rest. The two runs agree to 0.01 ms except at
-reaches 4 and 5, where one of them was evidently shared. `cineraw --bench`
+reaches 4 and 5, where one of them was evidently shared. With the
+streamed iterations of 20.3, per iteration, the median of 20 recordings
+of the full chain's sharpening on one frame, the tiled shader measured
+in the same session beside it:
+
+    radius     0.3    0.6    0.8    1.2    1.5    2.0
+    tiled      0.228  0.447  0.353  0.393  0.548  0.722
+    streamed   0.092  0.109  0.120  0.152  0.203  0.273
+
+so twenty iterations at radius 0.8 are 2.3 ms plus the rest where they
+were 6.6 ms, and five, cineview's while playing, 0.5 ms. The figures
+below are the tiled shader's. `cineraw --bench`
 over 60 frames of P1000387, which idles the GPU between frames (14.3),
 reads 7.37 ms without the stage, 8.81 ms with one iteration, 10.52 ms with
 5 and 16.62 ms with 20 at radius 0.8, identically on two runs: 0.41 ms an

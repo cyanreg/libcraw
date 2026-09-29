@@ -38,6 +38,7 @@
 #include "defringe.spv.h"
 #include "sharpen_prep.spv.h"
 #include "sharpen.spv.h"
+#include "sharpen_rows.spv.h"
 
 /* Every debayer pass shares this block; it mirrors CRAWPrepPushBuf in
  * lib/shaders/common.glsl field for field. Scalar layout gives every member
@@ -316,6 +317,10 @@ static uint32_t craw_fc_shared_bytes(uint32_t wg)
  * DESIGN.md 20.3. */
 #define CRAW_SH_CHUNK    8
 
+/* The rows one subgroup streams down in an iteration of
+ * sharpen_rows.comp.glsl: each strip spends 4R rows filling its rings. */
+#define CRAW_SH_STRIP_ROWS 32
+
 /* The shared memory an iteration of reach r takes on a square workgroup
  * of side wg, mirroring the tile sizes in lib/shaders/sharpen.comp.glsl. */
 static uint32_t craw_sh_shared_bytes(uint32_t wg, uint32_t r)
@@ -373,6 +378,11 @@ struct CRAWPipeline {
     CRAWVkShader sh_prep;
     /* Sharpening: [1] is the last iteration, and one of each per reach. */
     CRAWVkShader sh_iter[2][CRAW_SH_RMAX];
+    /* The iterations before the last streamed by subgroups, one per reach,
+     * with the subgroup size they were built for; a reach whose strip
+     * would not fit the subgroup has none and uses sh_iter[0]. */
+    CRAWVkShader sh_rows[CRAW_SH_RMAX];
+    uint32_t sh_lanes;
 
     CRAWVkImage inter;   /* camera RGB, RGBA16F */
     CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
@@ -482,10 +492,11 @@ static const CRAWVkBinding craw_bind_awb[4] = {
  * the RCD pass C phase (rcd_rb.comp.glsl), 2 and 3 the denoise search and
  * patch radii (denoise_nlm.comp.glsl), 4 the false colour tile side
  * (false_color.comp.glsl), 5 and 6 the sharpening's last iteration and
- * its kernel's reach (sharpen.comp.glsl). A shader that does not declare
- * one of these ignores its map entry, so every shader is given the prefix
- * of this array it needs. */
-static const VkSpecializationMapEntry craw_spec_map[7] = {
+ * its kernel's reach (sharpen.comp.glsl), 7 and 8 the subgroup size and
+ * the strip height of its streamed iterations (sharpen_rows.comp.glsl). A
+ * shader that does not declare one of these ignores its map entry, so
+ * every shader is given the prefix of this array it needs. */
+static const VkSpecializationMapEntry craw_spec_map[9] = {
     { .constantID = 0, .offset = 0,                    .size = sizeof(uint32_t) },
     { .constantID = 1, .offset = 1 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 2, .offset = 2 * sizeof(uint32_t), .size = sizeof(uint32_t) },
@@ -493,6 +504,8 @@ static const VkSpecializationMapEntry craw_spec_map[7] = {
     { .constantID = 4, .offset = 4 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 5, .offset = 5 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 6, .offset = 6 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 7, .offset = 7 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 8, .offset = 8 * sizeof(uint32_t), .size = sizeof(uint32_t) },
 };
 
 void craw_pipeline_params_init(CRAWPipelineParams *p)
@@ -538,11 +551,14 @@ static uint32_t craw_wg_dim(const CRAWContext *ctx, uint32_t want)
     return want;
 }
 
-static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
-                                const uint8_t *spirv, size_t spirv_len,
-                                const CRAWVkBinding *bindings, uint32_t nb_bindings,
-                                uint32_t push_size, uint32_t wg,
-                                const uint32_t *spec, uint32_t nb_spec)
+/* A shader with a square workgroup of side `wg`, or, with `sg` set, a
+ * workgroup of exactly one subgroup of that size, `sg` x 1, which the
+ * device is required to run in full subgroups of `sg`. */
+static int craw_pipeline_shader_sg(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
+                                   const uint8_t *spirv, size_t spirv_len,
+                                   const CRAWVkBinding *bindings, uint32_t nb_bindings,
+                                   uint32_t push_size, uint32_t wg, uint32_t sg,
+                                   const uint32_t *spec, uint32_t nb_spec)
 {
     CRAWVkShaderDesc desc = {
         .name           = name,
@@ -551,14 +567,25 @@ static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *n
         .bindings       = bindings,
         .nb_bindings    = nb_bindings,
         .push_size      = push_size,
-        .wg             = { wg, wg, 1 },
+        .wg             = { sg ? sg : wg, sg ? 1 : wg, 1 },
         .spec_entries   = nb_spec ? craw_spec_map : NULL,
         .nb_spec_entries = nb_spec,
         .spec_data      = nb_spec ? spec : NULL,
         .spec_size      = nb_spec * sizeof(uint32_t),
+        .required_subgroup_size = sg,
     };
 
     return craw_vk_shader_create(p->ctx, sh, &desc);
+}
+
+static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
+                                const uint8_t *spirv, size_t spirv_len,
+                                const CRAWVkBinding *bindings, uint32_t nb_bindings,
+                                uint32_t push_size, uint32_t wg,
+                                const uint32_t *spec, uint32_t nb_spec)
+{
+    return craw_pipeline_shader_sg(p, sh, name, spirv, spirv_len, bindings, nb_bindings,
+                                   push_size, wg, 0, spec, nb_spec);
 }
 
 /* The most dispatches one recording of this pipeline can make: every pass
@@ -643,7 +670,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                          CRAWPipeline **pipe)
 {
     CRAWPipeline *p;
-    uint32_t spec[7];
+    uint32_t spec[9];
     uint32_t wg2d, wgrcd, wgdn, wgfc, shared_max;
     int ret;
 
@@ -727,6 +754,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     spec[4] = craw_fc_tile(wgfc);
     spec[5] = 0;
     spec[6] = 1;
+    spec[7] = 0;
+    spec[8] = 0;
 
     /* The temporal pass is part of the raw stage's dispatch (DESIGN.md
      * 14.7), so either flag builds the stage. */
@@ -1010,8 +1039,32 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                     goto fail;
             }
         }
+
+        /* The iterations before the last, streamed down strips by
+         * subgroups of 32 (DESIGN.md 20.3 and 21), which on RDNA is what
+         * makes a shuffle one swizzle rather than three permutes. A device
+         * that cannot run 32 gets the nearest size it can; a strip that
+         * then has no room for output (four columns a lane, 2R of aprons
+         * on each side) leaves that reach to the tiled shader. */
+        p->sh_lanes = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                               ctx->caps.max_subgroup_size);
+        for (uint32_t r = 1; r <= CRAW_SH_RMAX; r++) {
+            if (!p->sh_lanes || 4 * p->sh_lanes < 4 * r + 8)
+                continue;
+            spec[6] = r;
+            spec[7] = p->sh_lanes;
+            spec[8] = CRAW_SH_STRIP_ROWS;
+            ret = craw_pipeline_shader_sg(p, &p->sh_rows[r - 1], "sharpen",
+                                          craw_sharpen_rows_spv_data, craw_sharpen_rows_spv_len,
+                                          craw_bind_sharpen, 4, sizeof(CRAWSharpenPush), 0,
+                                          p->sh_lanes, spec, 9);
+            if (ret < 0)
+                goto fail;
+        }
         spec[5] = 0;
         spec[6] = 1;
+        spec[7] = 0;
+        spec[8] = 0;
     }
 
     if (p->has_fc) {
@@ -1159,6 +1212,9 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         for (int r = 0; r < CRAW_SH_RMAX; r++)
             if (p->sh_iter[i][r].pipeline)
                 craw_vk_shader_free(ctx, &p->sh_iter[i][r]);
+    for (int r = 0; r < CRAW_SH_RMAX; r++)
+        if (p->sh_rows[r].pipeline)
+            craw_vk_shader_free(ctx, &p->sh_rows[r]);
 
     if (p->inter.image)
         craw_vk_image_free(ctx, &p->inter);
@@ -2095,8 +2151,18 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
             craw_vk_desc_buffer(&writes[1], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &p->sh_d, 0, 0);
             craw_vk_desc_buffer(&writes[2], 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, out, 0, 0);
             craw_vk_desc_image(&writes[3], 3, inter);
-            craw_pipeline_dispatch(p, cmd, &p->sh_iter[last][sh_reach - 1], writes, 4,
-                                   &shp, sizeof(shp), w, h, 1);
+            if (!last && p->sh_rows[sh_reach - 1].pipeline) {
+                /* One subgroup per strip: its output width across, its
+                 * rows down. */
+                uint32_t ow = 4 * p->sh_lanes - 4 * (uint32_t)sh_reach;
+
+                craw_pipeline_dispatch(p, cmd, &p->sh_rows[sh_reach - 1], writes, 4,
+                                       &shp, sizeof(shp), p->sh_lanes * ((w + ow - 1) / ow),
+                                       (h + CRAW_SH_STRIP_ROWS - 1) / CRAW_SH_STRIP_ROWS, 1);
+            } else {
+                craw_pipeline_dispatch(p, cmd, &p->sh_iter[last][sh_reach - 1], writes, 4,
+                                       &shp, sizeof(shp), w, h, 1);
+            }
             if (!last)
                 craw_vk_buffer_barrier(ctx, cmd, out, cs, wr, cs, rd);
             u = out;
