@@ -16,12 +16,12 @@ ARRIRAW and BRAW are planned.
 - Denoising in the raw domain, before the debayer can spread sensor noise
   into colour: non-local means on the four CFA planes in a variance
   stabilised domain, so one strength works from the shadows to the clip
-  point. About 1.9 ms on a 5.8K frame on an RX 6900 XT. In front of it,
+  point. About 1.2 ms on a 5.8K frame on an RX 6900 XT. In front of it,
   optionally, a temporal average in the same domain: every sample averaged
   with the previous frame's wherever the 3x3 around it agrees within the
   noise, so a static shot averages over the last few frames and whatever
   moved is left to the spatial filter, which then keeps more of the
-  detail. About 0.6 ms more.
+  detail. About 0.4 ms more.
 - A sensor noise model, variance = a * signal + b by exposure index, held
   in the camera profile, with a calibrator that fits it to a clip.
 - Camera profiles with per-CCT white balance and matrix tables, as-shot
@@ -97,7 +97,7 @@ longer hide under a white clip, go, and a real colour edge is left alone
 RADIUS[,ITERATIONS[,CONTRAST]]` turns on capture sharpening, off by
 default: Richardson-Lucy deconvolution of the luma by a Gaussian of RADIUS
 pixels (0.8 matches this camera's in-focus edges), ITERATIONS of it (20 by
-default, about 0.4 ms each at 5.8K), with every channel scaled by the
+default, about 0.12 ms each at 5.8K), with every channel scaled by the
 luma's change so that no colour moves, no pixel taken past the range of
 its neighbours so that a lamp gets no dark ring, and nothing sharpened
 where the local contrast is below CONTRAST times the camera's modelled

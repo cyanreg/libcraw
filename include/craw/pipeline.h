@@ -478,7 +478,7 @@ CRAW_API int craw_pipeline_get_awb_histogram_n(CRAWPipeline *pipe, uint32_t fram
 
 /* One pass of a profiled recording, CRAW_PIPELINE_FLAG_PROFILE. */
 typedef struct CRAWStageTime {
-    /* The pass's shader, "rcd_dir", "denoise_nlm", "sharpen" and so on.
+    /* The pass's shader, "rcd", "denoise_nlm", "sharpen" and so on.
      * Owned by the pipeline and valid until it is freed. */
     const char *name;
     uint32_t count;   /* dispatches of it in the recording */

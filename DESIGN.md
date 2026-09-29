@@ -4291,7 +4291,121 @@ reach of the 450 GB/s the card sustains out of memory, more where the
 Half the frame time is two stages: the sharpening's iterations, a third of
 it, and the raw denoise, an eighth. Both are bound by shared memory, not
 by memory: an iteration of the sharpening moves 105 MB in 0.35 ms and the
-denoise 245 MB in 2.6 ms. RCD's first pass and the lens warp are bound by
-the texture units' rate of image loads, 49 a pixel each. The rest is
-bandwidth, where subgroup operations cannot help and only moving fewer
-bytes can.
+denoise 245 MB in 2.6 ms. RCD's first pass and the lens warp looked bound
+by the texture units' rate of image loads, 49 a pixel each; for the warp
+that turned out wrong (16.6). The rest is bandwidth, where subgroup
+operations cannot help and only moving fewer bytes can.
+
+### 21.3 What was done, and what subgroups bought
+
+Each change was measured before and after with the table above's warm
+harness, median of 20 recordings, several runs alternated between the two
+builds with the GPU shared, and kept only when it measured faster; each
+writes the same bits as before unless it says otherwise, checked on the
+real frame's full chain against the previous build.
+
+- The sharpening's iterations but the last (20.3): streamed down strips
+  by subgroups of 32, the x blurs' neighbours from the next lanes with
+  `subgroupShuffleUp/Down`, the y blurs in a register ring. 0.353 to
+  0.120 ms an iteration at radius 0.8, 6.6 to 2.3 ms for twenty. The same
+  bits. This is where subgroups pay most: the tiled version was shared
+  memory traffic and barriers, and the streamed one has neither.
+- The raw denoise (14.3): the patch distances of a band of four rows a
+  lane, summed along x across the lanes with the same shuffles and along
+  y in registers, the offset column read once per dx. 2.60 to 1.59 ms
+  with the temporal pass, 2.02 to 1.18 without, 0.71 to 0.73 for the
+  temporal pass alone. Rounding moves 0.18% of the output pixels by at
+  most 4e-3 of the pixel; every test reads the same.
+- RCD (5.3): the three passes in one dispatch with shared memory tiles.
+  3.54 to 1.38 ms and 175 MB of images fewer; the same bits. No subgroup
+  operations: this was fusion, and bandwidth.
+- The defringe (19.3): both passes in one dispatch, 1.20 to 0.90 ms; the
+  same bits but one pixel of the real frame when the lens warp runs first.
+- The false colour stage (17.4): a tile sized for the frame's pass count,
+  0.83 to 0.70 ms at one pass. Occupancy.
+- The luma pass of the sharpening, the chroma downsample and the AWB
+  histogram (20.3, 14.4, 4.4): invocations placed so that a subgroup's
+  loads are runs of a row, the blocks gathered with quad broadcasts in the
+  order they were summed. 0.80 to 0.47, 0.65 to 0.44 and 0.39 to 0.31 ms
+  in the full chain; the same bits.
+- The lens warp (16.6): its alpha written rather than read back, 0.77 to
+  0.70 ms.
+
+Tried and dropped: DPP instead of the swizzles in the denoise
+(`subgroupClusteredRotate` over 16 lanes, folded into the adds: 1.54 ms
+against 1.27 at the same instruction count); wave64 for either streamed
+kernel (a constant shuffle is three `ds_bpermute` there: 0.21 ms against
+0.14 an iteration, over 5 ms for the denoise); a load a row ahead in the
+streamed sharpening (0.130 against 0.120, the registers cost occupancy);
+the lens taps in a shared memory tile found with subgroup min/max (0.70
+to 0.68, not worth its size); and RCD in fp32 throughout, which would
+cut the chain's error against the reference threefold but tightens one
+test's relative bound below the chroma stage's own error (5.3).
+
+Where subgroups did not help: every pass that is bound by bandwidth
+(highlight field and fill, the colour pass, the chroma upsample, the
+false colour stage, the warp), where the bytes are the cost and only
+moving fewer of them helped, which is what the fusions did; and RCD and
+the defringe, whose stencils reach five and nine pixels in both
+directions, which a tile in shared memory serves directly where lanes
+would have to exchange across rows as well. The AWB histogram's atomics
+(three a block) were never the bound, so a reduction before them would
+buy nothing. What subgroups did buy is the two passes whose inner loops
+were shared memory traffic, and the three whose loads were scattered.
+
+The subgroup operations used are basic, relative shuffle and quad,
+checked on the device as section 10 says; the streamed kernels require a
+subgroup size of 32 through `requiredSubgroupSize` and fall back to the
+nearest size the device has (lavapipe's 8 passes the tests). The shaders
+now use `GL_KHR_shader_subgroup_basic`, `_shuffle_relative` and `_quad`,
+`GL_EXT_control_flow_attributes` (the unrolled rings) and
+`GL_EXT_shader_16bit_storage` (the luma pass's 16-bit stores, under the
+storageBuffer16BitAccess the library already required), which section
+2's list of allowed extensions does not name yet.
+
+### 21.4 The chain after
+
+The same runs as 21.2 (cold: `cineraw --bench`, 30 frames of each clip;
+warm: the harness, RGBA32F output and the histogram on), the GPU shared
+with other work throughout:
+
+    pass              n    cold 387  cold 724   warm
+    denoise_nlm       1      2.53      2.39     1.62
+    highlight_field   1      0.14      0.16     0.11
+    highlight_pull   11      0.08      0.09     0.08
+    highlight_push   11      0.05      0.05     0.05
+    highlight_fill    1      0.15      0.14     0.12
+    rcd               1      1.79      1.75     1.42
+    false_color       1      0.67      0.67     0.64
+    lens              1      0.77      0.76     0.70
+    defringe          1      1.12      1.17     0.93
+    chroma_down       1      0.42      0.42     0.44
+    chroma_blur       1      0.19      0.17     0.16
+    chroma_up         1      0.51      0.51     0.51
+    sharpen_prep      1      0.47      0.47     0.47
+    sharpen          19      2.74      2.67     2.32
+    sharpen_last      1      0.75      0.75     0.64
+    awb_hist          -        -         -      0.31
+    color             1      0.48      0.49     0.74
+    sum of passes           12.97     12.89    11.26
+    whole recording         13.03     12.95    11.39
+
+21.5 ms to 13.0 a frame cold and 19.8 to 11.4 warm. The passes the shader
+core bounds lose the most on a cold GPU (the denoise 2.5 cold against 1.6
+warm), which is why the cold total fell less.
+
+### 21.5 What is left
+
+- The sharpening's last iteration, 0.64 ms, is still the tiled shader:
+  its contrast mask reads 125 values of shared memory a pixel. Streamed
+  like the others, with the observed luma's last seven rows in registers
+  and its columns from the neighbouring lanes, the mask would be register
+  arithmetic in the same order; about 0.2 ms to gain.
+- The highlight pyramid's 22 dispatches of small levels cost 0.13 ms and
+  the barriers between them; the levels below a workgroup's size could
+  pull and push in one dispatch each.
+- The luma pass reads the intermediate the chroma upsample (or whichever
+  stage ran last) has just written; writing the luma from that stage
+  would save a read of the frame, 0.3 ms, at the price of coupling them.
+- The denoise's temporal pass is bound by its state's bandwidth, R32F
+  read and written; nothing here changes that.
