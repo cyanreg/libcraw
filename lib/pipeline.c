@@ -387,7 +387,8 @@ struct CRAWPipeline {
     CRAWVkShader denoise;
     uint32_t dn_lanes, dn_bands;  /* the denoise's workgroup, subgroups */
     CRAWVkShader lens;
-    CRAWVkShader false_color;
+    /* One per pass count, [n - 1] with a tile for n passes. */
+    CRAWVkShader false_color[CRAW_FALSE_COLOR_MAX_PASSES];
     CRAWVkShader chroma_down;
     CRAWVkShader chroma_blur;
     CRAWVkShader chroma_up;
@@ -1118,12 +1119,19 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     }
 
     if (p->has_fc) {
-        ret = craw_pipeline_shader(p, &p->false_color, "false_color",
-                                   craw_false_color_spv_data, craw_false_color_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWFalseColorPush), wgfc,
-                                   spec, 5);
-        if (ret < 0)
-            goto fail;
+        /* A pipeline per pass count, each with the tile it needs: the
+         * shared memory of the five passes' tile would cost a one pass
+         * frame a tenth of its time in occupancy. */
+        for (uint32_t n = 1; n <= CRAW_FALSE_COLOR_MAX_PASSES; n++) {
+            spec[4] = wgfc + 4 * n;
+            ret = craw_pipeline_shader(p, &p->false_color[n - 1], "false_color",
+                                       craw_false_color_spv_data, craw_false_color_spv_len,
+                                       craw_bind_images, 2, sizeof(CRAWFalseColorPush), wgfc,
+                                       spec, 5);
+            if (ret < 0)
+                goto fail;
+        }
+        spec[4] = craw_fc_tile(wgfc);
     }
 
     ret = craw_pipeline_shader(p, &p->color, "color", craw_color_spv_data, craw_color_spv_len,
@@ -1229,8 +1237,9 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->denoise);
     if (p->lens.pipeline)
         craw_vk_shader_free(ctx, &p->lens);
-    if (p->false_color.pipeline)
-        craw_vk_shader_free(ctx, &p->false_color);
+    for (int i = 0; i < CRAW_FALSE_COLOR_MAX_PASSES; i++)
+        if (p->false_color[i].pipeline)
+            craw_vk_shader_free(ctx, &p->false_color[i]);
     if (p->chroma_down.pipeline)
         craw_vk_shader_free(ctx, &p->chroma_down);
     if (p->chroma_blur.pipeline)
@@ -2027,7 +2036,8 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_image(&writes[1], 1, other);
-        craw_pipeline_dispatch(p, cmd, &p->false_color, writes, 2, &fcp, sizeof(fcp), w, h, 1);
+        craw_pipeline_dispatch(p, cmd, &p->false_color[fcp.passes - 1], writes, 2, &fcp,
+                               sizeof(fcp), w, h, 1);
 
         craw_vk_image_barrier(ctx, cmd, other, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,

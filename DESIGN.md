@@ -3185,7 +3185,11 @@ frame without the stage:
 
 The apron grows with the passes, so five is not five times one: the tile
 is 36x36 for 16x16 pixels and ten sweeps run over it. Nothing at all on a
-frame with zero passes, which is not dispatched.
+frame with zero passes, which is not dispatched. There is a pipeline per
+pass count, each with the tile its count needs: with one tile for five,
+a frame of one pass held 20.7 KB of shared memory per workgroup for a
+20x20 tile of 6.4 KB, and gave up occupancy for it. At one pass that was
+0.83 ms back to back and is 0.70, the same bits.
 
 `CRAW_PIPELINE_FLAG_FALSE_COLOR` builds the stage and
 `CRAWFrameParams.false_color_passes`, 0 to `CRAW_FALSE_COLOR_MAX_PASSES`,
