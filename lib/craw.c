@@ -152,6 +152,33 @@ void craw_vulkan_get_requirements(CRAWVulkanRequirements *out)
     };
 }
 
+/* The subgroup operations the shaders use (DESIGN.md 21). They are Vulkan
+ * 1.1 core, but a device reports them in VkPhysicalDeviceSubgroupProperties
+ * rather than offering them as features to enable, so they are checked on
+ * the device instead of being asked for at device creation. */
+static const struct {
+    const char *name;
+    VkSubgroupFeatureFlags bit;
+} craw_subgroup_ops[] = {
+    { "subgroup operations: basic",            VK_SUBGROUP_FEATURE_BASIC_BIT },
+    { "subgroup operations: shuffle relative", VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT },
+    { "subgroup operations: quad",             VK_SUBGROUP_FEATURE_QUAD_BIT },
+};
+
+/* The first subgroup operation the device lacks in compute shaders, or
+ * NULL. */
+static const char *craw_first_missing_subgroup_op(const VkPhysicalDeviceVulkan11Properties *p11)
+{
+    if (!(p11->subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT))
+        return "subgroup operations in compute shaders";
+
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(craw_subgroup_ops); i++)
+        if (!(p11->subgroupSupportedOperations & craw_subgroup_ops[i].bit))
+            return craw_subgroup_ops[i].name;
+
+    return NULL;
+}
+
 /* The features a device reports, queried in one call. */
 typedef struct CRAWDeviceFeatures {
     VkPhysicalDeviceFeatures2        f2;
@@ -235,8 +262,12 @@ int craw_vulkan_check_device(PFN_vkGetInstanceProcAddr get_proc_addr,
 {
     PFN_vkGetPhysicalDeviceProperties2 get_props;
     PFN_vkGetPhysicalDeviceFeatures2 get_feats;
+    VkPhysicalDeviceVulkan11Properties p11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
+    };
     VkPhysicalDeviceProperties2 props = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &p11,
     };
     CRAWDeviceFeatures d;
     const char *name;
@@ -262,6 +293,8 @@ int craw_vulkan_check_device(PFN_vkGetInstanceProcAddr get_proc_addr,
 
     craw_query_device_features(get_feats, phys_device, &d);
     name = craw_first_missing_feature(&d);
+    if (!name)
+        name = craw_first_missing_subgroup_op(&p11);
     if (name) {
         if (missing)
             *missing = name;
@@ -273,6 +306,7 @@ int craw_vulkan_check_device(PFN_vkGetInstanceProcAddr get_proc_addr,
 
 static int craw_query_properties(CRAWContext *ctx)
 {
+    const char *name;
     VkPhysicalDeviceShaderIntegerDotProductProperties dot = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES,
     };
@@ -302,6 +336,13 @@ static int craw_query_properties(CRAWContext *ctx)
                  props.properties.deviceName,
                  VK_API_VERSION_MAJOR(props.properties.apiVersion),
                  VK_API_VERSION_MINOR(props.properties.apiVersion));
+        return CRAW_ERROR(ENOTSUP);
+    }
+
+    name = craw_first_missing_subgroup_op(&p11);
+    if (name) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Device \"%s\" is missing %s, which libcraw needs\n",
+                 props.properties.deviceName, name);
         return CRAW_ERROR(ENOTSUP);
     }
 

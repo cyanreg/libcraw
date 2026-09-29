@@ -82,8 +82,13 @@ consumer of the library: it is not part of the library's scope.)
   specialization constants 253/254/255. All descriptors in set 0, pushed.
   Push constants at most 128 bytes. `#extension GL_EXT_scalar_block_layout`,
   `GL_EXT_shader_image_load_formatted` and `GL_GOOGLE_include_directive`
-  (preprocessor only, for `#include "common.glsl"`) are allowed; anything
-  else needs a note here.
+  (preprocessor only, for `#include "common.glsl"`) are allowed, and so
+  are `GL_KHR_shader_subgroup_basic`, `_shuffle_relative` and `_quad`
+  (Vulkan 1.1 core operations, checked on the device by
+  `craw_vulkan_get_requirements()`, section 21), `GL_EXT_shader_16bit_storage`
+  (the sharpening's fp16 planes, on the 16-bit storage feature the library
+  already requires) and `GL_EXT_control_flow_attributes` (`[[unroll]]` on
+  the register rings); anything else needs a note here.
 - Precision: fp32 arithmetic in shaders unless a stage documents an fp16
   fast path; fp16 storage for the intermediate camera RGB image.
 
@@ -117,8 +122,9 @@ Scratch intermediate (internal, only with `CRAW_PIPELINE_FLAG_FALSE_COLOR`,
 image for the stages that cannot run in place; each writes it and the two
 swap roles, so what everything downstream reads is always the latest. The
 defringe keeps its first pass there and writes the intermediate in place
-(19.3). With RCD it is RCD's own aux image, borrowed; with the other
-methods it is an image of its own. Section 17.3.
+(19.3). It is an image of its own with every method; RCD, which used
+to lend its auxiliary image for it, has none since its passes became one
+dispatch (5.3). Section 17.3.
 
 Quarter resolution chroma images (internal, only with
 `CRAW_PIPELINE_FLAG_CHROMA_DENOISE`): two RGBA16F images of ceil(W/4) x
@@ -383,6 +389,40 @@ Rationale for the reference: this reproduces the published structure
 green, colour-difference chroma) with fully specified stencils so that a
 CPU and a GPU implementation written independently agree to float
 rounding.
+
+On the GPU the three passes are one dispatch (`rcd.comp.glsl`). A
+workgroup of 32x16 loads the prepped mosaic of its tile with an apron of
+five into shared memory and works inwards a ring at a time: L on an apron
+of 4, the directional values on 3, the weights and pass B's green on 2,
+pass C's R and B site estimates on 1, and the G sites and the output on
+the tile. Wherever a pass read what an earlier one wrote at a mirrored
+position, the tile holds at the position outside the frame the value
+computed at the one inside it; the directional values, which pass A
+computed from the mirrored patch at every offset, are computed at the
+position itself. Four dispatches used to write and read back an RGBA16F
+image of L and the weights, an R16F green plane and the intermediate
+twice, a gigabyte at 5.8K for the 175 MB of mosaic in and intermediate
+out, and the first pass was bound by its 49 image loads a pixel.
+
+The values the passes kept in fp16 images are rounded to fp16 where they
+were stored, the way those stores did it, so the output is the four
+passes' bit for bit. On RDNA2 that is toward zero, not to nearest: an
+RGBA16F store of 1 + 7/8 of an fp16 step reads back as 1, and denormals
+are kept. Left in fp32 the steps are the reference's arithmetic, and the
+intermediate's error against it on the synthetic scene falls from 1.57e-3
+to 9.8e-4 and the colour output's from 6.7e-3 relative to 1.7e-3 (on the
+real frame from 5.96e-2 absolute to 3.94e-2); but the real frame's false
+colour and chroma test holds its stage to twice the plain chain's error,
+and the plain chain's falling pulls that bound under the stage's own
+8.9e-2. Keeping the fp32 steps needs that bound reconsidered, so for now
+the truncation stays.
+
+At 5.8K on the 6900 XT, back to back, the four passes took 3.54 ms and
+the one takes 1.38 to 1.49 (in fp32, 1.31 to 1.37; a 16x16 workgroup
+1.51, wave64 1.57), and the aux image and the green plane, 175 MB, are
+gone. What is left is the tile's shared memory work, five barriers and
+the aprons' share of it, not memory: the mosaic in and the intermediate
+out are 0.4 ms of bandwidth.
 
 ## 6. Profile evaluation
 
@@ -704,7 +744,7 @@ for containers without them.
 - The pipeline records, per frame: barrier src to GENERAL/compute read,
   [fill histogram buffers], [denoise pass, temporal and spatial in one
   dispatch], [highlight field, pull and
-  push over its pyramid, fill], debayer passes, [false colour pass], [lens
+  push over its pyramid, fill], the debayer, [false colour pass], [lens
   pass], [defringe prep and clamp], [chroma down, blur and up], [awb
   histogram], colour pass, [copy histogram to readback], and a final
   barrier that returns dst to the caller's stated layout. The colour pass
@@ -1522,13 +1562,44 @@ which is a range filter with the same noise-adaptive threshold.
 One workgroup per tile of one plane, the four planes of a tile four
 neighbouring workgroups in x, so one dispatch covers all four (14.7 says
 why the planes are interleaved rather than in `gl_WorkGroupID.z`, as they
-were first). The workgroup loads
-its tile plus a halo of S + P into shared memory, already stabilised, and
-each invocation keeps its own patch in registers; every search position is
-then one pass over the patch in shared memory. The shared array is a fixed
-28x28 floats, which is a 16x16 workgroup plus a halo of 6, and
-`lib/pipeline.c` static-asserts that the configured radii fit. With the
-temporal pass of 14.7 the tile holds what that pass made of the plane.
+were first). The workgroup loads its tile plus a halo of S + P into
+shared memory, already stabilised; with the temporal pass of 14.7 the
+tile holds what that pass made of the plane.
+
+The workgroup is four subgroups of 32 stacked, each a band of M = 4 rows;
+a lane owns a column of its band and filters its four samples. For one
+search offset the lane forms the squared difference of its column
+against the offset column once per row of the band's patches, sums it
+along x with its neighbours' through `subgroupShuffleUp/Down` (a
+`ds_swizzle` each in wave32 on RDNA) and along y in registers, which is
+every patch distance of the band for two adds and two shuffles a row and
+two adds a sample, where each sample used to read (2P + 1)^2 = 9 values
+of shared memory per search position; and the offset column is read from
+the tile once for all 2S + 1 offsets that share its dx. The P lanes at
+either end of a subgroup have a neighbour on one side only and filter
+nothing, so a tile is 30 x 16 samples. The weight exp(-max(d2 - thr, 0)
+/ h^2) is evaluated as exp2(min(d2 c1 + c0, 0)) with the constants folded
+per sample, two multiplies fewer a neighbour. The search is then bound by
+its VALU: 13 instructions a neighbour, one of them the exp, 14.5 with a
+history, and three swizzles alongside. The sums are in
+another order than before, left to right along x as the reference sums a
+row but not the reference's raster order over the patch, so the result
+moves by rounding: on the real frame 0.18% of the output pixels change,
+by at most 4e-3 of the pixel, and every error `test_pipeline` prints is
+the same to the digits it prints. `lib/pipeline.c` sizes the tile and
+checks it against the device's shared memory (16 KB here), halving the
+bands on a device with less, and static-asserts the radii against the
+shader's register arrays (S up to 3, P up to 2, 16 rows).
+
+Measured against the tiled version it replaces, the pass alone at 5.8K,
+back to back, median of 20 over three runs: spatial 2.02 ms to 1.18,
+spatial and temporal 2.60 to 1.59, temporal alone 0.71 to 0.73 (the
+temporal pass alone is memory bound, and the new tile loses two lanes in
+32 to the patch it does not use). DPP instead of the swizzles
+(`subgroupClusteredRotate` over clusters of 16, which ACO folds into the
+adds as a row rotate) measured 1.54 ms against 1.27 for the swizzles at
+the same instruction count and was dropped; wave64, where a shuffle is
+three `ds_bpermute`, over 5 ms. The table below is the tiled version's.
 
 #### The highlight guard
 
@@ -1769,7 +1840,7 @@ Cost: one read of the full resolution intermediate into 1/16 of an
 RGBA16F image, an 81 tap bilateral over that quarter image, and one more
 read and write of the full resolution intermediate for the recombine; the
 two quarter images are 8.75 MB each at 5.8K, and the full resolution
-scratch image is shared with section 17 (RCD lends its aux to both).
+scratch image is shared with section 17.
 Measured with `cineraw --bench` at 5.8K, RCD: 5.8 ms a frame without it,
 7.2 ms with it at full strength, 1.4 ms for the stage, and the same 1.4
 ms on top of two false colour passes. That is above the 0.4 ms first
@@ -1777,7 +1848,11 @@ estimated, and the difference is the two full resolution reads and one
 write: folding the recombine into the colour stage, which reads the
 intermediate and writes the output anyway, would take most of it back,
 at the price of the histogram seeing the unsmoothed chroma. Not done;
-1.4 ms fits.
+1.4 ms fits. The downsample was an invocation per block reading its
+sixteen pixels, 0.65 ms of that; it is an invocation per column of a
+block now, whose four loads are runs of a row across the subgroup, and a
+quad broadcast (DPP) gathers the block's columns into its first lane,
+which sums them in the reference's order: 0.49 ms, the same bits.
 
 ### 14.5 Parameters and API
 
@@ -2073,7 +2148,8 @@ sample further out than the spatial tile (26x26 for a 16x16 workgroup and
 the 7x7/3x3 filter), works out t' and v for the tile, and the spatial
 filter runs on that; the temporal value of a sample is a function of the
 3x3 around it, mirrored, so every tile that holds a sample holds the same
-number. Shared memory is 13.5 KB. With the spatial filter off the tile is
+number. Shared memory is 13.5 KB (16 KB since the subgroup version of
+14.3, whose tile is 30 x 16). With the spatial filter off the tile is
 the workgroup plus the one sample.
 
 The four planes of a tile are four neighbouring workgroups in x rather
@@ -2726,8 +2802,8 @@ colour stage stays ahead of the warp: its medians work on the sensor's
 own grid, where the debayer's single pixel errors are single pixels.
 
 The warp cannot run in place, so it writes the second intermediate of
-section 3 and the two swap, like the false colour stage: RCD's aux image,
-or the pipeline's own scratch with the other methods. The colour pass then
+section 3 and the two swap, like the false colour stage: the pipeline's
+scratch image (RCD's aux image until RCD became one dispatch). The colour pass then
 writes the caller's destination whatever the flags. Running on the fp16
 intermediate costs a caller who asked for RGBA32F output nothing it had:
 the intermediate the colour pass reads was fp16 before the warp too.
@@ -2883,6 +2959,16 @@ card's bandwidth. There is a shared-memory tiling to be had here if the
 budget ever gets tight — the source footprint of a 16x16 output tile is a
 16x16 source tile plus a three pixel halo, wherever the warp has moved it —
 but at 0.8 ms it would be optimizing the wrong stage.
+
+Both were tried in the round of section 21, back to back at 5.8K with a
+60 mm record. The alpha load was not free: the warp now writes the 1.0
+every debayer puts there and every stage keeps, and the pass went from
+0.77 ms to 0.70. The tile (the box of every tap of a workgroup's pixels,
+found with subgroup minimums and maximums and a shared atomic per
+subgroup, loaded once and read 48 times a pixel) took it to 0.68, which
+was not worth its hundred lines: the loads were never the bound, the
+cache having absorbed them as said above, and the pass is the one read
+and one write of the frame plus the taps' arithmetic.
 
 A frame with no record costs nothing at all, because the pass is not
 recorded: measured at **0.037 ms** difference on the 256x160 test frame,
@@ -3193,10 +3279,13 @@ Between the debayer and everything that reads the intermediate: the auto
 white balance histogram of 4.4 and the colour stage of 4.3 both read the
 filtered copy, so a road full of glints stops voting on the illuminant too.
 The copy is a second RGBA16F image, because a pass that reads its
-neighbours cannot write the image it reads. With RCD it is RCD's own aux image (section 5.3
-pass A writes it, pass C is its last reader, and nothing touches it again
-until the next frame's pass A), so the default pipeline pays no memory for
-the stage. Bilinear and MHC have no such image and get one, 140 MB at 5.8K.
+neighbours cannot write the image it reads. It was RCD's aux image with
+RCD, which pass A wrote and pass C last read, so that the default pipeline
+paid no memory for the stage; since RCD's passes are one dispatch (5.3)
+there is no aux image, and every method gets the pipeline's scratch, 140
+MB at 5.8K, shared with the other stages that need one. An RCD pipeline
+with the stage is still 35 MB smaller than it was, the aux image and the
+green plane being gone.
 
 The passes run in one dispatch. Each workgroup loads a tile with an apron
 of two pixels per pass into shared memory, as the two differences in one
@@ -3246,7 +3335,11 @@ frame without the stage:
 
 The apron grows with the passes, so five is not five times one: the tile
 is 36x36 for 16x16 pixels and ten sweeps run over it. Nothing at all on a
-frame with zero passes, which is not dispatched.
+frame with zero passes, which is not dispatched. There is a pipeline per
+pass count, each with the tile its count needs: with one tile for five,
+a frame of one pass held 20.7 KB of shared memory per workgroup for a
+20x20 tile of 6.4 KB, and gave up occupancy for it. At one pass that was
+0.83 ms back to back and is 0.70, the same bits.
 
 `CRAW_PIPELINE_FLAG_FALSE_COLOR` builds the stage and
 `CRAWFrameParams.false_color_passes`, 0 to `CRAW_FALSE_COLOR_MAX_PASSES`,
@@ -3743,19 +3836,34 @@ spread. On the camera RGB rather than the output, because there every
 channel is positive, neutral is c = (0, 0) whatever the output space, and
 Y is the weighting the debayer used.
 
-Two dispatches. `defringe_prep` writes (l, c, E) per pixel into the
-second intermediate of section 3 as RGBA16F; l stays within +-4, so its
-fp16 is good to 2^-9, 0.2% of Y, and c and E need no more. `defringe`
-then works in place on the intermediate: each invocation reads the first
-pass's image around its pixel and only its own texel of the intermediate,
-and writes that texel only if the clamp moved it, so every pixel the
-stage leaves alone is bit for bit what came in. Most pixels leave after
-the 5x5 of E. The reference in `lib/ref/ref_defringe.c` rounds the first
-pass's four values to fp16 as the GPU stores them.
+Two passes, which were two dispatches. The first writes (l, c, E) per
+pixel as fp16; l stays within +-4, so its fp16 is good to 2^-9, 0.2% of
+Y, and c and E need no more. The second reads the first's values around
+its pixel and moves its pixel's colour or leaves it alone, so every pixel
+the stage leaves alone is bit for bit what came in. Most pixels leave
+after the 5x5 of E. The reference in `lib/ref/ref_defringe.c` rounds the
+first pass's four values to fp16 as the GPU stores them.
 
-With RCD the second image is RCD's aux, and the stage costs no memory;
-with bilinear or MHC it is the pipeline's scratch, 140 MB at 5.8K, shared
-with the other stages that need it.
+The first pass used to write the second intermediate of section 3 as an
+RGBA16F image, which the second read back around every pixel and then
+wrote the intermediate in place. Now (section 21) both are one dispatch,
+`defringe.comp.glsl`: a 32x32 workgroup (wave32) loads its tile of the
+intermediate with an apron of nine, keeps l in fp32 and works out the
+first pass's values on the apron of eight inside it into shared memory,
+rounded to fp16 the way the RGBA16F image stored them (toward zero on
+RDNA2, as in 5.3), and each invocation then treats its pixel from shared
+memory and writes it, moved or not, to the second image, which becomes
+the intermediate as with the stages that cannot run in place. The side
+search reaches six pixels along the normal and the side means two more,
+which is the apron of eight, and the Sobel one more for l; a position
+outside the frame holds what the first pass computed at the one inside
+it that mirrors there. On the real frame the output is the two passes'
+bit for bit, but for one pixel of 17.5 million when the lens warp runs
+first, moved by 6e-4 of itself: the side search is an argmin (19.5).
+
+The second image is the pipeline's scratch, 140 MB at 5.8K, shared with
+the other stages that need it (it was RCD's aux with RCD, until RCD's
+passes became one dispatch, 5.3).
 
 ### 19.4 Cost and API
 
@@ -3767,6 +3875,14 @@ write of an RGBA16F frame, 280 MB, is 0.55 ms at this card's bandwidth,
 and the nine logarithms per pixel of its Sobel read the 3x3 through the
 cache. The second pass, 25 loads for the gate at every pixel and the rest
 at the few percent near a strong edge, is 0.3 ms.
+
+In one dispatch (19.3) the stage reads the intermediate once and writes
+the second image once. Back to back at 5.8K, the two passes took 1.20 ms
+and the one takes 0.90 (0.92 in wave64, 0.99 at 32x16, 1.19 at 16x16:
+the aprons of nine are 4.5 times the pixels of a 16x16 tile and 2.4 times
+those of a 32x32 one, and every pixel of an apron costs a load and three
+logarithms). Its tiles take 37.6 KB of shared memory; a device with less,
+or with fewer than 1024 invocations to a workgroup, gets a smaller tile.
 
 `CRAW_PIPELINE_FLAG_DEFRINGE` builds the stage and
 `CRAWFrameParams.defringe_strength`, 0 to 1, switches it per frame: zero
@@ -4006,15 +4122,19 @@ The histogram then reads the sharpened intermediate, and since rho moves
 no ratio of channels its coordinates do not move; only a sample's weight
 does, with its level.
 
-Dispatches: `sharpen_prep`, one invocation per eight pixels of a row,
-writes d; then N of `sharpen`, one Richardson-Lucy iteration each, the
+Dispatches: `sharpen_prep`, one invocation per pixel of the plane's
+rows (it was one per eight pixels, whose loads a subgroup scattered over
+the row: 0.80 ms at 5.8K against 0.50 now, the same bits), writes d;
+then N of `sharpen`, one Richardson-Lucy iteration each, the
 first reading d as its estimate and each writing the plane the one before
 it did not; the last is a second pipeline of the same shader
 (specialization constant 5) that writes no plane but applies the clamp,
 the mask and rho to the intermediate in place, each invocation to its own
-texel only, and does not write a texel whose rho is 1.
+texel only, and does not write a texel whose rho is 1. The iterations
+before the last are `sharpen_rows.comp.glsl` wherever the device can run
+it, below; it computes the same numbers in another order of work.
 
-One dispatch per iteration: the workgroup loads its tile of the estimate
+The tiled iteration (`sharpen.comp.glsl`): the workgroup loads its tile of the estimate
 with an apron of 2R and of d with R (3 at least, for the mask), blurs the
 estimate along x and y over the part of the tile R inside its edge, takes
 the ratio there, and blurs the ratio down to its own pixels, all in shared
@@ -4049,6 +4169,36 @@ outputs to an invocation, 0.37 ms. Of the last, the loads and stores are
 0.16 ms, which at 105 MB an iteration is what the card's memory and cache
 deliver, and the blurs the rest.
 
+The streamed iteration (`sharpen_rows.comp.glsl`) does the blurs without
+shared memory. One subgroup of 32 owns a vertical strip of the planes,
+4 x 32 columns wide and 32 output rows tall, and walks down it a row at
+a time, each lane holding four adjacent columns. Along x a blur takes the
+R columns it needs past the lane's own from the neighbouring lanes with
+`subgroupShuffleUp/Down`, which in wave32 on RDNA is one `ds_swizzle`
+each: the lanes' crossbar, no shared memory traffic and no barrier.
+Along y the last 2R + 1 rows of each x blur stay in registers, a ring
+indexed by row modulo 2R + 1 whose loop is unrolled by its depth
+(`GL_EXT_control_flow_attributes`, since NIR would otherwise leave the
+ring's indices dynamic and lower them to selects), so nothing moves as
+the strip advances. Row y of u enters, b and q leave for row y - R and u'
+for row y - 2R; the first 4R rows of a strip fill the rings, and 2R
+columns on either side are computed and thrown away, as the tiles'
+aprons are. Every sum is the tiled shader's in the same order, and the
+store the same rounding, so the two write the same bits: the chain's
+output with either is identical, and the tests read the same errors.
+
+Wave32 is chosen, not left to the driver: in wave64 a constant shuffle
+is three `ds_bpermute` and the iteration took 0.21 ms instead of 0.14
+(before the unroll). The strip height is a plateau from 28 to 56 rows,
+0.119 to 0.120 ms, and falls off below and above (0.129 at 16, 0.132 at
+76), from the rows spent filling the rings on one side and too few
+subgroups for 160 SIMDs on the other. A load issued a row ahead made it
+slower (0.130 ms, the extra registers cost occupancy): the shader is
+bound by its VALU, a row of four columns taking about as many cycles as
+it has instructions, not by memory. A device whose subgroups cannot be 32 gets the
+nearest size it has; one whose strip would then have no room for output
+(below 8 lanes at R = 6) keeps the tiled shader for that reach.
+
 ### 20.4 Cost, the iteration count, and the API
 
 Per iteration, and the rest of the stage (the luma pass, and the last
@@ -4061,7 +4211,18 @@ another agent's runs shared the GPU:
     ms         0.24   0.26   0.37   0.41-0.48   0.57-0.63   0.74
 
 and about 0.9 ms for the rest. The two runs agree to 0.01 ms except at
-reaches 4 and 5, where one of them was evidently shared. `cineraw --bench`
+reaches 4 and 5, where one of them was evidently shared. With the
+streamed iterations of 20.3, per iteration, the median of 20 recordings
+of the full chain's sharpening on one frame, the tiled shader measured
+in the same session beside it:
+
+    radius     0.3    0.6    0.8    1.2    1.5    2.0
+    tiled      0.228  0.447  0.353  0.393  0.548  0.722
+    streamed   0.092  0.109  0.120  0.152  0.203  0.273
+
+so twenty iterations at radius 0.8 are 2.3 ms plus the rest where they
+were 6.6 ms, and five, cineview's while playing, 0.5 ms. The figures
+below are the tiled shader's. `cineraw --bench`
 over 60 frames of P1000387, which idles the GPU between frames (14.3),
 reads 7.37 ms without the stage, 8.81 ms with one iteration, 10.52 ms with
 5 and 16.62 ms with 20 at radius 0.8, identically on two runs: 0.41 ms an
@@ -4206,3 +4367,208 @@ the ninetieth percentile, never past the brightest pixel of its 3x3, on
 the rims of lights far above white. Two things are not done: an estimate of the radius from the frame itself, for
 which the edge fit of 20.1 is the obvious start, and any attempt to make
 the five iterations of playback look like twenty.
+
+## 21. Profiling and cost
+
+### 21.1 Timing every dispatch
+
+`CRAW_PIPELINE_FLAG_PROFILE` gives the pipeline a timestamp query pool and
+has every dispatch it records wrapped in a pair of timestamps, both written
+at `VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT`: the first once everything
+recorded before it has left the compute stage, i.e. once the previous pass
+has finished, the second once this one has. All dispatches go through one
+function in `lib/pipeline.c`, so that is the only place that knows; without
+the flag there is no pool and the function costs one predicted branch.
+
+The pool holds `CRAW_PIPELINE_PROFILE_SLOTS` (4) recordings, each a run of
+two queries per dispatch the pipeline can make: every pass it was built
+with, the highlight pyramid at its depth and `CRAW_SHARPEN_MAX_ITERATIONS`
+sharpening iterations. A recording resets its run in its own command
+buffer ahead of the timestamps, which needs no barrier (query commands on
+one queue are ordered among themselves), and remembers which shader each
+pair timed. `craw_pipeline_get_stage_times()` reads the last recording's
+run once the caller's fence has signalled, without `WAIT_BIT` (a
+submission that has not completed is an `EAGAIN`, not a hang), and folds
+the dispatches of one shader into one entry: its name, the number of
+dispatches and their summed time, in the order the passes first ran. The
+`_n` variant reads a recording up to three back, for a player that keeps
+several in flight, exactly as the histogram's does.
+
+What the numbers are: the GPU time of each pass alone, barriers excluded.
+The sum of the passes against a pair of timestamps around the whole
+recording is what the barriers and the launches between passes cost,
+under 0.2 ms on the full chain. Timing each dispatch serialises the two
+that could overlap, the histogram and the colour pass, so a profiled
+recording can be marginally slower than an unprofiled one; the output is
+the same bit for bit (`test_pipeline` checks both).
+
+`cineraw --bench` builds its pipeline with the flag and prints, after the
+per frame lines, every pass with its dispatches per frame and its average
+and median time over the run, then the sum of the passes and the whole
+recording. It runs cold: the software decode takes 170 ms to 500 ms a
+frame, the GPU drops its clocks in between, and every frame starts on an
+idle GPU. The passes are comparable with each other and from run to run,
+but a player whose frames arrive back to back is faster: by up to a third
+on the passes the shader core bounds (the denoise, RCD's first pass, the
+sharpening), by next to nothing on the ones memory bounds (below).
+
+### 21.2 The full chain, measured
+
+P1000387 (ISO 1000, 5760x3040) and P1094724 from the card, both with the
+lens record on every frame, through `--denoise 1,0.5,0.8 --highlights on
+--false-colour 1 --defringe 1 --sharpen 0.8,20` (the reach of a 0.8 px
+Gaussian is 3), 30 frames, on the RX 6900 XT under RADV (Mesa 26.3),
+wave64, with the GPU shared with other work. "Warm" is the same chain on
+one frame of P1000387 recorded 30 times back to back with RGBA32F output
+and the histogram on (a scratch harness, not in the tree), median. The
+bytes are the images each pass reads and writes once, at 17.5 Mpx; a pass
+is called bandwidth bound when those bytes over its warm time come within
+reach of the 450 GB/s the card sustains out of memory, more where the
+128 MB Infinity Cache still holds what the previous pass wrote.
+
+    pass              n    cold 387  cold 724   warm     MB    GB/s  bound by
+    denoise_nlm       1      3.90      3.91     2.61    245     94   LDS: 49 x 9 patch reads a sample
+    highlight_field   1      0.12      0.12     0.11     53    473   bandwidth
+    highlight_pull   11      0.09      0.08     0.08      -      -   launches, 7 us each
+    highlight_push   11      0.06      0.05     0.05      -      -   launches
+    highlight_fill    1      0.14      0.14     0.12     88    754   bandwidth (cache)
+    rcd_dir           1      1.48      1.48     1.19    175    147   texture fetch: 49 image loads a pixel
+    rcd_green         1      0.48      0.48     0.51    210    416   bandwidth
+    rcd_rb_rb         1      0.88      0.88     0.88    280    318   bandwidth, half the lanes idle
+    rcd_rb_g          1      0.84      0.85     0.85    385    455   bandwidth, half the lanes idle
+    false_color       1      0.94      0.94     0.83    280    337   bandwidth and LDS
+    lens              1      0.76      0.77     0.71    280    396   texture fetch: 49 image loads a pixel
+    defringe_prep     1      0.64      0.64     0.65    280    432   bandwidth
+    defringe          1      0.50      0.55     0.49    150    305   texture fetch: 25 loads for the 5x5 max
+    chroma_down       1      0.66      0.66     0.65    149    228   access pattern: 16 loads an invocation
+    chroma_blur       1      0.16      0.16     0.14      9      -   ALU: 81 exp a quarter texel
+    chroma_up         1      0.51      0.52     0.52    298    577   bandwidth
+    sharpen_prep      1      0.81      0.81     0.81    175    217   access pattern: 8 loads an invocation
+    sharpen          19      7.34      7.36     6.56    105    304   LDS and barriers, 0.345 ms each
+    sharpen_last      1      0.67      0.68     0.63      -      -   LDS and the mask
+    awb_hist          -        -         -      0.38    140    368   bandwidth, 64 loads an invocation
+    color             1      0.47      0.48     0.74    280    594   bandwidth (RGBA32F out: 420 MB)
+    sum of passes           21.45     21.56    19.49
+    whole recording         21.52     21.63    19.64
+
+Half the frame time is two stages: the sharpening's iterations, a third of
+it, and the raw denoise, an eighth. Both are bound by shared memory, not
+by memory: an iteration of the sharpening moves 105 MB in 0.35 ms and the
+denoise 245 MB in 2.6 ms. RCD's first pass and the lens warp looked bound
+by the texture units' rate of image loads, 49 a pixel each; for the warp
+that turned out wrong (16.6). The rest is bandwidth, where subgroup
+operations cannot help and only moving fewer bytes can.
+
+### 21.3 What was done, and what subgroups bought
+
+Each change was measured before and after with the table above's warm
+harness, median of 20 recordings, several runs alternated between the two
+builds with the GPU shared, and kept only when it measured faster; each
+writes the same bits as before unless it says otherwise, checked on the
+real frame's full chain against the previous build.
+
+- The sharpening's iterations but the last (20.3): streamed down strips
+  by subgroups of 32, the x blurs' neighbours from the next lanes with
+  `subgroupShuffleUp/Down`, the y blurs in a register ring. 0.353 to
+  0.120 ms an iteration at radius 0.8, 6.6 to 2.3 ms for twenty. The same
+  bits. This is where subgroups pay most: the tiled version was shared
+  memory traffic and barriers, and the streamed one has neither.
+- The raw denoise (14.3): the patch distances of a band of four rows a
+  lane, summed along x across the lanes with the same shuffles and along
+  y in registers, the offset column read once per dx. 2.60 to 1.59 ms
+  with the temporal pass, 2.02 to 1.18 without, 0.71 to 0.73 for the
+  temporal pass alone. Rounding moves 0.18% of the output pixels by at
+  most 4e-3 of the pixel; every test reads the same.
+- RCD (5.3): the three passes in one dispatch with shared memory tiles.
+  3.54 to 1.38 ms and 175 MB of images fewer; the same bits. No subgroup
+  operations: this was fusion, and bandwidth.
+- The defringe (19.3): both passes in one dispatch, 1.20 to 0.90 ms; the
+  same bits but one pixel of the real frame when the lens warp runs first.
+- The false colour stage (17.4): a tile sized for the frame's pass count,
+  0.83 to 0.70 ms at one pass. Occupancy.
+- The luma pass of the sharpening, the chroma downsample and the AWB
+  histogram (20.3, 14.4, 4.4): invocations placed so that a subgroup's
+  loads are runs of a row, the blocks gathered with quad broadcasts in the
+  order they were summed. 0.80 to 0.47, 0.65 to 0.44 and 0.39 to 0.31 ms
+  in the full chain; the same bits.
+- The lens warp (16.6): its alpha written rather than read back, 0.77 to
+  0.70 ms.
+
+Tried and dropped: DPP instead of the swizzles in the denoise
+(`subgroupClusteredRotate` over 16 lanes, folded into the adds: 1.54 ms
+against 1.27 at the same instruction count); wave64 for either streamed
+kernel (a constant shuffle is three `ds_bpermute` there: 0.21 ms against
+0.14 an iteration, over 5 ms for the denoise); a load a row ahead in the
+streamed sharpening (0.130 against 0.120, the registers cost occupancy);
+the lens taps in a shared memory tile found with subgroup min/max (0.70
+to 0.68, not worth its size); and RCD in fp32 throughout, which would
+cut the chain's error against the reference threefold but tightens one
+test's relative bound below the chroma stage's own error (5.3).
+
+Where subgroups did not help: every pass that is bound by bandwidth
+(highlight field and fill, the colour pass, the chroma upsample, the
+false colour stage, the warp), where the bytes are the cost and only
+moving fewer of them helped, which is what the fusions did; and RCD and
+the defringe, whose stencils reach five and nine pixels in both
+directions, which a tile in shared memory serves directly where lanes
+would have to exchange across rows as well. The AWB histogram's atomics
+(three a block) were never the bound, so a reduction before them would
+buy nothing. What subgroups did buy is the two passes whose inner loops
+were shared memory traffic, and the three whose loads were scattered.
+
+The subgroup operations used are basic, relative shuffle and quad,
+checked on the device as section 10 says; the streamed kernels require a
+subgroup size of 32 through `requiredSubgroupSize` and fall back to the
+nearest size the device has (lavapipe's 8 passes the tests). The shaders
+now use `GL_KHR_shader_subgroup_basic`, `_shuffle_relative` and `_quad`,
+`GL_EXT_control_flow_attributes` (the unrolled rings) and
+`GL_EXT_shader_16bit_storage` (the luma pass's 16-bit stores, under the
+storageBuffer16BitAccess the library already required), which section
+2's list of allowed extensions does not name yet.
+
+### 21.4 The chain after
+
+The same runs as 21.2 (cold: `cineraw --bench`, 30 frames of each clip;
+warm: the harness, RGBA32F output and the histogram on), the GPU shared
+with other work throughout:
+
+    pass              n    cold 387  cold 724   warm
+    denoise_nlm       1      2.53      2.39     1.62
+    highlight_field   1      0.14      0.16     0.11
+    highlight_pull   11      0.08      0.09     0.08
+    highlight_push   11      0.05      0.05     0.05
+    highlight_fill    1      0.15      0.14     0.12
+    rcd               1      1.79      1.75     1.42
+    false_color       1      0.67      0.67     0.64
+    lens              1      0.77      0.76     0.70
+    defringe          1      1.12      1.17     0.93
+    chroma_down       1      0.42      0.42     0.44
+    chroma_blur       1      0.19      0.17     0.16
+    chroma_up         1      0.51      0.51     0.51
+    sharpen_prep      1      0.47      0.47     0.47
+    sharpen          19      2.74      2.67     2.32
+    sharpen_last      1      0.75      0.75     0.64
+    awb_hist          -        -         -      0.31
+    color             1      0.48      0.49     0.74
+    sum of passes           12.97     12.89    11.26
+    whole recording         13.03     12.95    11.39
+
+21.5 ms to 13.0 a frame cold and 19.8 to 11.4 warm. The passes the shader
+core bounds lose the most on a cold GPU (the denoise 2.5 cold against 1.6
+warm), which is why the cold total fell less.
+
+### 21.5 What is left
+
+- The sharpening's last iteration, 0.64 ms, is still the tiled shader:
+  its contrast mask reads 125 values of shared memory a pixel. Streamed
+  like the others, with the observed luma's last seven rows in registers
+  and its columns from the neighbouring lanes, the mask would be register
+  arithmetic in the same order; about 0.2 ms to gain.
+- The highlight pyramid's 22 dispatches of small levels cost 0.13 ms and
+  the barriers between them; the levels below a workgroup's size could
+  pull and push in one dispatch each.
+- The luma pass reads the intermediate the chroma upsample (or whichever
+  stage ran last) has just written; writing the luma from that stage
+  would save a read of the frame, 0.3 ms, at the price of coupling them.
+- The denoise's temporal pass is bound by its state's bandwidth, R32F
+  read and written; nothing here changes that.

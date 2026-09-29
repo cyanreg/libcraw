@@ -15,6 +15,17 @@
  * state, which interleave all four: a plane at a time, each would stream
  * the whole frame for a quarter of every line it fetched.
  *
+ * The workgroup is a column of subgroups, each a band of M rows: a lane
+ * owns one column of its band and filters M samples down it. For one
+ * search offset the squared differences of the lane's column against the
+ * offset one are formed once per row, summed along x with the neighbouring
+ * lanes' through subgroupShuffleUp/Down and along y in registers, which
+ * gives every patch distance of the band for 1 + 2P shuffles and 2P adds a
+ * row instead of (2P + 1)^2 shared memory reads a sample; and the offset
+ * column is read from the tile once for all 2S + 1 offsets that share its
+ * dx. The P lanes at either end of a subgroup lack a neighbour on one side
+ * and produce no output, so a band is L - 2P columns wide for L lanes.
+ *
  * Reads the R16_UNORM mosaic and writes a denoised R16_UNORM mosaic in the
  * same raw encoding, so every stage downstream is unchanged and the prep of
  * 4.1 still applies to it. Re-encoding costs a quantization step of 1/65535
@@ -29,8 +40,14 @@
  * deviation), so fp16 would quantize the signal itself away. */
 
 /* GL_GOOGLE_include_directive is a preprocessor-only extension (it emits
- * no SPIR-V capability); the build passes -I for it. */
+ * no SPIR-V capability); the build passes -I for it. The subgroup
+ * extensions are the basic and relative shuffle operations lib/craw.c
+ * checks for, and the loop attribute unrolls the search's inner loop,
+ * whose registers it indexes. */
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_control_flow_attributes : require
 
 #include "common.glsl"
 
@@ -53,27 +70,35 @@ layout(binding = 5) writeonly uniform image2D craw_var_next;
 
 /* Search and patch radii, chosen by the host. A patch radius of 0 turns
  * the same binary into the bilateral fallback of DESIGN.md 14.3: the patch
- * distance is then the plain difference of two stabilised samples. */
+ * distance is then the plain difference of two stabilised samples. The
+ * subgroup size the host required, L, and the rows a lane filters, M. */
 layout (constant_id = 2) const int craw_dn_search = 3;
 layout (constant_id = 3) const int craw_dn_patch  = 1;
+layout (constant_id = 7) const int craw_dn_lanes  = 32;
+layout (constant_id = 8) const int craw_dn_rows   = 8;
 
-/* Largest tile the shared array can hold: a 16x16 workgroup plus a halo of
- * search + patch on each side, with that sum capped at 6. The host checks
- * this; see CRAW_DN_TILE_MAX in lib/pipeline.c. */
-#define CRAW_DN_TILE_MAX  28
-#define CRAW_DN_PATCH_MAX 25   /* (2 * 2 + 1)^2 */
+/* The most the host asks for: a search radius of 3, a patch radius of 2,
+ * 16 rows a lane. The register arrays are sized by these, the loops by the
+ * constants above. */
+#define CRAW_DN_SEARCH_MAX 3
+#define CRAW_DN_PATCH_MAX  2
+#define CRAW_DN_ROWS_MAX   16
 
-shared float craw_tile[CRAW_DN_TILE_MAX * CRAW_DN_TILE_MAX];
+const int S  = craw_dn_search;
+const int P  = craw_dn_patch;
+const int M  = craw_dn_rows;
+const int OX = craw_dn_lanes - 2 * P;                 /* a tile's columns */
+const int OY = int(gl_WorkGroupSize.y) * M;          /* and rows */
+const int TX = OX + 2 * (S + P);                     /* with the halo */
+const int TY = OY + 2 * (S + P);
 
-/* With a history, the noise variance left in each sample of the tile. */
-shared float craw_tvar[CRAW_DN_TILE_MAX * CRAW_DN_TILE_MAX];
-
-/* The temporal pass compares 3x3 patches of this frame and the last, so
- * both are loaded one sample further out than the tile: 30x30 at most. */
-#define CRAW_TN_TILE_MAX (CRAW_DN_TILE_MAX + 2)
-
-shared float craw_tcur[CRAW_TN_TILE_MAX * CRAW_TN_TILE_MAX];
-shared float craw_tprev[CRAW_TN_TILE_MAX * CRAW_TN_TILE_MAX];
+/* The tile and, with a history, the noise variance left in each of its
+ * samples. The temporal pass compares 3x3 patches of this frame and the
+ * last, so both of those are loaded one sample further out than the tile. */
+shared float craw_tile[TX * TY];
+shared float craw_tvar[TX * TY];
+shared float craw_tcur[(TX + 2) * (TY + 2)];
+shared float craw_tprev[(TX + 2) * (TY + 2)];
 
 /* Mirrors CRAWDenoisePush in lib/pipeline.c. */
 layout(push_constant, scalar) uniform CRAWDenoisePushBuf {
@@ -179,6 +204,165 @@ void craw_dn_store(ivec2 mp, int pl, float u0, float u)
     imageStore(craw_denoised, mp, vec4(clamp(pc.black[pl] + u * pc.range[pl], 0.0, 1.0)));
 }
 
+/* The search of DESIGN.md 14.3 for the M samples of the lane's column of
+ * its band, which starts at tile position (tx, ty0): res[m] is the
+ * weighted mean of the stabilised values around sample m. With a history
+ * the patch distances lose the noise the two samples still carry and the
+ * strength is taken in units of the centre's (14.7). */
+void craw_dn_search_band(bool history, int tx, int ty0, out float res[CRAW_DN_ROWS_MAX])
+{
+    const float inv_np = 1.0 / float((2 * P + 1) * (2 * P + 1));
+    float own[CRAW_DN_ROWS_MAX + 2 * CRAW_DN_PATCH_MAX];
+    float acc[CRAW_DN_ROWS_MAX], wsum[CRAW_DN_ROWS_MAX];
+
+    /* The weight exp(-max(d2 / np - thr, 0) / h^2) is evaluated as
+     * exp2(min(d2 * c1 + c0, 0)), with k = -log2(e) / h^2 folded into
+     * c1 = k / np and c0 = -thr k once per sample rather than per
+     * neighbour: the search is bound by its ALU, and those are two
+     * multiplies of the seven instructions a neighbour costs. With a
+     * history h^2 and thr depend on the samples, so c1 is per sample and
+     * c0 = -(vc + v) k becomes kv * v + ck. */
+    float c1[CRAW_DN_ROWS_MAX], ck[CRAW_DN_ROWS_MAX], kv[CRAW_DN_ROWS_MAX];
+    const float k0 = -1.4426950408889634 * pc.inv_h2;
+
+    /* The lane's own column over the band's patches. */
+    for (int r = 0; r < M + 2 * P; r++)
+        own[r] = craw_tile[(ty0 - P + r) * TX + tx];
+    for (int m = 0; m < M; m++) {
+        acc[m] = 0.0;
+        wsum[m] = 0.0;
+        if (history) {
+            float vc = craw_tvar[(ty0 + m) * TX + tx];
+            float k = k0 / vc;
+
+            c1[m] = k * inv_np;
+            kv[m] = -k;
+            ck[m] = -vc * k;
+        }
+    }
+
+    for (int dx = -S; dx <= S; dx++) {
+        /* The column dx over, over every row an offset of this dx reads:
+         * tc[r] is row ty0 - P - S + r. */
+        float tc[CRAW_DN_ROWS_MAX + 2 * (CRAW_DN_PATCH_MAX + CRAW_DN_SEARCH_MAX)];
+        float tv[CRAW_DN_ROWS_MAX + 2 * CRAW_DN_SEARCH_MAX];
+
+        for (int r = 0; r < M + 2 * (P + S); r++)
+            tc[r] = craw_tile[(ty0 - P - S + r) * TX + tx + dx];
+        if (history) {
+            for (int r = 0; r < M + 2 * S; r++)
+                tv[r] = craw_tvar[(ty0 - S + r) * TX + tx + dx];
+        }
+
+        [[unroll]] for (int dy = -S; dy <= S; dy++) {
+            /* The squared differences of a row of the patches, summed
+             * along x across the lanes. */
+            float hs[CRAW_DN_ROWS_MAX + 2 * CRAW_DN_PATCH_MAX];
+
+            for (int r = 0; r < M + 2 * P; r++) {
+                float e = own[r] - tc[r + S + dy];
+                float e2 = e * e;
+                float h = e2;
+
+                /* Left to right, as the reference sums a row. */
+                for (int k = 1; k <= P; k++)
+                    h = subgroupShuffleUp(e2, k) + h + subgroupShuffleDown(e2, k);
+                hs[r] = h;
+            }
+
+            /* And along y, into the patch distance of each sample. */
+            for (int m = 0; m < M; m++) {
+                float d2 = hs[m];
+                for (int j = 1; j <= 2 * P; j++)
+                    d2 += hs[m + j];
+
+                float ts = tc[m + P + S + dy];
+                float w;
+
+                /* Two stabilised samples of the same true value differ by
+                 * a variance of 2, so that much of the distance is noise
+                 * and is subtracted before it can count against a
+                 * neighbour. The centre itself always lands on weight 1, so
+                 * wsum >= 1. */
+                if (history)
+                    w = exp2(min(d2 * c1[m] + (kv[m] * tv[m + S + dy] + ck[m]), 0.0));
+                else
+                    w = exp2(min(d2 * (k0 * inv_np) - 2.0 * k0, 0.0));
+
+                wsum[m] += w;
+                acc[m] += w * ts;
+            }
+        }
+    }
+
+    for (int m = 0; m < M; m++)
+        res[m] = acc[m] / wsum[m];
+}
+
+/* Fills the tile of the plane `pl` whose first sample sits at `org`,
+ * with a halo of `rad`: the stabilised plane, halo included, already
+ * averaged with the previous frame when the temporal pass has one, since
+ * the spatial filter works on what the temporal one left. Borders are
+ * mirrored in the plane's own coordinates (DESIGN.md 14.3), which is what
+ * the neighbours' own tiles would have loaded, and the temporal value of a
+ * sample is a function of the 3x3 around it in the two frames, mirrored
+ * the same way, so every tile that holds it holds the same number. `rad`
+ * is always a literal at the call, so the tile's sides are constants and
+ * the divisions that walk it are multiplies. */
+void craw_dn_fill(bool history, const int rad, ivec2 org, int pl)
+{
+    const ivec2 tsz = ivec2(OX, OY) + 2 * rad;
+    const ivec2 esz = tsz + 2;
+    const int nt = int(gl_WorkGroupSize.x * gl_WorkGroupSize.y);
+    int lin = int(gl_LocalInvocationIndex);
+    ivec2 ph = ivec2(pl & 1, pl >> 1);
+
+    /* The walks are unrolled to their constant trip counts, so that every
+     * load of one is in flight before the first is waited for. */
+    if (!history) {
+        [[unroll]] for (int k = 0; k < (tsz.x * tsz.y + nt - 1) / nt; k++) {
+            int i = lin + k * nt;
+            ivec2 t = ivec2(i % tsz.x, i / tsz.x);
+            ivec2 q = craw_mirror(org + t, pc.size);
+            if (i < tsz.x * tsz.y)
+                craw_tile[t.y * TX + t.x] = craw_dn_gat(craw_dn_level(2 * q + ph, pl));
+        }
+        return;
+    }
+
+    [[unroll]] for (int k = 0; k < (esz.x * esz.y + nt - 1) / nt; k++) {
+        int i = lin + k * nt;
+        ivec2 t = ivec2(i % esz.x, i / esz.x);
+        ivec2 q = craw_mirror(org - 1 + t, pc.size);
+        ivec2 mq = 2 * q + ph;
+
+        if (i < esz.x * esz.y) {
+            craw_tcur[i] = craw_dn_gat(craw_dn_level(mq, pl));
+            craw_tprev[i] = craw_dn_gat(imageLoad(craw_state_prev, mq).x);
+        }
+    }
+
+    barrier();
+
+    /* The variance a sample is left with follows from the weight: this
+     * frame brings a variance of 1 and last frame's state what it carried,
+     * which the state keeps as its square root. */
+    [[unroll]] for (int k = 0; k < (tsz.x * tsz.y + nt - 1) / nt; k++) {
+        int i = lin + k * nt;
+        if (i >= tsz.x * tsz.y)
+            break;
+        ivec2 t = ivec2(i % tsz.x, i / tsz.x);
+        int c = (t.y + 1) * esz.x + t.x + 1;
+        ivec2 q = craw_mirror(org + t, pc.size);
+        float sp = imageLoad(craw_var_prev, 2 * q + ph).x;
+        float a = craw_dn_alpha(c, esz.x);
+
+        craw_tile[t.y * TX + t.x] = mix(craw_tcur[c], craw_tprev[c], a);
+        craw_tvar[t.y * TX + t.x] = max((1.0 - a) * (1.0 - a) + a * a * sp * sp,
+                                        CRAW_DN_VAR_MIN);
+    }
+}
+
 void main()
 {
     int pl = int(gl_WorkGroupID.x) & 3;
@@ -187,159 +371,71 @@ void main()
     bool spatial = (pc.mode & CRAW_DN_SPATIAL) != 0;
     bool history = (pc.mode & CRAW_DN_HISTORY) != 0;
     /* The spatial filter's halo; the temporal average alone needs none. */
-    int rad = spatial ? craw_dn_search + craw_dn_patch : 0;
-    ivec2 wgs = ivec2(gl_WorkGroupSize.xy);
-    ivec2 org = wid * wgs - rad;
-    ivec2 tsz = wgs + 2 * rad;
-    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    int rad = spatial ? S + P : 0;
 
-    /* The tile holds the stabilised plane, halo included, already
-     * averaged with the previous frame when the temporal pass has one: the
-     * spatial filter works on what the temporal one left. Borders are
-     * mirrored in the plane's own coordinates (DESIGN.md 14.3), which is
-     * what the neighbours' own tiles would have loaded, and the temporal
-     * value of a sample is a function of the 3x3 around it in the two
-     * frames, mirrored the same way, so every tile that holds it holds the
-     * same number. */
-    if (history) {
-        ivec2 esz = tsz + 2;
-
-        for (int ty = lid.y; ty < esz.y; ty += wgs.y) {
-            for (int tx = lid.x; tx < esz.x; tx += wgs.x) {
-                ivec2 q = craw_mirror(org - 1 + ivec2(tx, ty), pc.size);
-                ivec2 mq = 2 * q + ivec2(px, py);
-
-                craw_tcur[ty * esz.x + tx] = craw_dn_gat(craw_dn_level(mq, pl));
-                craw_tprev[ty * esz.x + tx] = craw_dn_gat(imageLoad(craw_state_prev, mq).x);
-            }
-        }
-
-        barrier();
-
-        /* The variance a sample is left with follows from the weight: this
-         * frame brings a variance of 1 and last frame's state what it
-         * carried, which the state keeps as its square root. */
-        for (int ty = lid.y; ty < tsz.y; ty += wgs.y) {
-            for (int tx = lid.x; tx < tsz.x; tx += wgs.x) {
-                int c = (ty + 1) * esz.x + tx + 1;
-                ivec2 q = craw_mirror(org + ivec2(tx, ty), pc.size);
-                float sp = imageLoad(craw_var_prev, 2 * q + ivec2(px, py)).x;
-                float a = craw_dn_alpha(c, esz.x);
-
-                craw_tile[ty * tsz.x + tx] = mix(craw_tcur[c], craw_tprev[c], a);
-                craw_tvar[ty * tsz.x + tx] = max((1.0 - a) * (1.0 - a) + a * a * sp * sp,
-                                                 CRAW_DN_VAR_MIN);
-            }
-        }
+    if (spatial) {
+        if (history)
+            craw_dn_fill(true, S + P, wid * ivec2(OX, OY) - (S + P), pl);
+        else
+            craw_dn_fill(false, S + P, wid * ivec2(OX, OY) - (S + P), pl);
     } else {
-        for (int ty = lid.y; ty < tsz.y; ty += wgs.y) {
-            for (int tx = lid.x; tx < tsz.x; tx += wgs.x) {
-                ivec2 q = craw_mirror(org + ivec2(tx, ty), pc.size);
-                craw_tile[ty * tsz.x + tx] = craw_dn_gat(craw_dn_level(2 * q + ivec2(px, py), pl));
-            }
-        }
+        if (history)
+            craw_dn_fill(true, 0, wid * ivec2(OX, OY), pl);
+        else
+            craw_dn_fill(false, 0, wid * ivec2(OX, OY), pl);
     }
 
     barrier();
 
-    ivec2 p = wid * wgs + lid;
-    if (any(greaterThanEqual(p, pc.size)))
-        return;
+    /* The lane's column of the tile and the band's first row, and the
+     * samples of the plane they are. The P lanes at either end filter
+     * nothing, but have to take part in the shuffles of their neighbours. */
+    int lane = int(gl_SubgroupInvocationID);
+    int tx = rad + lane - P;
+    int ty0 = rad + int(gl_SubgroupID) * M;
+    ivec2 p0 = wid * ivec2(OX, OY) + ivec2(lane - P, int(gl_SubgroupID) * M);
+    bool owns = lane >= P && lane < craw_dn_lanes - P && p0.x < pc.size.x;
 
-    int tw = tsz.x;
-    int ctr = (lid.y + rad) * tw + lid.x + rad;
-    ivec2 mp = 2 * p + ivec2(px, py);
-
-    /* The state is what the temporal pass made of this sample, before the
-     * spatial filter: fed back through it, a static scene would be
-     * filtered again every frame and smoothed further without end. It goes
-     * to the other image of the pair (DESIGN.md 14.7): written over the
-     * one being read, a neighbouring tile that holds this sample in its
-     * halo could read it back already averaged once. */
-    if ((pc.mode & CRAW_DN_TEMPORAL) != 0) {
-        imageStore(craw_state_next, mp, vec4(craw_dn_igat(craw_tile[ctr])));
-        imageStore(craw_var_next, mp, vec4(history ? sqrt(craw_tvar[ctr]) : 1.0));
+    float res[CRAW_DN_ROWS_MAX];
+    if (spatial) {
+        if (history)
+            craw_dn_search_band(true, tx, ty0, res);
+        else
+            craw_dn_search_band(false, tx, ty0, res);
     }
 
-    /* The guard compares against the sample as it came in, not against
-     * its temporal average. */
-    if (!spatial) {
-        craw_dn_store(mp, pl, craw_dn_level(mp, pl), craw_dn_igat(craw_tile[ctr]));
+    if (!owns)
         return;
-    }
 
-    /* The centre patch is read once and kept in registers; every search
-     * position then costs one pass over the patch in shared memory. */
-    float cp[CRAW_DN_PATCH_MAX];
-    int np = 0;
-    for (int ky = -craw_dn_patch; ky <= craw_dn_patch; ky++)
-        for (int kx = -craw_dn_patch; kx <= craw_dn_patch; kx++)
-            cp[np++] = craw_tile[ctr + ky * tw + kx];
+    /* The samples as they came in, for the guard, all loaded before any
+     * store: the compiler cannot tell the images apart and would otherwise
+     * wait for each load in turn. Rows past the plane read a mirrored row
+     * and store nothing. */
+    float u0[CRAW_DN_ROWS_MAX];
+    for (int m = 0; m < M; m++)
+        u0[m] = craw_dn_level(2 * craw_mirror(p0 + ivec2(0, m), pc.size) + ivec2(px, py), pl);
 
-    float inv_np = 1.0 / float(np);
-    float acc = 0.0, wsum = 0.0;
+    for (int m = 0; m < M; m++) {
+        ivec2 p = p0 + ivec2(0, m);
+        int ctr = (ty0 + m) * TX + tx;
+        ivec2 mp = 2 * p + ivec2(px, py);
 
-    /* After the temporal average a sample carries less noise than one
-     * noise standard deviation, the static ones a third of it at an
-     * alpha_max of 0.8, and a filter that still took two of them for noise
-     * in every patch distance would take the detail the average has just
-     * uncovered for noise too. So the distance loses the noise the two
-     * samples actually carry, and the strength is taken in units of the
-     * noise left in the sample being filtered: where nothing was averaged
-     * this is exactly the loop below, and where much was the filter
-     * reaches only as far into the signal as the remaining noise does.
-     * DESIGN.md 14.7. */
-    if (history) {
-        float vc = craw_tvar[ctr];
-        float inv_h2 = pc.inv_h2 / vc;
+        if (p.y >= pc.size.y)
+            break;
 
-        for (int dy = -craw_dn_search; dy <= craw_dn_search; dy++) {
-            for (int dx = -craw_dn_search; dx <= craw_dn_search; dx++) {
-                int s = ctr + dy * tw + dx;
-                float d2 = 0.0;
-                int n = 0;
-
-                for (int ky = -craw_dn_patch; ky <= craw_dn_patch; ky++) {
-                    for (int kx = -craw_dn_patch; kx <= craw_dn_patch; kx++) {
-                        float e = cp[n++] - craw_tile[s + ky * tw + kx];
-                        d2 += e * e;
-                    }
-                }
-
-                float w = exp(-max(d2 * inv_np - (vc + craw_tvar[s]), 0.0) * inv_h2);
-
-                wsum += w;
-                acc += w * craw_tile[s];
-            }
+        /* The state is what the temporal pass made of this sample, before
+         * the spatial filter: fed back through it, a static scene would be
+         * filtered again every frame and smoothed further without end. It
+         * goes to the other image of the pair (DESIGN.md 14.7): written
+         * over the one being read, a neighbouring tile that holds this
+         * sample in its halo could read it back already averaged once. */
+        if ((pc.mode & CRAW_DN_TEMPORAL) != 0) {
+            imageStore(craw_state_next, mp, vec4(craw_dn_igat(craw_tile[ctr])));
+            imageStore(craw_var_next, mp, vec4(history ? sqrt(craw_tvar[ctr]) : 1.0));
         }
 
-        craw_dn_store(mp, pl, craw_dn_level(mp, pl), craw_dn_igat(acc / wsum));
-        return;
+        /* The guard compares against the sample as it came in, not against
+         * its temporal average. */
+        craw_dn_store(mp, pl, u0[m], craw_dn_igat(spatial ? res[m] : craw_tile[ctr]));
     }
-
-    for (int dy = -craw_dn_search; dy <= craw_dn_search; dy++) {
-        for (int dx = -craw_dn_search; dx <= craw_dn_search; dx++) {
-            int s = ctr + dy * tw + dx;
-            float d2 = 0.0;
-            int n = 0;
-
-            for (int ky = -craw_dn_patch; ky <= craw_dn_patch; ky++) {
-                for (int kx = -craw_dn_patch; kx <= craw_dn_patch; kx++) {
-                    float e = cp[n++] - craw_tile[s + ky * tw + kx];
-                    d2 += e * e;
-                }
-            }
-
-            /* Two stabilised samples of the same true value differ by a
-             * variance of 2, so that much of the distance is noise and is
-             * subtracted before it can count against a neighbour. The
-             * centre itself always lands on weight 1, so wsum >= 1. */
-            float w = exp(-max(d2 * inv_np - 2.0, 0.0) * pc.inv_h2);
-
-            wsum += w;
-            acc += w * craw_tile[s];
-        }
-    }
-
-    craw_dn_store(mp, pl, craw_dn_level(mp, pl), craw_dn_igat(acc / wsum));
 }

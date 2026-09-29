@@ -67,6 +67,7 @@ int craw_vk_functions_load(CRAWVkFunctions *fn, VkInstance instance,
     LOAD_I(GetPhysicalDeviceMemoryProperties);
     LOAD_I(GetPhysicalDeviceFormatProperties2);
     LOAD_I(EnumerateDeviceExtensionProperties);
+    LOAD_I(GetPhysicalDeviceQueueFamilyProperties);
 
     LOAD_D(CreateBuffer);
     LOAD_D(DestroyBuffer);
@@ -95,6 +96,12 @@ int craw_vk_functions_load(CRAWVkFunctions *fn, VkInstance instance,
     LOAD_D(CmdCopyImageToBuffer);
     LOAD_D(CmdFillBuffer);
     LOAD_D(CmdClearColorImage);
+
+    LOAD_D(CreateQueryPool);
+    LOAD_D(DestroyQueryPool);
+    LOAD_D(GetQueryPoolResults);
+    LOAD_D(CmdResetQueryPool);
+    LOAD_D_KHR(CmdWriteTimestamp2);
 
 #undef LOAD_I
 #undef LOAD_D

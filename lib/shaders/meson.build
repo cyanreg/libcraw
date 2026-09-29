@@ -26,9 +26,7 @@
 craw_shader_names = [
     'debayer_bilinear',
     'debayer_mhc',
-    'rcd_dir',
-    'rcd_green',
-    'rcd_rb',
+    'rcd',
     'color',
     'awb_hist',
     'denoise_nlm',
@@ -41,10 +39,10 @@ craw_shader_names = [
     'highlight_pull',
     'highlight_push',
     'highlight_fill',
-    'defringe_prep',
     'defringe',
     'sharpen_prep',
     'sharpen',
+    'sharpen_rows',
 ]
 
 spv_embed = files('../../tools/spv_embed.py')

@@ -36,11 +36,14 @@ layout(push_constant, scalar) uniform CRAWFalseColorPushBuf {
 
 #define CRAW_FC_MAX_PASSES 5
 
-/* The tile's side: the workgroup's plus an apron of 2 * CRAW_FC_MAX_PASSES
- * on each side, chosen by the host to fit the device's shared memory
- * (lib/pipeline.c, CRAW_FC_WG_MAX). Two copies of both differences in one
- * vec2: a median cannot run in place, and the componentwise min and max
- * of the network below sort the two planes at once. */
+/* The tile's side: the workgroup's plus an apron of two a pass on each
+ * side, for the pass count the host built this pipeline for, one pipeline
+ * per count so that a frame of one pass does not hold the shared memory of
+ * five; the workgroup is chosen by the host to fit the device's shared
+ * memory at five (lib/pipeline.c, CRAW_FC_WG_MAX). Two copies of both
+ * differences in one vec2: a median cannot run in place, and the
+ * componentwise min and max of the network below sort the two planes at
+ * once. */
 layout (constant_id = 4) const int craw_fc_tile = 36;
 
 shared vec2 craw_fc_mem[2 * craw_fc_tile * craw_fc_tile];

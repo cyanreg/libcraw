@@ -16,12 +16,12 @@ ARRIRAW and BRAW are planned.
 - Denoising in the raw domain, before the debayer can spread sensor noise
   into colour: non-local means on the four CFA planes in a variance
   stabilised domain, so one strength works from the shadows to the clip
-  point. About 1.9 ms on a 5.8K frame on an RX 6900 XT. In front of it,
+  point. About 1.2 ms on a 5.8K frame on an RX 6900 XT. In front of it,
   optionally, a temporal average in the same domain: every sample averaged
   with the previous frame's wherever the 3x3 around it agrees within the
   noise, so a static shot averages over the last few frames and whatever
   moved is left to the spatial filter, which then keeps more of the
-  detail. About 0.6 ms more.
+  detail. About 0.4 ms more.
 - A sensor noise model, variance = a * signal + b by exposure index, held
   in the camera profile, with a calibrator that fits it to a clip. The
   S1II's is measured on its own clips from ISO 640 to 12800 and carried past
@@ -68,7 +68,7 @@ The options that matter most:
 
     cineraw --wb auto -v --frames 30 clip.MOV        estimate the illuminant
     cineraw --wb 5600:0.02 --ei 400 -o out_%05d.png clip.MOV
-    cineraw --bench --frames 60 clip.MOV             GPU and decode timing
+    cineraw --bench --frames 60 clip.MOV             GPU time per pass, decode timing
     cineraw --denoise 1.0 --crop 2750,1450,1000,1000 -o c_%d.png clip.MOV
     cineraw --noise-estimate --frames 10 flatfield.MOV   fit the noise model
 
@@ -102,7 +102,7 @@ longer hide under a white clip, go, and a real colour edge is left alone
 RADIUS[,ITERATIONS[,CONTRAST]]` turns on capture sharpening, off by
 default: Richardson-Lucy deconvolution of the luma by a Gaussian of RADIUS
 pixels (0.8 matches this camera's in-focus edges), ITERATIONS of it (20 by
-default, about 0.4 ms each at 5.8K), with every channel scaled by the
+default, about 0.12 ms each at 5.8K), with every channel scaled by the
 luma's change so that no colour moves, no pixel taken past the range of
 its neighbours so that a lamp gets no dark ring, and nothing sharpened
 where the local contrast is below CONTRAST times the camera's modelled
@@ -110,6 +110,14 @@ noise (1 by default; with `--denoise` on, 0.5 sharpens more texture and
 none of the noise that is left), DESIGN.md 20. `--crop X,Y,W,H` writes one rectangle of the output while
 the pipeline still runs on the whole frame, which is how a 5.8K frame gets
 looked at 1:1 without a 5.8K file.
+
+`--bench` prints the GPU and decode time of every frame and, at the
+end, a table of every pass of the pipeline with its average and median
+GPU time over the run, from `CRAW_PIPELINE_FLAG_PROFILE` and
+`craw_pipeline_get_stage_times()`. The software decode leaves the GPU idle
+between frames, so the frames run on a cold GPU and a player's back to
+back frames are faster; the passes still compare with each other and from
+run to run (DESIGN.md 21).
 
 `--wb` takes `as-shot`, `auto` or `CCT[:TINT]`; `--ei` re-rates the clip
 at a working exposure index, `--exposure` adds a bias in stops; `--encode`

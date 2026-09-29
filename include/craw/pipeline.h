@@ -54,24 +54,21 @@ enum CRAWDebayer {
 #define CRAW_PIPELINE_FLAG_DENOISE (1 << 1)
 
 /* Build the lens correction pass, a per-channel warp of the camera RGB
- * intermediate after the debayer. With the RCD debayer it costs no memory
- * (it borrows RCD's auxiliary image, as the false colour pass does); with
- * bilinear or MHC it costs one full resolution RGBA16F image, shared with
- * the other passes that need one. Once created it is switched per frame
- * with CRAWFrameParams.lens: a correction with valid = false skips the
- * warp entirely, so such a frame is bit for bit what a pipeline built
- * without the flag produces. See DESIGN.md 16. */
+ * intermediate after the debayer. It costs one full resolution RGBA16F
+ * image, shared with the other passes that need one. Once created it is
+ * switched per frame with CRAWFrameParams.lens: a correction with valid =
+ * false skips the warp entirely, so such a frame is bit for bit what a
+ * pipeline built without the flag produces. See DESIGN.md 16. */
 #define CRAW_PIPELINE_FLAG_LENS (1 << 2)
 
 /* Build the false colour suppression pass, DESIGN.md 17: a 3x3 median
  * followed by a 3x3 box blur of the colour differences of the debayered
  * intermediate, run up to CRAW_FALSE_COLOR_MAX_PASSES times, which turns
  * the coloured dots that a glint smaller than a CFA quad leaves into
- * neutral ones and touches nothing else. With the RCD debayer it costs no memory: the stage writes
- * RCD's own auxiliary image, which is free by then. With bilinear or MHC
- * it costs an extra full resolution RGBA16F image. Once built it is
- * switched per frame with CRAWFrameParams.false_color_passes, which costs
- * nothing when zero. */
+ * neutral ones and touches nothing else. It costs a full resolution
+ * RGBA16F image, shared with the other passes that need one. Once built
+ * it is switched per frame with CRAWFrameParams.false_color_passes, which
+ * costs nothing when zero. */
 #define CRAW_PIPELINE_FLAG_FALSE_COLOR (1 << 3)
 
 /* The most passes the stage's fused dispatch carries an apron for, the
@@ -84,11 +81,10 @@ enum CRAWDebayer {
  * bilateral guided by the quarter resolution G, and that band put back
  * into every pixel. It reaches the chroma blotches of a dark scene and the
  * colour of glints two and three sensels wide, which the false colour pass
- * leaves. It costs two quarter resolution RGBA16F images and, with the
- * bilinear or MHC debayer and no false colour pass, one full resolution
- * RGBA16F image (the two passes share it; RCD lends its own). Once built
- * it is switched per frame with CRAWFrameParams.denoise_chroma_strength,
- * which costs nothing when zero. */
+ * leaves. It costs two quarter resolution RGBA16F images and one full
+ * resolution RGBA16F image, shared with the other passes that need one.
+ * Once built it is switched per frame with
+ * CRAWFrameParams.denoise_chroma_strength, which costs nothing when zero. */
 #define CRAW_PIPELINE_FLAG_CHROMA_DENOISE (1 << 4)
 
 /* Build the highlight reconstruction pass, DESIGN.md 18: every sensel
@@ -110,11 +106,10 @@ enum CRAWDebayer {
  * and pink rims that the lens's chromatic aberration leaves along bright
  * edges and that highlight reconstruction no longer hides under the clip.
  * The level of every pixel is kept, and a pixel whose colour is already in
- * range is not touched. With the RCD debayer it costs no memory (it borrows
- * RCD's auxiliary image, as the false colour pass does); with bilinear or
- * MHC it costs one full resolution RGBA16F image, shared with the other
- * passes that need one. Once built it is switched per frame with
- * CRAWFrameParams.defringe_strength, which costs nothing when zero. */
+ * range is not touched. It costs one full resolution RGBA16F image, shared
+ * with the other passes that need one. Once built it is switched per
+ * frame with CRAWFrameParams.defringe_strength, which costs nothing when
+ * zero. */
 #define CRAW_PIPELINE_FLAG_DEFRINGE (1 << 6)
 
 /* Build the temporal denoise pass, DESIGN.md 14.7: in front of the spatial
@@ -154,6 +149,23 @@ enum CRAWDebayer {
  * tile; the count bounds how long one recording can keep the GPU busy. */
 #define CRAW_SHARPEN_MAX_RADIUS     2.0f
 #define CRAW_SHARPEN_MAX_ITERATIONS 100
+
+/* Time every dispatch the pipeline records, for
+ * craw_pipeline_get_stage_times(): a pair of GPU timestamps around each one,
+ * in a query pool the pipeline owns that holds the last
+ * CRAW_PIPELINE_PROFILE_SLOTS recordings. Without the flag no pool exists
+ * and a recording is exactly what it is on a pipeline that never heard of
+ * profiling. With it every dispatch starts after the one before it has
+ * finished, which the barriers between passes mostly demand anyway; the
+ * auto white balance histogram and the colour pass, which could overlap,
+ * no longer do, so the recording as a whole can take a little longer.
+ * Needs timestamps on the queue family the context was created with
+ * (timestampValidBits above zero); craw_pipeline_create() fails with
+ * CRAW_ERROR(ENOTSUP) on one without. DESIGN.md 21. */
+#define CRAW_PIPELINE_FLAG_PROFILE (1 << 9)
+
+/* How many recordings' timings a profiling pipeline keeps. */
+#define CRAW_PIPELINE_PROFILE_SLOTS 4
 
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
@@ -463,5 +475,33 @@ CRAW_API int craw_pipeline_get_awb_histogram(CRAWPipeline *pipe,
  * submission that recording belongs to must have completed. */
 CRAW_API int craw_pipeline_get_awb_histogram_n(CRAWPipeline *pipe, uint32_t frames_back,
                                                CRAWAwbHistogram *out);
+
+/* One pass of a profiled recording, CRAW_PIPELINE_FLAG_PROFILE. */
+typedef struct CRAWStageTime {
+    /* The pass's shader, "rcd", "denoise_nlm", "sharpen" and so on.
+     * Owned by the pipeline and valid until it is freed. */
+    const char *name;
+    uint32_t count;   /* dispatches of it in the recording */
+    double   ms;      /* their GPU time, summed */
+} CRAWStageTime;
+
+/* The GPU time of every pass of the last recording, one entry per pass in
+ * the order the passes first ran: a pass dispatched more than once (the
+ * sharpening's iterations, the highlight pyramid's levels) is one entry
+ * with its dispatches summed. Returns how many entries the recording has,
+ * of which the first `max` are written to `out` (which may be NULL when
+ * `max` is 0). Only valid once the submission that recording belongs to
+ * has completed; before that it fails with CRAW_ERROR(EAGAIN). Fails with
+ * CRAW_ERROR(EINVAL) on a pipeline created without
+ * CRAW_PIPELINE_FLAG_PROFILE. The times do not include the barriers
+ * between passes; the gap between their sum and a timestamp pair around
+ * the whole recording is what those cost. */
+CRAW_API int craw_pipeline_get_stage_times(CRAWPipeline *pipe, CRAWStageTime *out,
+                                           uint32_t max);
+
+/* The same for the recording made `frames_back` recordings ago, 0 to
+ * CRAW_PIPELINE_PROFILE_SLOTS - 1, whose submission must have completed. */
+CRAW_API int craw_pipeline_get_stage_times_n(CRAWPipeline *pipe, uint32_t frames_back,
+                                             CRAWStageTime *out, uint32_t max);
 
 #endif /* CRAW_PIPELINE_H */

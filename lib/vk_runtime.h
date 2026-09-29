@@ -29,6 +29,7 @@ typedef struct CRAWVkFunctions {
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
     PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2;
     PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties;
 
     /* Device level */
     PFN_vkCreateBuffer CreateBuffer;
@@ -58,6 +59,13 @@ typedef struct CRAWVkFunctions {
     PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
     PFN_vkCmdFillBuffer CmdFillBuffer;
     PFN_vkCmdClearColorImage CmdClearColorImage;
+
+    /* Timestamps, for CRAW_PIPELINE_FLAG_PROFILE only */
+    PFN_vkCreateQueryPool CreateQueryPool;
+    PFN_vkDestroyQueryPool DestroyQueryPool;
+    PFN_vkGetQueryPoolResults GetQueryPoolResults;
+    PFN_vkCmdResetQueryPool CmdResetQueryPool;
+    PFN_vkCmdWriteTimestamp2 CmdWriteTimestamp2;
 } CRAWVkFunctions;
 
 int craw_vk_functions_load(CRAWVkFunctions *fn, VkInstance instance, VkDevice device,

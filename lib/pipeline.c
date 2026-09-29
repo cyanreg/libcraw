@@ -19,9 +19,7 @@
 
 #include "debayer_bilinear.spv.h"
 #include "debayer_mhc.spv.h"
-#include "rcd_dir.spv.h"
-#include "rcd_green.spv.h"
-#include "rcd_rb.spv.h"
+#include "rcd.spv.h"
 #include "color.spv.h"
 #include "awb_hist.spv.h"
 #include "denoise_nlm.spv.h"
@@ -34,10 +32,10 @@
 #include "highlight_pull.spv.h"
 #include "highlight_push.spv.h"
 #include "highlight_fill.spv.h"
-#include "defringe_prep.spv.h"
 #include "defringe.spv.h"
 #include "sharpen_prep.spv.h"
 #include "sharpen.spv.h"
+#include "sharpen_rows.spv.h"
 
 /* Every debayer pass shares this block; it mirrors CRAWPrepPushBuf in
  * lib/shaders/common.glsl field for field. Scalar layout gives every member
@@ -262,16 +260,30 @@ static_assert(sizeof(CRAWFrameParams) == 264, "CRAWFrameParams size");
 #define CRAW_DN_SEARCH_R 3
 #define CRAW_DN_PATCH_R  1
 
-/* The shader's shared tile is a fixed 28x28 floats, which is a 16x16
- * workgroup plus a halo of search + patch on each side. Both of these are
- * compile-time here, so the check is too. */
-#define CRAW_DN_TILE_MAX 28
-#define CRAW_DN_WG       16
+/* The shader's register arrays are sized for a search radius of 3, a
+ * patch radius of 2 and 16 rows a lane (CRAW_DN_*_MAX in
+ * denoise_nlm.comp.glsl). */
+#define CRAW_DN_ROWS     4
 
-static_assert(CRAW_DN_WG + 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R) <= CRAW_DN_TILE_MAX,
-              "denoise tile does not fit the shader's shared array");
-static_assert((2 * CRAW_DN_PATCH_R + 1) * (2 * CRAW_DN_PATCH_R + 1) <= 25,
-              "denoise patch does not fit the shader's register array");
+static_assert(CRAW_DN_SEARCH_R <= 3 && CRAW_DN_PATCH_R <= 2 && CRAW_DN_ROWS <= 16,
+              "denoise radii do not fit the shader's register arrays");
+
+/* The denoise's tile, DESIGN.md 14.3: a subgroup's lanes less the patch
+ * radius's worth at either end, which filter nothing, across, and `bands`
+ * subgroups of CRAW_DN_ROWS rows down. */
+static uint32_t craw_dn_tile_w(uint32_t lanes)
+{
+    return lanes - 2 * CRAW_DN_PATCH_R;
+}
+
+/* The shared memory that takes, mirroring denoise_nlm.comp.glsl. */
+static uint32_t craw_dn_shared_bytes(uint32_t lanes, uint32_t bands)
+{
+    uint32_t tx = craw_dn_tile_w(lanes) + 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R);
+    uint32_t ty = bands * CRAW_DN_ROWS + 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R);
+
+    return (2 * tx * ty + 2 * (tx + 2) * (ty + 2)) * (uint32_t)sizeof(float);
+}
 
 /* Where the highlight guard of DESIGN.md 14.3 ramps the filter off, in
  * units of the sensor range above black. */
@@ -288,6 +300,29 @@ static_assert((2 * CRAW_DN_PATCH_R + 1) * (2 * CRAW_DN_PATCH_R + 1) <= 25,
 #define CRAW_FC_WG_MAX 16
 
 static_assert(CRAW_FALSE_COLOR_MAX_PASSES == 5, "false colour passes must match the shader's");
+
+/* The shared memory of RCD's tiles on a workgroup of wx x wy, mirroring
+ * lib/shaders/rcd.comp.glsl: the prepped mosaic with an apron of 5, the
+ * low-pass of 4, the four directional values of 3, the two weights and the
+ * green of 2 and the estimate of 1. */
+static uint32_t craw_rcd_shared_bytes(uint32_t wx, uint32_t wy)
+{
+    uint32_t a5 = (wx + 10) * (wy + 10), a4 = (wx + 8) * (wy + 8);
+    uint32_t a3 = (wx + 6) * (wy + 6), a2 = (wx + 4) * (wy + 4);
+    uint32_t a1 = (wx + 2) * (wy + 2);
+
+    return (a5 + a4 + 4 * a3 + 3 * a2 + a1) * (uint32_t)sizeof(float);
+}
+
+/* The shared memory of the defringe's tiles on a workgroup of wx x wy,
+ * mirroring lib/shaders/defringe.comp.glsl: l with an apron of 9, the
+ * first pass's c and (l, c, E) in fp16 with one of 8. */
+static uint32_t craw_df_shared_bytes(uint32_t wx, uint32_t wy)
+{
+    uint32_t a9 = (wx + 18) * (wy + 18), a8 = (wx + 16) * (wy + 16);
+
+    return (a9 + 3 * a8) * (uint32_t)sizeof(float);
+}
 
 static uint32_t craw_fc_tile(uint32_t wg)
 {
@@ -315,6 +350,10 @@ static uint32_t craw_fc_shared_bytes(uint32_t wg)
 /* The capture sharpening's planes are fp16 in chunks of eight pixels,
  * DESIGN.md 20.3. */
 #define CRAW_SH_CHUNK    8
+
+/* The rows one subgroup streams down in an iteration of
+ * sharpen_rows.comp.glsl: each strip spends 4R rows filling its rings. */
+#define CRAW_SH_STRIP_ROWS 32
 
 /* The shared memory an iteration of reach r takes on a square workgroup
  * of side wg, mirroring the tile sizes in lib/shaders/sharpen.comp.glsl. */
@@ -350,17 +389,15 @@ struct CRAWPipeline {
     bool has_temporal;
     bool has_sh;
 
-    /* One of `debayer` or the three RCD passes is created, never both.
-     * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
+    /* The debayer of the pipeline's method, RCD's three passes in one. */
     CRAWVkShader debayer;
-    CRAWVkShader rcd_dir;
-    CRAWVkShader rcd_green;
-    CRAWVkShader rcd_rb[2];
     CRAWVkShader color;
     CRAWVkShader awb_hist;
     CRAWVkShader denoise;
+    uint32_t dn_lanes, dn_bands;  /* the denoise's workgroup, subgroups */
     CRAWVkShader lens;
-    CRAWVkShader false_color;
+    /* One per pass count, [n - 1] with a tile for n passes. */
+    CRAWVkShader false_color[CRAW_FALSE_COLOR_MAX_PASSES];
     CRAWVkShader chroma_down;
     CRAWVkShader chroma_blur;
     CRAWVkShader chroma_up;
@@ -368,20 +405,22 @@ struct CRAWPipeline {
     CRAWVkShader hl_pull;
     CRAWVkShader hl_push;
     CRAWVkShader hl_fill;
-    CRAWVkShader df_prep;
     CRAWVkShader df;
     CRAWVkShader sh_prep;
     /* Sharpening: [1] is the last iteration, and one of each per reach. */
     CRAWVkShader sh_iter[2][CRAW_SH_RMAX];
+    /* The iterations before the last streamed by subgroups, one per reach,
+     * with the subgroup size they were built for; a reach whose strip
+     * would not fit the subgroup has none and uses sh_iter[0]. */
+    CRAWVkShader sh_rows[CRAW_SH_RMAX];
+    uint32_t sh_lanes;
 
     CRAWVkImage inter;   /* camera RGB, RGBA16F */
-    CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
-    CRAWVkImage green;   /* RCD: pass B green plane, R16F */
     CRAWVkImage clean;   /* denoise: the filtered mosaic, R16_UNORM */
     CRAWVkImage scratch; /* a second intermediate for the stages that cannot
-                          * run in place (false colour, chroma denoise) or
-                          * need one to prepare into (defringe), RGBA16F,
-                          * only without RCD, whose aux is borrowed */
+                          * run in place (false colour, lens, chroma
+                          * denoise) or need one to prepare into (defringe),
+                          * RGBA16F */
     CRAWVkImage chroma_q;  /* chroma denoise: quarter resolution (d_r, d_b, G) */
     CRAWVkImage chroma_qf; /* the same, differences filtered */
     CRAWVkImage hl_mosaic;  /* highlights: the rebuilt mosaic, R16F, balanced */
@@ -423,6 +462,23 @@ struct CRAWPipeline {
     CRAWLensCorrection keep_lc;
     float keep_scale;
     bool have_keep_scale;
+
+    /* Profiling, CRAW_PIPELINE_FLAG_PROFILE and DESIGN.md 21: a timestamp
+     * pair per dispatch, in CRAW_PIPELINE_PROFILE_SLOTS runs of 2 * prof_max
+     * queries, one run per recording in rotation. prof_sh holds which
+     * shader each pair timed, prof_max entries per slot, and prof_nb how
+     * many pairs each slot's recording wrote. prof_ts and prof_agg are
+     * scratch for the readback. */
+    VkQueryPool prof_pool;
+    uint32_t prof_max;
+    uint32_t prof_slot;
+    uint32_t prof_nb[CRAW_PIPELINE_PROFILE_SLOTS];
+    const CRAWVkShader **prof_sh;
+    uint64_t prof_recorded;
+    uint64_t prof_mask;
+    double prof_period;       /* ns per tick */
+    uint64_t *prof_ts;
+    CRAWStageTime *prof_agg;
 };
 
 static const CRAWVkBinding craw_bind_images[4] = {
@@ -462,13 +518,14 @@ static const CRAWVkBinding craw_bind_awb[4] = {
 };
 
 /* Specialization constants below 253: 0 is the CFA phase (common.glsl), 1
- * the RCD pass C phase (rcd_rb.comp.glsl), 2 and 3 the denoise search and
+ * unused (it was RCD's pass C phase), 2 and 3 the denoise search and
  * patch radii (denoise_nlm.comp.glsl), 4 the false colour tile side
  * (false_color.comp.glsl), 5 and 6 the sharpening's last iteration and
- * its kernel's reach (sharpen.comp.glsl). A shader that does not declare
- * one of these ignores its map entry, so every shader is given the prefix
- * of this array it needs. */
-static const VkSpecializationMapEntry craw_spec_map[7] = {
+ * its kernel's reach (sharpen.comp.glsl), 7 and 8 the subgroup size and
+ * the strip height of its streamed iterations (sharpen_rows.comp.glsl). A
+ * shader that does not declare one of these ignores its map entry, so
+ * every shader is given the prefix of this array it needs. */
+static const VkSpecializationMapEntry craw_spec_map[9] = {
     { .constantID = 0, .offset = 0,                    .size = sizeof(uint32_t) },
     { .constantID = 1, .offset = 1 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 2, .offset = 2 * sizeof(uint32_t), .size = sizeof(uint32_t) },
@@ -476,6 +533,8 @@ static const VkSpecializationMapEntry craw_spec_map[7] = {
     { .constantID = 4, .offset = 4 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 5, .offset = 5 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 6, .offset = 6 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 7, .offset = 7 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 8, .offset = 8 * sizeof(uint32_t), .size = sizeof(uint32_t) },
 };
 
 void craw_pipeline_params_init(CRAWPipelineParams *p)
@@ -521,11 +580,14 @@ static uint32_t craw_wg_dim(const CRAWContext *ctx, uint32_t want)
     return want;
 }
 
-static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
-                                const uint8_t *spirv, size_t spirv_len,
-                                const CRAWVkBinding *bindings, uint32_t nb_bindings,
-                                uint32_t push_size, uint32_t wg,
-                                const uint32_t *spec, uint32_t nb_spec)
+/* A shader with a workgroup of wx x wy, which the device is required to
+ * run in full subgroups of `sg` when that is not 0 (wx then a multiple of
+ * it). */
+static int craw_pipeline_shader_wh(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
+                                   const uint8_t *spirv, size_t spirv_len,
+                                   const CRAWVkBinding *bindings, uint32_t nb_bindings,
+                                   uint32_t push_size, uint32_t wx, uint32_t wy, uint32_t sg,
+                                   const uint32_t *spec, uint32_t nb_spec)
 {
     CRAWVkShaderDesc desc = {
         .name           = name,
@@ -534,22 +596,124 @@ static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *n
         .bindings       = bindings,
         .nb_bindings    = nb_bindings,
         .push_size      = push_size,
-        .wg             = { wg, wg, 1 },
+        .wg             = { wx, wy, 1 },
         .spec_entries   = nb_spec ? craw_spec_map : NULL,
         .nb_spec_entries = nb_spec,
         .spec_data      = nb_spec ? spec : NULL,
         .spec_size      = nb_spec * sizeof(uint32_t),
+        .required_subgroup_size = sg,
     };
 
     return craw_vk_shader_create(p->ctx, sh, &desc);
+}
+
+/* A shader with a workgroup `sg` wide and `wy` (at least 1) tall, run in
+ * full subgroups of `sg`: one subgroup per row. */
+static int craw_pipeline_shader_sg(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
+                                   const uint8_t *spirv, size_t spirv_len,
+                                   const CRAWVkBinding *bindings, uint32_t nb_bindings,
+                                   uint32_t push_size, uint32_t wy, uint32_t sg,
+                                   const uint32_t *spec, uint32_t nb_spec)
+{
+    return craw_pipeline_shader_wh(p, sh, name, spirv, spirv_len, bindings, nb_bindings,
+                                   push_size, sg, CRAW_MAX(wy, 1u), sg, spec, nb_spec);
+}
+
+/* A shader with a square workgroup of side `wg`. */
+static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
+                                const uint8_t *spirv, size_t spirv_len,
+                                const CRAWVkBinding *bindings, uint32_t nb_bindings,
+                                uint32_t push_size, uint32_t wg,
+                                const uint32_t *spec, uint32_t nb_spec)
+{
+    return craw_pipeline_shader_wh(p, sh, name, spirv, spirv_len, bindings, nb_bindings,
+                                   push_size, wg, wg, 0, spec, nb_spec);
+}
+
+/* The most dispatches one recording of this pipeline can make: every pass
+ * it was built with, the highlight pyramid at its depth and the most
+ * sharpening iterations a frame may ask for. */
+static uint32_t craw_pipeline_max_dispatches(const CRAWPipeline *p)
+{
+    uint32_t n = 1;                         /* colour */
+
+    n += 1;                                 /* debayer */
+    if (p->has_denoise || p->has_temporal)
+        n += 1;
+    if (p->has_hl)
+        n += 2 + 2 * (p->nb_hl_levels - 1); /* field, pull, push, fill */
+    if (p->has_fc)
+        n += 1;
+    if (p->has_lens)
+        n += 1;
+    if (p->has_df)
+        n += 1;
+    if (p->has_chroma)
+        n += 3;
+    if (p->has_sh)
+        n += 1 + CRAW_SHARPEN_MAX_ITERATIONS;
+    if (p->awb)
+        n += 1;
+
+    return n;
+}
+
+/* CRAW_PIPELINE_FLAG_PROFILE: the query pool and the host side of it. */
+static int craw_pipeline_profile_init(CRAWPipeline *p)
+{
+    CRAWContext *ctx = p->ctx;
+    VkQueueFamilyProperties *qf;
+    uint32_t nb_qf = 0, bits;
+    VkResult res;
+
+    ctx->fn.GetPhysicalDeviceQueueFamilyProperties(ctx->phys_device, &nb_qf, NULL);
+    if (ctx->queue_family_index >= nb_qf)
+        return CRAW_ERROR(EINVAL);
+    qf = calloc(nb_qf, sizeof(*qf));
+    if (!qf)
+        return CRAW_ERROR(ENOMEM);
+    ctx->fn.GetPhysicalDeviceQueueFamilyProperties(ctx->phys_device, &nb_qf, qf);
+    bits = qf[ctx->queue_family_index].timestampValidBits;
+    free(qf);
+
+    if (!bits) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Profiling needs timestamps, and queue family %u "
+                 "has none\n", ctx->queue_family_index);
+        return CRAW_ERROR(ENOTSUP);
+    }
+
+    p->prof_mask = bits >= 64 ? UINT64_MAX : (UINT64_C(1) << bits) - 1;
+    p->prof_period = ctx->props.properties.limits.timestampPeriod;
+    p->prof_max = craw_pipeline_max_dispatches(p);
+
+    p->prof_sh = calloc((size_t)CRAW_PIPELINE_PROFILE_SLOTS * p->prof_max, sizeof(*p->prof_sh));
+    p->prof_ts = calloc(2 * (size_t)p->prof_max, sizeof(*p->prof_ts));
+    p->prof_agg = calloc(p->prof_max, sizeof(*p->prof_agg));
+    if (!p->prof_sh || !p->prof_ts || !p->prof_agg)
+        return CRAW_ERROR(ENOMEM);
+
+    VkQueryPoolCreateInfo info = {
+        .sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType  = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = CRAW_PIPELINE_PROFILE_SLOTS * 2 * p->prof_max,
+    };
+    res = ctx->fn.CreateQueryPool(ctx->device, &info, ctx->alloc, &p->prof_pool);
+    if (res != VK_SUCCESS) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Unable to create the profiling query pool: %s\n",
+                 craw_vk_ret2str(res));
+        p->prof_pool = VK_NULL_HANDLE;
+        return craw_vk_ret2err(res);
+    }
+
+    return 0;
 }
 
 int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                          CRAWPipeline **pipe)
 {
     CRAWPipeline *p;
-    uint32_t spec[7];
-    uint32_t wg2d, wgrcd, wgdn, wgfc, shared_max;
+    uint32_t spec[9];
+    uint32_t wg2d, wgrcd, wgfc, shared_max;
     int ret;
 
     if (!ctx || !params || !pipe)
@@ -603,19 +767,21 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
     p->blocks[1] = (int32_t)(params->height / CRAW_AWB_BLOCK);
 
-    /* 16x16 for the pointwise and small-stencil stages; RCD pass A reads a
-     * 7x7 patch per invocation, so it gets half the occupancy pressure. */
+    /* 16x16 for the pointwise and small-stencil stages. */
     wg2d  = craw_wg_dim(ctx, 16);
-    wgrcd = craw_wg_dim(ctx, 8);
-    /* The denoise tile is sized for CRAW_DN_WG; a device that cannot run
-     * that many invocations gets a smaller one, which only shrinks the
-     * tile. */
-    wgdn  = craw_wg_dim(ctx, CRAW_DN_WG);
     /* The false colour tile has to fit the device's shared memory, and a
      * smaller workgroup only shrinks it. A limit below the 16 KB Vulkan
      * guarantees means the properties were never filled in, and only the
      * guarantee is trusted. */
     shared_max = CRAW_MAX(ctx->props.properties.limits.maxComputeSharedMemorySize, 16384u);
+    /* RCD's workgroup is twice as wide as tall, and its tiles take 32.7 KB
+     * at 32x16, more than the 16 KB Vulkan guarantees; a smaller workgroup
+     * only shrinks them. */
+    wgrcd = wg2d;
+    while (wgrcd > 4 && (craw_rcd_shared_bytes(2 * wgrcd, wgrcd) > shared_max ||
+                         2 * wgrcd * wgrcd > ctx->props.properties.limits.maxComputeWorkGroupInvocations ||
+                         2 * wgrcd > ctx->props.properties.limits.maxComputeWorkGroupSize[0]))
+        wgrcd /= 2;
     wgfc  = craw_wg_dim(ctx, CRAW_FC_WG_MAX);
     while (wgfc > 4 && craw_fc_shared_bytes(wgfc) > shared_max)
         wgfc /= 2;
@@ -632,6 +798,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     spec[4] = craw_fc_tile(wgfc);
     spec[5] = 0;
     spec[6] = 1;
+    spec[7] = 0;
+    spec[8] = 0;
 
     /* The temporal pass is part of the raw stage's dispatch (DESIGN.md
      * 14.7), so either flag builds the stage. */
@@ -661,10 +829,34 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         if (ret < 0)
             goto fail;
 
-        ret = craw_pipeline_shader(p, &p->denoise, "denoise_nlm",
-                                   craw_denoise_nlm_spv_data, craw_denoise_nlm_spv_len,
-                                   craw_bind_dn, 6, sizeof(CRAWDenoisePush), wgdn,
-                                   spec, 4);
+        /* Subgroups of 32 where the device can (a shuffle is then one
+         * swizzle on RDNA), four to a workgroup, fewer where the tiles
+         * would not fit the shared memory or the invocations the
+         * workgroup. A subgroup has to have a lane left over once the
+         * patch radius is taken off either end. */
+        p->dn_lanes = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                               ctx->caps.max_subgroup_size);
+        p->dn_bands = 4;
+        while (p->dn_bands > 1 &&
+               (craw_dn_shared_bytes(p->dn_lanes, p->dn_bands) > shared_max ||
+                p->dn_lanes * p->dn_bands >
+                    ctx->props.properties.limits.maxComputeWorkGroupInvocations))
+            p->dn_bands /= 2;
+        if (p->dn_lanes <= 2 * CRAW_DN_PATCH_R ||
+            craw_dn_shared_bytes(p->dn_lanes, p->dn_bands) > shared_max) {
+            craw_log(ctx, CRAW_LOG_ERROR, "The device cannot run the denoise's tiles\n");
+            ret = CRAW_ERROR(ENOTSUP);
+            goto fail;
+        }
+
+        spec[7] = p->dn_lanes;
+        spec[8] = CRAW_DN_ROWS;
+        ret = craw_pipeline_shader_sg(p, &p->denoise, "denoise_nlm",
+                                      craw_denoise_nlm_spv_data, craw_denoise_nlm_spv_len,
+                                      craw_bind_dn, 6, sizeof(CRAWDenoisePush), p->dn_bands,
+                                      p->dn_lanes, spec, 9);
+        spec[7] = 0;
+        spec[8] = 0;
         if (ret < 0)
             goto fail;
     }
@@ -752,50 +944,28 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                                    mhc ? craw_debayer_mhc_spv_data : craw_debayer_bilinear_spv_data,
                                    mhc ? craw_debayer_mhc_spv_len : craw_debayer_bilinear_spv_len,
                                    craw_bind_images, 2, sizeof(CRAWPrepPush), wg2d, spec, 1);
-        if (ret < 0)
-            goto fail;
     } else {
-        ret = craw_vk_image_create(ctx, &p->aux, params->width, params->height,
-                                   VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
-        if (ret < 0)
-            goto fail;
+        /* Twice as wide as tall, in subgroups of 32 where the device can:
+         * of the shapes and sizes tried, 32x16 in wave32 was the fastest,
+         * the aprons being a smaller part of a wider tile. Full subgroups
+         * need the width to be a multiple of the size. */
+        uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                               ctx->caps.max_subgroup_size);
 
-        ret = craw_vk_image_create(ctx, &p->green, params->width, params->height,
-                                   VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
-        if (ret < 0)
-            goto fail;
-
-        ret = craw_pipeline_shader(p, &p->rcd_dir, "rcd_dir",
-                                   craw_rcd_dir_spv_data, craw_rcd_dir_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWPrepPush), wgrcd, spec, 1);
-        if (ret < 0)
-            goto fail;
-
-        ret = craw_pipeline_shader(p, &p->rcd_green, "rcd_green",
-                                   craw_rcd_green_spv_data, craw_rcd_green_spv_len,
-                                   craw_bind_images, 3, sizeof(CRAWPrepPush), wg2d, spec, 1);
-        if (ret < 0)
-            goto fail;
-
-        for (uint32_t i = 0; i < 2; i++) {
-            spec[1] = i;
-            ret = craw_pipeline_shader(p, &p->rcd_rb[i], i ? "rcd_rb_g" : "rcd_rb_rb",
-                                       craw_rcd_rb_spv_data, craw_rcd_rb_spv_len,
-                                       craw_bind_images, 4, sizeof(CRAWPrepPush), wg2d, spec, 2);
-            if (ret < 0)
-                goto fail;
-        }
+        ret = craw_pipeline_shader_wh(p, &p->debayer, "rcd", craw_rcd_spv_data, craw_rcd_spv_len,
+                                      craw_bind_images, 2, sizeof(CRAWPrepPush), 2 * wgrcd, wgrcd,
+                                      (2 * wgrcd) % sg ? 0 : sg, spec, 1);
     }
+    if (ret < 0)
+        goto fail;
 
     /* Neither the false colour stage, the lens warp nor the chroma denoise
      * can run in place, so each needs a second intermediate to write, and
      * the two ping-pong between the debayer's and this one; the defringe
-     * keeps its first pass there. With RCD it is the aux image: pass A
-     * writes it, pass C is its last reader, and nothing touches it again
-     * until the next frame's pass A, so the stages borrow it and the
-     * pipeline costs no more memory than without the flags. The other two
-     * methods have no such image and get one. DESIGN.md 17.3. */
-    if ((p->has_fc || p->has_lens || p->has_chroma || p->has_df) && !p->rcd) {
+     * keeps its first pass there. DESIGN.md 17.3. RCD used to lend its
+     * auxiliary image for this; since its passes became one dispatch it
+     * has none. */
+    if (p->has_fc || p->has_lens || p->has_chroma || p->has_df) {
         ret = craw_vk_image_create(ctx, &p->scratch, params->width, params->height,
                                    VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
         if (ret < 0)
@@ -821,9 +991,19 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         if (ret < 0)
             goto fail;
 
-        ret = craw_pipeline_shader(p, &p->chroma_down, "chroma_down",
-                                   craw_chroma_down_spv_data, craw_chroma_down_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWChromaPush), wg2d, NULL, 0);
+        /* Four block rows tall, the rest across (see the shader), in full
+         * subgroups, since the shader places its invocations by subgroup
+         * and lane. */
+        {
+            uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                                   ctx->caps.max_subgroup_size);
+            uint32_t wx = wg2d * wg2d / 4;
+
+            ret = craw_pipeline_shader_wh(p, &p->chroma_down, "chroma_down",
+                                          craw_chroma_down_spv_data, craw_chroma_down_spv_len,
+                                          craw_bind_images, 2, sizeof(CRAWChromaPush),
+                                          wx, 4, wx % sg ? 0 : sg, NULL, 0);
+        }
         if (ret < 0)
             goto fail;
         ret = craw_pipeline_shader(p, &p->chroma_blur, "chroma_blur",
@@ -839,14 +1019,29 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     }
 
     if (p->has_df) {
-        ret = craw_pipeline_shader(p, &p->df_prep, "defringe_prep",
-                                   craw_defringe_prep_spv_data, craw_defringe_prep_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWDefringePush), wg2d, NULL, 0);
-        if (ret < 0)
-            goto fail;
-        ret = craw_pipeline_shader(p, &p->df, "defringe",
-                                   craw_defringe_spv_data, craw_defringe_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWDefringePush), wg2d, NULL, 0);
+        /* The aprons are nine pixels wide, so the tile is as big as the
+         * device allows, up to 32x32 in wave32, which of the shapes tried
+         * was the fastest: 0.90 ms at 5.8K against 0.92 in wave64, 0.99 at
+         * 32x16 and 1.19 at 16x16. Its tiles take 37.6 KB there; a device
+         * with less shared memory or fewer invocations gets a smaller one. */
+        const VkPhysicalDeviceLimits *lim = &ctx->props.properties.limits;
+        uint32_t wx = 2 * wg2d, wy = 2 * wg2d;
+        uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                               ctx->caps.max_subgroup_size);
+
+        while (wy > 4 && (craw_df_shared_bytes(wx, wy) > shared_max ||
+                          wx * wy > lim->maxComputeWorkGroupInvocations ||
+                          wx > lim->maxComputeWorkGroupSize[0] ||
+                          wy > lim->maxComputeWorkGroupSize[1])) {
+            if (wy >= wx)
+                wy /= 2;
+            else
+                wx /= 2;
+        }
+        ret = craw_pipeline_shader_wh(p, &p->df, "defringe",
+                                      craw_defringe_spv_data, craw_defringe_spv_len,
+                                      craw_bind_images, 2, sizeof(CRAWDefringePush), wx, wy,
+                                      wx % sg ? 0 : sg, NULL, 0);
         if (ret < 0)
             goto fail;
     }
@@ -880,9 +1075,12 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                 goto fail;
         }
 
-        ret = craw_pipeline_shader(p, &p->sh_prep, "sharpen_prep",
-                                   craw_sharpen_prep_spv_data, craw_sharpen_prep_spv_len,
-                                   craw_bind_awb, 2, sizeof(CRAWSharpenPush), wg2d, NULL, 0);
+        /* Twice as wide as tall: of 256x1 to 32x8, this was the fastest
+         * by a hair, 0.50 ms against 0.52. */
+        ret = craw_pipeline_shader_wh(p, &p->sh_prep, "sharpen_prep",
+                                      craw_sharpen_prep_spv_data, craw_sharpen_prep_spv_len,
+                                      craw_bind_awb, 2, sizeof(CRAWSharpenPush),
+                                      2 * wg2d, wg2d / 2, 0, NULL, 0);
         if (ret < 0)
             goto fail;
 
@@ -915,17 +1113,48 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                     goto fail;
             }
         }
+
+        /* The iterations before the last, streamed down strips by
+         * subgroups of 32 (DESIGN.md 20.3 and 21), which on RDNA is what
+         * makes a shuffle one swizzle rather than three permutes. A device
+         * that cannot run 32 gets the nearest size it can; a strip that
+         * then has no room for output (four columns a lane, 2R of aprons
+         * on each side) leaves that reach to the tiled shader. */
+        p->sh_lanes = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                               ctx->caps.max_subgroup_size);
+        for (uint32_t r = 1; r <= CRAW_SH_RMAX; r++) {
+            if (!p->sh_lanes || 4 * p->sh_lanes < 4 * r + 8)
+                continue;
+            spec[6] = r;
+            spec[7] = p->sh_lanes;
+            spec[8] = CRAW_SH_STRIP_ROWS;
+            ret = craw_pipeline_shader_sg(p, &p->sh_rows[r - 1], "sharpen",
+                                          craw_sharpen_rows_spv_data, craw_sharpen_rows_spv_len,
+                                          craw_bind_sharpen, 4, sizeof(CRAWSharpenPush), 0,
+                                          p->sh_lanes, spec, 9);
+            if (ret < 0)
+                goto fail;
+        }
         spec[5] = 0;
         spec[6] = 1;
+        spec[7] = 0;
+        spec[8] = 0;
     }
 
     if (p->has_fc) {
-        ret = craw_pipeline_shader(p, &p->false_color, "false_color",
-                                   craw_false_color_spv_data, craw_false_color_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWFalseColorPush), wgfc,
-                                   spec, 5);
-        if (ret < 0)
-            goto fail;
+        /* A pipeline per pass count, each with the tile it needs: the
+         * shared memory of the five passes' tile would cost a one pass
+         * frame a tenth of its time in occupancy. */
+        for (uint32_t n = 1; n <= CRAW_FALSE_COLOR_MAX_PASSES; n++) {
+            spec[4] = wgfc + 4 * n;
+            ret = craw_pipeline_shader(p, &p->false_color[n - 1], "false_color",
+                                       craw_false_color_spv_data, craw_false_color_spv_len,
+                                       craw_bind_images, 2, sizeof(CRAWFalseColorPush), wgfc,
+                                       spec, 5);
+            if (ret < 0)
+                goto fail;
+        }
+        spec[4] = craw_fc_tile(wgfc);
     }
 
     ret = craw_pipeline_shader(p, &p->color, "color", craw_color_spv_data, craw_color_spv_len,
@@ -941,9 +1170,18 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     }
 
     if (p->awb) {
-        ret = craw_pipeline_shader(p, &p->awb_hist, "awb_hist",
-                                   craw_awb_hist_spv_data, craw_awb_hist_spv_len,
-                                   craw_bind_awb, 4, sizeof(CRAWAwbPush), wg2d, NULL, 0);
+        /* A subgroup of 32 is a row of eight blocks, and the workgroup a
+         * stack of them (see the shader), in full subgroups since the
+         * shader places its invocations by subgroup and lane. */
+        {
+            uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                                   ctx->caps.max_subgroup_size);
+
+            ret = craw_pipeline_shader_sg(p, &p->awb_hist, "awb_hist",
+                                          craw_awb_hist_spv_data, craw_awb_hist_spv_len,
+                                          craw_bind_awb, 4, sizeof(CRAWAwbPush),
+                                          CRAW_MAX(wg2d * wg2d / sg, 1u), sg, NULL, 0);
+        }
         if (ret < 0)
             goto fail;
 
@@ -983,7 +1221,13 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
-    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s%s%s%s\n",
+    if (params->flags & CRAW_PIPELINE_FLAG_PROFILE) {
+        ret = craw_pipeline_profile_init(p);
+        if (ret < 0)
+            goto fail;
+    }
+
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s%s%s%s%s\n",
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
              p->awb ? ", awb histogram" : "",
              p->has_temporal ? ", temporal denoise" : "",
@@ -993,7 +1237,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
              p->has_df ? ", defringe" : "",
              p->has_chroma ? ", chroma denoise" : "",
              p->has_lens ? ", lens" : "",
-             p->has_sh ? ", sharpen" : "");
+             p->has_sh ? ", sharpen" : "",
+             p->prof_pool ? ", profiled" : "");
 
     *pipe = p;
     return 0;
@@ -1016,13 +1261,6 @@ void craw_pipeline_free(CRAWPipeline **pipe)
 
     if (p->debayer.pipeline)
         craw_vk_shader_free(ctx, &p->debayer);
-    if (p->rcd_dir.pipeline)
-        craw_vk_shader_free(ctx, &p->rcd_dir);
-    if (p->rcd_green.pipeline)
-        craw_vk_shader_free(ctx, &p->rcd_green);
-    for (int i = 0; i < 2; i++)
-        if (p->rcd_rb[i].pipeline)
-            craw_vk_shader_free(ctx, &p->rcd_rb[i]);
     if (p->color.pipeline)
         craw_vk_shader_free(ctx, &p->color);
     if (p->awb_hist.pipeline)
@@ -1031,8 +1269,9 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->denoise);
     if (p->lens.pipeline)
         craw_vk_shader_free(ctx, &p->lens);
-    if (p->false_color.pipeline)
-        craw_vk_shader_free(ctx, &p->false_color);
+    for (int i = 0; i < CRAW_FALSE_COLOR_MAX_PASSES; i++)
+        if (p->false_color[i].pipeline)
+            craw_vk_shader_free(ctx, &p->false_color[i]);
     if (p->chroma_down.pipeline)
         craw_vk_shader_free(ctx, &p->chroma_down);
     if (p->chroma_blur.pipeline)
@@ -1047,8 +1286,6 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->hl_push);
     if (p->hl_fill.pipeline)
         craw_vk_shader_free(ctx, &p->hl_fill);
-    if (p->df_prep.pipeline)
-        craw_vk_shader_free(ctx, &p->df_prep);
     if (p->df.pipeline)
         craw_vk_shader_free(ctx, &p->df);
     if (p->sh_prep.pipeline)
@@ -1057,13 +1294,12 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         for (int r = 0; r < CRAW_SH_RMAX; r++)
             if (p->sh_iter[i][r].pipeline)
                 craw_vk_shader_free(ctx, &p->sh_iter[i][r]);
+    for (int r = 0; r < CRAW_SH_RMAX; r++)
+        if (p->sh_rows[r].pipeline)
+            craw_vk_shader_free(ctx, &p->sh_rows[r]);
 
     if (p->inter.image)
         craw_vk_image_free(ctx, &p->inter);
-    if (p->aux.image)
-        craw_vk_image_free(ctx, &p->aux);
-    if (p->green.image)
-        craw_vk_image_free(ctx, &p->green);
     if (p->clean.image)
         craw_vk_image_free(ctx, &p->clean);
     for (int i = 0; i < 2; i++) {
@@ -1099,6 +1335,12 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         if (p->hist_readback[i].buf)
             craw_vk_buffer_free(ctx, &p->hist_readback[i]);
     }
+
+    if (p->prof_pool)
+        ctx->fn.DestroyQueryPool(ctx->device, p->prof_pool, ctx->alloc);
+    free(p->prof_sh);
+    free(p->prof_ts);
+    free(p->prof_agg);
 
     free(p);
     *pipe = NULL;
@@ -1334,16 +1576,36 @@ static int craw_pipeline_lens_push(CRAWPipeline *p, const CRAWLensCorrection *lc
 }
 
 /* `gz` is 1 for every pass; the denoise dispatches its four CFA planes as
- * four times the columns of workgroups instead. */
+ * four times the columns of workgroups instead.
+ *
+ * With profiling on, the dispatch sits between two timestamps written once
+ * everything before each has left the compute stage: the first when the
+ * previous pass is done, the second when this one is. Off, it is one
+ * well predicted branch per dispatch. DESIGN.md 21. */
 static void craw_pipeline_dispatch(CRAWPipeline *p, VkCommandBuffer cmd, const CRAWVkShader *sh,
                                    CRAWVkDescWrite *writes, uint32_t nb_writes,
                                    const void *push, uint32_t push_size,
                                    uint32_t gx, uint32_t gy, uint32_t gz)
 {
+    uint32_t q = UINT32_MAX;
+
+    if (p->prof_pool && p->prof_nb[p->prof_slot] < p->prof_max) {
+        uint32_t i = p->prof_nb[p->prof_slot]++;
+
+        p->prof_sh[p->prof_slot * p->prof_max + i] = sh;
+        q = 2 * (p->prof_slot * p->prof_max + i);
+        p->ctx->fn.CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                      p->prof_pool, q);
+    }
+
     craw_vk_shader_bind(p->ctx, cmd, sh);
     craw_vk_shader_push_desc(p->ctx, cmd, sh, writes, nb_writes);
     craw_vk_shader_push_const(p->ctx, cmd, sh, push, push_size);
     craw_vk_shader_dispatch(p->ctx, cmd, sh, gx, gy, gz);
+
+    if (q != UINT32_MAX)
+        p->ctx->fn.CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                      p->prof_pool, q + 1);
 }
 
 /* The highlight reconstruction of DESIGN.md 18: the colour field's level 0
@@ -1650,6 +1912,17 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     craw_vk_image_wrap(&src_img, src);
     craw_vk_image_wrap(&dst_img, dst);
 
+    /* Nothing can fail from here on, so the slot this recording times is
+     * taken now: its queries are reset in this command buffer, ahead of
+     * the timestamps that rewrite them, which query commands on one queue
+     * are ordered by without a barrier. */
+    if (p->prof_pool) {
+        p->prof_slot = (uint32_t)(p->prof_recorded % CRAW_PIPELINE_PROFILE_SLOTS);
+        p->prof_nb[p->prof_slot] = 0;
+        ctx->fn.CmdResetQueryPool(cmd, p->prof_pool, 2 * p->prof_slot * p->prof_max,
+                                  2 * p->prof_max);
+    }
+
     craw_vk_image_barrier(ctx, cmd, &src_img, VK_IMAGE_LAYOUT_GENERAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
@@ -1723,12 +1996,16 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
         craw_vk_desc_image(&dn_writes[4], 4, v_prev);
         craw_vk_desc_image(&dn_writes[5], 5, v_next);
         /* Half resolution, four workgroups per tile, one per CFA plane,
-         * side by side in x so that they run together. */
+         * side by side in x so that they run together. A tile is the
+         * subgroup's lanes less the patch radius at either end wide, and
+         * its bands' rows tall. */
         {
-            uint32_t wgx = p->denoise.wg[0];
+            uint32_t ox = craw_dn_tile_w(p->dn_lanes);
+            uint32_t oy = p->dn_bands * CRAW_DN_ROWS;
 
             craw_pipeline_dispatch(p, cmd, &p->denoise, dn_writes, 6, &dp, sizeof(dp),
-                                   4 * wgx * ((w / 2 + wgx - 1) / wgx), h / 2, 1);
+                                   4 * p->dn_lanes * ((w / 2 + ox - 1) / ox),
+                                   p->dn_bands * ((h / 2 + oy - 1) / oy), 1);
         }
 
         craw_vk_image_barrier(ctx, cmd, &p->clean, VK_IMAGE_LAYOUT_GENERAL,
@@ -1767,43 +2044,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
-    if (!p->rcd) {
-        craw_vk_desc_image(&writes[0], 0, mosaic);
-        craw_vk_desc_image(&writes[1], 1, &p->inter);
-        craw_pipeline_dispatch(p, cmd, &p->debayer, writes, 2, &pp, sizeof(pp), w, h, 1);
-    } else {
-        /* Pass A: low-pass and directional weights into the aux image. */
-        craw_vk_image_barrier(ctx, cmd, &p->aux, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_vk_desc_image(&writes[0], 0, mosaic);
-        craw_vk_desc_image(&writes[1], 1, &p->aux);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_dir, writes, 2, &pp, sizeof(pp), w, h, 1);
-
-        /* Pass B: the green plane. */
-        craw_vk_image_barrier(ctx, cmd, &p->aux, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        craw_vk_image_barrier(ctx, cmd, &p->green, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_vk_desc_image(&writes[2], 2, &p->green);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_green, writes, 3, &pp, sizeof(pp), w, h, 1);
-
-        /* Pass C phase 0: the R and B sites, which phase 1 then reads. */
-        craw_vk_image_barrier(ctx, cmd, &p->green, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        craw_vk_desc_image(&writes[3], 3, &p->inter);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[0], writes, 4, &pp, sizeof(pp), w, h, 1);
-
-        /* Pass C phase 1: the G sites. */
-        craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[1], writes, 4, &pp, sizeof(pp), w, h, 1);
-    }
+    craw_vk_desc_image(&writes[0], 0, mosaic);
+    craw_vk_desc_image(&writes[1], 1, &p->inter);
+    craw_pipeline_dispatch(p, cmd, &p->debayer, writes, 2, &pp, sizeof(pp), w, h, 1);
 
     craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -1813,11 +2056,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
      * what the false colour stage, the lens warp and the chroma denoise
      * made of it. Each of those writes the other full resolution image and
      * the two swap, so `inter` is always the latest and `other` free to
-     * write. The second image is RCD's aux when there is one (its last
-     * reader was pass C, just above) and the pipeline's own scratch
-     * otherwise. DESIGN.md 17.3. */
+     * write. DESIGN.md 17.3. */
     inter = &p->inter;
-    other = p->rcd ? &p->aux : (p->scratch.image ? &p->scratch : NULL);
+    other = p->scratch.image ? &p->scratch : NULL;
 
     if (false_color) {
         craw_vk_image_barrier(ctx, cmd, other, VK_IMAGE_LAYOUT_GENERAL,
@@ -1825,7 +2066,8 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_image(&writes[1], 1, other);
-        craw_pipeline_dispatch(p, cmd, &p->false_color, writes, 2, &fcp, sizeof(fcp), w, h, 1);
+        craw_pipeline_dispatch(p, cmd, &p->false_color[fcp.passes - 1], writes, 2, &fcp,
+                               sizeof(fcp), w, h, 1);
 
         craw_vk_image_barrier(ctx, cmd, other, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -1855,30 +2097,22 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     }
 
     if (defringe) {
-        /* DESIGN.md 19: l, c and E into the second image, then the clamp in
-         * place, each invocation touching only its own texel of the
-         * intermediate, so the two images keep their roles. */
+        /* DESIGN.md 19: the first pass's values in shared memory and the
+         * clamp in one dispatch, every pixel into the second image, which
+         * then becomes the intermediate as with the stages above. */
         craw_vk_image_barrier(ctx, cmd, other, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_image(&writes[1], 1, other);
-        craw_pipeline_dispatch(p, cmd, &p->df_prep, writes, 2, &dfp, sizeof(dfp), w, h, 1);
+        craw_pipeline_dispatch(p, cmd, &p->df, writes, 2, &dfp, sizeof(dfp), w, h, 1);
 
         craw_vk_image_barrier(ctx, cmd, other, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        craw_vk_image_barrier(ctx, cmd, inter, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_vk_desc_image(&writes[0], 0, other);
-        craw_vk_desc_image(&writes[1], 1, inter);
-        craw_pipeline_dispatch(p, cmd, &p->df, writes, 2, &dfp, sizeof(dfp), w, h, 1);
-
-        craw_vk_image_barrier(ctx, cmd, inter, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        CRAWVkImage *t = inter;
+        inter = other;
+        other = t;
     }
 
     if (chroma) {
@@ -1889,8 +2123,10 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_image(&writes[1], 1, &p->chroma_q);
+        /* An invocation per pixel column across, and one per block row
+         * down, of which a workgroup has four. */
         craw_pipeline_dispatch(p, cmd, &p->chroma_down, writes, 2, &cdp, sizeof(cdp),
-                               (uint32_t)p->qsize[0], (uint32_t)p->qsize[1], 1);
+                               (uint32_t)p->qsize[0] * 4, (uint32_t)p->qsize[1], 1);
 
         craw_vk_image_barrier(ctx, cmd, &p->chroma_q, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -1940,7 +2176,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
         craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_buffer(&writes[1], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &p->sh_d, 0, 0);
         craw_pipeline_dispatch(p, cmd, &p->sh_prep, writes, 2, &shp, sizeof(shp),
-                               (uint32_t)p->sh_stride, h, 1);
+                               (uint32_t)p->sh_stride * CRAW_SH_CHUNK, h, 1);
         craw_vk_buffer_barrier(ctx, cmd, &p->sh_d, cs, wr, cs, rd);
 
         craw_vk_image_barrier(ctx, cmd, inter, VK_IMAGE_LAYOUT_GENERAL, cs, rd | wr);
@@ -1956,8 +2192,18 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
             craw_vk_desc_buffer(&writes[1], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &p->sh_d, 0, 0);
             craw_vk_desc_buffer(&writes[2], 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, out, 0, 0);
             craw_vk_desc_image(&writes[3], 3, inter);
-            craw_pipeline_dispatch(p, cmd, &p->sh_iter[last][sh_reach - 1], writes, 4,
-                                   &shp, sizeof(shp), w, h, 1);
+            if (!last && p->sh_rows[sh_reach - 1].pipeline) {
+                /* One subgroup per strip: its output width across, its
+                 * rows down. */
+                uint32_t ow = 4 * p->sh_lanes - 4 * (uint32_t)sh_reach;
+
+                craw_pipeline_dispatch(p, cmd, &p->sh_rows[sh_reach - 1], writes, 4,
+                                       &shp, sizeof(shp), p->sh_lanes * ((w + ow - 1) / ow),
+                                       (h + CRAW_SH_STRIP_ROWS - 1) / CRAW_SH_STRIP_ROWS, 1);
+            } else {
+                craw_pipeline_dispatch(p, cmd, &p->sh_iter[last][sh_reach - 1], writes, 4,
+                                       &shp, sizeof(shp), w, h, 1);
+            }
             if (!last)
                 craw_vk_buffer_barrier(ctx, cmd, out, cs, wr, cs, rd);
             u = out;
@@ -1980,8 +2226,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                             &p->hist_weight, 0, CRAW_AWB_HIST_BYTES);
         craw_vk_desc_buffer(&writes[3], 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                             &p->hist_bright, 0, CRAW_AWB_HIST_BYTES);
+        /* Four invocations a block across, a block a subgroup down. */
         craw_pipeline_dispatch(p, cmd, &p->awb_hist, writes, 4, &ap, sizeof(ap),
-                               (uint32_t)p->blocks[0], (uint32_t)p->blocks[1], 1);
+                               (uint32_t)p->blocks[0] * 4, (uint32_t)p->blocks[1], 1);
     }
 
     craw_vk_image_barrier(ctx, cmd, &dst_img, VK_IMAGE_LAYOUT_GENERAL,
@@ -2028,6 +2275,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     craw_vk_image_barrier(ctx, cmd, &src_img, src->layout,
                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+    if (p->prof_pool)
+        p->prof_recorded++;
 
     /* The recording is made; only now does the temporal state move. The
      * set this one read is what a replay of it reads. A next frame without
@@ -2087,4 +2337,63 @@ int craw_pipeline_get_awb_histogram_n(CRAWPipeline *p, uint32_t frames_back,
 int craw_pipeline_get_awb_histogram(CRAWPipeline *p, CRAWAwbHistogram *out)
 {
     return craw_pipeline_get_awb_histogram_n(p, 0, out);
+}
+
+int craw_pipeline_get_stage_times_n(CRAWPipeline *p, uint32_t frames_back,
+                                    CRAWStageTime *out, uint32_t max)
+{
+    CRAWContext *ctx;
+    uint32_t slot, nb, nb_agg = 0;
+    VkResult res;
+
+    if (!p || (max && !out))
+        return CRAW_ERROR(EINVAL);
+
+    ctx = p->ctx;
+    if (!p->prof_pool) {
+        craw_log(ctx, CRAW_LOG_ERROR, "Pipeline was created without CRAW_PIPELINE_FLAG_PROFILE\n");
+        return CRAW_ERROR(EINVAL);
+    }
+    if (frames_back >= CRAW_PIPELINE_PROFILE_SLOTS || frames_back >= p->prof_recorded)
+        return CRAW_ERROR(EINVAL);
+
+    slot = (uint32_t)((p->prof_recorded - 1 - frames_back) % CRAW_PIPELINE_PROFILE_SLOTS);
+    nb = p->prof_nb[slot];
+    if (!nb)
+        return 0;
+
+    /* No WAIT_BIT: a submission that has not completed is the caller's
+     * mistake, and it should hear about it rather than block on it. */
+    res = ctx->fn.GetQueryPoolResults(ctx->device, p->prof_pool, 2 * slot * p->prof_max,
+                                      2 * nb, 2 * nb * sizeof(*p->prof_ts), p->prof_ts,
+                                      sizeof(*p->prof_ts), VK_QUERY_RESULT_64_BIT);
+    if (res == VK_NOT_READY)
+        return CRAW_ERROR(EAGAIN);
+    if (res != VK_SUCCESS)
+        return craw_vk_ret2err(res);
+
+    for (uint32_t i = 0; i < nb; i++) {
+        const char *name = p->prof_sh[slot * p->prof_max + i]->name;
+        uint64_t ticks = (p->prof_ts[2 * i + 1] - p->prof_ts[2 * i]) & p->prof_mask;
+        double ms = (double)ticks * p->prof_period / 1e6;
+        uint32_t j;
+
+        for (j = 0; j < nb_agg; j++)
+            if (!strcmp(p->prof_agg[j].name, name))
+                break;
+        if (j == nb_agg)
+            p->prof_agg[nb_agg++] = (CRAWStageTime) { .name = name };
+        p->prof_agg[j].count++;
+        p->prof_agg[j].ms += ms;
+    }
+
+    if (max)
+        memcpy(out, p->prof_agg, CRAW_MIN(max, nb_agg) * sizeof(*out));
+
+    return (int)nb_agg;
+}
+
+int craw_pipeline_get_stage_times(CRAWPipeline *p, CRAWStageTime *out, uint32_t max)
+{
+    return craw_pipeline_get_stage_times_n(p, 0, out, max);
 }
