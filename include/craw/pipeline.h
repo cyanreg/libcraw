@@ -54,24 +54,21 @@ enum CRAWDebayer {
 #define CRAW_PIPELINE_FLAG_DENOISE (1 << 1)
 
 /* Build the lens correction pass, a per-channel warp of the camera RGB
- * intermediate after the debayer. With the RCD debayer it costs no memory
- * (it borrows RCD's auxiliary image, as the false colour pass does); with
- * bilinear or MHC it costs one full resolution RGBA16F image, shared with
- * the other passes that need one. Once created it is switched per frame
- * with CRAWFrameParams.lens: a correction with valid = false skips the
- * warp entirely, so such a frame is bit for bit what a pipeline built
- * without the flag produces. See DESIGN.md 16. */
+ * intermediate after the debayer. It costs one full resolution RGBA16F
+ * image, shared with the other passes that need one. Once created it is
+ * switched per frame with CRAWFrameParams.lens: a correction with valid =
+ * false skips the warp entirely, so such a frame is bit for bit what a
+ * pipeline built without the flag produces. See DESIGN.md 16. */
 #define CRAW_PIPELINE_FLAG_LENS (1 << 2)
 
 /* Build the false colour suppression pass, DESIGN.md 17: a 3x3 median
  * followed by a 3x3 box blur of the colour differences of the debayered
  * intermediate, run up to CRAW_FALSE_COLOR_MAX_PASSES times, which turns
  * the coloured dots that a glint smaller than a CFA quad leaves into
- * neutral ones and touches nothing else. With the RCD debayer it costs no memory: the stage writes
- * RCD's own auxiliary image, which is free by then. With bilinear or MHC
- * it costs an extra full resolution RGBA16F image. Once built it is
- * switched per frame with CRAWFrameParams.false_color_passes, which costs
- * nothing when zero. */
+ * neutral ones and touches nothing else. It costs a full resolution
+ * RGBA16F image, shared with the other passes that need one. Once built
+ * it is switched per frame with CRAWFrameParams.false_color_passes, which
+ * costs nothing when zero. */
 #define CRAW_PIPELINE_FLAG_FALSE_COLOR (1 << 3)
 
 /* The most passes the stage's fused dispatch carries an apron for, the
@@ -84,11 +81,10 @@ enum CRAWDebayer {
  * bilateral guided by the quarter resolution G, and that band put back
  * into every pixel. It reaches the chroma blotches of a dark scene and the
  * colour of glints two and three sensels wide, which the false colour pass
- * leaves. It costs two quarter resolution RGBA16F images and, with the
- * bilinear or MHC debayer and no false colour pass, one full resolution
- * RGBA16F image (the two passes share it; RCD lends its own). Once built
- * it is switched per frame with CRAWFrameParams.denoise_chroma_strength,
- * which costs nothing when zero. */
+ * leaves. It costs two quarter resolution RGBA16F images and one full
+ * resolution RGBA16F image, shared with the other passes that need one.
+ * Once built it is switched per frame with
+ * CRAWFrameParams.denoise_chroma_strength, which costs nothing when zero. */
 #define CRAW_PIPELINE_FLAG_CHROMA_DENOISE (1 << 4)
 
 /* Build the highlight reconstruction pass, DESIGN.md 18: every sensel
@@ -110,11 +106,10 @@ enum CRAWDebayer {
  * and pink rims that the lens's chromatic aberration leaves along bright
  * edges and that highlight reconstruction no longer hides under the clip.
  * The level of every pixel is kept, and a pixel whose colour is already in
- * range is not touched. With the RCD debayer it costs no memory (it borrows
- * RCD's auxiliary image, as the false colour pass does); with bilinear or
- * MHC it costs one full resolution RGBA16F image, shared with the other
- * passes that need one. Once built it is switched per frame with
- * CRAWFrameParams.defringe_strength, which costs nothing when zero. */
+ * range is not touched. It costs one full resolution RGBA16F image, shared
+ * with the other passes that need one. Once built it is switched per
+ * frame with CRAWFrameParams.defringe_strength, which costs nothing when
+ * zero. */
 #define CRAW_PIPELINE_FLAG_DEFRINGE (1 << 6)
 
 /* Build the temporal denoise pass, DESIGN.md 14.7: in front of the spatial

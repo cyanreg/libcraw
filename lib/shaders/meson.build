@@ -26,9 +26,7 @@
 craw_shader_names = [
     'debayer_bilinear',
     'debayer_mhc',
-    'rcd_dir',
-    'rcd_green',
-    'rcd_rb',
+    'rcd',
     'color',
     'awb_hist',
     'denoise_nlm',

@@ -32,8 +32,8 @@ layout(push_constant, scalar) uniform CRAWSharpenPushBuf {
  * (x & 1) of component (x & 7) >> 1, the even pixel in the low half, as
  * unpackHalf2x16() reads it.
  *
- * The conversion to fp16 rounds to nearest, ties to even, as an image
- * store does and as the reference does. packHalf2x16() does not promise a
+ * The conversion to fp16 rounds to nearest, ties to even, as the
+ * reference does. packHalf2x16() does not promise a
  * rounding and on AMD truncates, which biased every iteration's estimate
  * low by a quarter of an fp16 step on average. Every value stored here is
  * at least the pedestal, the smallest normal fp16, so the normal case is

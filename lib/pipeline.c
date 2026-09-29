@@ -19,9 +19,7 @@
 
 #include "debayer_bilinear.spv.h"
 #include "debayer_mhc.spv.h"
-#include "rcd_dir.spv.h"
-#include "rcd_green.spv.h"
-#include "rcd_rb.spv.h"
+#include "rcd.spv.h"
 #include "color.spv.h"
 #include "awb_hist.spv.h"
 #include "denoise_nlm.spv.h"
@@ -304,6 +302,19 @@ static uint32_t craw_dn_shared_bytes(uint32_t lanes, uint32_t bands)
 
 static_assert(CRAW_FALSE_COLOR_MAX_PASSES == 5, "false colour passes must match the shader's");
 
+/* The shared memory of RCD's tiles on a workgroup of wx x wy, mirroring
+ * lib/shaders/rcd.comp.glsl: the prepped mosaic with an apron of 5, the
+ * low-pass of 4, the four directional values of 3, the two weights and the
+ * green of 2 and the estimate of 1. */
+static uint32_t craw_rcd_shared_bytes(uint32_t wx, uint32_t wy)
+{
+    uint32_t a5 = (wx + 10) * (wy + 10), a4 = (wx + 8) * (wy + 8);
+    uint32_t a3 = (wx + 6) * (wy + 6), a2 = (wx + 4) * (wy + 4);
+    uint32_t a1 = (wx + 2) * (wy + 2);
+
+    return (a5 + a4 + 4 * a3 + 3 * a2 + a1) * (uint32_t)sizeof(float);
+}
+
 static uint32_t craw_fc_tile(uint32_t wg)
 {
     return wg + 4 * CRAW_FALSE_COLOR_MAX_PASSES;
@@ -369,12 +380,8 @@ struct CRAWPipeline {
     bool has_temporal;
     bool has_sh;
 
-    /* One of `debayer` or the three RCD passes is created, never both.
-     * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
+    /* The debayer of the pipeline's method, RCD's three passes in one. */
     CRAWVkShader debayer;
-    CRAWVkShader rcd_dir;
-    CRAWVkShader rcd_green;
-    CRAWVkShader rcd_rb[2];
     CRAWVkShader color;
     CRAWVkShader awb_hist;
     CRAWVkShader denoise;
@@ -400,13 +407,11 @@ struct CRAWPipeline {
     uint32_t sh_lanes;
 
     CRAWVkImage inter;   /* camera RGB, RGBA16F */
-    CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
-    CRAWVkImage green;   /* RCD: pass B green plane, R16F */
     CRAWVkImage clean;   /* denoise: the filtered mosaic, R16_UNORM */
     CRAWVkImage scratch; /* a second intermediate for the stages that cannot
-                          * run in place (false colour, chroma denoise) or
-                          * need one to prepare into (defringe), RGBA16F,
-                          * only without RCD, whose aux is borrowed */
+                          * run in place (false colour, lens, chroma
+                          * denoise) or need one to prepare into (defringe),
+                          * RGBA16F */
     CRAWVkImage chroma_q;  /* chroma denoise: quarter resolution (d_r, d_b, G) */
     CRAWVkImage chroma_qf; /* the same, differences filtered */
     CRAWVkImage hl_mosaic;  /* highlights: the rebuilt mosaic, R16F, balanced */
@@ -504,7 +509,7 @@ static const CRAWVkBinding craw_bind_awb[4] = {
 };
 
 /* Specialization constants below 253: 0 is the CFA phase (common.glsl), 1
- * the RCD pass C phase (rcd_rb.comp.glsl), 2 and 3 the denoise search and
+ * unused (it was RCD's pass C phase), 2 and 3 the denoise search and
  * patch radii (denoise_nlm.comp.glsl), 4 the false colour tile side
  * (false_color.comp.glsl), 5 and 6 the sharpening's last iteration and
  * its kernel's reach (sharpen.comp.glsl), 7 and 8 the subgroup size and
@@ -610,7 +615,7 @@ static uint32_t craw_pipeline_max_dispatches(const CRAWPipeline *p)
 {
     uint32_t n = 1;                         /* colour */
 
-    n += p->rcd ? 4 : 1;                    /* debayer */
+    n += 1;                                 /* debayer */
     if (p->has_denoise || p->has_temporal)
         n += 1;
     if (p->has_hl)
@@ -740,15 +745,21 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
     p->blocks[1] = (int32_t)(params->height / CRAW_AWB_BLOCK);
 
-    /* 16x16 for the pointwise and small-stencil stages; RCD pass A reads a
-     * 7x7 patch per invocation, so it gets half the occupancy pressure. */
+    /* 16x16 for the pointwise and small-stencil stages. */
     wg2d  = craw_wg_dim(ctx, 16);
-    wgrcd = craw_wg_dim(ctx, 8);
     /* The false colour tile has to fit the device's shared memory, and a
      * smaller workgroup only shrinks it. A limit below the 16 KB Vulkan
      * guarantees means the properties were never filled in, and only the
      * guarantee is trusted. */
     shared_max = CRAW_MAX(ctx->props.properties.limits.maxComputeSharedMemorySize, 16384u);
+    /* RCD's workgroup is twice as wide as tall, and its tiles take 32.7 KB
+     * at 32x16, more than the 16 KB Vulkan guarantees; a smaller workgroup
+     * only shrinks them. */
+    wgrcd = wg2d;
+    while (wgrcd > 4 && (craw_rcd_shared_bytes(2 * wgrcd, wgrcd) > shared_max ||
+                         2 * wgrcd * wgrcd > ctx->props.properties.limits.maxComputeWorkGroupInvocations ||
+                         2 * wgrcd > ctx->props.properties.limits.maxComputeWorkGroupSize[0]))
+        wgrcd /= 2;
     wgfc  = craw_wg_dim(ctx, CRAW_FC_WG_MAX);
     while (wgfc > 4 && craw_fc_shared_bytes(wgfc) > shared_max)
         wgfc /= 2;
@@ -911,50 +922,40 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                                    mhc ? craw_debayer_mhc_spv_data : craw_debayer_bilinear_spv_data,
                                    mhc ? craw_debayer_mhc_spv_len : craw_debayer_bilinear_spv_len,
                                    craw_bind_images, 2, sizeof(CRAWPrepPush), wg2d, spec, 1);
-        if (ret < 0)
-            goto fail;
     } else {
-        ret = craw_vk_image_create(ctx, &p->aux, params->width, params->height,
-                                   VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
-        if (ret < 0)
-            goto fail;
+        /* Twice as wide as tall, in subgroups of 32 where the device can:
+         * of the shapes and sizes tried, 32x16 in wave32 was the fastest,
+         * the aprons being a smaller part of a wider tile. */
+        uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                               ctx->caps.max_subgroup_size);
+        CRAWVkShaderDesc desc = {
+            .name            = "rcd",
+            .spirv           = craw_rcd_spv_data,
+            .spirv_len       = craw_rcd_spv_len,
+            .bindings        = craw_bind_images,
+            .nb_bindings     = 2,
+            .push_size       = sizeof(CRAWPrepPush),
+            .wg              = { 2 * wgrcd, wgrcd, 1 },
+            .spec_entries    = craw_spec_map,
+            .nb_spec_entries = 1,
+            .spec_data       = spec,
+            .spec_size       = sizeof(uint32_t),
+            /* Full subgroups need the width to be a multiple of the size. */
+            .required_subgroup_size = (2 * wgrcd) % sg ? 0 : sg,
+        };
 
-        ret = craw_vk_image_create(ctx, &p->green, params->width, params->height,
-                                   VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
-        if (ret < 0)
-            goto fail;
-
-        ret = craw_pipeline_shader(p, &p->rcd_dir, "rcd_dir",
-                                   craw_rcd_dir_spv_data, craw_rcd_dir_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWPrepPush), wgrcd, spec, 1);
-        if (ret < 0)
-            goto fail;
-
-        ret = craw_pipeline_shader(p, &p->rcd_green, "rcd_green",
-                                   craw_rcd_green_spv_data, craw_rcd_green_spv_len,
-                                   craw_bind_images, 3, sizeof(CRAWPrepPush), wg2d, spec, 1);
-        if (ret < 0)
-            goto fail;
-
-        for (uint32_t i = 0; i < 2; i++) {
-            spec[1] = i;
-            ret = craw_pipeline_shader(p, &p->rcd_rb[i], i ? "rcd_rb_g" : "rcd_rb_rb",
-                                       craw_rcd_rb_spv_data, craw_rcd_rb_spv_len,
-                                       craw_bind_images, 4, sizeof(CRAWPrepPush), wg2d, spec, 2);
-            if (ret < 0)
-                goto fail;
-        }
+        ret = craw_vk_shader_create(ctx, &p->debayer, &desc);
     }
+    if (ret < 0)
+        goto fail;
 
     /* Neither the false colour stage, the lens warp nor the chroma denoise
      * can run in place, so each needs a second intermediate to write, and
      * the two ping-pong between the debayer's and this one; the defringe
-     * keeps its first pass there. With RCD it is the aux image: pass A
-     * writes it, pass C is its last reader, and nothing touches it again
-     * until the next frame's pass A, so the stages borrow it and the
-     * pipeline costs no more memory than without the flags. The other two
-     * methods have no such image and get one. DESIGN.md 17.3. */
-    if ((p->has_fc || p->has_lens || p->has_chroma || p->has_df) && !p->rcd) {
+     * keeps its first pass there. DESIGN.md 17.3. RCD used to lend its
+     * auxiliary image for this; since its passes became one dispatch it
+     * has none. */
+    if (p->has_fc || p->has_lens || p->has_chroma || p->has_df) {
         ret = craw_vk_image_create(ctx, &p->scratch, params->width, params->height,
                                    VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
         if (ret < 0)
@@ -1206,13 +1207,6 @@ void craw_pipeline_free(CRAWPipeline **pipe)
 
     if (p->debayer.pipeline)
         craw_vk_shader_free(ctx, &p->debayer);
-    if (p->rcd_dir.pipeline)
-        craw_vk_shader_free(ctx, &p->rcd_dir);
-    if (p->rcd_green.pipeline)
-        craw_vk_shader_free(ctx, &p->rcd_green);
-    for (int i = 0; i < 2; i++)
-        if (p->rcd_rb[i].pipeline)
-            craw_vk_shader_free(ctx, &p->rcd_rb[i]);
     if (p->color.pipeline)
         craw_vk_shader_free(ctx, &p->color);
     if (p->awb_hist.pipeline)
@@ -1253,10 +1247,6 @@ void craw_pipeline_free(CRAWPipeline **pipe)
 
     if (p->inter.image)
         craw_vk_image_free(ctx, &p->inter);
-    if (p->aux.image)
-        craw_vk_image_free(ctx, &p->aux);
-    if (p->green.image)
-        craw_vk_image_free(ctx, &p->green);
     if (p->clean.image)
         craw_vk_image_free(ctx, &p->clean);
     for (int i = 0; i < 2; i++) {
@@ -2001,43 +1991,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
-    if (!p->rcd) {
-        craw_vk_desc_image(&writes[0], 0, mosaic);
-        craw_vk_desc_image(&writes[1], 1, &p->inter);
-        craw_pipeline_dispatch(p, cmd, &p->debayer, writes, 2, &pp, sizeof(pp), w, h, 1);
-    } else {
-        /* Pass A: low-pass and directional weights into the aux image. */
-        craw_vk_image_barrier(ctx, cmd, &p->aux, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_vk_desc_image(&writes[0], 0, mosaic);
-        craw_vk_desc_image(&writes[1], 1, &p->aux);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_dir, writes, 2, &pp, sizeof(pp), w, h, 1);
-
-        /* Pass B: the green plane. */
-        craw_vk_image_barrier(ctx, cmd, &p->aux, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        craw_vk_image_barrier(ctx, cmd, &p->green, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_vk_desc_image(&writes[2], 2, &p->green);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_green, writes, 3, &pp, sizeof(pp), w, h, 1);
-
-        /* Pass C phase 0: the R and B sites, which phase 1 then reads. */
-        craw_vk_image_barrier(ctx, cmd, &p->green, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        craw_vk_desc_image(&writes[3], 3, &p->inter);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[0], writes, 4, &pp, sizeof(pp), w, h, 1);
-
-        /* Pass C phase 1: the G sites. */
-        craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
-                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                              VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_pipeline_dispatch(p, cmd, &p->rcd_rb[1], writes, 4, &pp, sizeof(pp), w, h, 1);
-    }
+    craw_vk_desc_image(&writes[0], 0, mosaic);
+    craw_vk_desc_image(&writes[1], 1, &p->inter);
+    craw_pipeline_dispatch(p, cmd, &p->debayer, writes, 2, &pp, sizeof(pp), w, h, 1);
 
     craw_vk_image_barrier(ctx, cmd, &p->inter, VK_IMAGE_LAYOUT_GENERAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -2047,11 +2003,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
      * what the false colour stage, the lens warp and the chroma denoise
      * made of it. Each of those writes the other full resolution image and
      * the two swap, so `inter` is always the latest and `other` free to
-     * write. The second image is RCD's aux when there is one (its last
-     * reader was pass C, just above) and the pipeline's own scratch
-     * otherwise. DESIGN.md 17.3. */
+     * write. DESIGN.md 17.3. */
     inter = &p->inter;
-    other = p->rcd ? &p->aux : (p->scratch.image ? &p->scratch : NULL);
+    other = p->scratch.image ? &p->scratch : NULL;
 
     if (false_color) {
         craw_vk_image_barrier(ctx, cmd, other, VK_IMAGE_LAYOUT_GENERAL,

@@ -117,8 +117,9 @@ Scratch intermediate (internal, only with `CRAW_PIPELINE_FLAG_FALSE_COLOR`,
 image for the stages that cannot run in place; each writes it and the two
 swap roles, so what everything downstream reads is always the latest. The
 defringe keeps its first pass there and writes the intermediate in place
-(19.3). With RCD it is RCD's own aux image, borrowed; with the other
-methods it is an image of its own. Section 17.3.
+(19.3). It is an image of its own with every method; RCD, which used
+to lend its auxiliary image for it, has none since its passes became one
+dispatch (5.3). Section 17.3.
 
 Quarter resolution chroma images (internal, only with
 `CRAW_PIPELINE_FLAG_CHROMA_DENOISE`): two RGBA16F images of ceil(W/4) x
@@ -383,6 +384,40 @@ Rationale for the reference: this reproduces the published structure
 green, colour-difference chroma) with fully specified stencils so that a
 CPU and a GPU implementation written independently agree to float
 rounding.
+
+On the GPU the three passes are one dispatch (`rcd.comp.glsl`). A
+workgroup of 32x16 loads the prepped mosaic of its tile with an apron of
+five into shared memory and works inwards a ring at a time: L on an apron
+of 4, the directional values on 3, the weights and pass B's green on 2,
+pass C's R and B site estimates on 1, and the G sites and the output on
+the tile. Wherever a pass read what an earlier one wrote at a mirrored
+position, the tile holds at the position outside the frame the value
+computed at the one inside it; the directional values, which pass A
+computed from the mirrored patch at every offset, are computed at the
+position itself. Four dispatches used to write and read back an RGBA16F
+image of L and the weights, an R16F green plane and the intermediate
+twice, a gigabyte at 5.8K for the 175 MB of mosaic in and intermediate
+out, and the first pass was bound by its 49 image loads a pixel.
+
+The values the passes kept in fp16 images are rounded to fp16 where they
+were stored, the way those stores did it, so the output is the four
+passes' bit for bit. On RDNA2 that is toward zero, not to nearest: an
+RGBA16F store of 1 + 7/8 of an fp16 step reads back as 1, and denormals
+are kept. Left in fp32 the steps are the reference's arithmetic, and the
+intermediate's error against it on the synthetic scene falls from 1.57e-3
+to 9.8e-4 and the colour output's from 6.7e-3 relative to 1.7e-3 (on the
+real frame from 5.96e-2 absolute to 3.94e-2); but the real frame's false
+colour and chroma test holds its stage to twice the plain chain's error,
+and the plain chain's falling pulls that bound under the stage's own
+8.9e-2. Keeping the fp32 steps needs that bound reconsidered, so for now
+the truncation stays.
+
+At 5.8K on the 6900 XT, back to back, the four passes took 3.54 ms and
+the one takes 1.38 to 1.49 (in fp32, 1.31 to 1.37; a 16x16 workgroup
+1.51, wave64 1.57), and the aux image and the green plane, 175 MB, are
+gone. What is left is the tile's shared memory work, five barriers and
+the aprons' share of it, not memory: the mosaic in and the intermediate
+out are 0.4 ms of bandwidth.
 
 ## 6. Profile evaluation
 
@@ -704,7 +739,7 @@ for containers without them.
 - The pipeline records, per frame: barrier src to GENERAL/compute read,
   [fill histogram buffers], [denoise pass, temporal and spatial in one
   dispatch], [highlight field, pull and
-  push over its pyramid, fill], debayer passes, [false colour pass], [lens
+  push over its pyramid, fill], the debayer, [false colour pass], [lens
   pass], [defringe prep and clamp], [chroma down, blur and up], [awb
   histogram], colour pass, [copy histogram to readback], and a final
   barrier that returns dst to the caller's stated layout. The colour pass
@@ -1719,7 +1754,7 @@ Cost: one read of the full resolution intermediate into 1/16 of an
 RGBA16F image, an 81 tap bilateral over that quarter image, and one more
 read and write of the full resolution intermediate for the recombine; the
 two quarter images are 8.75 MB each at 5.8K, and the full resolution
-scratch image is shared with section 17 (RCD lends its aux to both).
+scratch image is shared with section 17.
 Measured with `cineraw --bench` at 5.8K, RCD: 5.8 ms a frame without it,
 7.2 ms with it at full strength, 1.4 ms for the stage, and the same 1.4
 ms on top of two false colour passes. That is above the 0.4 ms first
@@ -2613,8 +2648,8 @@ colour stage stays ahead of the warp: its medians work on the sensor's
 own grid, where the debayer's single pixel errors are single pixels.
 
 The warp cannot run in place, so it writes the second intermediate of
-section 3 and the two swap, like the false colour stage: RCD's aux image,
-or the pipeline's own scratch with the other methods. The colour pass then
+section 3 and the two swap, like the false colour stage: the pipeline's
+scratch image (RCD's aux image until RCD became one dispatch). The colour pass then
 writes the caller's destination whatever the flags. Running on the fp16
 intermediate costs a caller who asked for RGBA32F output nothing it had:
 the intermediate the colour pass reads was fp16 before the warp too.
@@ -3080,10 +3115,13 @@ Between the debayer and everything that reads the intermediate: the auto
 white balance histogram of 4.4 and the colour stage of 4.3 both read the
 filtered copy, so a road full of glints stops voting on the illuminant too.
 The copy is a second RGBA16F image, because a pass that reads its
-neighbours cannot write the image it reads. With RCD it is RCD's own aux image (section 5.3
-pass A writes it, pass C is its last reader, and nothing touches it again
-until the next frame's pass A), so the default pipeline pays no memory for
-the stage. Bilinear and MHC have no such image and get one, 140 MB at 5.8K.
+neighbours cannot write the image it reads. It was RCD's aux image with
+RCD, which pass A wrote and pass C last read, so that the default pipeline
+paid no memory for the stage; since RCD's passes are one dispatch (5.3)
+there is no aux image, and every method gets the pipeline's scratch, 140
+MB at 5.8K, shared with the other stages that need one. An RCD pipeline
+with the stage is still 35 MB smaller than it was, the aux image and the
+green plane being gone.
 
 The passes run in one dispatch. Each workgroup loads a tile with an apron
 of two pixels per pass into shared memory, as the two differences in one
@@ -3640,9 +3678,9 @@ stage leaves alone is bit for bit what came in. Most pixels leave after
 the 5x5 of E. The reference in `lib/ref/ref_defringe.c` rounds the first
 pass's four values to fp16 as the GPU stores them.
 
-With RCD the second image is RCD's aux, and the stage costs no memory;
-with bilinear or MHC it is the pipeline's scratch, 140 MB at 5.8K, shared
-with the other stages that need it.
+The second image is the pipeline's scratch, 140 MB at 5.8K, shared with
+the other stages that need it (it was RCD's aux with RCD, until RCD's
+passes became one dispatch, 5.3).
 
 ### 19.4 Cost and API
 
