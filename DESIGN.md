@@ -29,6 +29,11 @@ In:
   including a sensor noise model by exposure index.
 - Raw domain denoising: non-local means on the four CFA planes in a
   variance stabilised domain, optional, per-frame strength. Section 14.
+- Temporal denoising in front of it, in the same domain: every sample
+  averaged with the previous frame's filtered value where a 3x3 patch of
+  the two agrees within the noise, optional, per-frame strength, with state
+  the pipeline keeps from one recording to the next and a reset and a
+  replay to steer it. Section 14.7.
 - Chroma denoising after the debayer: the quarter resolution chroma band
   replaced by its luma-guided bilateral smoothing, optional, per-frame
   strength. Section 14.4.
@@ -45,8 +50,8 @@ In:
   Section 19.
 - CPU reference of every stage, tests comparing it against the GPU.
 
-Out, deliberately, with a slot reserved: temporal denoising (section 14.7
-says how it attaches), scaling, learned debayer, OCIO-generated transforms, LUTs, other CFA phases, and ARRIRAW and
+Out, deliberately, with a slot reserved: motion compensated temporal
+denoising (section 14.7 says why not yet), scaling, learned debayer, OCIO-generated transforms, LUTs, other CFA phases, and ARRIRAW and
 BRAW profiles. Vignetting is out too, and unlike distortion it is out for
 good on this camera: the optical_correction record carries no shading
 term, because Panasonic applies shading correction in the camera before the
@@ -87,9 +92,16 @@ Input image: `VK_FORMAT_R16_UNORM`, the mosaic, sample `raw(x, y)` in
 [0, 1]. This is what FFmpeg's Vulkan hwcontext maps `AV_PIX_FMT_BAYER_RGGB16`
 to.
 
-Denoised mosaic (internal, only with `CRAW_PIPELINE_FLAG_DENOISE`):
-`VK_FORMAT_R16_UNORM`, the same raw encoding as the input, written by the
-denoise stage and read by the debayer in its place. Section 14.1.
+Denoised mosaic (internal, only with `CRAW_PIPELINE_FLAG_DENOISE` or
+`CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE`): `VK_FORMAT_R16_UNORM`, the same raw
+encoding as the input, written by the denoise stage and read by the
+debayer in its place. Section 14.1.
+
+Temporal state (internal, only with `CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE`):
+two sets, each a `VK_FORMAT_R32_SFLOAT` and a `VK_FORMAT_R8_UNORM` image at
+full resolution, indexed like the mosaic, holding one frame's temporally
+filtered level of every sample and the square root of the noise variance
+left in it. They persist from one recording to the next. Section 14.7.
 
 Intermediate image (internal): `VK_FORMAT_R16G16B16A16_SFLOAT`, camera RGB
 after prep and debayer, alpha unused.
@@ -127,9 +139,9 @@ own coordinates rather than to the mosaic; see 14.1 for why.
 
 ### 4.0 Denoise (optional, before everything)
 
-Filters the mosaic in the raw domain and hands the debayer a denoised
-mosaic in the same encoding. Defined in section 14; nothing else in this
-section changes when it runs.
+Filters the mosaic in the raw domain, in time (14.7) and then in space
+(14.3), and hands the debayer a denoised mosaic in the same encoding.
+Defined in section 14; nothing else in this section changes when it runs.
 
 ### 4.0b Highlight reconstruction (optional, before the debayer)
 
@@ -676,15 +688,17 @@ for containers without them.
 - Buffers for histograms are storage buffers with device addresses; the
   readback buffer is host visible and cached.
 - The pipeline records, per frame: barrier src to GENERAL/compute read,
-  [fill histogram buffers], [denoise pass], [highlight field, pull and
+  [fill histogram buffers], [denoise pass, temporal and spatial in one
+  dispatch], [highlight field, pull and
   push over its pyramid, fill], debayer passes, [false colour pass], [lens
   pass], [defringe prep and clamp], [chroma down, blur and up], [awb
   histogram], colour pass, [copy histogram to readback], and a final
   barrier that returns dst to the caller's stated layout. The colour pass
   always writes dst; a frame whose lens correction is invalid records no
   lens pass at all. The denoise pass
-  dispatches one workgroup slice per CFA plane over a half resolution grid
-  (`gl_WorkGroupID.z` selects the plane) and the debayer then reads its
+  dispatches four workgroups per tile of the half resolution grid, one per
+  CFA plane, side by side in x (the low two bits of `gl_WorkGroupID.x`
+  select the plane; 14.7 says why), and the debayer then reads its
   output image instead of the caller's source. The highlight
   reconstruction reads whichever of the two the debayer would have read
   and the debayer then reads the rebuilt mosaic instead.
@@ -727,7 +741,12 @@ for containers without them.
   run on the GPU's own undefringed intermediate, on the real frame to a
   count of pixels past that bound, plus the checks of section 19.5 that
   the definition does what it says, that both ways of switching it off
-  are the plain chain bit for bit and that it ran. lavapipe is acceptable for these
+  are the plain chain bit for bit and that it ran. The temporal denoise is
+  tested on a sequence rather than a frame: eight frames against the
+  reference at the denoise bound, the noise falling and the moving bars
+  leaving no trail, and its state rules — off, reset, replay, a frame
+  without the pass, four recordings in flight — bit for bit on the GPU
+  against the GPU (section 14.7). lavapipe is acceptable for these
   tests; it exposes everything required.
 - `test_pipeline`, gamut compression (section 8.1), in three parts. The
   operator alone, on the CPU: the thresholds and power against the
@@ -768,7 +787,20 @@ for containers without them.
   the pipeline. Creating every method's shaders up front and selecting per
   frame would make it a live control.
 - The pipeline's intermediates are not double-buffered, so a recording per
-  submission is the rule (section 4 of pipeline.h).
+  submission is the rule (section 4 of pipeline.h), and recordings are
+  submitted to one queue in the order they were made.
+- With `CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE` the pipeline is no longer a
+  function of its arguments: each recording reads the state the previous
+  one left (section 14.7). The caller has to say when the frame it hands
+  over is not the next one — `CRAW_FRAME_FLAG_TEMPORAL_RESET` after a
+  seek, a loop or a new clip, `denoise_temporal_replay` for the same
+  frame developed again — and a recording that is made but never
+  submitted has moved the state all the same. Two consumers of one clip
+  that want the same state (a viewer and an exporter) need a pipeline
+  each, or have to replay each other's frames in order; cineview builds
+  its exporter its own pipeline and starts both at the export's first
+  frame. A caller-visible way to save and restore the state, or to hand
+  it from one pipeline to another, does not exist yet.
 
 ## 12. Work split for the initial implementation
 
@@ -1392,13 +1424,16 @@ shader edit. **P = 0 turns the same binary into the bilateral fallback**:
 the patch distance is then the plain difference of two stabilised samples,
 which is a range filter with the same noise-adaptive threshold.
 
-One workgroup per tile of one plane, the plane index in
-`gl_WorkGroupID.z`, so one dispatch covers all four. The workgroup loads
+One workgroup per tile of one plane, the four planes of a tile four
+neighbouring workgroups in x, so one dispatch covers all four (14.7 says
+why the planes are interleaved rather than in `gl_WorkGroupID.z`, as they
+were first). The workgroup loads
 its tile plus a halo of S + P into shared memory, already stabilised, and
 each invocation keeps its own patch in registers; every search position is
 then one pass over the patch in shared memory. The shared array is a fixed
 28x28 floats, which is a 16x16 workgroup plus a halo of 6, and
-`lib/pipeline.c` static-asserts that the configured radii fit.
+`lib/pipeline.c` static-asserts that the configured radii fit. With the
+temporal pass of 14.7 the tile holds what that pass made of the plane.
 
 #### The highlight guard
 
@@ -1664,12 +1699,16 @@ frame, `CRAWFrameParams` carries:
   as given; otherwise the profile's table is evaluated at the profile's
   as-shot exposure index, and a profile with no table makes
   `craw_pipeline_record()` fail with `CRAW_ERROR(ENOTSUP)` whenever the
-  strength is positive. Failing is right: there is no default noise level,
-  and silently doing nothing would look like a broken pass.
+  strength, or the temporal strength of 14.7, is positive. Failing is
+  right: there is no default noise level, and silently doing nothing would
+  look like a broken pass.
 - `denoise_chroma_strength`, the blend of 14.4, 0 to 1. 0 skips the stage
   for that frame and is the default; above 1 is `CRAW_ERROR(EINVAL)`, the
   band cannot be replaced by more than all of itself. It needs no noise
   model: the bilateral's range term is relative to the level.
+- `denoise_temporal_strength` and `denoise_temporal_replay`, with
+  `CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE` and
+  `CRAW_FRAME_FLAG_TEMPORAL_RESET`: the temporal pass, section 14.7.
 
 `CRAWProfile` grows `noise_knots` and `nb_noise_knots` at the end of the
 struct, which changes its size; it is plain caller-filled data with no
@@ -1735,72 +1774,320 @@ highlights sit far above 1.0 where fp16 storage alone is worth tens of
 millis absolute. It measures 3.06e-3, against 1.35e-1 relative between the
 denoised frame and the undenoised one.
 
-### 14.7 Temporal denoising, when it comes
+### 14.7 Temporal denoising
 
 A spatial filter has one frame's worth of samples. A temporal one has as
 many as the scene holds still for, and for the shadows of a locked-off shot
-that is the difference between 4.5x and something much larger. It is the
-obvious next stage and it attaches to this one, not to the output.
+that is the difference between 4.5x and something much larger. It attaches
+to the raw stage of 14.3, not to the output.
 
-Where it goes: **inside the raw stage, in the stabilised domain, before the
-spatial filter.** The domain is the whole reason — in stabilised units one
-number is one noise standard deviation at every level and in every frame,
-so the decision "is this sensel the same as last frame's" is a comparison
-against a constant, exactly as the spatial patch distance already is. Doing
-it after the debayer would mean deciding that in a domain where the noise
-has already been mixed and coloured.
+#### Where it sits
 
-The state that persists across frames is one image: the previous frame's
-*filtered* stabilised planes, a full resolution R32_SFLOAT image, 70 MB at
-5.8K. It has to be fp32 for the reason 14.3 gives. The pipeline owns it,
-which means `craw_pipeline_record()` stops being idempotent and the
-"recorded once per submission" rule of section 11b becomes load bearing,
-and a seek or a switch of source has to be able to say so.
+**Inside the raw stage, in the stabilised domain, before the spatial
+filter**, in the same dispatch. The domain is the whole reason: in
+stabilised units one number is one noise standard deviation at every level
+and in every frame, so the decision "is this sensel the same as last
+frame's" is a comparison against a constant, exactly as the spatial patch
+distance already is. After the debayer the same decision would be made on
+noise that has already been mixed and coloured.
 
-The filter is a motion-adaptive recursive average, the cheap end of the
-family:
+The spatial filter then works on what the temporal one left, and the state
+carried to the next frame is the temporal result *before* the spatial
+filter: fed back through it, a static scene would be filtered again every
+frame and smoothed further without end.
 
-    d     = |t_prev(p) - t_cur(p)|          in stabilised units
-    alpha = alpha_max * exp(-max(d^2 - 2, 0) / ht^2)
-    t_out = alpha * t_prev(p) + (1 - alpha) * t_cur(p)
+The state holds the level u of every sample (`I(t)`), not its stabilised
+value, and the next frame puts it through its own transform. A frame with
+another noise model — a different exposure index, a `noise_override` the
+caller changed — then still reads last frame's state correctly. It is fp32
+for the reason 14.3 gives. Beside it the state keeps the noise variance
+left in each sample, in stabilised units, which the spatial filter needs
+(below): its square root in an R8_UNORM image, a step of 2.4% of the
+variance at an alpha_max of 0.8.
 
-which is the spatial weight of 14.3 with a patch of one sample and a search
-of one position, so the threshold and the strength mean the same thing and
-`ht` can be the same number as `h`. `alpha_max` below 1 bounds how long a
-sample can survive, which bounds the smearing a missed motion detection can
-cause; 0.8 gives an effective 5 frames on a static scene and forgets a
-wrong decision in three. A patch distance over 3x3 instead of a single
-sample would make the detection far less trigger-happy at the cost of a
-second tile load, and is the first thing to try if it ghosts.
+#### Definition
 
-Motion compensation — searching the previous frame over a window instead of
-reading it at p — is the expensive end and needs a real motion estimate,
-which this library does not have and should probably take from the caller
-rather than compute.
+For every sample p of each CFA plane, with t = T(u) of 14.3, s the state's
+level and v_s its variance, and the plane mirrored as in 14.1:
 
-Resetting. The state is wrong whenever the previous frame is not the
-previous frame of the same scene, and there are three cases:
+    tc(p)  = T(u(p))                                   this frame
+    tp(p)  = T(s(p))                                   last frame, filtered
+    d2(p)  = (1/9) sum over the 3x3 k of (tp(p+k) - tc(p+k))^2
+    a(p)   = alpha_max * exp(-max(d2(p) - 2, 0) / ht^2)
+    t'(p)  = (1 - a) tc(p) + a tp(p)
+    v(p)   = max((1 - a)^2 + a^2 v_s(p), 1e-4)
+    state' = (I(t'(p)), v(p))
 
-- The caller knows: a seek, a new clip, a jump in the pipeline's own frame
-  counter. A `CRAW_FRAME_FLAG_TEMPORAL_RESET` makes the pass ignore the
-  state for one frame (alpha = 0) and it refills from that frame on.
-  `craw_awb_smoother_push()` already takes a `scene_cut` flag for the same
-  reason and the two should be spelled the same way.
-- A cut the caller does not know about. The pass already computes `d` at
-  every sensel; the fraction of sensels with `d^2 > 2 + k` is a scene
-  change detector for free, and a small reduction buffer next to the AWB
-  histogram would hand it back to the host, one number a frame, to be read
-  the frame *after* — the same one-frame lag the AWB estimator already
-  accepts. On a cut alpha collapses to 0 by itself everywhere at once, so
-  the detector is a diagnostic and a way to reset the *spatial* strength,
-  not a correctness requirement.
-- Any frame the pipeline was not given the previous frame for. The state
-  image starts undefined; a `valid` flag in the pipeline, cleared on
-  creation and on reset, keeps the first frame from reading it.
+With no history (the first frame, a reset) a = 0, t' = tc and v = 1. The
+floor on v only keeps the division below finite at an alpha_max of 1. The
+2 is the `2 sigma^2` of 14.3 and `ht` is the spatial `h` when the spatial
+filter runs and 1.0 when it does not, so that one strength means the same
+in both. The sum over the patch is taken row by row, left to right, as the
+spatial one is. alpha_max bounds how long a sample survives, which bounds
+what a missed motion can smear: on a static scene the variance converges
+to (1 - a) / (1 + a), 0.11 at 0.8, a third of the noise in standard
+deviation, and a wrong decision is forgotten at a rate of a per frame. At
+1.0 a static sample keeps its first frame for ever and never takes in
+another, which is why cineview's row stops at 0.95.
 
-What it costs: one extra full resolution fp32 image read and written, plus
-about ten instructions per sensel, so well under 0.5 ms — the state image's
-bandwidth is the whole cost. That fits in what 14.3 leaves of the 4 ms.
+The spatial filter of 14.3 then runs on t' with two changes, both only
+where the pass had a history: the patch distance loses the noise the two
+samples actually carry, v(p) + v(q) instead of 2, and the strength is
+taken in units of the noise left in the sample being filtered:
+
+    w(q) = exp(-max(d2(q) - (v(p) + v(q)), 0) / (h^2 v(p)))
+
+Where nothing was averaged v = 1 and this is 14.3 exactly. The highlight
+guard of 14.3 compares against the sample as it came in and hands it
+through as it came in, temporal average and all.
+
+**A patch, not the sample alone.** The design first compared the single
+sample, `d = |tp - tc|`. That compares a sample against its own noise:
+every excursion past a sigma and a half reads as motion and passes through
+unaveraged, and those are exactly the samples the average was for. On
+static Gaussian noise the single sample converges on 0.84 of the noise and
+the 3x3 reaches 0.44 by the tenth frame (a numpy model of both); on 16 raw
+frames of the flat panel of P1094353 below, 0.85 on every CFA plane
+against 0.50 to 0.58. The 3x3 is also the less trigger-happy with a
+moving edge: in the same model a bar 3 sigma above its background leaves
+0.14 sigma behind it with the single sample and 0.02 with the patch.
+
+**The spatial filter's noise.** The first version left the spatial filter
+alone, subtracting 2 and measuring h against the noise of one frame. On a
+temporally averaged tile, whose samples carry a third of that, it took
+every true difference up to 1.3 sigma for noise and removed the fine
+detail the average had just uncovered: on the P1094353 panel below it kept
+0.5% to 2% of the fine detail, where the spatial filter alone keeps 13% to
+14%.
+Subtracting the variances alone gets some of it back (6% to 9% in a model
+on the raw frames); scaling h with the remaining noise as well is what
+makes the combination better than the spatial filter on both counts. The
+variance has to be tracked rather than inferred from a: the steady-state
+guess (1 - a) / (1 + a) takes the first frames after a reset, and after
+motion stops, for already averaged, and those frames came out noisier
+than with the spatial filter alone (13.3 against 7.6 codes on the frame
+after a reset, in the same model); tracked, every frame is at or below it.
+
+Motion compensation — searching the previous frame over a window instead
+of reading it at p — is the expensive end, needs a real motion estimate,
+which this library does not have and should probably take from the
+caller, and is not done.
+
+#### State, replay and reset
+
+The pipeline keeps two sets of state and two indices: `tn_cur`, the set
+the last recording wrote, and `tn_prev`, the set it read; -1 means nothing
+valid, which is where both start. A recording that is the next frame
+reads `tn_cur` and writes the other set; one flagged as a replay
+(`denoise_temporal_replay`) reads `tn_prev` and writes `tn_cur` over; a
+`CRAW_FRAME_FLAG_TEMPORAL_RESET` reads nothing. The two indices move only
+once the recording has succeeded. That gives:
+
+- The first frame, and the frame after a reset, are developed as if the
+  pipeline had just been created.
+- A frame developed again is bit for bit its first development, however
+  often and whatever was changed and changed back in between, and the
+  frame after it follows the first development. A grade changed while
+  paused therefore never averages the frame with itself.
+- A next frame recorded with the pass off leaves nothing valid, so the
+  frame after it starts again; a replay with the pass off leaves the
+  state as it was, so turning the pass off and on again while paused
+  returns the same picture. Turning it on while paused on a frame that
+  was developed without it, after frames developed without it, has no
+  history to use and shows the spatial filter alone until the next frame.
+- Two sets rather than one are what the replay needs, and the fused tile
+  load needs them anyway: a workgroup reads last frame's state in its
+  halo, which a neighbouring workgroup writing in place could already
+  have overwritten.
+
+The state is read and written only by recordings, so the barriers that
+order consecutive recordings order it too, across submissions in flight:
+this frame's read after the last one's write, this frame's write after the
+last one's read, and a replay's write after the first development's, which
+is why the pass leaves the image it wrote in the read state. Recordings
+have to be submitted in the order they were made, which was already true
+of the intermediates (11b). A recording made but never submitted has
+moved the indices all the same, and the caller should reset.
+
+What breaks the run is the caller's to say, and cineview says it on a seek
+to another frame, the loop back to the start, a new clip, and the first
+frame of a video export, which is developed with a reset even when it is
+the picture on screen, so that the same range exported twice is the same
+file and the export's own pipeline, which starts empty, averages the same
+frames as the display's. A frame the player drops to keep up is not a
+break: the next one is still the next frame of the same scene, further on,
+and the pass takes what moved as motion. A development of the frame last
+developed is a replay whether it comes from a grade change, a white pick
+or a seek to the picture already on screen. A still export of the frame
+on screen is the picture on screen; of any other frame, a seek and a
+start from nothing, except that a frame up to eight ahead is reached by
+developing the frames between, which carries the average forward.
+
+A scene change detector — the fraction of samples whose patch distance
+exceeds the threshold, handed back like the AWB histogram — was designed
+here and is not built. A cut moves nearly every patch far past the
+threshold, so the pass already takes nothing from the frame before it
+everywhere at once; the detector would only be a diagnostic. Not measured
+on a real cut.
+
+#### Dispatch and cost
+
+One dispatch for both filters, as in 14.3, with a mode in the push
+constant saying which run and whether there is a history. With a history
+the workgroup loads this frame and last frame's state, stabilised, one
+sample further out than the spatial tile (26x26 for a 16x16 workgroup and
+the 7x7/3x3 filter), works out t' and v for the tile, and the spatial
+filter runs on that; the temporal value of a sample is a function of the
+3x3 around it, mirrored, so every tile that holds a sample holds the same
+number. Shared memory is 13.5 KB. With the spatial filter off the tile is
+the workgroup plus the one sample.
+
+The four planes of a tile are four neighbouring workgroups in x rather
+than a slice of `gl_WorkGroupID.z` each, as they were. Each plane touches
+every other sample of every other row of the mosaic and of the state, so a
+plane at a time streamed the whole 70 MB state four times over for a
+quarter of every line it fetched; side by side the four share the lines.
+That took the temporal pass alone from 1.9 ms to 0.84 in `cineraw
+--bench`, and the whole pipeline with the spatial filter, which is not
+bandwidth bound, from between 6.15 and 6.18 ms to between 6.09 and 6.12.
+
+RX 6900 XT, 5760x3040, RCD, two decoded frames of P1094353 alternating,
+back-to-back submissions, median of 20; four runs, the last two with
+nothing else on the GPU:
+
+    raw stage                         pipeline         stage
+    built, both at 0 (nothing runs)   4.13 to 4.16     --
+    spatial 1.0                       6.06 to 6.12     1.95
+    spatial 1.0 + temporal 0.8        6.65 to 6.71     +0.58 on top
+    temporal 0.8 alone                4.79 to 4.81     0.65
+
+Of the 0.58, about 0.08 is reading and writing the variance and 0.12 its
+use in the spatial filter; the version without either measured +0.38.
+Temporal alone includes the stage's own read of the mosaic and write of
+its output, which the spatial filter pays too. `cineraw --bench --frames
+60` on the same clip, which keeps the GPU idle between frames (14.3),
+reads 7.40 to 7.43 ms off, 9.76 spatial, 10.46 both and 8.43 to 8.45
+temporal alone over two runs. The state is 175 MB at 5.8K.
+
+#### API and tools
+
+`CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE` builds the state and, with or
+without `CRAW_PIPELINE_FLAG_DENOISE`, the raw stage it runs in.
+`CRAWFrameParams.denoise_temporal_strength` is alpha_max, 0 to 1: zero
+dispatches nothing the pipeline would not otherwise and is free (above),
+above one is EINVAL at record time, and it needs the noise model exactly
+as `denoise_strength` does, ENOTSUP without one.
+`CRAWFrameParams.denoise_temporal_replay` and
+`CRAW_FRAME_FLAG_TEMPORAL_RESET` are the replay and the reset above. Both
+fields come out of the padding tail.
+
+`cineraw` takes the temporal strength as a third component of `--denoise
+STRENGTH[,CHROMA[,TEMPORAL]]`; it hands the pipeline its frames one after
+another, and a rebuild for a new frame size or a lens record starts the
+average by itself. cineview's Denoise section gets a `temporal` row, 0 to
+0.95 and 0 by default, under the section's switch like the rest, and its
+strength row now reaches 0, the spatial filter off, so that the temporal
+average and the chroma stage can each be looked at alone; `--denoise`
+takes the same third component, and a strength of 0 with a chroma or
+temporal amount above it switches the section on with the spatial filter
+off. The viewer builds the pass into both its pipelines, the display's
+and the scene-referred exporter's.
+
+#### Testing
+
+`test_pipeline` runs a sequence of its own: eight frames of a scene whose
+noise is drawn afresh every frame at exactly the model's level (the model
+has to be the truth here, since what the pass decides is whether a
+difference is noise), with a bar far above its background (0.40 on 0.10)
+and one 2 sigma above it sliding 12 pixels a frame, a checkerboard far above the
+noise and a faint one 1.5 sigma from square to square. Through one
+pipeline and through `craw_ref_denoise_temporal()`, frame by frame, at
+spatial strength 0 and 1:
+
+- GPU against the reference within the denoise bound of 14.6, 2e-3 on the
+  MHC intermediate: 5.4e-4 and 8.6e-4 at worst over the eight frames.
+- Temporal alone, on the reference's own mosaics: a flat patch keeps 71.7,
+  60.0, 50.2, 43.2, 40.0, 36.3, 34.8, 31.9 counts of noise over the
+  frames, every frame quieter than the first and the last under half of
+  it; both checkerboards keep their detail (the faint one 1.01 of it, by
+  the regression of the high pass on the truth's).
+- With the spatial filter: the patch keeps 3.2 counts where the spatial
+  filter alone keeps 5.2 (at most 0.75 of it is allowed), and the faint
+  checkerboard 0.77 of its detail where the spatial filter alone keeps
+  0.21 (it may not keep less).
+- What the bars leave behind them, the strip each vacated since the last
+  frame: the strong one at most 0.09 sigma from the background (0.25
+  allowed), the faint one 0.25 to 0.31 sigma (0.6 allowed), and on the
+  GPU's own output 0.15 to 0.18.
+
+Then the state, bit for bit, the GPU against the GPU: strength 0, the flag
+not set, and a first frame of the temporal average alone are all the plain
+chain; frame 4 developed six times, with other settings, with the pass off
+and back, at the original settings is its first development every time,
+and frame 5 after it is frame 5 of an unreplayed run; a reset is a first
+frame and changes the output of a warm pipeline; the frame after one
+without the pass is a first frame; four frames recorded into four command
+buffers and submitted back to back without a wait, each into its own
+images, match the sequential run. A strength of 1.5 is refused, and the
+pass without a noise model is ENOTSUP.
+
+#### On real footage
+
+P1094353, a phone booth at night, locked off, ISO 10000, with the model
+fitted to the clip itself (`--noise 1.19e-4,2.95e-8`; the profile's table
+ends at the 1250 knot, eight times too small in a here). A flat metal
+panel, 600x290 pixels of the linear BT.709 output at a mean G of 0.035,
+the residual after a quadratic surface over frames 20 to 29, the frame to
+frame difference, and how much of the panel's fine detail survives (the
+regression of the 3x3 high pass of frames 27 to 29 on that of the mean of
+the undenoised frames 0 to 15):
+
+                  R        G        B        R-G      B-G      frame diff G  detail
+    off           1.98e-2  9.38e-3  1.18e-2  2.11e-2  1.27e-2  1.30e-2       1.00
+    spatial 1     5.60e-3  2.50e-3  3.55e-3  6.05e-3  4.09e-3  3.05e-3       0.13
+    temporal 0.8  1.04e-2  4.78e-3  6.66e-3  1.09e-2  7.16e-3  3.73e-3       1.04
+    both          3.89e-3  1.90e-3  2.68e-3  3.99e-3  2.90e-3  1.42e-3       0.22
+
+The frame difference, which static texture cannot enter, is the cleanest
+of these: the two together flicker 2.2 times less than the spatial filter
+alone, while keeping 1.7 to 1.8 times the detail (0.22 against 0.13 on
+the flat part, 0.27 against 0.14 on the panel's slotted lower half). After the start the difference is 2.00e-3,
+1.71e-3, 1.54e-3 and 1.40e-3 by the fifth frame, against a steady 3.05e-3.
+The temporal average alone reaches half the noise rather than the third
+the definition allows, and the raw frames say why: this clip's noise is 3%
+to 6% above even its own fitted model in stabilised units, which puts
+more patches over the threshold (a mean a of 0.757 at the sixteenth frame
+against 0.780 for noise at exactly the model), and the residual counts
+the panel's own texture, which the average rightly keeps.
+
+P1094352, the same booth with three people walking past at 50 to 100
+pixels a frame. Behind the bright edges of an arm and a bag against the
+dark foliage nothing is left: at 1:1 the frame after them is the spatial
+filter's alone. Dark hair passing over the dark foliage is different: the
+two differ by 0.56 of the undenoised noise, less than the pass can tell
+from noise, and two frames after the hair has gone the foliage there sits
+0.21 sigma above where the spatial filter alone puts it, 38% of the
+contrast and 0.74 of the spatial filter's own residual noise — a faint
+lighter smear, visible at 1:1 with the picture brightened four times. That is the price of the
+single threshold: detail that moves at less than a noise standard deviation
+of contrast is averaged in time as the spatial filter averages it in space.
+Lowering alpha_max shortens it; so would subtracting the noise the two
+frames actually carry (1 + v_s) from the patch distance instead of 2,
+which would make the test about twice as sensitive to a sub-sigma change
+and cost part of the noise reduction on a static scene. Not tried. The
+static foliage beside the walkers goes from a frame difference of 3.02e-3
+to 0.80e-3 with the spatial filter and 0.45e-3 with both.
+
+The model matters more here than to the spatial filter. cineview takes it
+from the profile's table, which for this ISO 10000 clip is the 1250 knot:
+the pass sees every frame's noise as motion and an export's frame to frame
+difference does not fall at all (0.032 on every frame of 10 to 25). On
+P1000387 (ISO 1000, the table's own knot) an export of frames 5 to 20
+goes from a frame difference of 0.0020 with the spatial filter alone to
+0.0013, 0.0011, 0.0009 and 0.0007 by the end with both, through the
+display's pipeline, and from 0.00111 to 0.00075 and then 0.00040 through
+the scene-referred exporter's. The ISO series of 14.2 is
+what makes the pass work at every ISO in the viewer.
 
 ## 15. Soft light and vibrance
 

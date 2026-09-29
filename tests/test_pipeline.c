@@ -750,6 +750,694 @@ done:
     return ret;
 }
 
+/* ------------------------------------------------------------ temporal */
+
+/* DESIGN.md 14.7. The temporal pass has state, so it is tested on a short
+ * sequence rather than on one frame: eight frames of a scene whose noise
+ * is drawn afresh every frame at exactly the level the model states, with
+ * two bars sliding across it, one far above the noise and one only two
+ * noise standard deviations above its background, and two static
+ * checkerboards for detail, one far above the noise and one a standard
+ * deviation and a half from square to square. The model has to be the
+ * truth here, unlike on the scene the other stages use, because what the
+ * pass decides is whether a difference between two frames is noise.
+ *
+ * Every level is in units of the sensor range above black, the same at all
+ * four sites, so the scene is grey in the raw and the debayer's output is
+ * that grey times the as-shot gains. */
+#define TEST_TN_FRAMES  8
+#define TEST_TN_ALPHA   0.8f
+#define TEST_TN_BG      0.10
+#define TEST_TN_BAR     0.40
+#define TEST_TN_STEP    12      /* the bars move this far every frame */
+#define TEST_TN_BAR_W   16
+#define TEST_TN_STRONG_Y0  88
+#define TEST_TN_STRONG_Y1 119
+#define TEST_TN_FAINT_Y0  124
+#define TEST_TN_FAINT_Y1  151
+
+static int test_tn_bar_x(int frame)
+{
+    return 16 + TEST_TN_STEP * frame;
+}
+
+static double test_tn_sigma(double u)
+{
+    return sqrt(TEST_NOISE_A * u + TEST_NOISE_B);
+}
+
+static double test_tn_truth(int x, int y, int frame)
+{
+    int bx = test_tn_bar_x(frame);
+
+    /* Static detail: 4x4 squares, so that every CFA plane sees a 2x2
+     * checkerboard of its own. One far above the noise, and one only a
+     * standard deviation and a half from light to dark square, which is
+     * the detail a spatial filter at strength 1 takes for noise and a
+     * temporal average is there to recover. */
+    if (test_in_rect(x, y, 160, 16, 223, 79))
+        return (((x >> 2) + (y >> 2)) & 1) ? 0.25 : 0.05;
+    if (test_in_rect(x, y, 16, 16, 127, 79))
+        return TEST_TN_BG + ((((x >> 2) + (y >> 2)) & 1) ? 0.75 : -0.75) *
+                            test_tn_sigma(TEST_TN_BG);
+
+    if (x >= bx && x < bx + TEST_TN_BAR_W) {
+        if (y >= TEST_TN_STRONG_Y0 && y <= TEST_TN_STRONG_Y1)
+            return TEST_TN_BAR;
+        if (y >= TEST_TN_FAINT_Y0 && y <= TEST_TN_FAINT_Y1)
+            return TEST_TN_BG + 2.0 * test_tn_sigma(TEST_TN_BG);
+    }
+
+    return TEST_TN_BG;
+}
+
+/* A standard normal deviate per sample and frame, Box and Muller's
+ * transform of two hashed uniforms: deterministic, so the reference and
+ * the GPU see the same frames on every run. */
+static double test_tn_gauss(int x, int y, int frame)
+{
+    uint32_t k = (uint32_t)((frame * TEST_H + y) * TEST_W + x);
+    double u1 = ((double)test_hash(2u * k + 1u) + 0.5) / 4294967296.0;
+    double u2 = ((double)test_hash((2u * k + 2u) ^ 0x9e3779b9u) + 0.5) / 4294967296.0;
+
+    return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+}
+
+/* A frame of the scene; without noise when `noisy` is false, which is the
+ * truth the detail is measured against. */
+static void test_tn_gen(uint16_t *m, int frame, bool noisy)
+{
+    for (int y = 0; y < TEST_H; y++) {
+        for (int x = 0; x < TEST_W; x++) {
+            double u = test_tn_truth(x, y, frame);
+            double raw;
+            long iv;
+
+            if (noisy)
+                u += test_tn_sigma(u) * test_tn_gauss(x, y, frame);
+            raw = TEST_BLACK + u * (TEST_WHITE - TEST_BLACK);
+            iv = lrint(raw * 65535.0);
+            m[y * TEST_W + x] = (uint16_t)CRAW_CLAMP(iv, 0, 65535);
+        }
+    }
+}
+
+/* How much of the truth's detail over a rectangle of a mosaic survives:
+ * the regression of the mosaic's per-plane high pass (the kernel of
+ * test_plane_noise()) on the truth's. Noise is uncorrelated with the truth
+ * and drops out; smoothing shows as a coefficient below 1. */
+static double test_tn_detail(const uint16_t *m, const uint16_t *truth,
+                             int x0, int y0, int x1, int y1)
+{
+    double num = 0.0, den = 0.0;
+
+    for (int y = y0 + 2; y <= y1 - 2; y++) {
+        for (int x = x0 + 2; x <= x1 - 2; x++) {
+            double hm = 0.0, ht = 0.0;
+
+            for (int ky = -1; ky <= 1; ky++) {
+                for (int kx = -1; kx <= 1; kx++) {
+                    double k = (ky ? 1.0 : -2.0) * (kx ? 1.0 : -2.0);
+                    size_t i = (size_t)(y + 2 * ky) * TEST_W + x + 2 * kx;
+
+                    hm += k * m[i];
+                    ht += k * truth[i];
+                }
+            }
+            num += hm * ht;
+            den += ht * ht;
+        }
+    }
+
+    return den > 0.0 ? num / den : 0.0;
+}
+
+/* How far the mean level of a rectangle of a mosaic sits from `truth`, in
+ * noise standard deviations of one frame at that level. */
+static double test_tn_bias(const uint16_t *m, int x0, int y0, int x1, int y1, double truth)
+{
+    double sum = 0.0;
+    int n = 0;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            double u = ((double)m[y * TEST_W + x] / 65535.0 - TEST_BLACK) /
+                       (TEST_WHITE - TEST_BLACK);
+            sum += u;
+            n++;
+        }
+    }
+
+    return (sum / n - truth) / test_tn_sigma(truth);
+}
+
+/* The same over G of a camera RGB buffer, whose G is the level itself. */
+static double test_tn_bias_rgb(const float *rgb, int x0, int y0, int x1, int y1, double truth)
+{
+    double sum = 0.0;
+    int n = 0;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            sum += rgb[((size_t)y * TEST_W + x) * 4 + 1];
+            n++;
+        }
+    }
+
+    return (sum / n - truth) / test_tn_sigma(truth);
+}
+
+static int test_tn_download(CRAWTestDevice *td, CRAWTestImage *dst, float *out)
+{
+    const size_t n = (size_t)TEST_W * TEST_H * 4;
+    uint16_t *half = malloc(n * sizeof(*half));
+    int ret;
+
+    if (!half)
+        return CRAW_ERROR(ENOMEM);
+
+    ret = craw_testdev_image_download(td, dst, half, n * sizeof(*half));
+    if (ret >= 0)
+        for (size_t i = 0; i < n; i++)
+            out[i] = test_half_to_float(half[i]);
+
+    free(half);
+    return ret;
+}
+
+/* One recording on a pipeline that outlives it, which is the whole point
+ * for a pass with state, and its output as floats. */
+static int test_tn_run(CRAWTestDevice *td, CRAWPipeline *pipe, CRAWTestImage *src,
+                       CRAWTestImage *dst, const uint16_t *mosaic, const CRAWFrameParams *fp,
+                       float *out)
+{
+    struct test_run run = { .pipe = pipe, .src = src, .dst = dst, .fp = fp };
+    int ret;
+
+    ret = craw_testdev_image_upload(td, src, mosaic, (size_t)TEST_W * TEST_H * sizeof(*mosaic));
+    if (ret < 0)
+        return ret;
+
+    ret = craw_testdev_run(td, test_record, &run);
+    if (ret < 0)
+        return ret;
+
+    return test_tn_download(td, dst, out);
+}
+
+static bool test_tn_same(const float *a, const float *b)
+{
+    return !memcmp(a, b, (size_t)TEST_W * TEST_H * 4 * sizeof(*a));
+}
+
+static CRAWPipeline *test_tn_pipeline(CRAWContext *ctx, uint32_t flags)
+{
+    CRAWPipelineParams pp;
+    CRAWPipeline *pipe = NULL;
+
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_W;
+    pp.height = TEST_H;
+    pp.debayer = CRAW_DEBAYER_MHC;
+    pp.out_space = CRAW_CS_XYZ_D65;
+    pp.flags = flags;
+
+    if (craw_pipeline_create(ctx, &pp, &pipe) < 0)
+        return NULL;
+
+    return pipe;
+}
+
+static void test_tn_params(CRAWFrameParams *fp, const CRAWProfile *identity,
+                           float strength, float alpha)
+{
+    craw_frame_params_init(fp);
+    fp->profile = identity;
+    fp->denoise_strength = strength;
+    fp->denoise_temporal_strength = alpha;
+    fp->noise_override = (CRAWNoiseModel) { .a = (float)TEST_NOISE_A, .b = (float)TEST_NOISE_B };
+}
+
+/* Several recordings, each into its own command buffer, all made before
+ * the first is submitted and then submitted back to back without a wait:
+ * what a player with frames in flight does. */
+static int test_tn_in_flight(CRAWTestDevice *td, CRAWPipeline *pipe, CRAWTestImage *srcs,
+                             CRAWTestImage *dsts, const CRAWFrameParams *fp, int n)
+{
+    VkCommandBuffer cmds[4] = { 0 };
+    VkCommandBufferAllocateInfo alloc = {
+        .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool        = td->pool,
+        .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = (uint32_t)n,
+    };
+    VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    int ret = 0;
+
+    if (n > 4 || vkAllocateCommandBuffers(td->device, &alloc, cmds) != VK_SUCCESS)
+        return CRAW_ERROR(EINVAL);
+
+    for (int i = 0; i < n && ret >= 0; i++) {
+        if (vkBeginCommandBuffer(cmds[i], &begin) != VK_SUCCESS) {
+            ret = CRAW_ERROR(EIO);
+            break;
+        }
+        ret = craw_pipeline_record(pipe, cmds[i], &srcs[i].img, &dsts[i].img, fp);
+        if (vkEndCommandBuffer(cmds[i]) != VK_SUCCESS && ret >= 0)
+            ret = CRAW_ERROR(EIO);
+    }
+
+    for (int i = 0; i < n && ret >= 0; i++) {
+        VkCommandBufferSubmitInfo ci = {
+            .sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+            .commandBuffer = cmds[i],
+        };
+        VkSubmitInfo2 si = {
+            .sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos    = &ci,
+        };
+
+        if (vkQueueSubmit2(td->queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS)
+            ret = CRAW_ERROR(EIO);
+    }
+
+    if (vkQueueWaitIdle(td->queue) != VK_SUCCESS && ret >= 0)
+        ret = CRAW_ERROR(EIO);
+
+    vkFreeCommandBuffers(td->device, td->pool, (uint32_t)n, cmds);
+    return ret;
+}
+
+/* The sequence through one pipeline and through the reference, frame by
+ * frame, at spatial strength `strength` (0 for the temporal average alone),
+ * with the functional checks of DESIGN.md 14.7: the noise of a flat patch
+ * falls from frame to frame, what the bars leave behind them is the
+ * background again, and the static detail keeps its contrast, all of it
+ * under the average alone, and under the two together more of the faint
+ * one than the spatial filter alone keeps. `frames` holds the eight
+ * mosaics. */
+static int test_tn_sequence(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                            const uint16_t *frames, CRAWTestImage *src, CRAWTestImage *dst,
+                            float strength, float *gpu, float *ref)
+{
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    CRAWNoiseModel nm = { .a = (float)TEST_NOISE_A, .b = (float)TEST_NOISE_B };
+    CRAWPipeline *pipe = NULL;
+    CRAWFrameParams fp;
+    uint16_t *clean = NULL, *single = NULL, *truth = NULL;
+    float *state = NULL;
+    double noise[TEST_TN_FRAMES], strong = 0.0, faint = 0.0, gpu_strong = 0.0, err = 0.0;
+    double spatial_noise = 0.0, detail0 = 0.0, detail = 0.0, faint_kept, spatial_kept = 1.0;
+    int ret = -1;
+
+    clean = malloc(npix * sizeof(*clean));
+    single = malloc(npix * sizeof(*single));
+    truth = malloc(npix * sizeof(*truth));
+    state = malloc(2 * 2 * npix * sizeof(*state));
+    pipe = test_tn_pipeline(ctx, CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE);
+    if (!clean || !single || !truth || !state || !pipe)
+        goto done;
+
+    /* The static part of the scene is the same in every frame. */
+    test_tn_gen(truth, TEST_TN_FRAMES - 1, false);
+
+    test_tn_params(&fp, identity, strength, TEST_TN_ALPHA);
+
+    for (int f = 0; f < TEST_TN_FRAMES; f++) {
+        const uint16_t *m = frames + (size_t)f * npix;
+        const float *prev = f ? state + (size_t)((f - 1) & 1) * 2 * npix : NULL;
+        float *next = state + (size_t)(f & 1) * 2 * npix;
+
+        if (test_tn_run(td, pipe, src, dst, m, &fp, gpu) < 0)
+            goto done;
+
+        if (craw_ref_denoise_temporal(m, TEST_W, TEST_H, TEST_W, identity, &nm, strength,
+                                      TEST_TN_ALPHA, prev, next, clean, TEST_W) < 0 ||
+            craw_ref_debayer(clean, TEST_W, TEST_H, TEST_W, identity, CRAW_DEBAYER_MHC,
+                             ref) < 0) {
+            fprintf(stderr, "temporal: the reference failed\n");
+            goto done;
+        }
+
+        err = CRAW_MAX(err, test_max_abs(gpu, ref, npix));
+
+        /* The flat background, clear of both bars on every frame. */
+        noise[f] = test_plane_noise(clean, 162, 90, 221, 149);
+
+        if (f == 0)
+            detail0 = test_plane_noise(clean, 164, 20, 219, 75);
+
+        /* The strip the bars left since the last frame, which is
+         * background again now. */
+        if (f > 0) {
+            int x0 = test_tn_bar_x(f - 1), x1 = test_tn_bar_x(f) - 1;
+
+            strong = CRAW_MAX(strong, fabs(test_tn_bias(clean, x0, TEST_TN_STRONG_Y0, x1,
+                                                        TEST_TN_STRONG_Y1, TEST_TN_BG)));
+            faint = CRAW_MAX(faint, fabs(test_tn_bias(clean, x0, TEST_TN_FAINT_Y0, x1,
+                                                      TEST_TN_FAINT_Y1, TEST_TN_BG)));
+            /* On the GPU's own output, inset by the debayer's reach. */
+            gpu_strong = CRAW_MAX(gpu_strong,
+                                  fabs(test_tn_bias_rgb(gpu, x0 + 3, TEST_TN_STRONG_Y0 + 3,
+                                                        x1 - 3, TEST_TN_STRONG_Y1 - 3,
+                                                        TEST_TN_BG)));
+        }
+    }
+
+    detail = test_plane_noise(clean, 164, 20, 219, 75);
+    faint_kept = test_tn_detail(clean, truth, 16, 16, 127, 79);
+
+    /* The last frame through the spatial filter alone, for scale. */
+    if (strength > 0.0f) {
+        if (craw_ref_denoise(frames + (size_t)(TEST_TN_FRAMES - 1) * npix, TEST_W, TEST_H,
+                             TEST_W, identity, &nm, strength, single, TEST_W) < 0)
+            goto done;
+        spatial_noise = test_plane_noise(single, 162, 90, 221, 149);
+        spatial_kept = test_tn_detail(single, truth, 16, 16, 127, 79);
+    }
+
+    printf("  temporal spatial %.1f   : max abs %.3e over %d frames (tol %.1e)\n",
+           (double)strength, err, TEST_TN_FRAMES, TEST_DENOISE_TOL);
+    printf("  temporal spatial %.1f   : flat patch noise", (double)strength);
+    for (int f = 0; f < TEST_TN_FRAMES; f++)
+        printf(" %.1f", noise[f]);
+    printf(" counts");
+    if (strength > 0.0f)
+        printf(" (spatial alone %.1f)", spatial_noise);
+    printf("\n");
+    printf("  temporal spatial %.1f   : trail behind the bars %.3f sigma (strong), %.3f "
+           "(faint), %.3f on the GPU output; static detail %.0f -> %.0f counts\n",
+           (double)strength, strong, faint, gpu_strong, detail0, detail);
+    printf("  temporal spatial %.1f   : faint static checkerboard kept %.2f",
+           (double)strength, faint_kept);
+    if (strength > 0.0f)
+        printf(" (spatial alone %.2f)", spatial_kept);
+    printf("\n");
+
+    if (!(err <= TEST_DENOISE_TOL)) {
+        fprintf(stderr, "temporal: the GPU differs from the reference by %.3e, tolerance "
+                        "%.1e\n", err, TEST_DENOISE_TOL);
+        goto done;
+    }
+
+    if (strength > 0.0f) {
+        /* On top of the spatial filter, the average has to take away a
+         * good part of what that one leaves. */
+        if (!(noise[TEST_TN_FRAMES - 1] <= 0.75 * spatial_noise)) {
+            fprintf(stderr, "temporal: the flat patch keeps %.1f counts of noise against "
+                            "%.1f from the spatial filter alone\n",
+                    noise[TEST_TN_FRAMES - 1], spatial_noise);
+            goto done;
+        }
+        /* And not by taking more of the detail: the spatial filter measures
+         * against the noise the average left, DESIGN.md 14.7. */
+        if (!(faint_kept >= spatial_kept)) {
+            fprintf(stderr, "temporal: the faint checkerboard keeps %.2f of its detail "
+                            "against %.2f from the spatial filter alone\n",
+                    faint_kept, spatial_kept);
+            goto done;
+        }
+    } else {
+        /* The first frame has no history and is the frame itself; after
+         * that the average converges on sqrt((1 - a) / (1 + a)) = 0.33 of
+         * the noise, a little less where noise alone trips the motion
+         * test. Every frame has to be quieter than the first, and the last
+         * less than half as noisy. */
+        for (int f = 1; f < TEST_TN_FRAMES; f++) {
+            if (!(noise[f] < noise[0])) {
+                fprintf(stderr, "temporal: frame %d is as noisy as the first\n", f);
+                goto done;
+            }
+        }
+        if (!(noise[TEST_TN_FRAMES - 1] <= 0.5 * noise[0])) {
+            fprintf(stderr, "temporal: the flat patch keeps %.0f%% of its noise after %d "
+                            "frames\n", 100.0 * noise[TEST_TN_FRAMES - 1] / noise[0],
+                    TEST_TN_FRAMES);
+            goto done;
+        }
+        /* Static detail is exactly what a temporal average keeps. */
+        if (!(detail >= 0.95 * detail0) || !(faint_kept >= 0.95)) {
+            fprintf(stderr, "temporal: the static checkerboards lost contrast (%.0f -> "
+                            "%.0f, faint kept %.2f)\n", detail0, detail, faint_kept);
+            goto done;
+        }
+    }
+
+    /* A bar far above the noise leaves nothing behind it; one two noise
+     * standard deviations up is where the motion test starts to let a
+     * little of the last frame through. */
+    if (!(strong <= 0.25 && gpu_strong <= 0.25 && faint <= 0.6)) {
+        fprintf(stderr, "temporal: the bars leave a trail of %.3f and %.3f sigma (GPU "
+                        "%.3f)\n", strong, faint, gpu_strong);
+        goto done;
+    }
+
+    ret = 0;
+
+done:
+    craw_pipeline_free(&pipe);
+    free(state);
+    free(truth);
+    free(single);
+    free(clean);
+    return ret;
+}
+
+/* DESIGN.md 14.7: the sequences above, the ways of switching the pass off,
+ * and its state semantics: a reset, a replay, a frame without the pass,
+ * several recordings in flight. The state rules are checked bit for bit,
+ * on the GPU against the GPU, because they are about which state a
+ * recording reads and not about arithmetic. */
+static int test_temporal(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                         CRAWTestImage *src, CRAWTestImage *dst, float *gpu, float *ref)
+{
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    const uint32_t both = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE;
+    CRAWTestImage srcs[4] = { 0 }, dsts[4] = { 0 };
+    CRAWPipeline *pipe = NULL, *other = NULL;
+    CRAWFrameParams fp, alt;
+    uint16_t *frames = NULL;
+    float *seq = NULL, *plain = NULL;
+    int nb_srcs = 0, nb_dsts = 0;
+    int ret = -1;
+
+    frames = malloc(TEST_TN_FRAMES * npix * sizeof(*frames));
+    /* The outputs of one plain sequential run, for everything below that
+     * has to match it. */
+    seq = malloc(TEST_TN_FRAMES * npix * 4 * sizeof(*seq));
+    plain = malloc(npix * 4 * sizeof(*plain));
+    if (!frames || !seq || !plain)
+        goto done;
+
+    for (int f = 0; f < TEST_TN_FRAMES; f++)
+        test_tn_gen(frames + (size_t)f * npix, f, true);
+
+    if (test_tn_sequence(td, ctx, identity, frames, src, dst, 0.0f, gpu, ref) < 0 ||
+        test_tn_sequence(td, ctx, identity, frames, src, dst, 1.0f, gpu, ref) < 0)
+        goto done;
+
+    /* Off both ways, and the first frame of the average alone, which has
+     * nothing to average with: all three are the plain chain bit for bit. */
+    pipe = test_tn_pipeline(ctx, 0);
+    test_tn_params(&fp, identity, 0.0f, 0.0f);
+    if (!pipe || test_tn_run(td, pipe, src, dst, frames, &fp, plain) < 0)
+        goto done;
+    craw_pipeline_free(&pipe);
+
+    pipe = test_tn_pipeline(ctx, CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE);
+    test_tn_params(&fp, identity, 0.0f, 0.0f);
+    if (!pipe || test_tn_run(td, pipe, src, dst, frames, &fp, gpu) < 0)
+        goto done;
+    if (!test_tn_same(gpu, plain)) {
+        fprintf(stderr, "temporal: strength 0 is not the plain chain\n");
+        goto done;
+    }
+    test_tn_params(&fp, identity, 0.0f, TEST_TN_ALPHA);
+    if (test_tn_run(td, pipe, src, dst, frames, &fp, gpu) < 0)
+        goto done;
+    if (!test_tn_same(gpu, plain)) {
+        fprintf(stderr, "temporal: a first frame of the average alone is not the frame\n");
+        goto done;
+    }
+    craw_pipeline_free(&pipe);
+
+    pipe = test_tn_pipeline(ctx, 0);
+    test_tn_params(&fp, identity, 0.0f, TEST_TN_ALPHA);
+    if (!pipe || test_tn_run(td, pipe, src, dst, frames, &fp, gpu) < 0)
+        goto done;
+    if (!test_tn_same(gpu, plain)) {
+        fprintf(stderr, "temporal: a pipeline without the flag ran the pass\n");
+        goto done;
+    }
+    craw_pipeline_free(&pipe);
+    printf("  temporal off           : strength 0, flag not set and a first frame are the "
+           "plain chain bit for bit\n");
+
+    /* The reference sequence of GPU outputs, spatial and temporal. */
+    test_tn_params(&fp, identity, 1.0f, TEST_TN_ALPHA);
+    pipe = test_tn_pipeline(ctx, both);
+    if (!pipe)
+        goto done;
+    for (int f = 0; f < TEST_TN_FRAMES; f++) {
+        if (test_tn_run(td, pipe, src, dst, frames + (size_t)f * npix, &fp,
+                        seq + (size_t)f * npix * 4) < 0)
+            goto done;
+    }
+    craw_pipeline_free(&pipe);
+
+    /* Replays. Frame 4 developed again, as it is, with other settings and
+     * with the pass off, and then as it was: every development at the
+     * original settings is the first one, and the frame after it is the
+     * frame after an unreplayed frame 4. */
+    pipe = test_tn_pipeline(ctx, both);
+    if (!pipe)
+        goto done;
+    for (int f = 0; f <= 4; f++) {
+        if (test_tn_run(td, pipe, src, dst, frames + (size_t)f * npix, &fp, gpu) < 0)
+            goto done;
+    }
+    {
+        static const float alt_alpha[] = { 0.8f, 0.5f, 0.0f, 0.8f, 1.0f, 0.8f };
+        static const float alt_h[]     = { 1.0f, 2.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+        const float *first = seq + 4 * npix * 4;
+
+        for (size_t i = 0; i < CRAW_ARRAY_ELEMS(alt_alpha); i++) {
+            bool original = alt_alpha[i] == TEST_TN_ALPHA && alt_h[i] == 1.0f;
+
+            test_tn_params(&alt, identity, alt_h[i], alt_alpha[i]);
+            alt.denoise_temporal_replay = true;
+            if (test_tn_run(td, pipe, src, dst, frames + 4 * npix, &alt, gpu) < 0)
+                goto done;
+            if (original != test_tn_same(gpu, first)) {
+                fprintf(stderr, "temporal: replay %zu of frame 4 (h %.1f, alpha %.1f) %s the "
+                                "first development\n", i, (double)alt_h[i],
+                        (double)alt_alpha[i], original ? "is not" : "is");
+                goto done;
+            }
+        }
+    }
+    if (test_tn_run(td, pipe, src, dst, frames + 5 * npix, &fp, gpu) < 0)
+        goto done;
+    if (!test_tn_same(gpu, seq + 5 * npix * 4)) {
+        fprintf(stderr, "temporal: the frame after a replayed one is not the frame after "
+                        "the first development\n");
+        goto done;
+    }
+    printf("  temporal replay        : frame 4 six times over, the original settings "
+           "bit for bit each time, frame 5 unchanged\n");
+
+    /* A reset is a new pipeline, and so is the frame after one without
+     * the pass. Frame 0's mosaic after frame 7 is a cut, which is the
+     * point. */
+    other = test_tn_pipeline(ctx, both);
+    if (!other || test_tn_run(td, other, src, dst, frames + 6 * npix, &fp, plain) < 0)
+        goto done;
+    craw_pipeline_free(&other);
+    alt = fp;
+    alt.flags |= CRAW_FRAME_FLAG_TEMPORAL_RESET;
+    if (test_tn_run(td, pipe, src, dst, frames + 6 * npix, &alt, gpu) < 0)
+        goto done;
+    if (!test_tn_same(gpu, plain)) {
+        fprintf(stderr, "temporal: a reset frame is not a first frame\n");
+        goto done;
+    }
+    if (test_tn_same(gpu, seq + 6 * npix * 4)) {
+        fprintf(stderr, "temporal: a reset changed nothing; the sequence cannot have "
+                        "carried state\n");
+        goto done;
+    }
+    alt = fp;
+    alt.denoise_temporal_strength = 0.0f;
+    if (test_tn_run(td, pipe, src, dst, frames + 7 * npix, &alt, gpu) < 0)
+        goto done;
+    other = test_tn_pipeline(ctx, both);
+    if (!other || test_tn_run(td, other, src, dst, frames, &fp, plain) < 0)
+        goto done;
+    craw_pipeline_free(&other);
+    if (test_tn_run(td, pipe, src, dst, frames, &fp, gpu) < 0)
+        goto done;
+    if (!test_tn_same(gpu, plain)) {
+        fprintf(stderr, "temporal: the frame after one without the pass is not a first "
+                        "frame\n");
+        goto done;
+    }
+    craw_pipeline_free(&pipe);
+    printf("  temporal reset         : a reset, and the frame after a frame without the "
+           "pass, are first frames bit for bit\n");
+
+    /* Four frames in flight at once, each in its own submission and its
+     * own images: the barriers alone have to order the state. */
+    for (int i = 0; i < 4; i++) {
+        if (craw_testdev_image_create(td, &srcs[i], TEST_W, TEST_H, VK_FORMAT_R16_UNORM) < 0)
+            goto done;
+        nb_srcs++;
+        if (craw_testdev_image_create(td, &dsts[i], TEST_W, TEST_H,
+                                      VK_FORMAT_R16G16B16A16_SFLOAT) < 0)
+            goto done;
+        nb_dsts++;
+        if (craw_testdev_image_upload(td, &srcs[i], frames + (size_t)i * npix,
+                                      npix * sizeof(*frames)) < 0)
+            goto done;
+    }
+    pipe = test_tn_pipeline(ctx, both);
+    if (!pipe || test_tn_in_flight(td, pipe, srcs, dsts, &fp, 4) < 0)
+        goto done;
+    for (int i = 0; i < 4; i++) {
+        if (test_tn_download(td, &dsts[i], gpu) < 0)
+            goto done;
+        if (!test_tn_same(gpu, seq + (size_t)i * npix * 4)) {
+            fprintf(stderr, "temporal: frame %d recorded in flight differs from the same "
+                            "frame recorded alone\n", i);
+            goto done;
+        }
+    }
+    printf("  temporal in flight     : four submissions back to back match the sequential "
+           "run bit for bit\n");
+
+    /* More than all of the last frame, and no model. */
+    {
+        CRAWProfile bare = *identity;
+        struct test_run run = { .pipe = pipe, .src = src, .dst = dst, .fp = &alt };
+        int rec;
+
+        test_tn_params(&alt, identity, 0.0f, 1.5f);
+        rec = craw_testdev_run(td, test_record, &run);
+        if (rec != CRAW_ERROR(EINVAL)) {
+            fprintf(stderr, "temporal: a strength of 1.5 returned %d, wanted %d\n",
+                    rec, CRAW_ERROR(EINVAL));
+            goto done;
+        }
+
+        bare.nb_noise_knots = 0;
+        test_tn_params(&alt, &bare, 0.0f, TEST_TN_ALPHA);
+        alt.noise_override = (CRAWNoiseModel) { 0 };
+        rec = craw_testdev_run(td, test_record, &run);
+        if (rec != CRAW_ERROR(ENOTSUP)) {
+            fprintf(stderr, "temporal: the pass without a noise model returned %d, wanted "
+                            "%d\n", rec, CRAW_ERROR(ENOTSUP));
+            goto done;
+        }
+    }
+
+    ret = 0;
+
+done:
+    craw_pipeline_free(&other);
+    craw_pipeline_free(&pipe);
+    for (int i = 0; i < nb_srcs; i++)
+        craw_testdev_image_free(td, &srcs[i]);
+    for (int i = 0; i < nb_dsts; i++)
+        craw_testdev_image_free(td, &dsts[i]);
+    free(plain);
+    free(seq);
+    free(frames);
+    return ret;
+}
+
 /* ----------------------------------------------------------- rejections */
 
 /* The configurations craw_pipeline_create() must refuse, plus the histogram
@@ -4100,6 +4788,13 @@ int main(void)
     }
 
     if (test_denoise(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
+
+    /* Replaces the scene in `src`; the stages after it upload their own
+     * or the one below again. */
+    if (test_temporal(&td, ctx, &identity, &src, &dst, gpu, ref) < 0)
+        goto done;
+    if (craw_testdev_image_upload(&td, &src, mosaic, npix * sizeof(*mosaic)) < 0)
         goto done;
 
     if (test_false_color(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)

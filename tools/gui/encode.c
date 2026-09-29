@@ -2633,8 +2633,23 @@ static int view_enc_walk(struct view_encode *e, struct view_state *st,
 {
     int ret;
 
-    if (st->have_frame && st->index == want)
+    if (st->have_frame && st->index == want) {
+        /* An export starts the temporal denoise afresh at its first frame
+         * (DESIGN.md 14.7), whatever the picture on screen was averaged
+         * with, so that the same range exported twice is the same file and
+         * the direct path's own pipeline, which starts empty, averages the
+         * same frames. A first frame that has to be sought gets that from
+         * the seek. */
+        if (!e->sought) {
+            e->sought = true;
+            if (view_temporal_strength(st) > 0.0f) {
+                ret = view_replay_frame_flags(st, CRAW_FRAME_FLAG_TEMPORAL_RESET);
+                if (ret < 0)
+                    return ret;
+            }
+        }
         return 2;
+    }
 
     /* One seek, at the start: every frame after it is the next one. */
     if (!e->sought) {

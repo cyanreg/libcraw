@@ -117,6 +117,25 @@ enum CRAWDebayer {
  * CRAWFrameParams.defringe_strength, which costs nothing when zero. */
 #define CRAW_PIPELINE_FLAG_DEFRINGE (1 << 6)
 
+/* Build the temporal denoise pass, DESIGN.md 14.7: in front of the spatial
+ * filter of CRAW_PIPELINE_FLAG_DENOISE and in the same variance stabilised
+ * domain, every sample of the mosaic is averaged with the previous frame's
+ * filtered value at the same place, as far as the 3x3 around it agrees
+ * with last frame's within the noise the model predicts. A static scene
+ * then averages over the last few frames and anything that moved is left
+ * to the spatial filter, which measures what it removes against the noise
+ * the average left. It costs two sets of full resolution state, an R32F
+ * and an R8 image each, 175 MB at 5.8K, and builds the raw denoise pass
+ * and its R16_UNORM image whether or not CRAW_PIPELINE_FLAG_DENOISE is
+ * also set. Once built it is switched per frame with
+ * CRAWFrameParams.denoise_temporal_strength, which costs nothing when
+ * zero.
+ *
+ * With it the pipeline stops being a function of the frame it is given:
+ * each recording reads what the previous one left. See "Temporal state"
+ * at craw_pipeline_record() for the rules that makes. */
+#define CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE (1 << 7)
+
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
 typedef struct CRAWPipelineParams {
@@ -183,6 +202,16 @@ typedef struct CRAWPipelineParams {
  * A flag rather than a strength because there is nothing to dial: a
  * rebuilt channel is either the estimate or the clip. */
 #define CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION (1 << 3)
+
+/* The frame before this one was not the previous frame of the same scene:
+ * a seek, a loop back to the start, a new clip, a cut. The temporal
+ * denoise ignores its state for this frame, as if the pipeline had just
+ * been created, and fills it again from this frame on. It is the
+ * denoiser's `scene_cut` (craw_awb_smoother_push()), and stricter: the
+ * state is last frame's picture sample by sample, so any jump breaks it,
+ * where an illuminant track may well survive a seek within one scene. No
+ * effect without CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE. DESIGN.md 14.7. */
+#define CRAW_FRAME_FLAG_TEMPORAL_RESET (1 << 4)
 
 /* Per-frame settings. */
 typedef struct CRAWFrameParams {
@@ -261,12 +290,43 @@ typedef struct CRAWFrameParams {
      * unless the pipeline was created with CRAW_PIPELINE_FLAG_DEFRINGE. */
     float defringe_strength;
 
+    /* Temporal denoise, DESIGN.md 14.7: alpha_max, the most of the previous
+     * frame's filtered value that a sample can take on, 0.0 to 1.0. On a
+     * static scene the average then reaches back about 1 / (1 - alpha_max)
+     * frames and the noise falls towards sqrt((1 - a) / (1 + a)) of a
+     * frame's alone, a third at 0.8; where the 3x3 around a sample differs
+     * from last frame's by more than the model's noise it takes less, and
+     * where it has moved it takes nothing. How much more counts as moved
+     * is the spatial strength h of denoise_strength when that pass runs
+     * and 1.0 when it does not; the spatial filter then measures what it
+     * removes against the noise the average left. 0.8 is a good value;
+     * 1.0 is allowed and useless, a static sample then keeps last frame's
+     * value for ever and never takes in another. It needs the noise model
+     * exactly as denoise_strength does, and fails the same way without
+     * one. 0.0, the default, skips the pass for this frame without
+     * rebuilding the pipeline; above 1.0 makes craw_pipeline_record() fail
+     * with CRAW_ERROR(EINVAL). Ignored unless the pipeline was created
+     * with CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE.
+     *
+     * denoise_temporal_replay says that this recording develops the same
+     * frame as the last one did, again: a grade changed while paused, a
+     * picker that needs the frame without the gamut compression. It reads
+     * the state that recording read, and replaces what that recording
+     * wrote, so a frame developed any number of times comes out the same
+     * as the first time and the next frame still follows it. Unset, the
+     * recording is the next frame. See "Temporal state" at
+     * craw_pipeline_record(). */
+    float denoise_temporal_strength;
+    bool denoise_temporal_replay;
+
     /* Padding to allow for future options. Must always be set to 0. The
      * `- 8` after the 64 is out_space, out_space_set and the alignment hole
-     * after it, and the three `- 4` are false_color_passes,
-     * denoise_chroma_strength and defringe_strength, all taken out of the
-     * tail so that sizeof stays what it was. */
-    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8 - 4 - 4 - 4];
+     * after it, the three `- 4` after that are false_color_passes,
+     * denoise_chroma_strength and defringe_strength, and the last `- 4 - 4`
+     * are denoise_temporal_strength, then denoise_temporal_replay with the
+     * three bytes after it, all taken out of the tail so that sizeof stays
+     * what it was. */
+    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8 - 4 - 4 - 4 - 4 - 4];
 } CRAWFrameParams;
 
 /* Fills `p` with defaults: RGGB, RCD, XYZ D65 output, RGBA16F, no flags.
@@ -274,7 +334,7 @@ typedef struct CRAWFrameParams {
 CRAW_API void craw_pipeline_params_init(CRAWPipelineParams *p);
 
 /* Fills `fp` with defaults: as-shot white balance, the pipeline's own
- * output colour space, no exposure change, no denoising of either kind, no
+ * output colour space, no exposure change, no denoising of any kind, no
  * noise model override, no highlight reconstruction, no false colour
  * suppression, no defringe, no lens correction. The profile pointer is left NULL and
  * must be set by the caller. */
@@ -291,6 +351,7 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
 /* Records the whole chain into `cmd`:
  *
  *   src (VK_FORMAT_R16_UNORM Bayer mosaic, params width x height)
+ *     -> [temporal denoise, each sample averaged with the previous frame's]
  *     -> [denoise, in the raw domain, on the four CFA planes]
  *     -> black/white normalization, as-shot white balance, and either the
  *        clip or [highlight reconstruction, clipped channels rebuilt]
@@ -309,7 +370,40 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
  * src and dst must not alias. Both must already be in their stated layouts
  * with prior work made visible to VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT.
  * The pipeline may be recorded once per command buffer submission; its
- * intermediates are not double-buffered. */
+ * intermediates are not double-buffered. Recordings must be submitted to
+ * one queue in the order they were made: the barriers that order one
+ * recording's use of the intermediates after the last one's are recorded
+ * into the later command buffer and only reach back in submission order.
+ * Any number of them may be in flight at once.
+ *
+ * Temporal state. With CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE the pipeline
+ * keeps two sets of state and remembers which holds the last developed
+ * frame's filtered planes and which the one before it; a recording is no
+ * longer a function of its arguments alone. The rules:
+ *
+ *  - Nothing is valid on creation, and CRAW_FRAME_FLAG_TEMPORAL_RESET
+ *    forgets whatever was: the frame is developed as the first one, and
+ *    the average refills from it.
+ *  - A recording without denoise_temporal_replay is the next frame: it
+ *    reads the state the last recording wrote and writes the other set.
+ *    A frame the caller skipped (a player dropping one to keep up) is
+ *    not a cut; the next one simply moved further, and the pass sees that
+ *    as motion.
+ *  - A recording with it develops the last recorded frame again: it reads
+ *    the set that recording read and writes the one that recording
+ *    wrote. With the same parameters the output is bit for bit the first
+ *    development's, however often it is repeated, and a change of
+ *    parameters is a change to that frame alone.
+ *  - A next frame recorded with the pass off (a strength of zero) leaves
+ *    no state behind, so the frame after it starts again; a replay with
+ *    the pass off leaves the state as it was.
+ *  - A recording that fails has changed nothing. One that succeeds but is
+ *    never submitted has: follow it with a reset.
+ *
+ * The state images are read and written only by recordings, in the order
+ * above, so the barriers that order consecutive recordings on one queue
+ * order them too, however many submissions are in flight. DESIGN.md 14.7
+ * and 11b. */
 CRAW_API int craw_pipeline_record(CRAWPipeline *pipe, VkCommandBuffer cmd,
                                   const CRAWImage *src, const CRAWImage *dst,
                                   const CRAWFrameParams *fp);

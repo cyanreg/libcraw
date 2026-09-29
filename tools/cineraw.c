@@ -112,6 +112,7 @@ struct tool_cfg {
 
     float denoise;            /* 0 = off */
     float chroma;             /* chroma denoise strength, 0 = off */
+    float temporal;           /* temporal denoise alpha_max, 0 = off */
     CRAWNoiseModel noise;     /* a > 0 overrides the profile's table */
     bool noise_estimate;
 
@@ -302,7 +303,7 @@ static void tool_usage(FILE *f)
 "                      (default: 1): the purple, blue and pink rims chromatic\n"
 "                      aberration leaves along lamps, windows and branches\n"
 "                      against the sky. 0 is off. DESIGN.md 19\n"
-"  --denoise STRENGTH[,CHROMA]\n"
+"  --denoise STRENGTH[,CHROMA[,TEMPORAL]]\n"
 "                      raw domain denoising at this strength: 1.0 removes\n"
 "                      noise at the level the camera's noise model predicts,\n"
 "                      2.0 smooths twice as far, 0 (the default) is off. The\n"
@@ -313,7 +314,14 @@ static void tool_usage(FILE *f)
 "                      its luma-guided smoothing, which takes the colour\n"
 "                      blotches out of a dark scene and the colour out of\n"
 "                      the glints --false-colour leaves; 0 (the default) is\n"
-"                      off, and it needs no noise model. DESIGN.md 14.4\n"
+"                      off, and it needs no noise model. DESIGN.md 14.4.\n"
+"                      TEMPORAL, 0 to 1, averages every sample with the\n"
+"                      previous frame's wherever the two agree within the\n"
+"                      model's noise, before the spatial pass: the most of\n"
+"                      the previous frame a sample keeps, 0.8 being about\n"
+"                      five frames on a static shot; 0 (the default) is off.\n"
+"                      It needs the noise model, and works with STRENGTH 0\n"
+"                      too. DESIGN.md 14.7\n"
 "  --noise A,B         override the noise model: variance = A * u + B with u\n"
 "                      the signal above black over the sensor range. Print a\n"
 "                      clip's own pair with --noise-estimate\n"
@@ -871,6 +879,8 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
     pp.flags = cfg->wb == TOOL_WB_AUTO ? CRAW_PIPELINE_FLAG_AWB_HISTOGRAM : 0;
     if (cfg->denoise > 0.0f)
         pp.flags |= CRAW_PIPELINE_FLAG_DENOISE;
+    if (cfg->temporal > 0.0f)
+        pp.flags |= CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE;
     if (cfg->chroma > 0.0f)
         pp.flags |= CRAW_PIPELINE_FLAG_CHROMA_DENOISE;
     if (cfg->false_color > 0)
@@ -1840,7 +1850,8 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
 
             d = strtod(optarg, &end);
             if (end == optarg || d < 0.0 || (*end && *end != ',')) {
-                fprintf(stderr, "--denoise: expected STRENGTH[,CHROMA], got `%s`\n", optarg);
+                fprintf(stderr, "--denoise: expected STRENGTH[,CHROMA[,TEMPORAL]], got `%s`\n",
+                        optarg);
                 return CRAW_ERROR(EINVAL);
             }
             cfg->denoise = (float)d;
@@ -1848,11 +1859,21 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
                 const char *arg = end + 1;
 
                 d = strtod(arg, &end);
-                if (end == arg || *end || d < 0.0 || d > 1.0) {
+                if (end == arg || (*end && *end != ',') || d < 0.0 || d > 1.0) {
                     fprintf(stderr, "--denoise: CHROMA must be 0 to 1, got `%s`\n", arg);
                     return CRAW_ERROR(EINVAL);
                 }
                 cfg->chroma = (float)d;
+            }
+            if (*end == ',') {
+                const char *arg = end + 1;
+
+                d = strtod(arg, &end);
+                if (end == arg || *end || d < 0.0 || d > 1.0) {
+                    fprintf(stderr, "--denoise: TEMPORAL must be 0 to 1, got `%s`\n", arg);
+                    return CRAW_ERROR(EINVAL);
+                }
+                cfg->temporal = (float)d;
             }
             break;
         }
@@ -2306,6 +2327,11 @@ have_device:
             fp.flags |= CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION;
         fp.denoise_strength = cfg.denoise;
         fp.denoise_chroma_strength = cfg.chroma;
+        /* Frames arrive one after another from one decoder, so each is the
+         * next frame of the last. The first after --start, and the first
+         * after a rebuild for a new frame size or a lens record, go to a
+         * pipeline with no state yet, which starts the average by itself. */
+        fp.denoise_temporal_strength = cfg.temporal;
         fp.noise_override = cfg.noise;
         fp.false_color_passes = cfg.false_color;
         fp.defringe_strength = cfg.defringe;

@@ -72,6 +72,23 @@ int craw_ref_denoise(const uint16_t *bayer, uint32_t width, uint32_t height,
                      const CRAWNoiseModel *model, float strength,
                      uint16_t *out, size_t out_stride);
 
+/* The same with the temporal average of DESIGN.md 14.7 in front of it:
+ * `alpha_max` in [0, 1], 0 for none; `prev` the previous frame's state,
+ * or NULL when there is none (a first frame, a reset); `next` receives
+ * this frame's, and must not be `prev`. A state is 2*width*height floats,
+ * two planes indexed like the mosaic: the filtered level of every sample,
+ * then the noise variance left in it as the GPU keeps it (the square root
+ * in eight bits). `strength` 0 is the temporal average alone; the two cannot both
+ * be 0. The temporal threshold is `strength` when it is positive and 1.0
+ * otherwise, as in the pipeline. The frame must be two samples larger on
+ * each side than craw_ref_denoise() asks, for the temporal comparison's
+ * reach. */
+int craw_ref_denoise_temporal(const uint16_t *bayer, uint32_t width, uint32_t height,
+                              size_t stride, const CRAWProfile *profile,
+                              const CRAWNoiseModel *model, float strength,
+                              float alpha_max, const float *prev, float *next,
+                              uint16_t *out, size_t out_stride);
+
 /* Resolves the noise model the pipeline would use for a frame: the
  * override when it carries a positive `a`, else the profile's table at its
  * as-shot exposure index. */
@@ -158,7 +175,9 @@ int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
  * CRAW_PIPELINE_FLAG_CHROMA_DENOISE and `fp->denoise_chroma_strength` is
  * positive, and the warp when it carries CRAW_PIPELINE_FLAG_LENS and
  * `fp->lens` is valid; all six are the conditions craw_pipeline_record()
- * applies. */
+ * applies. A single frame has no history, so the temporal denoise of
+ * CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE runs as on a pipeline's first frame;
+ * a sequence goes through craw_ref_denoise_temporal() instead. */
 int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
                      size_t stride, const CRAWPipelineParams *params,
                      const CRAWFrameParams *fp, float *out);

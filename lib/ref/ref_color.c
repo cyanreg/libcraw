@@ -93,6 +93,8 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
                      const CRAWFrameParams *fp, float *out)
 {
     uint16_t *clean = NULL;
+    float *state = NULL;
+    float strength, alpha_max;
     int ret;
 
     if (!params || !fp || !fp->profile)
@@ -102,7 +104,15 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
     if (params->cfa != fp->profile->cfa)
         return CRAW_ERROR(EINVAL);
 
-    if ((params->flags & CRAW_PIPELINE_FLAG_DENOISE) && fp->denoise_strength > 0.0f) {
+    /* A single frame has no previous one, so the temporal average is
+     * what it is on a pipeline's first frame or after a reset: the frame
+     * taken as it stands, spatial filter or not. DESIGN.md 14.7. */
+    strength = (params->flags & CRAW_PIPELINE_FLAG_DENOISE) ? fp->denoise_strength : 0.0f;
+    alpha_max = (params->flags & CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE)
+              ? fp->denoise_temporal_strength : 0.0f;
+    strength = CRAW_MAX(strength, 0.0f);
+    alpha_max = CRAW_MAX(alpha_max, 0.0f);
+    if (strength > 0.0f || alpha_max > 0.0f) {
         CRAWNoiseModel nm;
 
         ret = craw_ref_noise_model(fp, &nm);
@@ -110,15 +120,17 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
             return ret;
 
         clean = malloc((size_t)width * height * sizeof(*clean));
-        if (!clean)
-            return CRAW_ERROR(ENOMEM);
-
-        ret = craw_ref_denoise(bayer, width, height, stride, fp->profile, &nm,
-                               fp->denoise_strength, clean, width);
-        if (ret < 0) {
-            free(clean);
-            return ret;
+        if (alpha_max > 0.0f)
+            state = malloc(2 * (size_t)width * height * sizeof(*state));
+        if (!clean || (alpha_max > 0.0f && !state)) {
+            ret = CRAW_ERROR(ENOMEM);
+            goto done;
         }
+
+        ret = craw_ref_denoise_temporal(bayer, width, height, stride, fp->profile, &nm,
+                                        strength, alpha_max, NULL, state, clean, width);
+        if (ret < 0)
+            goto done;
 
         bayer = clean;
         stride = width;
@@ -194,6 +206,7 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
     ret = craw_ref_color(out, width, height, fp, craw_ref_out_space(params, fp));
 
 done:
+    free(state);
     free(clean);
 
     return ret;

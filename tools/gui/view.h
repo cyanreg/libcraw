@@ -163,6 +163,7 @@ struct view_pipeline_look {
     /* The strength the pass actually ran at, 0 when it did not: a toggle
      * while paused has to put the frame through again. */
     float denoise;
+    float temporal;             /* temporal denoise alpha_max, the same way */
     /* Whether the lens warp ran, for the same reason. The record itself is
      * the frame's own and changes with it, so a replay of the *same* frame
      * only has to notice the switch. `lens_keep` is the same for the
@@ -924,6 +925,22 @@ struct view_denoise {
      * raw stage it needs no noise model. Kept across an off like the
      * strength. */
     float chroma;
+    /* The temporal denoise in front of the raw stage, DESIGN.md 14.7: the
+     * most of the previous frame a sample keeps, 0 to 1. Switched with the
+     * section and kept across an off like the other two; it needs the model
+     * as the raw stage does. */
+    float temporal;
+
+    /* The viewer's side of the pipeline's temporal state. `reset` is set by
+     * whatever breaks the run of frames - a seek to another frame, the loop
+     * back to the start, a new clip, the start of a video export - and
+     * taken by the next frame developed, which then starts the average
+     * again. `last` is the frame the last new development was of, so that
+     * developing it again, however that comes about, replays it instead of
+     * averaging it with itself. */
+    bool reset;
+    bool have_last;
+    int64_t last;
 
     /* What the frame on screen resolved, for the readout. */
     CRAWNoiseModel model;
@@ -1522,6 +1539,10 @@ float view_denoise_strength(const struct view_state *st);
  * Denoise section is off or the control is at zero. */
 float view_chroma_strength(const struct view_state *st);
 
+/* The temporal denoise's alpha_max for the next frame: zero unless the
+ * switch is on, the control is positive and a model exists. */
+float view_temporal_strength(const struct view_state *st);
+
 /* The pipeline-relevant part of the current look, and whether two of them
  * would give the same picture. */
 struct view_pipeline_look view_pipeline_look(const struct view_state *st);
@@ -1534,7 +1555,11 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
  * CRAW_FRAME_FLAG_* bits to the frame's parameters for this one pass,
  * which is how the spot white balance reads the colour stage's output
  * uncompressed; the look the picture is recorded as processed with does
- * not know about them, so the caller puts the frame through again. */
+ * not know about them, so the caller puts the frame through again. A
+ * replay develops the frame from the temporal state its first development
+ * read (DESIGN.md 14.7), so it is the same picture as that one however
+ * often it is repeated; CRAW_FRAME_FLAG_TEMPORAL_RESET among the flags
+ * develops it with no history instead. */
 int  view_replay_frame(struct view_state *st);
 int  view_replay_frame_flags(struct view_state *st, uint32_t flags);
 

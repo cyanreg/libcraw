@@ -16,7 +16,12 @@ ARRIRAW and BRAW are planned.
 - Denoising in the raw domain, before the debayer can spread sensor noise
   into colour: non-local means on the four CFA planes in a variance
   stabilised domain, so one strength works from the shadows to the clip
-  point. About 1.9 ms on a 5.8K frame on an RX 6900 XT.
+  point. About 1.9 ms on a 5.8K frame on an RX 6900 XT. In front of it,
+  optionally, a temporal average in the same domain: every sample averaged
+  with the previous frame's wherever the 3x3 around it agrees within the
+  noise, so a static shot averages over the last few frames and whatever
+  moved is left to the spatial filter, which then keeps more of the
+  detail. About 0.6 ms more.
 - A sensor noise model, variance = a * signal + b by exposure index, held
   in the camera profile, with a calibrator that fits it to a clip.
 - Camera profiles with per-CCT white balance and matrix tables, as-shot
@@ -62,11 +67,16 @@ The options that matter most:
     cineraw --denoise 1.0 --crop 2750,1450,1000,1000 -o c_%d.png clip.MOV
     cineraw --noise-estimate --frames 10 flatfield.MOV   fit the noise model
 
-`--denoise STRENGTH[,CHROMA]` takes a strength in units of the camera's
-modelled noise level, 1.0 meaning "remove exactly that much", and an
+`--denoise STRENGTH[,CHROMA[,TEMPORAL]]` takes a strength in units of the
+camera's modelled noise level, 1.0 meaning "remove exactly that much", an
 optional chroma denoise amount from 0 to 1, the quarter resolution chroma
 band replaced by its luma-guided smoothing, which takes the colour
-blotches out of a dark scene and needs no noise model; `--noise A,B`
+blotches out of a dark scene and needs no noise model, and an optional
+temporal amount from 0 to 1, how much of the previous frame a sample keeps
+where the two agree within the noise (0.8 is about five frames of a static
+shot; it needs the model, works with STRENGTH 0 too, and leaves a faint
+trail behind things that move with less contrast than the noise;
+DESIGN.md 14.7); `--noise A,B`
 overrides the model and `--noise-estimate` measures one, printing a line
 ready for a `--tables` file. `--false-colour PASSES` runs one to five passes of a
 median and a blur over the colour differences after the debayer,
@@ -221,10 +231,16 @@ The defringe row under it, 1 by default, is the defringe strength;
 `--defringe STRENGTH` sets it. The "Denoise" section sets the raw stage's strength and reports the
 noise model it found for the clip's own ISO — that stage stays off when
 the camera has none, which the section says rather than leaving you
-guessing — and the chroma amount, the luma-guided smoothing of the
-quarter resolution chroma band after the debayer, which needs no model;
-`--denoise STRENGTH[,CHROMA]` sets the switch and both amounts from the
-command line.
+guessing — the temporal amount in front of it, 0 to 0.95 and 0 by
+default, which needs the model too, and the chroma amount, the luma-guided
+smoothing of the quarter resolution chroma band after the debayer, which
+needs no model; a strength of 0 leaves the spatial filter out, so the
+other two can be looked at alone. `--denoise STRENGTH[,CHROMA[,TEMPORAL]]`
+sets the switch and all three amounts from the command line. The temporal
+average starts again after a seek, at the loop point, on a new clip and at
+the first frame of a video export, and a grade changed while paused
+develops the frame on screen from the same history it was first developed
+from.
 With four mono audio tracks the last two are taken as the stereo pair
 (`--audio-map` overrides). `cineview -h` lists the options.
 

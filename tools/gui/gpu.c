@@ -829,8 +829,11 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
      * left at strength 0 costs nothing measurable, a false colour pass at
      * zero passes, a defringe at strength 0 and an unflagged highlight
      * reconstruction are not dispatched, and a lens pass handed a frame with no record drops out
-     * entirely, which is what makes them all live controls. */
+     * entirely, which is what makes them all live controls. The temporal
+     * denoise is the same at 0, and its state, 175 MB at 5.8K, is the
+     * price of being able to turn it on without losing a frame. */
     pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE |
+                    CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE |
                     CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_CHROMA_DENOISE |
                     CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION | CRAW_PIPELINE_FLAG_DEFRINGE |
                     CRAW_PIPELINE_FLAG_LENS;
@@ -1055,7 +1058,8 @@ int view_gpu_process(struct view_gpu *g, const AVFrame *frame,
 
     /* Charged to this slot's timestamps, which are read back the next time
      * the slot comes round. */
-    g->slot_denoise[g->slot] = fp->denoise_strength > 0.0f;
+    g->slot_denoise[g->slot] = fp->denoise_strength > 0.0f ||
+                               fp->denoise_temporal_strength > 0.0f;
     g->slot_lens[g->slot] = fp->lens.valid;
 
     VkCommandBufferBeginInfo begin = {
@@ -2527,7 +2531,11 @@ int view_gpu_direct_open(struct view_gpu *g)
      * pass or a lens warp set in the panel has to be in the file too. The
      * histogram is not: the
      * auto white balance reads the display pipeline's own, and a second set
-     * of slots would only be another buffer to zero every frame. */
+     * of slots would only be another buffer to zero every frame. The
+     * temporal denoise keeps its own state here, which starts empty with
+     * every export because this pipeline is built for each one and freed
+     * after it; the display's pipeline starts again at the same frame
+     * (encode.c), so the two average the same frames. */
     craw_pipeline_params_init(&pp);
     pp.width      = g->width;
     pp.height     = g->height;
@@ -2535,8 +2543,8 @@ int view_gpu_direct_open(struct view_gpu *g)
     pp.debayer    = g->pipe_debayer;
     pp.out_space  = CRAW_CS_ACES_AP1_LINEAR;
     pp.out_format = VK_FORMAT_R32G32B32A32_SFLOAT;
-    pp.flags      = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_FALSE_COLOR |
-                    CRAW_PIPELINE_FLAG_CHROMA_DENOISE |
+    pp.flags      = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE |
+                    CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_CHROMA_DENOISE |
                     CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION | CRAW_PIPELINE_FLAG_DEFRINGE |
                     CRAW_PIPELINE_FLAG_LENS;
 

@@ -1918,8 +1918,9 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
  * was found for the frame's own ISO, because a clip the camera has not been
  * characterized at cannot be denoised at all and the reason has to be
  * visible rather than inferred from nothing happening. The stage's own
- * switch is the header's; what is left here is the strength and what the
- * frame on screen resolved. */
+ * switch is the header's; what is left here is the strength, what the
+ * frame on screen resolved, the temporal average in front of the stage
+ * and the chroma stage after the debayer. */
 static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
 {
     struct view_denoise *d = &st->denoise;
@@ -1929,13 +1930,15 @@ static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
               !d->have_model ? "no model: raw stage off"
                              : d->on ? "on, before the debayer" : "off");
 
-    nk_property_float(ctx, "#strength", 0.25f, &d->strength, 3.0f, 0.25f, 0.01f);
-    nk_slider_float(ctx, 0.25f, &d->strength, 3.0f, 0.05f);
+    nk_property_float(ctx, "#strength", 0.0f, &d->strength, 3.0f, 0.25f, 0.01f);
+    nk_slider_float(ctx, 0.0f, &d->strength, 3.0f, 0.05f);
 
     /* 1.0 is "remove noise at exactly the modelled level", so the numbers
-     * either side of it are worth naming. */
+     * either side of it are worth naming. Zero leaves the spatial filter
+     * out, for the temporal average or the chroma stage alone. */
     nk_labelf(ctx, NK_TEXT_LEFT, "%.2f: %s", (double)d->strength,
-              d->strength < 0.95f  ? "under the modelled level"
+              d->strength <= 0.0f  ? "spatial filter off"
+            : d->strength < 0.95f  ? "under the modelled level"
             : d->strength < 1.05f  ? "the modelled level"
             : d->strength < 2.05f  ? "smooths across real detail"
                                    : "heavy");
@@ -1945,6 +1948,14 @@ static void view_panel_denoise(struct nk_context *ctx, struct view_state *st)
     else
         nk_labelf(ctx, NK_TEXT_LEFT, "noise a %.3g, b %.2g at ISO %.0f",
                   (double)d->model.a, (double)d->model.b, (double)d->iso);
+
+    /* The temporal average in front of the raw stage, DESIGN.md 14.7: how
+     * much of the previous frame a sample keeps where the two agree within
+     * the model's noise. It needs the model, like the strength above. The
+     * row stops short of 1, at which a static sample would keep its first
+     * frame for ever. */
+    nk_property_float(ctx, "#temporal", 0.0f, &d->temporal, 0.95f, 0.05f, 0.01f);
+    nk_slider_float(ctx, 0.0f, &d->temporal, 0.95f, 0.02f);
 
     /* The chroma denoise after the debayer, DESIGN.md 14.4: the quarter
      * resolution chroma band replaced by its luma-guided smoothing. It

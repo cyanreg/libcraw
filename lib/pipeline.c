@@ -94,7 +94,9 @@ static_assert(offsetof(CRAWHighlightLevelPush, top) == 16, "CRAWHighlightLevelPu
 /* Mirrors CRAWDenoisePushBuf in lib/shaders/denoise_nlm.comp.glsl. The
  * transform constants are all derived from the frame's (a, b) on the host,
  * so the shader never divides by a value it cannot check and the CPU
- * reference in lib/ref/ref_denoise.c can be handed the same numbers. */
+ * reference in lib/ref/ref_denoise.c can be handed the same numbers. The
+ * last three are the temporal pass of DESIGN.md 14.7 and which of the two
+ * filters run. */
 typedef struct CRAWDenoisePush {
     int32_t size[2];       /* plane size, i.e. the mosaic halved */
     float   black[4];      /* black level per quad site, UNORM */
@@ -109,13 +111,25 @@ typedef struct CRAWDenoisePush {
     float   inv_h2;        /* 1 / strength^2 */
     float   guard_lo;      /* highlight ramp start, in u */
     float   guard_inv;     /* 1 / (guard_hi - guard_lo) */
+    float   t_alpha;       /* alpha_max */
+    float   t_inv_h2;      /* 1 / ht^2 */
+    int32_t mode;          /* CRAW_DN_MODE_* */
 } CRAWDenoisePush;
 
-static_assert(sizeof(CRAWDenoisePush) == 92, "CRAWDenoisePush layout");
+static_assert(sizeof(CRAWDenoisePush) == 104, "CRAWDenoisePush layout");
 static_assert(offsetof(CRAWDenoisePush, black) == 8, "CRAWDenoisePush layout");
 static_assert(offsetof(CRAWDenoisePush, range) == 40, "CRAWDenoisePush layout");
 static_assert(offsetof(CRAWDenoisePush, gat_a) == 56, "CRAWDenoisePush layout");
 static_assert(offsetof(CRAWDenoisePush, inv_h2) == 80, "CRAWDenoisePush layout");
+static_assert(offsetof(CRAWDenoisePush, t_alpha) == 92, "CRAWDenoisePush layout");
+static_assert(offsetof(CRAWDenoisePush, mode) == 100, "CRAWDenoisePush layout");
+
+/* Mirrors CRAW_DN_* in lib/shaders/denoise_nlm.comp.glsl: which of the two
+ * filters of the raw stage run, and whether the temporal one has a
+ * previous frame to read. */
+#define CRAW_DN_MODE_SPATIAL  1
+#define CRAW_DN_MODE_TEMPORAL 2
+#define CRAW_DN_MODE_HISTORY  4
 
 /* Mirrors CRAWColorPushBuf in lib/shaders/color.comp.glsl. `matrix` is row
  * major, as everything in libcraw is, and the shader reads it as three
@@ -291,6 +305,7 @@ struct CRAWPipeline {
     bool has_chroma;
     bool has_hl;
     bool has_df;
+    bool has_temporal;
 
     /* One of `debayer` or the three RCD passes is created, never both.
      * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
@@ -328,6 +343,18 @@ struct CRAWPipeline {
                                                * and its pyramid, RGBA32F */
     uint32_t nb_hl_levels;
 
+    /* Temporal denoise, DESIGN.md 14.7: two sets of state, each the
+     * temporally filtered level of every mosaic sample of one frame
+     * (R32F, full resolution) and the square root of the noise variance
+     * left in it (R8_UNORM). `tn_cur` is the set the last recording wrote,
+     * which the next frame reads, and `tn_prev` the one that recording
+     * read, which a replay of it reads again; -1 is "nothing valid", which
+     * is where both start and where a reset puts them. The two are never
+     * the same set, so a recording always writes the set it does not read. */
+    CRAWVkImage tn_state[2];
+    CRAWVkImage tn_var[2];
+    int tn_prev, tn_cur;
+
     CRAWVkBuffer hist_count;
     CRAWVkBuffer hist_weight;
     CRAWVkBuffer hist_bright;
@@ -354,6 +381,17 @@ static const CRAWVkBinding craw_bind_images[4] = {
     { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
     { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
     { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+};
+
+/* The raw denoise: mosaic, output, and the temporal state's two images
+ * read and two written. */
+static const CRAWVkBinding craw_bind_dn[6] = {
+    { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+    { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
 };
 
 static const CRAWVkBinding craw_bind_awb[4] = {
@@ -494,6 +532,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     p->has_chroma = !!(params->flags & CRAW_PIPELINE_FLAG_CHROMA_DENOISE);
     p->has_hl = !!(params->flags & CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION);
     p->has_df = !!(params->flags & CRAW_PIPELINE_FLAG_DEFRINGE);
+    p->has_temporal = !!(params->flags & CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE);
+    p->tn_prev = p->tn_cur = -1;
     p->qsize[0] = (int32_t)((params->width + 3) / 4);
     p->qsize[1] = (int32_t)((params->height + 3) / 4);
     p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
@@ -527,13 +567,17 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     spec[3] = CRAW_DN_PATCH_R;
     spec[4] = craw_fc_tile(wgfc);
 
-    if (p->has_denoise) {
+    /* The temporal pass is part of the raw stage's dispatch (DESIGN.md
+     * 14.7), so either flag builds the stage. */
+    if (p->has_denoise || p->has_temporal) {
         /* The denoise stage mirrors inside each CFA plane, and one
          * reflection only reaches a stencil radius of plane size - 1, so a
          * frame smaller than this would read outside the plane. Every real
          * frame is orders of magnitude bigger; this exists so that the
-         * rule of DESIGN.md 3 is enforced rather than assumed. */
-        const uint32_t dn_min = 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R + 1);
+         * rule of DESIGN.md 3 is enforced rather than assumed. The temporal
+         * pass's 3x3 comparison reaches one sample further. */
+        const uint32_t dn_min = 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R + 1 +
+                                     (p->has_temporal ? 1 : 0));
 
         if (params->width < dn_min || params->height < dn_min) {
             craw_log(ctx, CRAW_LOG_ERROR,
@@ -553,10 +597,28 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
 
         ret = craw_pipeline_shader(p, &p->denoise, "denoise_nlm",
                                    craw_denoise_nlm_spv_data, craw_denoise_nlm_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWDenoisePush), wgdn,
+                                   craw_bind_dn, 6, sizeof(CRAWDenoisePush), wgdn,
                                    spec, 4);
         if (ret < 0)
             goto fail;
+    }
+
+    if (p->has_temporal) {
+        /* fp32 for the reason the stabilised domain needs it (DESIGN.md
+         * 14.3), and two sets so that a frame can be developed again from
+         * the state it was first developed from. The variance is a number
+         * between 0 and 1 that only scales thresholds, and eight bits of
+         * its square root are a step of 2.4% of it at an alpha_max of 0.8. */
+        for (int i = 0; i < 2; i++) {
+            ret = craw_vk_image_create(ctx, &p->tn_state[i], params->width, params->height,
+                                       VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT);
+            if (ret < 0)
+                goto fail;
+            ret = craw_vk_image_create(ctx, &p->tn_var[i], params->width, params->height,
+                                       VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT);
+            if (ret < 0)
+                goto fail;
+        }
     }
 
     if (p->has_hl) {
@@ -787,9 +849,10 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
-    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s%s\n",
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s%s%s\n",
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
              p->awb ? ", awb histogram" : "",
+             p->has_temporal ? ", temporal denoise" : "",
              p->has_denoise ? ", denoise" : "",
              p->has_hl ? ", highlight reconstruction" : "",
              p->has_fc ? (wgfc == CRAW_FC_WG_MAX ? ", false colour" : ", false colour (small tile)") : "",
@@ -862,6 +925,12 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_image_free(ctx, &p->green);
     if (p->clean.image)
         craw_vk_image_free(ctx, &p->clean);
+    for (int i = 0; i < 2; i++) {
+        if (p->tn_state[i].image)
+            craw_vk_image_free(ctx, &p->tn_state[i]);
+        if (p->tn_var[i].image)
+            craw_vk_image_free(ctx, &p->tn_var[i]);
+    }
     if (p->scratch.image)
         craw_vk_image_free(ctx, &p->scratch);
     if (p->chroma_q.image)
@@ -926,12 +995,14 @@ static int craw_pipeline_prep_push(CRAWPipeline *p, const CRAWProfile *prof,
  * constants, DESIGN.md 14.3. The model is looked up at the sensor's own
  * exposure index (as_shot_ei) and not at the working one: rating a clip at
  * a different index scales the picture afterwards, it does not change how
- * the sensels were read. */
+ * the sensels were read. `mode` says which of the two filters run; the
+ * temporal one's history bit is the caller's to add. */
 static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
-                                      const CRAWFrameParams *fp, CRAWDenoisePush *dp)
+                                      const CRAWFrameParams *fp, int32_t mode,
+                                      CRAWDenoisePush *dp)
 {
     CRAWNoiseModel nm;
-    float a, b, c, sc;
+    float a, b, c, sc, h;
     int ret;
 
     if (fp->noise_override.a > 0.0f) {
@@ -958,6 +1029,11 @@ static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
     c = 3.0f * a * a / 8.0f + b;
     sc = sqrtf(c);
 
+    /* The temporal threshold is the spatial one when the spatial filter
+     * runs, so that one strength means one thing in both, and the modelled
+     * noise level itself when it does not. DESIGN.md 14.7. */
+    h = (mode & CRAW_DN_MODE_SPATIAL) ? fp->denoise_strength : 1.0f;
+
     *dp = (CRAWDenoisePush) {
         .size      = { (int32_t)(p->params.width / 2), (int32_t)(p->params.height / 2) },
         .gat_a     = a,
@@ -966,9 +1042,12 @@ static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
         .gat_fwd   = 2.0f / a,
         .gat_inv   = a / 4.0f,
         .gat_off   = c / a,
-        .inv_h2    = 1.0f / (fp->denoise_strength * fp->denoise_strength),
+        .inv_h2    = 1.0f / (h * h),
         .guard_lo  = CRAW_DN_GUARD_LO,
         .guard_inv = 1.0f / (CRAW_DN_GUARD_HI - CRAW_DN_GUARD_LO),
+        .t_alpha   = (mode & CRAW_DN_MODE_TEMPORAL) ? fp->denoise_temporal_strength : 0.0f,
+        .t_inv_h2  = 1.0f / (h * h),
+        .mode      = mode,
     };
 
     for (int i = 0; i < 4; i++) {
@@ -1046,8 +1125,8 @@ static int craw_pipeline_lens_push(CRAWPipeline *p, const CRAWLensCorrection *lc
     return 0;
 }
 
-/* `gz` is 1 for every pass but the denoise, which puts the CFA plane index
- * there and dispatches all four at once. */
+/* `gz` is 1 for every pass; the denoise dispatches its four CFA planes as
+ * four times the columns of workgroups instead. */
 static void craw_pipeline_dispatch(CRAWPipeline *p, VkCommandBuffer cmd, const CRAWVkShader *sh,
                                    CRAWVkDescWrite *writes, uint32_t nb_writes,
                                    const void *push, uint32_t push_size,
@@ -1171,6 +1250,9 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     CRAWDefringePush dfp;
     enum CRAWColorSpace out_space;
     bool denoise, lens, false_color, chroma, highlights, defringe;
+    bool spatial, temporal, replay;
+    int t_read, t_write;
+    int32_t dn_mode;
     float m_out[3][3], scale;
     uint32_t w, h;
     int ret;
@@ -1216,12 +1298,37 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     if (ret < 0)
         return ret;
 
-    /* A strength of zero is the documented way to turn the pass off for one
-     * frame, so it is not an error on a pipeline that was never built with
-     * it either. */
-    denoise = p->has_denoise && fp->denoise_strength > 0.0f;
+    /* A strength of zero is the documented way to turn either filter off
+     * for one frame, so it is not an error on a pipeline that was never
+     * built with it either. More than all of last frame's value is. */
+    spatial = p->has_denoise && fp->denoise_strength > 0.0f;
+    temporal = p->has_temporal && fp->denoise_temporal_strength > 0.0f;
+    if (temporal && !(fp->denoise_temporal_strength <= 1.0f)) {
+        craw_log(ctx, CRAW_LOG_ERROR, "denoise_temporal_strength = %g; at most 1.0\n",
+                 (double)fp->denoise_temporal_strength);
+        return CRAW_ERROR(EINVAL);
+    }
+
+    /* Which state this recording reads and which it writes, DESIGN.md
+     * 14.7: the next frame reads what the last recording wrote, a replay
+     * what the last recording read, and a reset nothing. The set written
+     * is the other one, or for a replay the one the last recording wrote,
+     * which is then never the one being read. Worked out here and only
+     * committed once nothing can fail. */
+    replay = fp->denoise_temporal_replay;
+    t_read = replay ? p->tn_prev : p->tn_cur;
+    if (fp->flags & CRAW_FRAME_FLAG_TEMPORAL_RESET)
+        t_read = -1;
+    t_write = -1;
+    if (temporal)
+        t_write = replay && p->tn_cur >= 0 ? p->tn_cur : (t_read == 0 ? 1 : 0);
+
+    denoise = spatial || temporal;
     if (denoise) {
-        ret = craw_pipeline_denoise_push(p, fp->profile, fp, &dp);
+        dn_mode = (spatial ? CRAW_DN_MODE_SPATIAL : 0) |
+                  (temporal ? CRAW_DN_MODE_TEMPORAL : 0) |
+                  (temporal && t_read >= 0 ? CRAW_DN_MODE_HISTORY : 0);
+        ret = craw_pipeline_denoise_push(p, fp->profile, fp, dn_mode, &dp);
         if (ret < 0)
             return ret;
     }
@@ -1354,18 +1461,69 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
      * everything downstream, the prep of 4.1 included, is untouched. */
     mosaic = &src_img;
     if (denoise) {
+        /* The state images are only ever touched here, by consecutive
+         * recordings in submission order, so these barriers are what order
+         * this frame's read after the last one's write and this frame's
+         * write after the last one's read, across submissions in flight
+         * too. Bindings the mode does not use get stand-ins the shader
+         * never touches: the source for the reads, the output for the
+         * writes. */
+        CRAWVkImage *t_prev = &src_img, *t_next = &p->clean;
+        CRAWVkImage *v_prev = &src_img, *v_next = &p->clean;
+        CRAWVkDescWrite dn_writes[6];
+
         craw_vk_image_barrier(ctx, cmd, &p->clean, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        craw_vk_desc_image(&writes[0], 0, &src_img);
-        craw_vk_desc_image(&writes[1], 1, &p->clean);
-        /* Half resolution, one workgroup slice per CFA plane. */
-        craw_pipeline_dispatch(p, cmd, &p->denoise, writes, 2, &dp, sizeof(dp),
-                               w / 2, h / 2, 4);
+        if (temporal) {
+            if (t_read >= 0) {
+                t_prev = &p->tn_state[t_read];
+                v_prev = &p->tn_var[t_read];
+                craw_vk_image_barrier(ctx, cmd, t_prev, VK_IMAGE_LAYOUT_GENERAL,
+                                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                      VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                craw_vk_image_barrier(ctx, cmd, v_prev, VK_IMAGE_LAYOUT_GENERAL,
+                                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                      VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            }
+            t_next = &p->tn_state[t_write];
+            v_next = &p->tn_var[t_write];
+            craw_vk_image_barrier(ctx, cmd, t_next, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            craw_vk_image_barrier(ctx, cmd, v_next, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+
+        craw_vk_desc_image(&dn_writes[0], 0, &src_img);
+        craw_vk_desc_image(&dn_writes[1], 1, &p->clean);
+        craw_vk_desc_image(&dn_writes[2], 2, t_prev);
+        craw_vk_desc_image(&dn_writes[3], 3, t_next);
+        craw_vk_desc_image(&dn_writes[4], 4, v_prev);
+        craw_vk_desc_image(&dn_writes[5], 5, v_next);
+        /* Half resolution, four workgroups per tile, one per CFA plane,
+         * side by side in x so that they run together. */
+        {
+            uint32_t wgx = p->denoise.wg[0];
+
+            craw_pipeline_dispatch(p, cmd, &p->denoise, dn_writes, 6, &dp, sizeof(dp),
+                                   4 * wgx * ((w / 2 + wgx - 1) / wgx), h / 2, 1);
+        }
 
         craw_vk_image_barrier(ctx, cmd, &p->clean, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                               VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        /* Left as read, so that the next write to them, which may be a
+         * replay's to these same images, gets a barrier of its own. */
+        if (temporal) {
+            craw_vk_image_barrier(ctx, cmd, t_next, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                  VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            craw_vk_image_barrier(ctx, cmd, v_next, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                  VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        }
         mosaic = &p->clean;
     }
 
@@ -1608,6 +1766,18 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     craw_vk_image_barrier(ctx, cmd, &src_img, src->layout,
                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                           VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+    /* The recording is made; only now does the temporal state move. The
+     * set this one read is what a replay of it reads. A next frame without
+     * the pass leaves nothing for the frame after it, while a replay
+     * without it leaves the frame's earlier development in place. */
+    if (p->has_temporal) {
+        p->tn_prev = t_read;
+        if (temporal)
+            p->tn_cur = t_write;
+        else if (!replay)
+            p->tn_cur = -1;
+    }
 
     return 0;
 }

@@ -276,6 +276,18 @@ float view_chroma_strength(const struct view_state *st)
     return CRAW_MIN(st->denoise.chroma, 1.0f);
 }
 
+/* The temporal average needs the model as the spatial filter does: it is
+ * the model that says which differences from the last frame are noise. */
+float view_temporal_strength(const struct view_state *st)
+{
+    if (!st->denoise.on || !(st->denoise.temporal > 0.0f))
+        return 0.0f;
+    if (!view_denoise_model(st, NULL, NULL))
+        return 0.0f;
+
+    return CRAW_MIN(st->denoise.temporal, 0.95f);
+}
+
 /* The warp runs when the switch is on and the picture on screen carried a
  * record. A clip whose frames have none - every ProRes RAW clip that is not
  * from this camera - can never turn it on, which is why the panel's row
@@ -304,6 +316,10 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
      * as-shot index. */
     fp->denoise_strength = view_denoise_strength(st);
     fp->denoise_chroma_strength = view_chroma_strength(st);
+    /* Whether this is the next frame, a replay or a new start is the
+     * caller's to say (view_process_frame()); the direct export's own
+     * pipeline only ever gets next frames, from its first on. */
+    fp->denoise_temporal_strength = view_temporal_strength(st);
     /* The pipeline is always built with the stage (gpu.c), so the count is
      * all it takes; zero is not dispatched. */
     fp->false_color_passes = (uint32_t)CRAW_CLAMP(st->look.false_color, 0,
@@ -346,6 +362,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .defringe   = CRAW_CLAMP(st->look.defringe, 0.0f, 1.0f),
         .chroma     = view_chroma_strength(st),
         .denoise    = view_denoise_strength(st),
+        .temporal   = view_temporal_strength(st),
         .lens       = view_lens_active(st),
         .lens_keep  = view_lens_keep_all(st),
     };
@@ -393,7 +410,8 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->false_color == b->false_color && a->highlights == b->highlights &&
            a->defringe == b->defringe &&
            a->chroma == b->chroma &&
-           a->denoise == b->denoise && a->lens == b->lens &&
+           a->denoise == b->denoise && a->temporal == b->temporal &&
+           a->lens == b->lens &&
            a->lens_keep == b->lens_keep;
 }
 
@@ -1341,10 +1359,12 @@ static int view_awb_step(struct view_state *st)
  * from the look, the pass itself and the auto white balance step that reads
  * the previous pass's histogram. `flags` are CRAW_FRAME_FLAG_* bits added
  * for this one pass on top of what the look asks for; zero for every
- * picture that is meant to be looked at. */
-static int view_process_frame(struct view_state *st, uint32_t flags)
+ * picture that is meant to be looked at. `replay` says the picture is the
+ * one the last pass developed, again. */
+static int view_process_frame(struct view_state *st, uint32_t flags, bool replay)
 {
     CRAWFrameParams fp;
+    bool reset;
     int ret;
 
     st->prof = st->base;
@@ -1375,6 +1395,24 @@ static int view_process_frame(struct view_state *st, uint32_t flags)
 
     view_frame_params(st, &fp);
     fp.flags |= flags;
+
+    /* The temporal state, DESIGN.md 14.7. A frame that follows a break in
+     * the run starts the average again; the frame the last pass developed,
+     * developed again, is a replay whether it came from a grade change, a
+     * pick or a seek to the picture already on screen, so that it comes
+     * out as it did the first time instead of averaged with itself. A
+     * frame the player dropped to keep up is neither: the next one is
+     * still the next frame of the same scene, only further on, and the
+     * pass takes what moved as motion. */
+    reset = !replay && st->denoise.reset;
+    if (!replay && !reset && st->denoise.have_last && st->denoise.last == st->index)
+        replay = true;
+    if (reset)
+        fp.flags |= CRAW_FRAME_FLAG_TEMPORAL_RESET;
+    fp.denoise_temporal_replay = replay;
+    if (fp.denoise_temporal_strength > 0.0f && (fp.flags & CRAW_FRAME_FLAG_TEMPORAL_RESET))
+        view_log(st, "temporal: frame %" PRId64 " starts the average again\n", st->index);
+
     /* Taken before the white balance step below moves the track, so that a
      * new estimate counts as a change and a paused picture follows it. */
     st->processed = view_pipeline_look(st);
@@ -1384,6 +1422,11 @@ static int view_process_frame(struct view_state *st, uint32_t flags)
         return ret;
 
     st->have_frame = true;
+    if (!replay) {
+        st->denoise.reset = false;
+        st->denoise.have_last = true;
+        st->denoise.last = st->index;
+    }
 
     /* What the panel reports, resolved once per frame rather than once per
      * panel redraw. */
@@ -1428,9 +1471,10 @@ int view_replay_frame_flags(struct view_state *st, uint32_t flags)
     }
 
     view_log(st, "replay frame %" PRId64 "%s\n", st->index,
-             flags ? " (uncompressed, for a pick)" : "");
+             (flags & CRAW_FRAME_FLAG_NO_GAMUT_COMPRESSION) ? " (uncompressed, for a pick)"
+           : (flags & CRAW_FRAME_FLAG_TEMPORAL_RESET) ? " (no temporal history)" : "");
 
-    return view_process_frame(st, flags);
+    return view_process_frame(st, flags, true);
 }
 
 int view_replay_frame(struct view_state *st)
@@ -1493,9 +1537,14 @@ int view_step_frame(struct view_state *st)
          * smoother's own clamp on the time step already limits how far one
          * frame can pull it. Only the stale estimate is dropped, the one
          * whose histogram was read a frame behind and belongs to the
-         * picture the seek left. */
-        if (jump)
+         * picture the seek left. The temporal denoise's state does not
+         * survive it: it is last frame's picture sample by sample, and
+         * after a jump no sample is where it was. A loop back to the start
+         * is a jump like any other. */
+        if (jump) {
             st->awb.skip = 1;
+            st->denoise.reset = true;
+        }
     }
 
     t0 = av_gettime_relative();
@@ -1595,7 +1644,7 @@ int view_step_frame(struct view_state *st)
         return 2;
     }
 
-    ret = view_process_frame(st, 0);
+    ret = view_process_frame(st, 0, false);
     if (ret < 0)
         return ret;
 
@@ -1808,16 +1857,22 @@ static void view_usage(FILE *f)
 "                      coloured dots of glints smaller than a CFA quad\n"
 "                      neutral and leave luminance alone; 0 (the default)\n"
 "                      is off. The Debayer section has the same row\n"
-"  --denoise STRENGTH[,CHROMA]\n"
+"  --denoise STRENGTH[,CHROMA[,TEMPORAL]]\n"
 "                      raw domain denoising, in units of the camera's\n"
 "                      modelled noise level: 1.0 removes exactly that much,\n"
-"                      0.25 to 3.0, 0 (the default) leaves the section off.\n"
+"                      up to 3.0, 0 (the default) leaves the section off.\n"
 "                      Needs a noise model for the clip's ISO; the Denoise\n"
 "                      section says which one it found. CHROMA, 0 to 1, is\n"
 "                      the section's chroma denoise after the debayer, the\n"
 "                      luma-guided smoothing of the quarter resolution\n"
 "                      chroma band; it needs no model and defaults to 1\n"
-"                      when the section is on\n"
+"                      when the section is on. TEMPORAL, 0 to 0.95 and 0 by\n"
+"                      default, averages every sample with the previous\n"
+"                      frame's wherever the two agree within the model's\n"
+"                      noise: the most of the previous frame a sample\n"
+"                      keeps, 0.8 being about five frames of a static shot.\n"
+"                      A STRENGTH of 0 with a CHROMA or TEMPORAL above it\n"
+"                      turns the section on with the spatial filter off\n"
 "  --highlights on|off rebuild clipped highlights before the debayer (on by\n"
 "                      default): every channel that clipped is estimated\n"
 "                      from the channels that did not clip around it and\n"
@@ -2208,28 +2263,37 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             float v2 = strtof(optarg, &end);
 
             if (end == optarg || (*end && *end != ',') || v2 < 0.0f || v2 > 3.0f) {
-                fprintf(stderr, "--denoise: expected STRENGTH[,CHROMA], the strength "
-                                "0 to 3, got `%s`\n", optarg);
+                fprintf(stderr, "--denoise: expected STRENGTH[,CHROMA[,TEMPORAL]], the "
+                                "strength 0 to 3, got `%s`\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
-            /* Zero keeps it off and leaves the panel's own strength where
-             * it was, so the section still opens on a sensible number. */
+            /* Zero alone keeps it off and leaves the panel's own strength
+             * where it was, so the section still opens on a sensible
+             * number. */
             st->denoise.on = v2 > 0.0f;
             if (v2 > 0.0f)
                 st->denoise.strength = v2;
-            if (*end == ',') {
+            for (int k = 0; k < 2 && *end == ','; k++) {
                 const char *arg = end + 1;
                 float c2 = strtof(arg, &end);
 
-                if (end == arg || *end || c2 < 0.0f || c2 > 1.0f) {
-                    fprintf(stderr, "--denoise: CHROMA must be 0 to 1, got `%s`\n", arg);
+                if (end == arg || (*end && (k || *end != ',')) || c2 < 0.0f ||
+                    c2 > (k ? 0.95f : 1.0f)) {
+                    fprintf(stderr, "--denoise: %s must be 0 to %s, got `%s`\n",
+                            k ? "TEMPORAL" : "CHROMA", k ? "0.95" : "1", arg);
                     return CRAW_ERROR(EINVAL);
                 }
-                st->denoise.chroma = c2;
-                /* A chroma strength alone is still a reason to switch the
-                 * section on. */
-                if (c2 > 0.0f)
+                if (k)
+                    st->denoise.temporal = c2;
+                else
+                    st->denoise.chroma = c2;
+                /* Either alone is still a reason to switch the section on,
+                 * and then a strength of zero means what it says: the
+                 * spatial filter off. */
+                if (c2 > 0.0f) {
                     st->denoise.on = true;
+                    st->denoise.strength = v2;
+                }
             }
             break;
         }
@@ -2594,9 +2658,10 @@ static void view_log_look(const struct view_state *st)
     else
         fprintf(stderr, ", defringe off");
 
-    if (st->denoise.on && (st->denoise.strength > 0.0f || st->denoise.chroma > 0.0f))
-        fprintf(stderr, ", denoise %.2f, chroma %.2f", st->denoise.strength,
-                st->denoise.chroma);
+    if (st->denoise.on && (st->denoise.strength > 0.0f || st->denoise.chroma > 0.0f ||
+                           st->denoise.temporal > 0.0f))
+        fprintf(stderr, ", denoise %.2f, chroma %.2f, temporal %.2f", st->denoise.strength,
+                st->denoise.chroma, st->denoise.temporal);
     else
         fprintf(stderr, ", denoise off");
 
@@ -2703,6 +2768,9 @@ static int view_open_clip(struct view_state *st, int index, bool first)
     st->lens.ms_on = st->lens.ms_off = 0.0;
     st->denoise.have_model = false;
     st->denoise.ms_on = st->denoise.ms_off = 0.0;
+    /* Another clip is a cut, whatever its first frame's number. */
+    st->denoise.reset = true;
+    st->denoise.have_last = false;
 
     st->clip_status[0] = '\0';
     st->exp.status[0] = '\0';
