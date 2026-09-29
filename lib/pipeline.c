@@ -571,13 +571,13 @@ static uint32_t craw_wg_dim(const CRAWContext *ctx, uint32_t want)
     return want;
 }
 
-/* A shader with a square workgroup of side `wg`, or, with `sg` set, a
- * workgroup `sg` wide and `wg` (at least 1) tall, which the device is
- * required to run in full subgroups of `sg`: one subgroup per row. */
-static int craw_pipeline_shader_sg(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
+/* A shader with a workgroup of wx x wy, which the device is required to
+ * run in full subgroups of `sg` when that is not 0 (wx then a multiple of
+ * it). */
+static int craw_pipeline_shader_wh(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
                                    const uint8_t *spirv, size_t spirv_len,
                                    const CRAWVkBinding *bindings, uint32_t nb_bindings,
-                                   uint32_t push_size, uint32_t wg, uint32_t sg,
+                                   uint32_t push_size, uint32_t wx, uint32_t wy, uint32_t sg,
                                    const uint32_t *spec, uint32_t nb_spec)
 {
     CRAWVkShaderDesc desc = {
@@ -587,7 +587,7 @@ static int craw_pipeline_shader_sg(CRAWPipeline *p, CRAWVkShader *sh, const char
         .bindings       = bindings,
         .nb_bindings    = nb_bindings,
         .push_size      = push_size,
-        .wg             = { sg ? sg : wg, sg ? CRAW_MAX(wg, 1u) : wg, 1 },
+        .wg             = { wx, wy, 1 },
         .spec_entries   = nb_spec ? craw_spec_map : NULL,
         .nb_spec_entries = nb_spec,
         .spec_data      = nb_spec ? spec : NULL,
@@ -598,14 +598,27 @@ static int craw_pipeline_shader_sg(CRAWPipeline *p, CRAWVkShader *sh, const char
     return craw_vk_shader_create(p->ctx, sh, &desc);
 }
 
+/* A shader with a workgroup `sg` wide and `wy` (at least 1) tall, run in
+ * full subgroups of `sg`: one subgroup per row. */
+static int craw_pipeline_shader_sg(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
+                                   const uint8_t *spirv, size_t spirv_len,
+                                   const CRAWVkBinding *bindings, uint32_t nb_bindings,
+                                   uint32_t push_size, uint32_t wy, uint32_t sg,
+                                   const uint32_t *spec, uint32_t nb_spec)
+{
+    return craw_pipeline_shader_wh(p, sh, name, spirv, spirv_len, bindings, nb_bindings,
+                                   push_size, sg, CRAW_MAX(wy, 1u), sg, spec, nb_spec);
+}
+
+/* A shader with a square workgroup of side `wg`. */
 static int craw_pipeline_shader(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
                                 const uint8_t *spirv, size_t spirv_len,
                                 const CRAWVkBinding *bindings, uint32_t nb_bindings,
                                 uint32_t push_size, uint32_t wg,
                                 const uint32_t *spec, uint32_t nb_spec)
 {
-    return craw_pipeline_shader_sg(p, sh, name, spirv, spirv_len, bindings, nb_bindings,
-                                   push_size, wg, 0, spec, nb_spec);
+    return craw_pipeline_shader_wh(p, sh, name, spirv, spirv_len, bindings, nb_bindings,
+                                   push_size, wg, wg, 0, spec, nb_spec);
 }
 
 /* The most dispatches one recording of this pipeline can make: every pass
@@ -925,26 +938,14 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     } else {
         /* Twice as wide as tall, in subgroups of 32 where the device can:
          * of the shapes and sizes tried, 32x16 in wave32 was the fastest,
-         * the aprons being a smaller part of a wider tile. */
+         * the aprons being a smaller part of a wider tile. Full subgroups
+         * need the width to be a multiple of the size. */
         uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
                                ctx->caps.max_subgroup_size);
-        CRAWVkShaderDesc desc = {
-            .name            = "rcd",
-            .spirv           = craw_rcd_spv_data,
-            .spirv_len       = craw_rcd_spv_len,
-            .bindings        = craw_bind_images,
-            .nb_bindings     = 2,
-            .push_size       = sizeof(CRAWPrepPush),
-            .wg              = { 2 * wgrcd, wgrcd, 1 },
-            .spec_entries    = craw_spec_map,
-            .nb_spec_entries = 1,
-            .spec_data       = spec,
-            .spec_size       = sizeof(uint32_t),
-            /* Full subgroups need the width to be a multiple of the size. */
-            .required_subgroup_size = (2 * wgrcd) % sg ? 0 : sg,
-        };
 
-        ret = craw_vk_shader_create(ctx, &p->debayer, &desc);
+        ret = craw_pipeline_shader_wh(p, &p->debayer, "rcd", craw_rcd_spv_data, craw_rcd_spv_len,
+                                      craw_bind_images, 2, sizeof(CRAWPrepPush), 2 * wgrcd, wgrcd,
+                                      (2 * wgrcd) % sg ? 0 : sg, spec, 1);
     }
     if (ret < 0)
         goto fail;
@@ -981,9 +982,19 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         if (ret < 0)
             goto fail;
 
-        ret = craw_pipeline_shader(p, &p->chroma_down, "chroma_down",
-                                   craw_chroma_down_spv_data, craw_chroma_down_spv_len,
-                                   craw_bind_images, 2, sizeof(CRAWChromaPush), wg2d, NULL, 0);
+        /* Four block rows tall, the rest across (see the shader), in full
+         * subgroups, since the shader places its invocations by subgroup
+         * and lane. */
+        {
+            uint32_t sg = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                                   ctx->caps.max_subgroup_size);
+            uint32_t wx = wg2d * wg2d / 4;
+
+            ret = craw_pipeline_shader_wh(p, &p->chroma_down, "chroma_down",
+                                          craw_chroma_down_spv_data, craw_chroma_down_spv_len,
+                                          craw_bind_images, 2, sizeof(CRAWChromaPush),
+                                          wx, 4, wx % sg ? 0 : sg, NULL, 0);
+        }
         if (ret < 0)
             goto fail;
         ret = craw_pipeline_shader(p, &p->chroma_blur, "chroma_blur",
@@ -1040,9 +1051,12 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                 goto fail;
         }
 
-        ret = craw_pipeline_shader(p, &p->sh_prep, "sharpen_prep",
-                                   craw_sharpen_prep_spv_data, craw_sharpen_prep_spv_len,
-                                   craw_bind_awb, 2, sizeof(CRAWSharpenPush), wg2d, NULL, 0);
+        /* Twice as wide as tall: of 256x1 to 32x8, this was the fastest
+         * by a hair, 0.50 ms against 0.52. */
+        ret = craw_pipeline_shader_wh(p, &p->sh_prep, "sharpen_prep",
+                                      craw_sharpen_prep_spv_data, craw_sharpen_prep_spv_len,
+                                      craw_bind_awb, 2, sizeof(CRAWSharpenPush),
+                                      2 * wg2d, wg2d / 2, 0, NULL, 0);
         if (ret < 0)
             goto fail;
 
@@ -2077,8 +2091,10 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_image(&writes[1], 1, &p->chroma_q);
+        /* An invocation per pixel column across, and one per block row
+         * down, of which a workgroup has four. */
         craw_pipeline_dispatch(p, cmd, &p->chroma_down, writes, 2, &cdp, sizeof(cdp),
-                               (uint32_t)p->qsize[0], (uint32_t)p->qsize[1], 1);
+                               (uint32_t)p->qsize[0] * 4, (uint32_t)p->qsize[1], 1);
 
         craw_vk_image_barrier(ctx, cmd, &p->chroma_q, VK_IMAGE_LAYOUT_GENERAL,
                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -2128,7 +2144,7 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
         craw_vk_desc_image(&writes[0], 0, inter);
         craw_vk_desc_buffer(&writes[1], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &p->sh_d, 0, 0);
         craw_pipeline_dispatch(p, cmd, &p->sh_prep, writes, 2, &shp, sizeof(shp),
-                               (uint32_t)p->sh_stride, h, 1);
+                               (uint32_t)p->sh_stride * CRAW_SH_CHUNK, h, 1);
         craw_vk_buffer_barrier(ctx, cmd, &p->sh_d, cs, wr, cs, rd);
 
         craw_vk_image_barrier(ctx, cmd, inter, VK_IMAGE_LAYOUT_GENERAL, cs, rd | wr);

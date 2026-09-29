@@ -162,6 +162,7 @@ static const struct {
 } craw_subgroup_ops[] = {
     { "subgroup operations: basic",            VK_SUBGROUP_FEATURE_BASIC_BIT },
     { "subgroup operations: shuffle relative", VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT },
+    { "subgroup operations: quad",             VK_SUBGROUP_FEATURE_QUAD_BIT },
 };
 
 /* The first subgroup operation the device lacks in compute shaders, or

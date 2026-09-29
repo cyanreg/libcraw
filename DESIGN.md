@@ -1762,7 +1762,11 @@ estimated, and the difference is the two full resolution reads and one
 write: folding the recombine into the colour stage, which reads the
 intermediate and writes the output anyway, would take most of it back,
 at the price of the histogram seeing the unsmoothed chroma. Not done;
-1.4 ms fits.
+1.4 ms fits. The downsample was an invocation per block reading its
+sixteen pixels, 0.65 ms of that; it is an invocation per column of a
+block now, whose four loads are runs of a row across the subgroup, and a
+quad broadcast (DPP) gathers the block's columns into its first lane,
+which sums them in the reference's order: 0.49 ms, the same bits.
 
 ### 14.5 Parameters and API
 
@@ -3931,8 +3935,10 @@ The histogram then reads the sharpened intermediate, and since rho moves
 no ratio of channels its coordinates do not move; only a sample's weight
 does, with its level.
 
-Dispatches: `sharpen_prep`, one invocation per eight pixels of a row,
-writes d; then N of `sharpen`, one Richardson-Lucy iteration each, the
+Dispatches: `sharpen_prep`, one invocation per pixel of the plane's
+rows (it was one per eight pixels, whose loads a subgroup scattered over
+the row: 0.80 ms at 5.8K against 0.50 now, the same bits), writes d;
+then N of `sharpen`, one Richardson-Lucy iteration each, the
 first reading d as its estimate and each writing the plane the one before
 it did not; the last is a second pipeline of the same shader
 (specialization constant 5) that writes no plane but applies the clamp,
