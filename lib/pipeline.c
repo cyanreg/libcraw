@@ -263,16 +263,30 @@ static_assert(sizeof(CRAWFrameParams) == 264, "CRAWFrameParams size");
 #define CRAW_DN_SEARCH_R 3
 #define CRAW_DN_PATCH_R  1
 
-/* The shader's shared tile is a fixed 28x28 floats, which is a 16x16
- * workgroup plus a halo of search + patch on each side. Both of these are
- * compile-time here, so the check is too. */
-#define CRAW_DN_TILE_MAX 28
-#define CRAW_DN_WG       16
+/* The shader's register arrays are sized for a search radius of 3, a
+ * patch radius of 2 and 16 rows a lane (CRAW_DN_*_MAX in
+ * denoise_nlm.comp.glsl). */
+#define CRAW_DN_ROWS     4
 
-static_assert(CRAW_DN_WG + 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R) <= CRAW_DN_TILE_MAX,
-              "denoise tile does not fit the shader's shared array");
-static_assert((2 * CRAW_DN_PATCH_R + 1) * (2 * CRAW_DN_PATCH_R + 1) <= 25,
-              "denoise patch does not fit the shader's register array");
+static_assert(CRAW_DN_SEARCH_R <= 3 && CRAW_DN_PATCH_R <= 2 && CRAW_DN_ROWS <= 16,
+              "denoise radii do not fit the shader's register arrays");
+
+/* The denoise's tile, DESIGN.md 14.3: a subgroup's lanes less the patch
+ * radius's worth at either end, which filter nothing, across, and `bands`
+ * subgroups of CRAW_DN_ROWS rows down. */
+static uint32_t craw_dn_tile_w(uint32_t lanes)
+{
+    return lanes - 2 * CRAW_DN_PATCH_R;
+}
+
+/* The shared memory that takes, mirroring denoise_nlm.comp.glsl. */
+static uint32_t craw_dn_shared_bytes(uint32_t lanes, uint32_t bands)
+{
+    uint32_t tx = craw_dn_tile_w(lanes) + 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R);
+    uint32_t ty = bands * CRAW_DN_ROWS + 2 * (CRAW_DN_SEARCH_R + CRAW_DN_PATCH_R);
+
+    return (2 * tx * ty + 2 * (tx + 2) * (ty + 2)) * (uint32_t)sizeof(float);
+}
 
 /* Where the highlight guard of DESIGN.md 14.3 ramps the filter off, in
  * units of the sensor range above black. */
@@ -364,6 +378,7 @@ struct CRAWPipeline {
     CRAWVkShader color;
     CRAWVkShader awb_hist;
     CRAWVkShader denoise;
+    uint32_t dn_lanes, dn_bands;  /* the denoise's workgroup, subgroups */
     CRAWVkShader lens;
     CRAWVkShader false_color;
     CRAWVkShader chroma_down;
@@ -552,8 +567,8 @@ static uint32_t craw_wg_dim(const CRAWContext *ctx, uint32_t want)
 }
 
 /* A shader with a square workgroup of side `wg`, or, with `sg` set, a
- * workgroup of exactly one subgroup of that size, `sg` x 1, which the
- * device is required to run in full subgroups of `sg`. */
+ * workgroup `sg` wide and `wg` (at least 1) tall, which the device is
+ * required to run in full subgroups of `sg`: one subgroup per row. */
 static int craw_pipeline_shader_sg(CRAWPipeline *p, CRAWVkShader *sh, const char *name,
                                    const uint8_t *spirv, size_t spirv_len,
                                    const CRAWVkBinding *bindings, uint32_t nb_bindings,
@@ -567,7 +582,7 @@ static int craw_pipeline_shader_sg(CRAWPipeline *p, CRAWVkShader *sh, const char
         .bindings       = bindings,
         .nb_bindings    = nb_bindings,
         .push_size      = push_size,
-        .wg             = { sg ? sg : wg, sg ? 1 : wg, 1 },
+        .wg             = { sg ? sg : wg, sg ? CRAW_MAX(wg, 1u) : wg, 1 },
         .spec_entries   = nb_spec ? craw_spec_map : NULL,
         .nb_spec_entries = nb_spec,
         .spec_data      = nb_spec ? spec : NULL,
@@ -671,7 +686,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
 {
     CRAWPipeline *p;
     uint32_t spec[9];
-    uint32_t wg2d, wgrcd, wgdn, wgfc, shared_max;
+    uint32_t wg2d, wgrcd, wgfc, shared_max;
     int ret;
 
     if (!ctx || !params || !pipe)
@@ -729,10 +744,6 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
      * 7x7 patch per invocation, so it gets half the occupancy pressure. */
     wg2d  = craw_wg_dim(ctx, 16);
     wgrcd = craw_wg_dim(ctx, 8);
-    /* The denoise tile is sized for CRAW_DN_WG; a device that cannot run
-     * that many invocations gets a smaller one, which only shrinks the
-     * tile. */
-    wgdn  = craw_wg_dim(ctx, CRAW_DN_WG);
     /* The false colour tile has to fit the device's shared memory, and a
      * smaller workgroup only shrinks it. A limit below the 16 KB Vulkan
      * guarantees means the properties were never filled in, and only the
@@ -785,10 +796,34 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         if (ret < 0)
             goto fail;
 
-        ret = craw_pipeline_shader(p, &p->denoise, "denoise_nlm",
-                                   craw_denoise_nlm_spv_data, craw_denoise_nlm_spv_len,
-                                   craw_bind_dn, 6, sizeof(CRAWDenoisePush), wgdn,
-                                   spec, 4);
+        /* Subgroups of 32 where the device can (a shuffle is then one
+         * swizzle on RDNA), four to a workgroup, fewer where the tiles
+         * would not fit the shared memory or the invocations the
+         * workgroup. A subgroup has to have a lane left over once the
+         * patch radius is taken off either end. */
+        p->dn_lanes = CRAW_MIN(CRAW_MAX(32u, ctx->caps.min_subgroup_size),
+                               ctx->caps.max_subgroup_size);
+        p->dn_bands = 4;
+        while (p->dn_bands > 1 &&
+               (craw_dn_shared_bytes(p->dn_lanes, p->dn_bands) > shared_max ||
+                p->dn_lanes * p->dn_bands >
+                    ctx->props.properties.limits.maxComputeWorkGroupInvocations))
+            p->dn_bands /= 2;
+        if (p->dn_lanes <= 2 * CRAW_DN_PATCH_R ||
+            craw_dn_shared_bytes(p->dn_lanes, p->dn_bands) > shared_max) {
+            craw_log(ctx, CRAW_LOG_ERROR, "The device cannot run the denoise's tiles\n");
+            ret = CRAW_ERROR(ENOTSUP);
+            goto fail;
+        }
+
+        spec[7] = p->dn_lanes;
+        spec[8] = CRAW_DN_ROWS;
+        ret = craw_pipeline_shader_sg(p, &p->denoise, "denoise_nlm",
+                                      craw_denoise_nlm_spv_data, craw_denoise_nlm_spv_len,
+                                      craw_bind_dn, 6, sizeof(CRAWDenoisePush), p->dn_bands,
+                                      p->dn_lanes, spec, 9);
+        spec[7] = 0;
+        spec[8] = 0;
         if (ret < 0)
             goto fail;
     }
@@ -1918,12 +1953,16 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
         craw_vk_desc_image(&dn_writes[4], 4, v_prev);
         craw_vk_desc_image(&dn_writes[5], 5, v_next);
         /* Half resolution, four workgroups per tile, one per CFA plane,
-         * side by side in x so that they run together. */
+         * side by side in x so that they run together. A tile is the
+         * subgroup's lanes less the patch radius at either end wide, and
+         * its bands' rows tall. */
         {
-            uint32_t wgx = p->denoise.wg[0];
+            uint32_t ox = craw_dn_tile_w(p->dn_lanes);
+            uint32_t oy = p->dn_bands * CRAW_DN_ROWS;
 
             craw_pipeline_dispatch(p, cmd, &p->denoise, dn_writes, 6, &dp, sizeof(dp),
-                                   4 * wgx * ((w / 2 + wgx - 1) / wgx), h / 2, 1);
+                                   4 * p->dn_lanes * ((w / 2 + ox - 1) / ox),
+                                   p->dn_bands * ((h / 2 + oy - 1) / oy), 1);
         }
 
         craw_vk_image_barrier(ctx, cmd, &p->clean, VK_IMAGE_LAYOUT_GENERAL,

@@ -1441,13 +1441,44 @@ which is a range filter with the same noise-adaptive threshold.
 One workgroup per tile of one plane, the four planes of a tile four
 neighbouring workgroups in x, so one dispatch covers all four (14.7 says
 why the planes are interleaved rather than in `gl_WorkGroupID.z`, as they
-were first). The workgroup loads
-its tile plus a halo of S + P into shared memory, already stabilised, and
-each invocation keeps its own patch in registers; every search position is
-then one pass over the patch in shared memory. The shared array is a fixed
-28x28 floats, which is a 16x16 workgroup plus a halo of 6, and
-`lib/pipeline.c` static-asserts that the configured radii fit. With the
-temporal pass of 14.7 the tile holds what that pass made of the plane.
+were first). The workgroup loads its tile plus a halo of S + P into
+shared memory, already stabilised; with the temporal pass of 14.7 the
+tile holds what that pass made of the plane.
+
+The workgroup is four subgroups of 32 stacked, each a band of M = 4 rows;
+a lane owns a column of its band and filters its four samples. For one
+search offset the lane forms the squared difference of its column
+against the offset column once per row of the band's patches, sums it
+along x with its neighbours' through `subgroupShuffleUp/Down` (a
+`ds_swizzle` each in wave32 on RDNA) and along y in registers, which is
+every patch distance of the band for two adds and two shuffles a row and
+two adds a sample, where each sample used to read (2P + 1)^2 = 9 values
+of shared memory per search position; and the offset column is read from
+the tile once for all 2S + 1 offsets that share its dx. The P lanes at
+either end of a subgroup have a neighbour on one side only and filter
+nothing, so a tile is 30 x 16 samples. The weight exp(-max(d2 - thr, 0)
+/ h^2) is evaluated as exp2(min(d2 c1 + c0, 0)) with the constants folded
+per sample, two multiplies fewer a neighbour. The search is then bound by
+its VALU: 13 instructions a neighbour, one of them the exp, 14.5 with a
+history, and three swizzles alongside. The sums are in
+another order than before, left to right along x as the reference sums a
+row but not the reference's raster order over the patch, so the result
+moves by rounding: on the real frame 0.18% of the output pixels change,
+by at most 4e-3 of the pixel, and every error `test_pipeline` prints is
+the same to the digits it prints. `lib/pipeline.c` sizes the tile and
+checks it against the device's shared memory (16 KB here), halving the
+bands on a device with less, and static-asserts the radii against the
+shader's register arrays (S up to 3, P up to 2, 16 rows).
+
+Measured against the tiled version it replaces, the pass alone at 5.8K,
+back to back, median of 20 over three runs: spatial 2.02 ms to 1.18,
+spatial and temporal 2.60 to 1.59, temporal alone 0.71 to 0.73 (the
+temporal pass alone is memory bound, and the new tile loses two lanes in
+32 to the patch it does not use). DPP instead of the swizzles
+(`subgroupClusteredRotate` over clusters of 16, which ACO folds into the
+adds as a row rotate) measured 1.54 ms against 1.27 for the swizzles at
+the same instruction count and was dropped; wave64, where a shuffle is
+three `ds_bpermute`, over 5 ms. The table below is the tiled version's.
 
 #### The highlight guard
 
@@ -1953,7 +1984,8 @@ sample further out than the spatial tile (26x26 for a 16x16 workgroup and
 the 7x7/3x3 filter), works out t' and v for the tile, and the spatial
 filter runs on that; the temporal value of a sample is a function of the
 3x3 around it, mirrored, so every tile that holds a sample holds the same
-number. Shared memory is 13.5 KB. With the spatial filter off the tile is
+number. Shared memory is 13.5 KB (16 KB since the subgroup version of
+14.3, whose tile is 30 x 16). With the spatial filter off the tile is
 the workgroup plus the one sample.
 
 The four planes of a tile are four neighbouring workgroups in x rather
