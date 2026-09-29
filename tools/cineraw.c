@@ -119,6 +119,9 @@ struct tool_cfg {
     uint32_t false_color;     /* median passes after the debayer, 0 = off */
     bool highlights;          /* rebuild clipped highlights, DESIGN.md 18 */
     float defringe;           /* DESIGN.md 19, 0 = off */
+    float sharpen_radius;     /* DESIGN.md 20, 0 = off */
+    uint32_t sharpen_iterations;
+    float sharpen_contrast;
 
     enum tool_lens lens;
 
@@ -303,6 +306,20 @@ static void tool_usage(FILE *f)
 "                      (default: 1): the purple, blue and pink rims chromatic\n"
 "                      aberration leaves along lamps, windows and branches\n"
 "                      against the sky. 0 is off. DESIGN.md 19\n"
+"  --sharpen RADIUS[,ITERATIONS[,CONTRAST]]\n"
+"                      capture sharpening, after every other stage on the\n"
+"                      camera RGB: RADIUS is the sigma in pixels of the\n"
+"                      Gaussian blur undone (0.8 is this camera's in-focus\n"
+"                      blur, up to %g), ITERATIONS the Richardson-Lucy\n"
+"                      iterations (default 20, at most %d, 0.4 ms each at\n"
+"                      5.8K), CONTRAST the local contrast below which\n"
+"                      nothing is sharpened, in units of the modelled noise\n"
+"                      like --denoise (default 1; 0 sharpens noise too; with\n"
+"                      --denoise, 0.5 sharpens more texture and none of the\n"
+"                      noise it leaves). The luma is sharpened and every\n"
+"                      channel scaled with it, so no colour moves, and no\n"
+"                      pixel goes past the range of its neighbours, so a\n"
+"                      lamp gets no dark ring. Off by default. DESIGN.md 20\n"
 "  --denoise STRENGTH[,CHROMA[,TEMPORAL]]\n"
 "                      raw domain denoising at this strength: 1.0 removes\n"
 "                      noise at the level the camera's noise model predicts,\n"
@@ -362,6 +379,7 @@ static void tool_usage(FILE *f)
 "has just processed and applies the smoothed result to the *next* frame, so\n"
 "the correction lags the picture by one frame. That is deliberate for now:\n"
 "correcting the frame itself would mean running the pipeline twice.\n",
+    (double)CRAW_SHARPEN_MAX_RADIUS, CRAW_SHARPEN_MAX_ITERATIONS,
     craw_tool_profile_builtin_list());
 }
 
@@ -889,6 +907,8 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
         pp.flags |= CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION;
     if (cfg->defringe > 0.0f)
         pp.flags |= CRAW_PIPELINE_FLAG_DEFRINGE;
+    if (cfg->sharpen_radius > 0.0f)
+        pp.flags |= CRAW_PIPELINE_FLAG_SHARPEN;
     /* Only built once a frame has been seen to carry a record: a clip
      * without one never pays for the extra image. */
     if (lens)
@@ -1558,6 +1578,53 @@ static int tool_parse_wb(struct tool_cfg *cfg, const char *arg)
 }
 
 /* `X,Y,W,H` in output pixels. */
+/* --sharpen RADIUS[,ITERATIONS[,CONTRAST]]: the two left out keep the
+ * defaults tool_parse_args() set. */
+static int tool_parse_sharpen(struct tool_cfg *cfg, const char *arg)
+{
+    const char *at = arg;
+    double v[3];
+    char *end;
+    int n = 0;
+
+    while (n < 3) {
+        v[n] = strtod(at, &end);
+        if (end == at)
+            break;
+        n++;
+        if (*end != ',')
+            break;
+        at = end + 1;
+    }
+    if (!n || *end) {
+        fprintf(stderr, "--sharpen: expected RADIUS[,ITERATIONS[,CONTRAST]], got `%s`\n", arg);
+        return CRAW_ERROR(EINVAL);
+    }
+    if (!(v[0] >= 0.0 && v[0] <= CRAW_SHARPEN_MAX_RADIUS)) {
+        fprintf(stderr, "--sharpen: RADIUS must be 0 to %g, got %g\n",
+                (double)CRAW_SHARPEN_MAX_RADIUS, v[0]);
+        return CRAW_ERROR(EINVAL);
+    }
+    cfg->sharpen_radius = (float)v[0];
+    if (n > 1) {
+        if (!(v[1] >= 0.0 && v[1] <= CRAW_SHARPEN_MAX_ITERATIONS) || v[1] != (double)(int)v[1]) {
+            fprintf(stderr, "--sharpen: ITERATIONS must be 0 to %d, got %g\n",
+                    CRAW_SHARPEN_MAX_ITERATIONS, v[1]);
+            return CRAW_ERROR(EINVAL);
+        }
+        cfg->sharpen_iterations = (uint32_t)v[1];
+    }
+    if (n > 2) {
+        if (!(v[2] >= 0.0 && v[2] < 1e6)) {
+            fprintf(stderr, "--sharpen: CONTRAST must be 0 or more, got %g\n", v[2]);
+            return CRAW_ERROR(EINVAL);
+        }
+        cfg->sharpen_contrast = (float)v[2];
+    }
+
+    return 0;
+}
+
 static int tool_parse_crop(struct tool_cfg *cfg, const char *arg)
 {
     double v[4];
@@ -1698,6 +1765,7 @@ enum {
     TOOL_OPT_FALSE_COLOUR,
     TOOL_OPT_HIGHLIGHTS,
     TOOL_OPT_DEFRINGE,
+    TOOL_OPT_SHARPEN,
     TOOL_OPT_NOISE,
     TOOL_OPT_NOISE_EST,
     TOOL_OPT_LENS,
@@ -1729,6 +1797,7 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         { "false-colour",   required_argument, NULL, TOOL_OPT_FALSE_COLOUR },
         { "highlights",     required_argument, NULL, TOOL_OPT_HIGHLIGHTS },
         { "defringe",       required_argument, NULL, TOOL_OPT_DEFRINGE },
+        { "sharpen",        required_argument, NULL, TOOL_OPT_SHARPEN   },
         { "noise",          required_argument, NULL, TOOL_OPT_NOISE     },
         { "noise-estimate", no_argument,       NULL, TOOL_OPT_NOISE_EST },
         { "lens",           required_argument, NULL, TOOL_OPT_LENS      },
@@ -1752,6 +1821,10 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         /* On with it: the fringes it takes out are the ones the rebuilt
          * highlights stop hiding. */
         .defringe = 1.0f,
+        /* Off, as in every raw converter; --sharpen RADIUS alone takes
+         * these two. DESIGN.md 20.4. */
+        .sharpen_iterations = 20,
+        .sharpen_contrast = 1.5f,
     };
 
     while ((c = getopt_long(argc, argv, "o:vh", opts, NULL)) != -1) {
@@ -1907,6 +1980,10 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
                 return CRAW_ERROR(EINVAL);
             }
             cfg->defringe = (float)d;
+            break;
+        case TOOL_OPT_SHARPEN:
+            if ((ret = tool_parse_sharpen(cfg, optarg)) < 0)
+                return ret;
             break;
         case TOOL_OPT_HIGHLIGHTS:
             if ((ret = tool_lookup(tool_switches, "--highlights", optarg, &v)) < 0)
@@ -2335,6 +2412,9 @@ have_device:
         fp.noise_override = cfg.noise;
         fp.false_color_passes = cfg.false_color;
         fp.defringe_strength = cfg.defringe;
+        fp.sharpen_radius = cfg.sharpen_radius;
+        fp.sharpen_iterations = cfg.sharpen_iterations;
+        fp.sharpen_contrast = cfg.sharpen_contrast;
         fp.lens = lens;
 
         if (cfg.wb == TOOL_WB_FIXED) {

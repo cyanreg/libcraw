@@ -43,6 +43,8 @@ craw_shader_names = [
     'highlight_fill',
     'defringe_prep',
     'defringe',
+    'sharpen_prep',
+    'sharpen',
 ]
 
 spv_embed = files('../../tools/spv_embed.py')
@@ -53,7 +55,7 @@ foreach name : craw_shader_names
         name + '_spv',
         input: name + '.comp.glsl',
         output: name + '.spv',
-        depend_files: files('common.glsl', 'highlight.glsl', 'defringe.glsl'),
+        depend_files: files('common.glsl', 'highlight.glsl', 'defringe.glsl', 'sharpen.glsl'),
         command: [ glslang_prog, '--target-env', 'vulkan1.4', '-V', '-S', 'comp',
                    '--glsl-version', '460', '-I' + meson.current_source_dir(),
                    '@INPUT@', '-o', '@OUTPUT@' ],

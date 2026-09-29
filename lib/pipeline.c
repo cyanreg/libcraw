@@ -15,6 +15,7 @@
 
 #include "vk_runtime.h"
 #include "gamut.h"
+#include "sharpen.h"
 
 #include "debayer_bilinear.spv.h"
 #include "debayer_mhc.spv.h"
@@ -35,6 +36,8 @@
 #include "highlight_fill.spv.h"
 #include "defringe_prep.spv.h"
 #include "defringe.spv.h"
+#include "sharpen_prep.spv.h"
+#include "sharpen.spv.h"
 
 /* Every debayer pass shares this block; it mirrors CRAWPrepPushBuf in
  * lib/shaders/common.glsl field for field. Scalar layout gives every member
@@ -198,6 +201,25 @@ typedef struct CRAWDefringePush {
 static_assert(sizeof(CRAWDefringePush) == 12, "CRAWDefringePush layout");
 static_assert(offsetof(CRAWDefringePush, strength) == 8, "CRAWDefringePush layout");
 
+/* Mirrors CRAWSharpenPushBuf in lib/shaders/sharpen.glsl, which both
+ * sharpening passes read. The taps and the noise coefficients come from
+ * lib/sharpen.h, which the CPU reference uses too. */
+typedef struct CRAWSharpenPush {
+    int32_t size[2];
+    int32_t stride;        /* a plane's row, in chunks of eight pixels */
+    float   k[CRAW_SH_RMAX + 1];  /* taps up to the reach, which is the
+                                   * iteration's specialization constant */
+    float   contrast;      /* the mask's threshold in noise units, 0: none */
+    float   noise_a;       /* the contrast statistic's modelled variance */
+    float   noise_b;       /* at level L is noise_a * L + noise_b */
+} CRAWSharpenPush;
+
+static_assert(sizeof(CRAWSharpenPush) == 52, "CRAWSharpenPush layout");
+static_assert(offsetof(CRAWSharpenPush, stride) == 8, "CRAWSharpenPush layout");
+static_assert(offsetof(CRAWSharpenPush, k) == 12, "CRAWSharpenPush layout");
+static_assert(offsetof(CRAWSharpenPush, contrast) == 40, "CRAWSharpenPush layout");
+static_assert(offsetof(CRAWSharpenPush, noise_b) == 48, "CRAWSharpenPush layout");
+
 /* Mirrors CRAWChromaPushBuf in the three lib/shaders/chroma_*.comp.glsl;
  * each pass reads the fields it needs. */
 typedef struct CRAWChromaPush {
@@ -290,6 +312,26 @@ static uint32_t craw_fc_shared_bytes(uint32_t wg)
 #define CRAW_HL_BLOCK      4
 #define CRAW_HL_MAX_LEVELS 16
 
+/* The capture sharpening's planes are fp16 in chunks of eight pixels,
+ * DESIGN.md 20.3. */
+#define CRAW_SH_CHUNK    8
+
+/* The shared memory an iteration of reach r takes on a square workgroup
+ * of side wg, mirroring the tile sizes in lib/shaders/sharpen.comp.glsl. */
+static uint32_t craw_sh_shared_bytes(uint32_t wg, uint32_t r)
+{
+    const uint32_t nb = 4;
+    uint32_t rd = CRAW_MAX(r, (uint32_t)CRAW_SH_MASK_R + 1);
+    uint32_t cu0 = (2 * r + 7) / 8, ncu = cu0 + (wg + 2 * r + 7) / 8;
+    uint32_t cd0 = (rd + 7) / 8, ncd = cd0 + (wg + rd + 7) / 8;
+    uint32_t uy = wg + 4 * r, bx = wg + 2 * r, dy = wg + 2 * rd;
+    uint32_t hx = (bx + nb - 1) / nb * nb;
+    uint32_t a = CRAW_MAX(uy * (ncu * 8 + nb), bx * bx);
+    uint32_t h = CRAW_MAX((uy + nb) * hx, bx * wg);
+
+    return (a + h + dy * ncd * 8) * (uint32_t)sizeof(float);
+}
+
 #define CRAW_AWB_HIST_ENTRIES (CRAW_AWB_HIST_BINS * CRAW_AWB_HIST_BINS)
 #define CRAW_AWB_HIST_BYTES   (CRAW_AWB_HIST_ENTRIES * (uint32_t)sizeof(uint32_t))
 
@@ -306,6 +348,7 @@ struct CRAWPipeline {
     bool has_hl;
     bool has_df;
     bool has_temporal;
+    bool has_sh;
 
     /* One of `debayer` or the three RCD passes is created, never both.
      * rcd_rb exists twice, once per phase of DESIGN.md 5.3 pass C. */
@@ -327,6 +370,9 @@ struct CRAWPipeline {
     CRAWVkShader hl_fill;
     CRAWVkShader df_prep;
     CRAWVkShader df;
+    CRAWVkShader sh_prep;
+    /* Sharpening: [1] is the last iteration, and one of each per reach. */
+    CRAWVkShader sh_iter[2][CRAW_SH_RMAX];
 
     CRAWVkImage inter;   /* camera RGB, RGBA16F */
     CRAWVkImage aux;     /* RCD: (L, wv, wp, unused), RGBA16F */
@@ -342,6 +388,9 @@ struct CRAWPipeline {
     CRAWVkImage hl_level[CRAW_HL_MAX_LEVELS]; /* highlights: the colour field
                                                * and its pyramid, RGBA32F */
     uint32_t nb_hl_levels;
+    CRAWVkBuffer sh_d;      /* sharpening: the observed luma, fp16 */
+    CRAWVkBuffer sh_u[2];   /* sharpening: the estimate, ping-pong, fp16 */
+    int32_t sh_stride;      /* their rows, in chunks of eight pixels */
 
     /* Temporal denoise, DESIGN.md 14.7: two sets of state, each the
      * temporally filtered level of every mosaic sample of one frame
@@ -394,6 +443,17 @@ static const CRAWVkBinding craw_bind_dn[6] = {
     { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
 };
 
+/* The sharpening's iteration: the estimate, the observed luma, the next
+ * estimate, and the camera RGB intermediate the last iteration writes.
+ * Its first pass takes the prefix of craw_bind_awb: the intermediate, and
+ * the luma it writes. */
+static const CRAWVkBinding craw_bind_sharpen[4] = {
+    { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+    { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+    { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
+    { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
+};
+
 static const CRAWVkBinding craw_bind_awb[4] = {
     { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE },
     { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },
@@ -404,15 +464,18 @@ static const CRAWVkBinding craw_bind_awb[4] = {
 /* Specialization constants below 253: 0 is the CFA phase (common.glsl), 1
  * the RCD pass C phase (rcd_rb.comp.glsl), 2 and 3 the denoise search and
  * patch radii (denoise_nlm.comp.glsl), 4 the false colour tile side
- * (false_color.comp.glsl). A shader that does not declare one of these
- * ignores its map entry, so every shader is given the prefix of this
- * array it needs. */
-static const VkSpecializationMapEntry craw_spec_map[5] = {
+ * (false_color.comp.glsl), 5 and 6 the sharpening's last iteration and
+ * its kernel's reach (sharpen.comp.glsl). A shader that does not declare
+ * one of these ignores its map entry, so every shader is given the prefix
+ * of this array it needs. */
+static const VkSpecializationMapEntry craw_spec_map[7] = {
     { .constantID = 0, .offset = 0,                    .size = sizeof(uint32_t) },
     { .constantID = 1, .offset = 1 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 2, .offset = 2 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 3, .offset = 3 * sizeof(uint32_t), .size = sizeof(uint32_t) },
     { .constantID = 4, .offset = 4 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 5, .offset = 5 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = 6, .offset = 6 * sizeof(uint32_t), .size = sizeof(uint32_t) },
 };
 
 void craw_pipeline_params_init(CRAWPipelineParams *p)
@@ -485,7 +548,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
                          CRAWPipeline **pipe)
 {
     CRAWPipeline *p;
-    uint32_t spec[5];
+    uint32_t spec[7];
     uint32_t wg2d, wgrcd, wgdn, wgfc, shared_max;
     int ret;
 
@@ -534,6 +597,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     p->has_df = !!(params->flags & CRAW_PIPELINE_FLAG_DEFRINGE);
     p->has_temporal = !!(params->flags & CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE);
     p->tn_prev = p->tn_cur = -1;
+    p->has_sh = !!(params->flags & CRAW_PIPELINE_FLAG_SHARPEN);
     p->qsize[0] = (int32_t)((params->width + 3) / 4);
     p->qsize[1] = (int32_t)((params->height + 3) / 4);
     p->blocks[0] = (int32_t)(params->width / CRAW_AWB_BLOCK);
@@ -566,6 +630,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
     spec[2] = CRAW_DN_SEARCH_R;
     spec[3] = CRAW_DN_PATCH_R;
     spec[4] = craw_fc_tile(wgfc);
+    spec[5] = 0;
+    spec[6] = 1;
 
     /* The temporal pass is part of the raw stage's dispatch (DESIGN.md
      * 14.7), so either flag builds the stage. */
@@ -785,6 +851,74 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
             goto fail;
     }
 
+    if (p->has_sh) {
+        if (params->width < CRAW_SH_MIN_SIZE || params->height < CRAW_SH_MIN_SIZE) {
+            craw_log(ctx, CRAW_LOG_ERROR,
+                     "Sharpening needs a frame of at least %ux%u, got %ux%u\n",
+                     (unsigned)CRAW_SH_MIN_SIZE, (unsigned)CRAW_SH_MIN_SIZE,
+                     params->width, params->height);
+            ret = CRAW_ERROR(EINVAL);
+            goto fail;
+        }
+
+        /* The observed luma and two estimates to ping-pong between, fp16:
+         * a rounding of at most 2^-11 relative, 7.4 / sqrt(u) times below
+         * the sensor's own noise and so seven times below it even at the
+         * clip (DESIGN.md 18.3 has the same argument). Storage buffers
+         * rather than images, eight pixels to a 16-byte chunk, so that an
+         * iteration loads its tiles a chunk at a time. */
+        p->sh_stride = (int32_t)((params->width + CRAW_SH_CHUNK - 1) / CRAW_SH_CHUNK);
+        {
+            VkDeviceSize bytes = (VkDeviceSize)p->sh_stride * params->height * 16;
+
+            ret = craw_vk_buffer_create(ctx, &p->sh_d, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                        CRAW_MEM_DEVICE);
+            for (int i = 0; i < 2 && ret >= 0; i++)
+                ret = craw_vk_buffer_create(ctx, &p->sh_u[i], bytes,
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, CRAW_MEM_DEVICE);
+            if (ret < 0)
+                goto fail;
+        }
+
+        ret = craw_pipeline_shader(p, &p->sh_prep, "sharpen_prep",
+                                   craw_sharpen_prep_spv_data, craw_sharpen_prep_spv_len,
+                                   craw_bind_awb, 2, sizeof(CRAWSharpenPush), wg2d, NULL, 0);
+        if (ret < 0)
+            goto fail;
+
+        /* A pipeline per reach and per kind of iteration, twelve in all:
+         * with the reach a constant, every tile size, loop and divisor in
+         * the shader is one. The tile has to fit the device's shared
+         * memory, which at the widest reach and 16x16 is a few hundred
+         * bytes over the 16 KB Vulkan guarantees; a smaller workgroup only
+         * shrinks it, and the chunked loads need at least 8. */
+        for (uint32_t r = 1; r <= CRAW_SH_RMAX; r++) {
+            uint32_t wg = craw_wg_dim(ctx, 16);
+
+            while (wg > 8 && craw_sh_shared_bytes(wg, r) > shared_max)
+                wg /= 2;
+            if (wg < 8 || craw_sh_shared_bytes(wg, r) > shared_max) {
+                craw_log(ctx, CRAW_LOG_ERROR, "The device cannot run the sharpening's tiles\n");
+                ret = CRAW_ERROR(ENOTSUP);
+                goto fail;
+            }
+
+            for (uint32_t i = 0; i < 2; i++) {
+                spec[5] = i;
+                spec[6] = r;
+                ret = craw_pipeline_shader(p, &p->sh_iter[i][r - 1],
+                                           i ? "sharpen_last" : "sharpen",
+                                           craw_sharpen_spv_data, craw_sharpen_spv_len,
+                                           craw_bind_sharpen, 4, sizeof(CRAWSharpenPush), wg,
+                                           spec, 7);
+                if (ret < 0)
+                    goto fail;
+            }
+        }
+        spec[5] = 0;
+        spec[6] = 1;
+    }
+
     if (p->has_fc) {
         ret = craw_pipeline_shader(p, &p->false_color, "false_color",
                                    craw_false_color_spv_data, craw_false_color_spv_len,
@@ -849,7 +983,7 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
         }
     }
 
-    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s%s%s\n",
+    craw_log(ctx, CRAW_LOG_VERBOSE, "Pipeline: %ux%u, debayer %d, workgroup %ux%u%s%s%s%s%s%s%s%s%s\n",
              params->width, params->height, (int)params->debayer, wg2d, wg2d,
              p->awb ? ", awb histogram" : "",
              p->has_temporal ? ", temporal denoise" : "",
@@ -858,7 +992,8 @@ int craw_pipeline_create(CRAWContext *ctx, const CRAWPipelineParams *params,
              p->has_fc ? (wgfc == CRAW_FC_WG_MAX ? ", false colour" : ", false colour (small tile)") : "",
              p->has_df ? ", defringe" : "",
              p->has_chroma ? ", chroma denoise" : "",
-             p->has_lens ? ", lens" : "");
+             p->has_lens ? ", lens" : "",
+             p->has_sh ? ", sharpen" : "");
 
     *pipe = p;
     return 0;
@@ -916,6 +1051,12 @@ void craw_pipeline_free(CRAWPipeline **pipe)
         craw_vk_shader_free(ctx, &p->df_prep);
     if (p->df.pipeline)
         craw_vk_shader_free(ctx, &p->df);
+    if (p->sh_prep.pipeline)
+        craw_vk_shader_free(ctx, &p->sh_prep);
+    for (int i = 0; i < 2; i++)
+        for (int r = 0; r < CRAW_SH_RMAX; r++)
+            if (p->sh_iter[i][r].pipeline)
+                craw_vk_shader_free(ctx, &p->sh_iter[i][r]);
 
     if (p->inter.image)
         craw_vk_image_free(ctx, &p->inter);
@@ -942,6 +1083,11 @@ void craw_pipeline_free(CRAWPipeline **pipe)
     for (uint32_t i = 0; i < p->nb_hl_levels; i++)
         if (p->hl_level[i].image)
             craw_vk_image_free(ctx, &p->hl_level[i]);
+    if (p->sh_d.buf)
+        craw_vk_buffer_free(ctx, &p->sh_d);
+    for (int i = 0; i < 2; i++)
+        if (p->sh_u[i].buf)
+            craw_vk_buffer_free(ctx, &p->sh_u[i]);
 
     if (p->hist_count.buf)
         craw_vk_buffer_free(ctx, &p->hist_count);
@@ -991,12 +1137,35 @@ static int craw_pipeline_prep_push(CRAWPipeline *p, const CRAWProfile *prof,
     return 0;
 }
 
-/* Resolves the frame's noise model and turns it into the shader's
- * constants, DESIGN.md 14.3. The model is looked up at the sensor's own
- * exposure index (as_shot_ei) and not at the working one: rating a clip at
- * a different index scales the picture afterwards, it does not change how
- * the sensels were read. `mode` says which of the two filters run; the
- * temporal one's history bit is the caller's to add. */
+/* Resolves the frame's noise model, for the denoise and for the
+ * sharpening's mask alike: the override when it carries a positive a, else
+ * the profile's table. The model is looked up at the sensor's own exposure
+ * index (as_shot_ei) and not at the working one: rating a clip at a
+ * different index scales the picture afterwards, it does not change how
+ * the sensels were read. */
+static int craw_pipeline_noise_model(CRAWPipeline *p, const CRAWProfile *prof,
+                                     const CRAWFrameParams *fp, const char *what,
+                                     CRAWNoiseModel *nm)
+{
+    int ret;
+
+    if (fp->noise_override.a > 0.0f) {
+        *nm = fp->noise_override;
+        return 0;
+    }
+
+    ret = craw_profile_noise_eval(prof, prof->as_shot_ei, nm);
+    if (ret < 0)
+        craw_log(p->ctx, CRAW_LOG_ERROR,
+                 "%s needs a noise model: the profile `%s` has no table and "
+                 "CRAWFrameParams.noise_override was not set\n", what,
+                 prof->name[0] ? prof->name : "(unnamed)");
+    return ret;
+}
+
+/* Turns the frame's noise model into the denoise shader's constants,
+ * DESIGN.md 14.3. `mode` says which of the two filters run; the temporal
+ * one's history bit is the caller's to add. */
 static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
                                       const CRAWFrameParams *fp, int32_t mode,
                                       CRAWDenoisePush *dp)
@@ -1005,18 +1174,9 @@ static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
     float a, b, c, sc, h;
     int ret;
 
-    if (fp->noise_override.a > 0.0f) {
-        nm = fp->noise_override;
-    } else {
-        ret = craw_profile_noise_eval(prof, prof->as_shot_ei, &nm);
-        if (ret < 0) {
-            craw_log(p->ctx, CRAW_LOG_ERROR,
-                     "Denoising needs a noise model: the profile `%s` has no table and "
-                     "CRAWFrameParams.noise_override was not set\n",
-                     prof->name[0] ? prof->name : "(unnamed)");
-            return ret;
-        }
-    }
+    ret = craw_pipeline_noise_model(p, prof, fp, "Denoising", &nm);
+    if (ret < 0)
+        return ret;
 
     a = nm.a;
     b = CRAW_MAX(nm.b, 0.0f);
@@ -1056,6 +1216,54 @@ static int craw_pipeline_denoise_push(CRAWPipeline *p, const CRAWProfile *prof,
         dp->black[i] = prof->black_level[i];
         dp->inv_range[i] = 1.0f / range;
         dp->range[i] = range;
+    }
+
+    return 0;
+}
+
+/* The sharpening's push constants, DESIGN.md 20: the Gaussian's taps for
+ * the frame's radius and, when the mask is on, the luma's modelled noise
+ * from the same model the denoise uses, under the frame's own gains. */
+static int craw_pipeline_sharpen_push(CRAWPipeline *p, const CRAWProfile *prof,
+                                      const CRAWFrameParams *fp, const float wb[3],
+                                      CRAWSharpenPush *sp, int *reach)
+{
+    CRAWNoiseModel nm;
+    int ret;
+
+    if (!(fp->sharpen_radius <= CRAW_SHARPEN_MAX_RADIUS)) {
+        craw_log(p->ctx, CRAW_LOG_ERROR, "sharpen_radius = %g; at most %g\n",
+                 (double)fp->sharpen_radius, (double)CRAW_SHARPEN_MAX_RADIUS);
+        return CRAW_ERROR(EINVAL);
+    }
+    if (fp->sharpen_iterations > CRAW_SHARPEN_MAX_ITERATIONS) {
+        craw_log(p->ctx, CRAW_LOG_ERROR, "sharpen_iterations = %u; at most %u\n",
+                 fp->sharpen_iterations, (unsigned)CRAW_SHARPEN_MAX_ITERATIONS);
+        return CRAW_ERROR(EINVAL);
+    }
+    if (!(fp->sharpen_contrast >= 0.0f) || !isfinite(fp->sharpen_contrast)) {
+        craw_log(p->ctx, CRAW_LOG_ERROR, "sharpen_contrast = %g is not a threshold\n",
+                 (double)fp->sharpen_contrast);
+        return CRAW_ERROR(EINVAL);
+    }
+
+    *sp = (CRAWSharpenPush) {
+        .size     = { (int32_t)p->params.width, (int32_t)p->params.height },
+        .stride   = p->sh_stride,
+        .contrast = fp->sharpen_contrast,
+    };
+    *reach = craw_sharpen_kernel(fp->sharpen_radius, sp->k);
+
+    if (fp->sharpen_contrast > 0.0f) {
+        ret = craw_pipeline_noise_model(p, prof, fp, "The sharpening's contrast mask", &nm);
+        if (ret < 0)
+            return ret;
+        if (!(nm.a > 0.0f)) {
+            craw_log(p->ctx, CRAW_LOG_ERROR, "Noise model a = %g is not positive\n",
+                     (double)nm.a);
+            return CRAW_ERROR(EINVAL);
+        }
+        craw_sharpen_noise(&nm, wb, &sp->noise_a, &sp->noise_b);
     }
 
     return 0;
@@ -1248,8 +1456,10 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
     CRAWFalseColorPush fcp;
     CRAWChromaPush cdp;
     CRAWDefringePush dfp;
+    CRAWSharpenPush shp;
+    int sh_reach = 1;
     enum CRAWColorSpace out_space;
-    bool denoise, lens, false_color, chroma, highlights, defringe;
+    bool denoise, lens, false_color, chroma, highlights, defringe, sharpen;
     bool spatial, temporal, replay;
     int t_read, t_write;
     int32_t dn_mode;
@@ -1380,6 +1590,16 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
             .qsize    = { p->qsize[0], p->qsize[1] },
             .strength = fp->denoise_chroma_strength,
         };
+    }
+
+    /* No iterations or no radius is the documented way to leave one frame
+     * alone. The mask's noise is the luma's under the frame's own gains,
+     * which is what the intermediate holds. */
+    sharpen = p->has_sh && fp->sharpen_iterations > 0 && fp->sharpen_radius > 0.0f;
+    if (sharpen) {
+        ret = craw_pipeline_sharpen_push(p, fp->profile, fp, frame.wb, &shp, &sh_reach);
+        if (ret < 0)
+            return ret;
     }
 
     /* A correction marked invalid is the documented way to leave one frame
@@ -1701,6 +1921,48 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
         CRAWVkImage *t = inter;
         inter = other;
         other = t;
+    }
+
+    if (sharpen) {
+        /* DESIGN.md 20.3: the observed luma, then the iterations, the first
+         * reading the luma as its estimate and each writing the plane the
+         * one before it did not, and the last multiplying the
+         * intermediate's own texels in place, so the two full resolution
+         * images keep their roles. The planes are buffers, whose barriers
+         * are spelled out: each write waits for the reads before it, in
+         * this recording or the last one. */
+        const VkPipelineStageFlags2 cs = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        const VkAccessFlags2 rd = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        const VkAccessFlags2 wr = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        CRAWVkBuffer *u = &p->sh_d;
+
+        craw_vk_buffer_barrier(ctx, cmd, &p->sh_d, cs, rd, cs, wr);
+        craw_vk_desc_image(&writes[0], 0, inter);
+        craw_vk_desc_buffer(&writes[1], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &p->sh_d, 0, 0);
+        craw_pipeline_dispatch(p, cmd, &p->sh_prep, writes, 2, &shp, sizeof(shp),
+                               (uint32_t)p->sh_stride, h, 1);
+        craw_vk_buffer_barrier(ctx, cmd, &p->sh_d, cs, wr, cs, rd);
+
+        craw_vk_image_barrier(ctx, cmd, inter, VK_IMAGE_LAYOUT_GENERAL, cs, rd | wr);
+        for (uint32_t it = 0; it < fp->sharpen_iterations; it++) {
+            bool last = it + 1 == fp->sharpen_iterations;
+            CRAWVkBuffer *out = &p->sh_u[it & 1];
+
+            /* The last iteration writes no plane, but the binding is part
+             * of the shader and is given the one it would have written. */
+            if (!last)
+                craw_vk_buffer_barrier(ctx, cmd, out, cs, rd, cs, wr);
+            craw_vk_desc_buffer(&writes[0], 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, u, 0, 0);
+            craw_vk_desc_buffer(&writes[1], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, &p->sh_d, 0, 0);
+            craw_vk_desc_buffer(&writes[2], 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, out, 0, 0);
+            craw_vk_desc_image(&writes[3], 3, inter);
+            craw_pipeline_dispatch(p, cmd, &p->sh_iter[last][sh_reach - 1], writes, 4,
+                                   &shp, sizeof(shp), w, h, 1);
+            if (!last)
+                craw_vk_buffer_barrier(ctx, cmd, out, cs, wr, cs, rd);
+            u = out;
+        }
+        craw_vk_image_barrier(ctx, cmd, inter, VK_IMAGE_LAYOUT_GENERAL, cs, rd);
     }
 
     if (p->awb) {

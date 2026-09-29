@@ -1909,6 +1909,33 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
     }
 }
 
+/* The "Sharpen" section: the capture sharpening of DESIGN.md 20, the last
+ * stage on the camera RGB. The pipeline is always built with it (gpu.c), so
+ * every row is live. The iteration count is the one a paused picture and an
+ * export get; while the clip plays the pass runs at most
+ * VIEW_SHARPEN_PLAY_ITERATIONS, and pausing puts the picture through again
+ * at the full count. The contrast row greys on a camera with no noise
+ * model, where there is nothing to measure contrast against and the stage
+ * sharpens everything. */
+static void view_panel_sharpen(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_sharpen *sh = &st->sharpen;
+    bool grey = !view_denoise_model(st, NULL, NULL);
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    nk_property_float(ctx, "#radius", 0.3f, &sh->radius, CRAW_SHARPEN_MAX_RADIUS, 0.05f, 0.005f);
+    nk_slider_float(ctx, 0.3f, &sh->radius, CRAW_SHARPEN_MAX_RADIUS, 0.05f);
+    nk_property_int(ctx, "#iterations", 1, &sh->iterations, CRAW_SHARPEN_MAX_ITERATIONS, 1, 0.2f);
+    nk_slider_int(ctx, 1, &sh->iterations, CRAW_SHARPEN_MAX_ITERATIONS, 1);
+
+    if (grey)
+        view_disable_begin(ctx);
+    nk_property_float(ctx, "#contrast", 0.0f, &sh->contrast, 4.0f, 0.1f, 0.01f);
+    nk_slider_float(ctx, 0.0f, &sh->contrast, 4.0f, 0.05f);
+    if (grey)
+        view_disable_end(st, ctx);
+}
+
 /* The "Denoise" section: the raw domain stage of DESIGN.md 14, which runs
  * on the CFA planes before the debayer. The pipeline is always built with
  * the pass (gpu.c), so everything here is live: the strength reaches the
@@ -2706,8 +2733,8 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
      * The white balance is offered for both kinds of clip, but only a
      * developed clip's can be switched off: a raw clip's is always applied,
      * so its header carries the empty switch slot that keeps the column
-     * lined up. A developed clip has no mosaic, so Debayer, Denoise and
-     * Lens are not offered for one at all. */
+     * lined up. A developed clip has no mosaic, so Debayer, Denoise, Lens
+     * and Sharpen are not offered for one at all. */
     if (view_section_header(ctx, st, VIEW_SEC_WB, "White balance",
                             st->dec.raw ? NULL : &st->sections.wb, false)) {
         view_panel_wb(ctx, st);
@@ -2758,6 +2785,12 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         view_section_header(ctx, st, VIEW_SEC_LENS, "Lens", &st->lens.on,
                             !st->lens.record.valid)) {
         view_panel_lens(ctx, st);
+        view_section_end(ctx);
+    }
+
+    if (st->dec.raw &&
+        view_section_header(ctx, st, VIEW_SEC_SHARPEN, "Sharpen", &st->sharpen.on, false)) {
+        view_panel_sharpen(ctx, st);
         view_section_end(ctx);
     }
 

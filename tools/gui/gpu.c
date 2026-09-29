@@ -824,19 +824,23 @@ int view_gpu_ensure(struct view_gpu *g, uint32_t w, uint32_t h,
     pp.out_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     /* All of them always built: the panel can switch to auto white
      * balance, to denoising, to false colour suppression, to highlight
-     * reconstruction, to defringe or to lens correction at any time and a pipeline
-     * rebuild mid-clip would drop a frame. A denoise pass that is built but
-     * left at strength 0 costs nothing measurable, a false colour pass at
-     * zero passes, a defringe at strength 0 and an unflagged highlight
-     * reconstruction are not dispatched, and a lens pass handed a frame with no record drops out
-     * entirely, which is what makes them all live controls. The temporal
-     * denoise is the same at 0, and its state, 175 MB at 5.8K, is the
-     * price of being able to turn it on without losing a frame. */
+     * reconstruction, to defringe, to lens correction or to sharpening at
+     * any time and a pipeline rebuild mid-clip would drop a frame. A
+     * denoise pass that is built but left at strength 0 costs nothing
+     * measurable, a false colour pass at zero passes, a defringe at
+     * strength 0, a sharpening at zero iterations and an unflagged
+     * highlight reconstruction are not dispatched, and a lens pass handed a
+     * frame with no record drops out entirely, which is what makes them all
+     * live controls. The temporal denoise is the same at 0, and its state,
+     * 175 MB at 5.8K, is the price of being able to turn it on without
+     * losing a frame. The sharpening also changes its iteration count
+     * between playing and paused, which changes how many dispatches are
+     * recorded and nothing that was built. */
     pp.flags      = CRAW_PIPELINE_FLAG_AWB_HISTOGRAM | CRAW_PIPELINE_FLAG_DENOISE |
                     CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE |
                     CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_CHROMA_DENOISE |
                     CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION | CRAW_PIPELINE_FLAG_DEFRINGE |
-                    CRAW_PIPELINE_FLAG_LENS;
+                    CRAW_PIPELINE_FLAG_LENS | CRAW_PIPELINE_FLAG_SHARPEN;
     /* Enough copies that the previous frame's histogram is still readable
      * while the current one is in flight, which is what lets the auto white
      * balance run without a per-frame stall. */

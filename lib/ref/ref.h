@@ -134,6 +134,18 @@ int craw_ref_false_color(float *rgb, uint32_t width, uint32_t height, uint32_t p
  * call; the frame must be at least 20 pixels on each side. */
 int craw_ref_chroma_denoise(float *rgb, uint32_t width, uint32_t height, float strength);
 
+/* Capture sharpening, DESIGN.md 20, in place on a camera RGB buffer of
+ * width*height*4 floats: `iterations` Richardson-Lucy iterations on the
+ * luma with a Gaussian of `radius`, and the luma ratio, clamped to the
+ * local range and weighed by the contrast mask, applied to all three
+ * channels. The planes are rounded to fp16 where the GPU stores them.
+ * `radius` and `iterations` must be positive (zero is the caller's
+ * decision not to call); with `contrast` positive, `model` is the frame's
+ * resolved noise model and `wb` its gains. */
+int craw_ref_sharpen(float *rgb, uint32_t width, uint32_t height, float radius,
+                     uint32_t iterations, float contrast, const CRAWNoiseModel *model,
+                     const float wb[3]);
+
 /* Runs the colour stage on a camera RGB buffer in place: matrix, gain and
  * exposure for the frame's illuminant, then XYZ to `out_space`, which is
  * the *effective* space — the caller has already resolved the frame's own
@@ -162,7 +174,7 @@ int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
                   const CRAWLensCorrection *lc, bool keep_all, float *dst);
 
 /* Whole chain: [denoise,] [highlight reconstruction,] debayer, [false
- * colour,] [lens,] [defringe,] [chroma denoise,] colour. `out` receives
+ * colour,] [lens,] [defringe,] [chroma denoise,] [sharpen,] colour. `out` receives
  * width*height*4 floats. The denoise runs when `params` carries
  * CRAW_PIPELINE_FLAG_DENOISE and `fp->denoise_strength` is positive, the
  * highlight reconstruction when it carries
@@ -174,10 +186,13 @@ int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
  * positive, the chroma denoise when it carries
  * CRAW_PIPELINE_FLAG_CHROMA_DENOISE and `fp->denoise_chroma_strength` is
  * positive, and the warp when it carries CRAW_PIPELINE_FLAG_LENS and
- * `fp->lens` is valid; all six are the conditions craw_pipeline_record()
- * applies. A single frame has no history, so the temporal denoise of
- * CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE runs as on a pipeline's first frame;
- * a sequence goes through craw_ref_denoise_temporal() instead. */
+ * `fp->lens` is valid, and the sharpening when it carries
+ * CRAW_PIPELINE_FLAG_SHARPEN and `fp->sharpen_iterations` and
+ * `fp->sharpen_radius` are both positive; all seven are the conditions
+ * craw_pipeline_record() applies. A single frame has no history, so the
+ * temporal denoise of CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE runs as on a
+ * pipeline's first frame; a sequence goes through
+ * craw_ref_denoise_temporal() instead. */
 int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
                      size_t stride, const CRAWPipelineParams *params,
                      const CRAWFrameParams *fp, float *out);

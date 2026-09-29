@@ -48,6 +48,11 @@ In:
   range of colours on the two sides of the edge, the level kept; takes out
   the rims chromatic aberration leaves. Optional, per-frame strength.
   Section 19.
+- Capture sharpening: Richardson-Lucy deconvolution of the luma by a
+  Gaussian PSF after every other stage on the camera RGB, each pixel's
+  channels scaled by its luma's ratio, held to the range around it and
+  masked by the local contrast in units of the modelled noise. Optional,
+  per-frame radius, iteration count and threshold. Section 20.
 - CPU reference of every stage, tests comparing it against the GPU.
 
 Out, deliberately, with a slot reserved: motion compensated temporal
@@ -204,6 +209,15 @@ Replaces the intermediate with a copy whose quarter resolution chroma
 band has been smoothed by a luma-guided bilateral, G untouched. Defined
 in section 14.4; the histogram of 4.4 and the colour stage of 4.3 read
 the copy.
+
+### 4.2f Capture sharpening (optional, after 4.2e)
+
+The luma deconvolved by Richardson-Lucy iterations with a Gaussian PSF,
+and the three channels of each pixel multiplied by its luma's ratio, held
+to the range of the luma around it and weighed by a local contrast mask; a
+pixel the mask leaves alone is untouched. Defined in section 20; in place
+in the intermediate, so the histogram of 4.4 and the colour stage of 4.3
+read it.
 
 ### 4.3 Colour
 
@@ -3673,3 +3687,364 @@ because R reached its clip on some and not others; that is a fault of
 level and the stage keeps level. Fringes wider than D_MAX, the purple
 bloom around a strongly defocused highlight, are wider than the side
 search and stay.
+
+## 20. Capture sharpening
+
+### 20.1 The blur
+
+Before anything is done to it, the picture is already soft: the lens's
+point spread, the sensel's own aperture, the debayer's interpolation, the
+codec, and the lens warp's resample at a fraction of a pixel (16.4) each
+blur it a little, and together they are close to Gaussian. Fitting an
+error function across the edges of P1094366, a street under signs at ISO
+1250 in focus (the edges at the 99th percentile of the log gradient whose
+sides are flat, in the camera RGB luma), gives a spread of 0.72 px in the
+median over 697 edges of the signs and 0.57 over 702 of the street below
+them; taken over a stricter set of the same signs' edges it reads 0.88, and
+P1081807, much of it out of focus, reads 1.16. So the capture blur of this
+camera in focus is a Gaussian of 0.6 to 0.9 px.
+
+Capture sharpening undoes that blur and nothing more: it is not the
+unsharp mask of an output sharpening, which adds contrast at whatever
+scale it is set to, but deconvolution by the blur the capture made, which
+RawTherapee has as a step of its own right after the demosaic for the same
+reason. The deconvolution is Richardson's and Lucy's (Richardson, JOSA
+1972; Lucy, AJ 1974): the maximum likelihood estimate under Poisson noise,
+found by multiplicative updates that keep every value positive. What this
+section adds to the textbook iteration, the luma it runs on, the clamp and
+the mask, is its own.
+
+### 20.2 Definition
+
+Constants:
+
+    P        = 2^-14    pedestal, and the floor under the estimate
+    CORR_MAX = 2        bound on one iteration's correction
+    RANGE_R  = 1        the clamp's window, 3x3
+    MASK_R   = 2        the contrast statistic's window, 5x5
+    KAPPA    = 0.5      the statistic's reading of the noise model, below
+
+The PSF is the Gaussian of the frame's radius sigma, integrated over each
+pixel's footprint and cut at R = ceil(3 sigma), at most 6:
+
+    k_i = Phi((i + 1/2) / sigma) - Phi((i - 1/2) / sigma),   i = 0 .. R
+    k_i = k_i / (k_0 + 2 (k_1 + .. + k_R))
+
+with Phi the standard normal distribution. K * f is the separable blur, x
+first and then y, each tap sum the centre term first and then the pairs
+k_i (f(-i) + f(+i)) from i = 1 outwards, borders mirrored as in section 3.
+
+On the camera RGB intermediate:
+
+    d   = fp16(max((R + 2 G + B) / 4, 0) + P)     the observed luma
+    u_0 = d
+    for n = 0 .. N - 1:
+        c       = K * (d / (K * u_n))
+        u_(n+1) = max(u_n * clamp(c, 1 / CORR_MAX, CORR_MAX), P)
+        rounded to fp16, except u_N
+
+and then at every pixel, with the windows mirrored:
+
+    lo, hi = the smallest and largest d over the 3x3
+    E      = sum over the 5x5 of (d(x+1) - d(x-1))^2 + (d(y+1) - d(y-1))^2,
+             summed row by row, left to right, times 1 / (4 * 25)
+    L      = the mean of d over the 5x5, minus P
+    V      = n_a * max(L, 0) + n_b
+    m      = smoothstep(C, 2 C, sqrt(E / V)),  or 1 when C = 0
+    rho    = 1 + m * (clamp(u_N, lo, hi) / d - 1)
+    RGB    = rho * RGB                           alpha unchanged
+
+with C the frame's contrast threshold and, from the frame's noise model
+(a, b) of section 14.2 and its white balance gains,
+
+    n_a = KAPPA * a * (wb_R + 2 wb_G + wb_B) / 4
+    n_b = KAPPA * b * (wb_R^2 + 2 wb_G^2 + wb_B^2) / 4
+
+A pixel with rho = 1 is left exactly as it was.
+
+*The luma, and the ratio.* The deconvolution runs on one plane, the
+Bayer-weighted luma the defringe of 19.2 uses, and every channel of a
+pixel is scaled by the same factor, so R/G and B/G do not move at all
+(to 2e-7 in the tests). The channels have had four stages of their own by
+then, the false colour, the lens warp, the defringe and the chroma
+denoise, and a deconvolution per channel would undo each of them: that re-sharpens
+the chroma noise 14.4 smoothed and the fringes 19 took out. The luma is
+where the detail is.
+
+*The pedestal.* Richardson-Lucy divides by the blurred estimate and
+multiplies by the ratio, which needs everything positive. The debayer
+leaves a black area's noise either side of zero, so the luma is floored at
+zero and raised by P, the smallest normal fp16 value: every value the
+planes hold then keeps fp16's full relative precision, no store can flush
+to zero, and P is 4 code values of the 16-bit range, about the read noise
+of section 14.2. Because the ratio rho is taken against d = Y + P, the
+change a pixel gets is Y / (Y + P) of its luma's, which damps the deepest
+shadows and nothing else. The estimate is floored at P for the same
+reasons.
+
+*The clamp.* The target luma is held to the range of the observed luma in
+the 3x3 around the pixel: sharpening may steepen an edge but never makes
+a new extremum. It is what keeps the halos out. Near a light, the lens's
+blur is not the modelled Gaussian but a wider glow, and the deconvolution,
+trying to explain that glow as blur, digs a dark moat into the
+surroundings a few pixels out; on a hard clipped edge, which is sharper
+than any blur allows, it rings. Measured on the fluorescent tube of
+P1081807 over 4655 edges of more than 20:1, as the darkest luma one to
+four pixels out on the dark side over that side's level six to eight
+pixels out, at the tenth percentile, and on the signs of 20.1 as the edge
+spread, radius 0.8, 20 iterations, no mask:
+
+    clamp                               tube moat   signs spread   street
+    none                                0.507       0.370          0.251
+    3x3 range                           0.915       0.426          0.334
+    5x5 range                           0.882       0.410          0.322
+    3x3, 25% beyond it                  0.817       0.376          0.277
+    3x3, 50% beyond while hi/lo < 2,    0.794       0.376          0.279
+      nothing beyond from hi/lo = 8
+    unsharpened                         0.961       0.719          0.571
+
+Without the clamp one edge in ten gets a moat at half its surroundings'
+level. Any allowance past the range, even one that shrinks to nothing next
+to a light, lets the moat back, because the pixels that dip are two to
+four pixels out, where their own 3x3 sees only the gentle slope of the
+glow. The strict 3x3 keeps 84% of the unclamped sharpening of the signs
+and is the one kept. It also limits the noise: a noise peak is a local
+extremum and cannot rise, which is visible as a much quieter flat area
+than the unclamped result gives. What it cannot do is raise the peak of a
+line one pixel wide; such a line comes out narrower, not brighter.
+
+*The correction bound.* Clamping one iteration's c to [1/2, 2] made no
+difference to the numbers above, the signs' spread or the lamp of 20.6
+from a bound of 1.25 to one of 100: the range clamp decides. It stays as a guard, so that no single
+iteration moves the estimate by more than a factor of two whatever the
+data.
+
+*The mask.* Sharpening noise is the other artefact, and in video it
+flickers. E is the mean squared central difference over a 5x5, which on
+white noise of variance s^2 is s^2; V is what the camera's noise model says
+it should read at the window's level. On noise sqrt(E / V) is about 1,
+on detail it is larger, and the threshold C is in those units, the units
+of denoise_strength: 1 is "the modelled noise level" at every level and,
+as far as the model is right, at every ISO. The ramp to 2 C is scale free.
+
+KAPPA is measured. A debayered luma is correlated noise, of which central
+differences see only a part: over a flat dark patch of P1000387 (320x200
+at level 0.0037 of the clip, RCD) E reads 0.50 of the per-sensel variance
+in the mean, 0.48 in the median, 0.375 at the lower quartile. On three
+whole ISO 1000 frames (P1000387, P1094725, P1094715), taken level by level
+from 5e-4 to 2e-2 of the clip, the lower quartile reads 0.35 to 0.46 and
+the 5th percentile 0.25 to 0.30, against the patch's 0.375 and 0.265: the
+model's linear dependence on the level is the right shape, and noise sits
+at the bottom of every level's distribution. With KAPPA = 0.5 the flat
+patch's sqrt(E / V) is 0.98 at the median, 1.21 at the 90th percentile and
+1.43 at the 99th.
+
+The raw denoise of section 14 changes what the mask sees: at strength 1
+the statistic on the same patch falls to 0.02 of the model, a seventh of
+its standard deviation. The threshold stays in units of the modelled
+noise rather than guessing at what the denoise left, which is scene
+dependent; 20.6 measures what a lower threshold does then.
+
+### 20.3 Where it sits, and the dispatches
+
+After the chroma denoise of 14.4, the last stage on the camera RGB, and
+before the histogram of 4.4 and the colour stage of 4.3. After every
+denoise, because a deconvolution amplifies whatever noise it is given and
+the denoises remove it at the scale the deconvolution works at. After the
+lens warp, because the warp's resample at a fraction of a pixel is part of
+the blur and a sharpened picture resampled afterwards is soft again, with
+its overshoot interpolated. After the defringe, whose edge gate was set on
+edges as the debayer leaves them (19.2) and would open wider on sharpened
+ones, and whose clamp of colour the ratio cannot undo. On the camera RGB,
+where every channel is positive and the luma has the debayer's weighting.
+The histogram then reads the sharpened intermediate, and since rho moves
+no ratio of channels its coordinates do not move; only a sample's weight
+does, with its level.
+
+Dispatches: `sharpen_prep`, one invocation per eight pixels of a row,
+writes d; then N of `sharpen`, one Richardson-Lucy iteration each, the
+first reading d as its estimate and each writing the plane the one before
+it did not; the last is a second pipeline of the same shader
+(specialization constant 5) that writes no plane but applies the clamp,
+the mask and rho to the intermediate in place, each invocation to its own
+texel only, and does not write a texel whose rho is 1.
+
+One dispatch per iteration: the workgroup loads its tile of the estimate
+with an apron of 2R and of d with R (3 at least, for the mask), blurs the
+estimate along x and y over the part of the tile R inside its edge, takes
+the ratio there, and blurs the ratio down to its own pixels, all in shared
+memory, so that the planes are read once an iteration instead of four
+times. As in 17.3 the apron is the mirror of section 3 and the fused
+result is the sequential definition at the borders too: the mirror is a
+reflection and the Gaussian symmetric, so the blur at a mirrored position
+is the blur at the position it mirrors.
+
+The three planes, d and two estimates, are fp16 (a rounding of at most
+2^-11, seven times below the sensor's noise even at the clip, the argument
+of 18.3) in storage buffers rather than images, eight pixels to a 16-byte
+chunk, so that a tile is loaded a chunk at a time; the part of a tile
+outside the frame is then filled from the positions the mirror maps it
+to, on the border workgroups only. The conversion to fp16 is written out
+as round to nearest even: packHalf2x16() promises no rounding and on this
+GPU truncates, which biased every iteration's estimate low and put 2500
+pixels of the synthetic scene past 1e-3 of the reference. The reach R is
+specialization constant 6, twelve pipelines in all, so that every tile
+size, loop bound and divisor is a constant; and the blurs along x and the
+first along y take four outputs to an invocation, from one run of 4 + 2R
+values held in registers. At 16x16 the tiles need 9.7 KB of shared memory
+at R = 3 and 16.4 KB at R = 6, a little over the 16 KB Vulkan guarantees,
+so the host halves a reach's workgroup to 8x8 on a device with only the
+guarantee. The planes cost 105 MB at 5.8K.
+
+What each of those steps bought, per iteration at R = 3, 5.8K, on the
+6900 XT, back-to-back submissions: a formatless image load per pixel of
+the tiles and the reach in the push constants, 0.86 ms; the reach a
+specialization constant, 0.60 ms; fp16 buffers in chunks, 0.39 ms; four
+outputs to an invocation, 0.37 ms. Of the last, the loads and stores are
+0.16 ms, which at 105 MB an iteration is what the card's memory and cache
+deliver, and the blurs the rest.
+
+### 20.4 Cost, the iteration count, and the API
+
+Per iteration, and the rest of the stage (the luma pass, and the last
+iteration's read and write of the RGBA16F intermediate and its mask), at
+5.8K on the 6900 XT, back-to-back submissions, each measured twice while
+another agent's runs shared the GPU:
+
+    radius     0.3    0.6    0.8    1.2         1.5         2.0
+    reach R    1      2      3      4           5           6
+    ms         0.24   0.26   0.37   0.41-0.48   0.57-0.63   0.74
+
+and about 0.9 ms for the rest. The two runs agree to 0.01 ms except at
+reaches 4 and 5, where one of them was evidently shared. `cineraw --bench`
+over 60 frames of P1000387, which idles the GPU between frames (14.3),
+reads 7.37 ms without the stage, 8.81 ms with one iteration, 10.52 ms with
+5 and 16.62 ms with 20 at radius 0.8, identically on two runs: 0.41 ms an
+iteration and 1.0 ms for the rest.
+
+Convergence, as the edge spread of the signs and the street of 20.1 at
+radius 0.8 and no mask:
+
+    iterations   0      1      2      4      6      10     20     40
+    signs        0.719  0.601  0.558  0.507  0.482  0.457  0.426  0.403
+    street       0.571  0.487  0.448  0.407  0.385  0.364  0.334  0.322
+
+Twenty is where more stops paying: forty cost twice as much for a tenth
+more. Twenty is 8 to 9 ms at 5.8K, which a still or an export can pay and
+playback cannot: the pipeline is about 5 ms without the stage, libplacebo's
+render 13 to 19 ms, and the frame 33 ms. So the iteration count is a
+per-frame parameter, and cineview runs at most five while playing, 2.7 to
+3.2 ms and three quarters of the edge sharpening twenty do, and the full
+count on a paused picture and on every exported frame. Pausing is a
+change of look and puts the held picture through again (the same
+mechanism a grade change while paused uses), so what is paused, looked at
+and exported is the full count, and what plays is a little softer.
+
+`CRAW_PIPELINE_FLAG_SHARPEN` builds the stage and its planes; per frame,
+`CRAWFrameParams` carries `sharpen_radius`, the sigma, above 0 and at
+most `CRAW_SHARPEN_MAX_RADIUS` (2.0); `sharpen_iterations`, at most
+`CRAW_SHARPEN_MAX_ITERATIONS` (100, a bound on how long one recording can
+hold the GPU); and `sharpen_contrast`, C, at least 0. A radius or a count
+of zero, the default of `craw_frame_params_init`, dispatches nothing and is
+the plain chain bit for bit; out of range is EINVAL at record time. A
+positive contrast needs a noise model exactly as the denoise does, the
+override or the profile's table, and fails with ENOTSUP without one; the
+three fields come out of the padding tail.
+
+The CLI spelling is `--sharpen RADIUS[,ITERATIONS[,CONTRAST]]` in both
+tools, off by default as in every raw converter, the two left out taking
+20 and 1. cineview's Sharpen section, after Lens, has the standard switch
+and the three rows; on a camera with no noise model it greys the contrast
+row and sharpens unmasked. Radius 0.8 is the default for the in-focus blur
+of 20.1.
+
+### 20.5 Testing
+
+`test_pipeline`, on the CPU, through the reference: a scene of bars six
+pixels wide, a block and a ramp, blurred by the PSF the stage assumes at
+sigma 1.0 and deconvolved with it, falls from an rms error of 0.0537
+against the unblurred scene to 0.0484, 0.0429, 0.0340 and 0.0265 after 1,
+4, 16 and 64 iterations (every step must fall, and 64 must halve it). A
+flat patch carrying white noise at exactly the modelled level beside a
+blurred step: unmasked, 16 iterations raise the noise 1.26 times; with a
+threshold of 1.5 the patch is untouched but for one pixel in 15872 (the
+bound is one in a thousand) while all 768 pixels of the step are
+sharpened; and the colour ratios of every pixel hold to 1.9e-7.
+
+On the GPU: three ways of switching it off (no flag, radius 0, no
+iterations) are the plain chain bit for bit; MHC and RCD, at radius 0.6
+with 25 iterations unmasked and 1.3 with 12 masked, match the reference
+run on the GPU's own unsharpened intermediate within 4e-3 relative (1.6e-3
+to 2.1e-3 measured; one iteration alone is one fp16 step, 9.7e-4) and sit
+a whole pixel's value away from the plain chain; a 246x150 frame, whose
+rows end in a part-filled chunk and whose last workgroups hang over the
+right and bottom edges, at radius 2.0, matches within 1.5e-3, and so, to
+8.9e-4, does the smallest frame the stage takes, 14x14 from the middle of
+the checkerboard, where one tile holds the whole frame and the mirror
+reaches across it; a 12x12 pipeline, a radius of 2.5, 101 iterations, a
+negative contrast and a positive one without a model are refused. With
+`CRAW_TEST_FRAME` the real frame runs RCD with 20 iterations at radius 0.8
+and threshold 1, moves 30.7% of the pixels of P1000387, and holds to
+3.0e-3 of the reference with no pixel past 4e-3.
+
+### 20.6 On real frames
+
+Radius 0.8, threshold 1, the edge spread of 20.1 and the high-pass noise
+of flat areas (the rms of the 3x3 Laplacian of the luma) over what the
+unsharpened frame reads:
+
+    frame                                    5 iterations  20 iterations
+    P1094366 signs, spread 0.718             0.493         0.426
+    P1094366 street, spread 0.571            0.397         0.335
+    P1000387 dark flat patch, noise          x1.008        x1.015
+      the same, raw denoise at 1             x1.000        x1.000
+    P1094352 dark trees, ISO 10000, noise    x1.001        x1.002
+      with the table's clamped model         x1.092        x1.187
+
+The detail comes out: edges lose two fifths of their spread, the sign's text
+and the edges of the lit panel in P1094352 are crisp at 1:1, and a flat
+area moves by 1.5% of its noise or not at all. The threshold was chosen on
+these numbers, the same measure at 20 iterations, no denoise:
+
+    threshold                        0      1      1.5    2
+    P1000387 flat patch noise        x1.35  x1.02  x1.00  x1.00
+    P1000387 wood grain, band        x1.35  x1.03  x1.00  x1.00
+    P1094738 hair, ISO 3200, band    x1.35  x1.04  x1.02  x1.01
+
+(the band being the rms of the difference of two Gaussians of 0.6 and 2
+px, P1094738 with its own fitted model). Strong edges sharpen identically
+at every threshold up to 3; what the threshold decides is texture at the
+level of the noise, which at 1 comes through a little and at 1.5 not at
+all. 1 is the default, the modelled level, and costs 2% on a flat patch.
+With the raw denoise at strength 1 the noise that is left is a seventh of
+the model's and a lower threshold is safe: at 0.5 the flat patch and the
+wood are untouched and the hair gains 13%, at 0.25 the flat patch's noise
+rises 1%.
+
+The last row of the first table is the open problem. The noise table of
+section 14.2 has knots at ISO 1000 and 1250 only, and above them it holds
+the last knot, which is the right failure for the denoise (too little) and
+the wrong one for the mask: this clip's own fit is a = 1.18e-4, eight
+times the knot, the mask reads its noise at nearly three times the
+modelled level, and 20 iterations raise it 19%. P1094738 at ISO 3200 is 2.3
+times the knot. The planned ISO series fixes both stages at once; until
+then `--noise`, which the mask uses as the denoise does, is the remedy.
+
+Lights, over the edges of more than 20:1 contrast, the dark side's moat
+of 20.2 at the tenth percentile and the bright side's peak one to four
+pixels in over its level six to eight pixels in, at the ninetieth:
+
+    frame                       moat, 0 / 5 / 20        peak, 0 / 5 / 20
+    P1000387 lamp               1.152 1.132 1.095       1.794 1.981 1.973
+    P1081807 tube               0.961 0.945 0.922       1.360 1.447 1.468
+    P1094352 booth lights       0.431 0.372 0.351       1.904 2.083 2.142
+    P1094715 leaves, sun        1.107 1.087 1.075       0.988 1.001 0.997
+
+The moats that are there before sharpening are the scene's (the booth's
+dark frame against its lights); the stage deepens them by at most the 3x3
+range allows, which at 1:1 on the tube, the booth and a string of bulbs
+reads as steeper edges and no ring. The bright side rises by 8% to 12% at
+the ninetieth percentile, never past the brightest pixel of its 3x3, on
+the rims of lights far above white. Two things are not done: an estimate of the radius from the frame itself, for
+which the edge fit of 20.1 is the obvious start, and any attempt to make
+the five iterations of playback look like twenty.

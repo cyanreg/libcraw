@@ -93,7 +93,16 @@ edge back into the range of colours on the two sides of that edge,
 keeping its level: the purple, blue and pink rims the lens's chromatic
 aberration leaves along bright edges, which the rebuilt highlights no
 longer hide under a white clip, go, and a real colour edge is left alone
-(DESIGN.md 19); `--defringe 0` turns it off. `--crop X,Y,W,H` writes one rectangle of the output while
+(DESIGN.md 19); `--defringe 0` turns it off. `--sharpen
+RADIUS[,ITERATIONS[,CONTRAST]]` turns on capture sharpening, off by
+default: Richardson-Lucy deconvolution of the luma by a Gaussian of RADIUS
+pixels (0.8 matches this camera's in-focus edges), ITERATIONS of it (20 by
+default, about 0.4 ms each at 5.8K), with every channel scaled by the
+luma's change so that no colour moves, no pixel taken past the range of
+its neighbours so that a lamp gets no dark ring, and nothing sharpened
+where the local contrast is below CONTRAST times the camera's modelled
+noise (1 by default; with `--denoise` on, 0.5 sharpens more texture and
+none of the noise that is left), DESIGN.md 20. `--crop X,Y,W,H` writes one rectangle of the output while
 the pipeline still runs on the whole frame, which is how a 5.8K frame gets
 looked at 1:1 without a 5.8K file.
 
@@ -148,14 +157,14 @@ than as a tag. `-v` prints the same rows once per clip, and the maker
 note's white balance multipliers with them.
 
 The panel is a column of sections — White balance, Exposure, Debayer,
-Denoise, Lens, Look, Adjustments, Film grain, Crop, Export — each behind a
+Denoise, Lens, Sharpen, Look, Adjustments, Film grain, Crop, Export — each behind a
 header with a power switch at the left of its title, the way RawTherapee
 puts an enable button on every tool. Off bypasses that section while every
 setting in it is kept, so switching it back on returns the picture it had:
 Exposure off is a bias of zero at the as-shot index with the slider still
 where it was, Look off drops the film simulation or the `--lut` cube
 without unselecting it, Adjustments off drops soft light and vibrance, Film
-grain, Denoise and Lens off turn their stages off, and Crop is the same
+grain, Denoise, Lens and Sharpen off turn their stages off, and Crop is the same
 switch `c` is. Debayer has nothing to bypass, and neither has a raw clip's
 White balance, which is always applied; they carry an empty slot so the
 titles stay in line. A developed clip's White balance does have a switch,
@@ -240,7 +249,15 @@ sets the switch and all three amounts from the command line. The temporal
 average starts again after a seek, at the loop point, on a new clip and at
 the first frame of a video export, and a grade changed while paused
 develops the frame on screen from the same history it was first developed
-from.
+from. The "Sharpen" section is the capture sharpening, off until its
+switch is lit: the radius, the iteration count and the contrast threshold
+of `cineraw --sharpen`, 0.8, 20 and 1 until changed. The count is what a
+paused picture and every exported frame get; while the clip plays the pass
+runs at most five iterations, which is what fits the frame time, and
+pausing puts the picture through again at the full count. On a camera with
+no noise model the contrast row greys out and everything is sharpened.
+`--sharpen RADIUS[,ITERATIONS[,CONTRAST]]` sets the switch and the numbers
+from the command line.
 With four mono audio tracks the last two are taken as the stereo pair
 (`--audio-map` overrides). `cineview -h` lists the options.
 
@@ -251,7 +268,7 @@ ProRes RAW and already developed, different sizes, stereo or four-channel or
 no audio at all — and a switch keeps every setting exactly as it was: the
 white balance mode and a manual CCT, the exposure index and bias, debayer
 and its false colour passes, highlight switch and defringe, denoise, lens correction
-and its fit, the
+and its fit, the sharpening, the
 export's colour space, size,
 pixel format, audio mode and threads, the two export file paths once typed,
 the film simulation, the tone map, the adjustments, the grain, every

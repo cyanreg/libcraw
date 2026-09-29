@@ -305,6 +305,31 @@ bool view_lens_keep_all(const struct view_state *st)
     return view_lens_active(st) && st->lens.keep;
 }
 
+/* The full count wherever the picture is looked at or kept: paused, and
+ * on every frame an export develops, still or video, since an export never
+ * plays. While playing, what fits the frame time. */
+int view_sharpen_iterations(const struct view_state *st)
+{
+    const struct view_sharpen *sh = &st->sharpen;
+
+    if (!st->dec.raw || !sh->on || !(sh->radius > 0.0f) || sh->iterations <= 0)
+        return 0;
+    if (st->playing && !st->exp.active && !st->video.active)
+        return CRAW_MIN(sh->iterations, VIEW_SHARPEN_PLAY_ITERATIONS);
+    return CRAW_MIN(sh->iterations, CRAW_SHARPEN_MAX_ITERATIONS);
+}
+
+/* Without a noise model the mask has nothing to measure contrast against,
+ * and craw_pipeline_record() refuses one rather than guess, so on such a
+ * camera the stage sharpens everything and the panel greys the row. */
+float view_sharpen_contrast(const struct view_state *st)
+{
+    if (!view_sharpen_iterations(st) || !view_denoise_model(st, NULL, NULL))
+        return 0.0f;
+
+    return CRAW_MAX(st->sharpen.contrast, 0.0f);
+}
+
 void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
 {
     craw_frame_params_init(fp);
@@ -336,6 +361,13 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
         fp->lens = st->lens.record;
     if (view_lens_keep_all(st))
         fp->flags |= CRAW_FRAME_FLAG_LENS_KEEP_ALL;
+    /* Built into the pipeline like the rest; no iterations is not
+     * dispatched. */
+    fp->sharpen_iterations = (uint32_t)view_sharpen_iterations(st);
+    if (fp->sharpen_iterations) {
+        fp->sharpen_radius = CRAW_CLAMP(st->sharpen.radius, 0.1f, CRAW_SHARPEN_MAX_RADIUS);
+        fp->sharpen_contrast = view_sharpen_contrast(st);
+    }
 
     if (st->look.wb == VIEW_WB_MANUAL && st->prof.nb_wb_knots) {
         fp->wb_mode = CRAW_WB_REBALANCE;
@@ -365,6 +397,9 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .temporal   = view_temporal_strength(st),
         .lens       = view_lens_active(st),
         .lens_keep  = view_lens_keep_all(st),
+        .sharpen_iterations = view_sharpen_iterations(st),
+        .sharpen_radius = view_sharpen_iterations(st) ? st->sharpen.radius : 0.0f,
+        .sharpen_contrast = view_sharpen_contrast(st),
     };
 }
 
@@ -412,7 +447,10 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->chroma == b->chroma &&
            a->denoise == b->denoise && a->temporal == b->temporal &&
            a->lens == b->lens &&
-           a->lens_keep == b->lens_keep;
+           a->lens_keep == b->lens_keep &&
+           a->sharpen_radius == b->sharpen_radius &&
+           a->sharpen_iterations == b->sharpen_iterations &&
+           a->sharpen_contrast == b->sharpen_contrast;
 }
 
 const char *view_clip_dir(const struct view_state *st)
@@ -1886,6 +1924,18 @@ static void view_usage(FILE *f)
 "                      chromatic aberration leaves along lamps, windows and\n"
 "                      branches against the sky. The Debayer section has the\n"
 "                      same row\n"
+"  --sharpen RADIUS[,ITERATIONS[,CONTRAST]]\n"
+"                      capture sharpening after every other stage on the\n"
+"                      camera RGB: Richardson-Lucy deconvolution of the luma\n"
+"                      by a Gaussian of RADIUS pixels (0.8 is this camera's\n"
+"                      in-focus blur; up to %g), ITERATIONS of it (1 to %d,\n"
+"                      default 20) on a paused picture and on export and at\n"
+"                      most %d while playing, and nothing sharpened where the\n"
+"                      local contrast is below CONTRAST times the modelled\n"
+"                      noise (default 1; with the Denoise section on, 0.5\n"
+"                      sharpens more texture and still none of the noise it\n"
+"                      leaves). 0 (the default) leaves the Sharpen section\n"
+"                      off with its numbers kept\n"
 "  --lens on|off       geometric lens correction from each frame's own\n"
 "                      optical_correction record: a per-channel radial warp\n"
 "                      after the debayer that takes the distortion out and\n"
@@ -2060,6 +2110,7 @@ static void view_usage(FILE *f)
 "cropping), closes an open menu, and otherwise quits, as q does. While a\n"
 "video export runs the panel and every key but q are locked; q stops the\n"
 "export, finishes the file and quits.\n",
+    (double)CRAW_SHARPEN_MAX_RADIUS, CRAW_SHARPEN_MAX_ITERATIONS, VIEW_SHARPEN_PLAY_ITERATIONS,
     craw_tool_profile_builtin_list());
 }
 
@@ -2100,6 +2151,7 @@ enum {
     VIEW_OPT_LENS,
     VIEW_OPT_HIGHLIGHTS,
     VIEW_OPT_DEFRINGE,
+    VIEW_OPT_SHARPEN,
     VIEW_OPT_LENS_FIT,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
@@ -2150,6 +2202,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "lens",     required_argument, NULL, VIEW_OPT_LENS      },
         { "highlights", required_argument, NULL, VIEW_OPT_HIGHLIGHTS },
         { "defringe", required_argument, NULL, VIEW_OPT_DEFRINGE },
+        { "sharpen",  required_argument, NULL, VIEW_OPT_SHARPEN   },
         { "lens-fit", required_argument, NULL, VIEW_OPT_LENS_FIT  },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
@@ -2235,6 +2288,45 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return CRAW_ERROR(EINVAL);
             }
             break;
+        case VIEW_OPT_SHARPEN: {
+            /* RADIUS[,ITERATIONS[,CONTRAST]]; what is left out keeps the
+             * panel's number, and a radius of zero leaves the section off
+             * with its numbers where they were, as --denoise 0 does. */
+            float r = strtof(optarg, &end);
+
+            if (end == optarg || (*end && *end != ',') || !(r >= 0.0f && r <= CRAW_SHARPEN_MAX_RADIUS)) {
+                fprintf(stderr, "--sharpen: expected RADIUS[,ITERATIONS[,CONTRAST]], the "
+                                "radius 0 to %g, got `%s`\n", (double)CRAW_SHARPEN_MAX_RADIUS,
+                        optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            st->sharpen.on = r > 0.0f;
+            if (r > 0.0f)
+                st->sharpen.radius = r;
+            if (*end == ',') {
+                const char *arg = end + 1;
+                long n = strtol(arg, &end, 10);
+
+                if (end == arg || (*end && *end != ',') || n < 1 ||
+                    n > CRAW_SHARPEN_MAX_ITERATIONS) {
+                    fprintf(stderr, "--sharpen: ITERATIONS must be 1 to %d, got `%s`\n",
+                            CRAW_SHARPEN_MAX_ITERATIONS, arg);
+                    return CRAW_ERROR(EINVAL);
+                }
+                st->sharpen.iterations = (int)n;
+            }
+            if (*end == ',') {
+                const char *arg = end + 1;
+                float t = strtof(arg, &end);
+
+                if (end == arg || *end || !(t >= 0.0f && t <= 10.0f)) {
+                    fprintf(stderr, "--sharpen: CONTRAST must be 0 to 10, got `%s`\n", arg);
+                    return CRAW_ERROR(EINVAL);
+                }
+                st->sharpen.contrast = t;
+            }
+            break;
+        }
         case VIEW_OPT_HIGHLIGHTS:
             if (!strcmp(optarg, "on")) {
                 st->look.highlights = 1;
@@ -2667,6 +2759,11 @@ static void view_log_look(const struct view_state *st)
 
     fprintf(stderr, ", lens %s", st->lens.on ? st->lens.keep ? "on (keep all)"
                                                              : "on (fill)" : "off");
+    if (st->sharpen.on)
+        fprintf(stderr, ", sharpen %.2f x%d contrast %.2f", st->sharpen.radius,
+                st->sharpen.iterations, st->sharpen.contrast);
+    else
+        fprintf(stderr, ", sharpen off");
     /* The export's sound and threads, which carry like every other export
      * setting. */
     fprintf(stderr, ", export audio %s, threads %d",
@@ -3878,6 +3975,14 @@ int main(int argc, char **argv)
      * or the panel's row, keeps the corners instead. */
     st.lens.keep = false;
     st.lens.keep_sel = 0;
+    /* Off, as in every raw converter, at the numbers the switch turns it
+     * on with: this camera's in-focus blur, the full count, and a mask at
+     * the modelled noise. DESIGN.md 20.4. */
+    st.sharpen = (struct view_sharpen) {
+        .radius     = 0.8f,
+        .iterations = 20,
+        .contrast   = 1.0f,
+    };
     /* The three section switches that are nothing but a bypass start off,
      * as RawTherapee's tools do: their parameters are neutral, so off and
      * on develop the clip the same way, and a lit switch then only ever

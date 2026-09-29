@@ -166,8 +166,8 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
     }
 
     /* On the intermediate, before anything reads it: the false colour,
-     * DESIGN.md 17.3, the lens warp, 16.3, the defringe, 19.3, and the
-     * chroma denoise on what they left, 14.4. */
+     * DESIGN.md 17.3, the lens warp, 16.3, the defringe, 19.3, the chroma
+     * denoise on what they left, 14.4, and the sharpening, 20.3. */
     if ((params->flags & CRAW_PIPELINE_FLAG_FALSE_COLOR) && fp->false_color_passes > 0) {
         ret = craw_ref_false_color(out, width, height, fp->false_color_passes);
         if (ret < 0)
@@ -199,6 +199,22 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
     }
     if ((params->flags & CRAW_PIPELINE_FLAG_CHROMA_DENOISE) && fp->denoise_chroma_strength > 0.0f) {
         ret = craw_ref_chroma_denoise(out, width, height, fp->denoise_chroma_strength);
+        if (ret < 0)
+            goto done;
+    }
+    /* After every other stage on the camera RGB, DESIGN.md 20.3, with the
+     * mask's noise under the frame's own gains. */
+    if ((params->flags & CRAW_PIPELINE_FLAG_SHARPEN) && fp->sharpen_iterations > 0 &&
+        fp->sharpen_radius > 0.0f) {
+        CRAWNoiseModel nm = { 0 };
+        CRAWColorParams par;
+
+        ret = craw_profile_eval(fp->profile, fp->wb_mode, &fp->illuminant, &par);
+        if (ret >= 0 && fp->sharpen_contrast > 0.0f)
+            ret = craw_ref_noise_model(fp, &nm);
+        if (ret >= 0)
+            ret = craw_ref_sharpen(out, width, height, fp->sharpen_radius,
+                                   fp->sharpen_iterations, fp->sharpen_contrast, &nm, par.wb);
         if (ret < 0)
             goto done;
     }

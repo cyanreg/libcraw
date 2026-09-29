@@ -31,6 +31,7 @@
 
 #include "vkdev.h"
 #include "gamut.h"
+#include "sharpen.h"
 #include "ref/ref.h"
 
 #define TEST_W 256
@@ -527,6 +528,14 @@ static int test_check_histogram(const char *method, const uint32_t *gpu_count,
  * the edge's normal turns fast and an E one fp16 step apart picks a
  * different side sample. DESIGN.md 19.5. */
 #define TEST_DF_TOL          1e-2
+
+/* The sharpening against the reference on the same input, relative to the
+ * pixel as test_max_rel() measures it. Every iteration rounds the estimate
+ * to fp16 on both sides, and a product that lands within an ulp of a
+ * rounding boundary rounds the other way when the two differ in the last
+ * bit of an fp32 sum; the iterations after it carry that step along.
+ * DESIGN.md 20.5. */
+#define TEST_SH_TOL          4e-3
 
 /* The 3x3 [1 -2 1; -2 4 -2; 1 -2 1] / 6 high pass of one CFA plane has
  * unit gain on white noise variance and none at all on a bilinear signal,
@@ -3138,6 +3147,17 @@ static int test_validation(CRAWContext *ctx)
         return -1;
     }
 
+    /* So has the sharpening's apron, DESIGN.md 20.3. */
+    craw_pipeline_params_init(&pp);
+    pp.width = 12;
+    pp.height = 12;
+    pp.flags = CRAW_PIPELINE_FLAG_SHARPEN;
+    if (craw_pipeline_create(ctx, &pp, &pipe) != CRAW_ERROR(EINVAL)) {
+        fprintf(stderr, "a 12x12 sharpening pipeline was not rejected with EINVAL\n");
+        craw_pipeline_free(&pipe);
+        return -1;
+    }
+
     craw_pipeline_params_init(&pp);
     pp.width = TEST_W;
     pp.height = TEST_H;
@@ -4254,6 +4274,437 @@ done:
     return ret;
 }
 
+/* ------------------------------------------------------------ sharpening */
+
+/* The deconvolution scene of DESIGN.md 20.5, a luma: bars six pixels wide
+ * on a twelve pixel pitch, a block, and a dim ramp behind them, all of it
+ * edges the range clamp lets through, since a plateau is within the range
+ * of the pixels around it. */
+static float test_sh_truth(int x, int y)
+{
+    float v = 0.05f + 0.05f * (float)y / (float)TEST_H;
+
+    if (x >= 16 && x < 112 && y >= 16 && y < 144 && ((x - 16) % 12) < 6)
+        v = 0.5f;
+    if (x >= 140 && x < 220 && y >= 24 && y < 64)
+        v = 0.3f;
+    if (x >= 150 && x < 200 && y >= 90 && y < 136)
+        v = 0.8f;
+    return v;
+}
+
+/* dst = src blurred by the Gaussian of `sigma` the stage assumes, taps and
+ * mirror as DESIGN.md 20.2 defines them, in double. */
+static void test_sh_blur(const float *src, float *dst, float sigma)
+{
+    float k[CRAW_SH_RMAX + 1];
+    int r = craw_sharpen_kernel(sigma, k);
+    double *tmp = malloc((size_t)TEST_W * TEST_H * sizeof(*tmp));
+
+    if (!tmp)
+        abort();
+    for (int y = 0; y < TEST_H; y++) {
+        for (int x = 0; x < TEST_W; x++) {
+            double acc = 0.0;
+            for (int i = -r; i <= r; i++) {
+                int xx = x + i < 0 ? -(x + i) : x + i >= TEST_W ? 2 * TEST_W - 2 - (x + i) : x + i;
+                acc += k[abs(i)] * (double)src[y * TEST_W + xx];
+            }
+            tmp[y * TEST_W + x] = acc;
+        }
+    }
+    for (int y = 0; y < TEST_H; y++) {
+        for (int x = 0; x < TEST_W; x++) {
+            double acc = 0.0;
+            for (int i = -r; i <= r; i++) {
+                int yy = y + i < 0 ? -(y + i) : y + i >= TEST_H ? 2 * TEST_H - 2 - (y + i) : y + i;
+                acc += k[abs(i)] * tmp[yy * TEST_W + x];
+            }
+            dst[y * TEST_W + x] = (float)acc;
+        }
+    }
+    free(tmp);
+}
+
+/* A standard normal deviate from a hash, Box-Muller. */
+static double test_sh_gauss(uint32_t i)
+{
+    double u1 = ((double)(test_hash(i * 2u + 1u) >> 8) + 0.5) / 16777216.0;
+    double u2 = ((double)(test_hash(i * 2u + 2u) >> 8) + 0.5) / 16777216.0;
+    return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+}
+
+static double test_sh_rms(const float *rgb, const float *truth, int x0, int y0, int x1, int y1)
+{
+    double acc = 0.0;
+    int n = 0;
+
+    for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+            const float *px = &rgb[((size_t)y * TEST_W + x) * 4];
+            double e = (px[0] + 2.0 * px[1] + px[2]) * 0.25 - truth[y * TEST_W + x];
+            acc += e * e;
+            n++;
+        }
+    }
+    return sqrt(acc / n);
+}
+
+/* The definition on the CPU, DESIGN.md 20.5: the deconvolution undoes the
+ * blur it models, by more with every iteration; the mask leaves noise at
+ * the modelled level alone and still sharpens an edge beside it; and the
+ * colour of every pixel is kept. */
+static int test_sh_definition(void)
+{
+    static const uint32_t iters[] = { 1, 4, 16, 64 };
+    static const float wb[3] = { 2.02539f, 1.0f, 1.66797f };
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    const CRAWNoiseModel nm = { .a = (float)TEST_NOISE_A, .b = (float)TEST_NOISE_B };
+    const float sigma = 1.0f;
+    float *truth = malloc(npix * sizeof(*truth)), *blur = malloc(npix * sizeof(*blur));
+    float *rgb = malloc(npix * 4 * sizeof(*rgb)), *before = malloc(npix * 4 * sizeof(*before));
+    double err[CRAW_ARRAY_ELEMS(iters)], err0, sd_off = 0.0, sd_on = 0.0, sd0 = 0.0;
+    int ret = -1, moved_flat = 0, moved_edge = 0, n_edge = 0;
+    double hue = 0.0;
+
+    if (!truth || !blur || !rgb || !before)
+        goto done;
+
+    /* The deconvolution, without the mask: a neutral scene, so that the
+     * luma is every channel. */
+    for (int y = 0; y < TEST_H; y++)
+        for (int x = 0; x < TEST_W; x++)
+            truth[y * TEST_W + x] = test_sh_truth(x, y);
+    test_sh_blur(truth, blur, sigma);
+    for (size_t i = 0; i < npix; i++) {
+        for (int c = 0; c < 3; c++)
+            before[i * 4 + c] = blur[i];
+        before[i * 4 + 3] = 1.0f;
+    }
+    err0 = test_sh_rms(before, truth, 8, 8, TEST_W - 9, TEST_H - 9);
+    for (size_t k = 0; k < CRAW_ARRAY_ELEMS(iters); k++) {
+        memcpy(rgb, before, npix * 4 * sizeof(*rgb));
+        if (craw_ref_sharpen(rgb, TEST_W, TEST_H, sigma, iters[k], 0.0f, NULL, NULL) < 0) {
+            fprintf(stderr, "craw_ref_sharpen failed\n");
+            goto done;
+        }
+        err[k] = test_sh_rms(rgb, truth, 8, 8, TEST_W - 9, TEST_H - 9);
+    }
+    printf("  sharpen definition: rms error against the unblurred scene %.4f blurred, "
+           "%.4f %.4f %.4f %.4f after 1, 4, 16, 64 iterations\n", err0, err[0], err[1],
+           err[2], err[3]);
+    for (size_t k = 0; k < CRAW_ARRAY_ELEMS(iters); k++) {
+        if (!(err[k] < (k ? err[k - 1] : err0))) {
+            fprintf(stderr, "the deconvolution's error did not fall from %u iterations on\n",
+                    iters[k]);
+            goto done;
+        }
+    }
+    if (!(err[3] < 0.5 * err0)) {
+        fprintf(stderr, "64 iterations left %.4f of an error of %.4f\n", err[3], err0);
+        goto done;
+    }
+
+    /* The mask: a flat patch at 0.1 carrying exactly the modelled noise,
+     * white, beside a step to 0.3 that is itself blurred by the PSF, in a
+     * warm colour so that its ratios can be checked. */
+    {
+        float na, nb, sd;
+
+        craw_sharpen_noise(&nm, wb, &na, &nb);
+        sd = sqrtf(na * 0.1f + nb);
+        for (int y = 0; y < TEST_H; y++)
+            for (int x = 0; x < TEST_W; x++)
+                truth[y * TEST_W + x] = x < 160 ? 0.1f : 0.3f;
+        test_sh_blur(truth, blur, sigma);
+        for (int y = 0; y < TEST_H; y++) {
+            for (int x = 0; x < TEST_W; x++) {
+                size_t i = (size_t)y * TEST_W + x;
+                float v = blur[i] + (x < 150 ? sd * (float)test_sh_gauss((uint32_t)i) : 0.0f);
+                /* R and B at 1.3 and 0.7 of G: the luma is v. */
+                before[i * 4 + 0] = 1.3f * v;
+                before[i * 4 + 1] = v;
+                before[i * 4 + 2] = 0.7f * v;
+                before[i * 4 + 3] = 1.0f;
+            }
+        }
+
+        for (int on = 0; on < 2; on++) {
+            memcpy(rgb, before, npix * 4 * sizeof(*rgb));
+            if (craw_ref_sharpen(rgb, TEST_W, TEST_H, sigma, 16, on ? 1.5f : 0.0f, &nm, wb) < 0) {
+                fprintf(stderr, "craw_ref_sharpen failed\n");
+                goto done;
+            }
+            for (int y = 16; y < TEST_H - 16; y++) {
+                for (int x = 16; x < 140; x++) {
+                    size_t i = (size_t)y * TEST_W + x;
+                    double dv = rgb[i * 4 + 1] - blur[i], d0 = before[i * 4 + 1] - blur[i];
+                    if (on) {
+                        sd_on += dv * dv;
+                        moved_flat += memcmp(&rgb[i * 4], &before[i * 4], 4 * sizeof(*rgb)) != 0;
+                    } else {
+                        sd_off += dv * dv;
+                        sd0 += d0 * d0;
+                    }
+                }
+                for (int x = 157; x <= 162 && on; x++) {
+                    size_t i = (size_t)y * TEST_W + x;
+                    moved_edge += memcmp(&rgb[i * 4], &before[i * 4], 4 * sizeof(*rgb)) != 0;
+                    n_edge++;
+                }
+            }
+            for (size_t i = 0; i < npix && on; i++) {
+                double g = rgb[i * 4 + 1];
+                if (g > 0.0)
+                    hue = fmax(hue, fmax(fabs(rgb[i * 4] / g - 1.3), fabs(rgb[i * 4 + 2] / g - 0.7)));
+            }
+        }
+        sd_off = sqrt(sd_off / sd0);
+        sd_on = sqrt(sd_on / sd0);
+    }
+    printf("  sharpen definition: noise at the modelled level x%.2f unmasked, x%.3f with a "
+           "contrast of 1.5 (%d px of the flat patch moved), %d of %d edge px sharpened, "
+           "colour ratios within %.1e\n", sd_off, sd_on, moved_flat, moved_edge, n_edge, hue);
+    if (!(sd_off > 1.2) || moved_flat > 0.001 * (TEST_H - 32) * 124 || !(moved_edge > n_edge * 9 / 10) ||
+        !(hue < 1e-5)) {
+        fprintf(stderr, "the sharpening's mask or ratio does not do what DESIGN.md 20.2 says\n");
+        goto done;
+    }
+    ret = 0;
+
+done:
+    free(before);
+    free(rgb);
+    free(blur);
+    free(truth);
+    return ret;
+}
+
+/* DESIGN.md 20.5: the definition on the CPU, the three ways of switching
+ * the stage off, the GPU against the reference on its own unsharpened
+ * intermediate with MHC and RCD, masked and not, on a frame of awkward
+ * size, and the parameters that must be refused. `src` holds `mosaic`, the
+ * standard scene. */
+static int test_sharpen(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                        const uint16_t *mosaic, CRAWTestImage *src, CRAWTestImage *dst,
+                        float *gpu, float *ref)
+{
+    static const enum CRAWDebayer methods[] = { CRAW_DEBAYER_MHC, CRAW_DEBAYER_RCD };
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    const CRAWNoiseModel nm = { .a = (float)TEST_NOISE_A, .b = (float)TEST_NOISE_B };
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    float *plain = malloc(npix * 4 * sizeof(*plain));
+    double ms = 0.0;
+    int ret = -1;
+
+    if (!plain)
+        goto done;
+    if (test_sh_definition() < 0)
+        goto done;
+
+    /* Off both ways, bit for bit. */
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_W;
+    pp.height = TEST_H;
+    pp.debayer = CRAW_DEBAYER_RCD;
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+    if (test_run_config(td, ctx, src, dst, &pp, &fp, plain, NULL, NULL, &ms) < 0)
+        goto done;
+    for (int off = 0; off < 3; off++) {
+        pp.flags = off == 0 ? 0 : CRAW_PIPELINE_FLAG_SHARPEN;
+        fp.sharpen_radius = off == 1 ? 0.0f : 0.8f;
+        fp.sharpen_iterations = off == 2 ? 0 : 10;
+        if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto done;
+        if (memcmp(gpu, plain, npix * 4 * sizeof(*gpu))) {
+            fprintf(stderr, "sharpening %s changed the frame\n",
+                    off == 0 ? "on a pipeline without the stage" :
+                    off == 1 ? "at radius 0" : "at 0 iterations");
+            goto done;
+        }
+    }
+    printf("  sharpen off three ways: bit for bit the plain chain\n");
+
+    /* The stage against the reference run on the GPU's own unsharpened
+     * frame: with identity colour the destination is the intermediate
+     * itself. Masked and not, and at two radii, so that two reaches of
+     * the shader are exercised. */
+    for (size_t mi = 0; mi < CRAW_ARRAY_ELEMS(methods); mi++) {
+        for (int k = 0; k < 2; k++) {
+            enum CRAWDebayer method = methods[mi];
+            const float radius = k ? 1.3f : 0.6f, contrast = k ? 1.5f : 0.0f;
+            const uint32_t iterations = k ? 12 : 25;
+            double err, cross;
+            size_t moved = 0;
+
+            craw_pipeline_params_init(&pp);
+            pp.width = TEST_W;
+            pp.height = TEST_H;
+            pp.debayer = method;
+            pp.flags = CRAW_PIPELINE_FLAG_SHARPEN;
+            craw_frame_params_init(&fp);
+            fp.profile = identity;
+            fp.noise_override = nm;
+
+            if (test_run_config(td, ctx, src, dst, &pp, &fp, plain, NULL, NULL, &ms) < 0)
+                goto done;
+            fp.sharpen_radius = radius;
+            fp.sharpen_iterations = iterations;
+            fp.sharpen_contrast = contrast;
+            if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+                goto done;
+            memcpy(ref, plain, npix * 4 * sizeof(*ref));
+            if (craw_ref_sharpen(ref, TEST_W, TEST_H, radius, iterations, contrast, &nm,
+                                 identity->as_shot_wb) < 0) {
+                fprintf(stderr, "sharpen: craw_ref_sharpen failed\n");
+                goto done;
+            }
+            err = test_max_rel(gpu, ref, npix);
+            cross = test_max_rel(gpu, plain, npix);
+            for (size_t i = 0; i < npix; i++)
+                moved += memcmp(&gpu[i * 4], &plain[i * 4], 3 * sizeof(*gpu)) != 0;
+
+            printf("  sharpen %-8s radius %.1f x%-2u contrast %.1f: max rel %.3e (tol %.1e) on "
+                   "the same input, %.3e against the plain chain, %zu px moved, %.3f ms\n",
+                   test_method_name(method), (double)radius, iterations, (double)contrast,
+                   err, TEST_SH_TOL, cross, moved, ms);
+            if (!(err <= TEST_SH_TOL)) {
+                fprintf(stderr, "sharpening on %s differs by %.3e, tolerance %.1e\n",
+                        test_method_name(method), err, TEST_SH_TOL);
+                goto done;
+            }
+            if (!(cross > 10.0 * TEST_SH_TOL)) {
+                fprintf(stderr, "a sharpened %s frame is only %.3e from the plain one; the pass "
+                        "cannot have run\n", test_method_name(method), cross);
+                goto done;
+            }
+        }
+    }
+
+    /* A frame whose width is not a whole number of the planes' eight
+     * pixel chunks, nor either side of the 16x16 workgroups: the last chunk
+     * of a row is part padding, the last workgroups hang over the right and
+     * bottom edges, and the mirror is filled in at both, at the widest
+     * reach. Then the smallest frame the stage takes, from the middle of
+     * the checkerboard, where one workgroup's tile holds the whole frame
+     * and the mirror reaches the far side of it. The standard scene cut
+     * down to both. */
+    for (int k = 0; k < 2; k++) {
+        const uint32_t ow = k ? 14 : TEST_W - 10, oh = k ? 14 : TEST_H - 10;
+        const uint32_t ox = k ? 214 : 0, oy = k ? 100 : 0;
+        const size_t on = (size_t)ow * oh;
+        CRAWTestImage osrc = { 0 }, odst = { 0 };
+        uint16_t *om = malloc(on * sizeof(*om));
+        double err, cross;
+        int bad = -1;
+
+        if (!om)
+            goto odd_done;
+        for (uint32_t y = 0; y < oh; y++)
+            memcpy(&om[y * ow], &mosaic[(oy + y) * TEST_W + ox], ow * sizeof(*om));
+        if (craw_testdev_image_create(td, &osrc, ow, oh, VK_FORMAT_R16_UNORM) < 0)
+            goto odd_done;
+        if (craw_testdev_image_create(td, &odst, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT) < 0)
+            goto odd_done;
+        if (craw_testdev_image_upload(td, &osrc, om, on * sizeof(*om)) < 0)
+            goto odd_done;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = ow;
+        pp.height = oh;
+        pp.debayer = CRAW_DEBAYER_RCD;
+        pp.flags = CRAW_PIPELINE_FLAG_SHARPEN;
+        craw_frame_params_init(&fp);
+        fp.profile = identity;
+        fp.noise_override = nm;
+        if (test_run_config(td, ctx, &osrc, &odst, &pp, &fp, plain, NULL, NULL, &ms) < 0)
+            goto odd_done;
+        fp.sharpen_radius = CRAW_SHARPEN_MAX_RADIUS;
+        fp.sharpen_iterations = 8;
+        fp.sharpen_contrast = k ? 0.0f : 1.0f;
+        if (test_run_config(td, ctx, &osrc, &odst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+            goto odd_done;
+        memcpy(ref, plain, on * 4 * sizeof(*ref));
+        if (craw_ref_sharpen(ref, ow, oh, fp.sharpen_radius, fp.sharpen_iterations,
+                             fp.sharpen_contrast, &nm, identity->as_shot_wb) < 0)
+            goto odd_done;
+        err = test_max_rel(gpu, ref, on);
+        cross = test_max_rel(gpu, plain, on);
+        printf("  sharpen rcd      %ux%u radius %.1f x%u contrast %.1f: max rel %.3e (tol %.1e), "
+               "%.3e against the plain chain\n", ow, oh, (double)fp.sharpen_radius,
+               fp.sharpen_iterations, (double)fp.sharpen_contrast, err, TEST_SH_TOL, cross);
+        if (!(err <= TEST_SH_TOL) || !(cross > 10.0 * TEST_SH_TOL)) {
+            fprintf(stderr, "sharpening a %ux%u frame differs by %.3e from the reference and "
+                    "%.3e from the plain chain\n", ow, oh, err, cross);
+            goto odd_done;
+        }
+        bad = 0;
+
+odd_done:
+        if (odst.img.image)
+            craw_testdev_image_free(td, &odst);
+        if (osrc.img.image)
+            craw_testdev_image_free(td, &osrc);
+        free(om);
+        if (bad < 0)
+            goto done;
+    }
+
+    /* Out of range is an error, not a clamp, and a mask needs a model. */
+    {
+        static const struct {
+            float radius;
+            uint32_t iterations;
+            float contrast;
+            bool model;
+            int want;
+        } bad[] = {
+            { 2.5f, 10, 0.0f, true, CRAW_ERROR(EINVAL) },
+            { 1.0f, CRAW_SHARPEN_MAX_ITERATIONS + 1, 0.0f, true, CRAW_ERROR(EINVAL) },
+            { 1.0f, 10, -1.0f, true, CRAW_ERROR(EINVAL) },
+            { 1.0f, 10, 1.5f, false, CRAW_ERROR(ENOTSUP) },
+        };
+        CRAWPipeline *pipe = NULL;
+
+        craw_pipeline_params_init(&pp);
+        pp.width = TEST_W;
+        pp.height = TEST_H;
+        pp.flags = CRAW_PIPELINE_FLAG_SHARPEN;
+        if (craw_pipeline_create(ctx, &pp, &pipe) < 0)
+            goto done;
+        for (size_t i = 0; i < CRAW_ARRAY_ELEMS(bad); i++) {
+            struct test_run run = { .pipe = pipe, .src = src, .dst = dst, .fp = &fp };
+            int rec;
+
+            craw_frame_params_init(&fp);
+            fp.profile = identity;
+            fp.sharpen_radius = bad[i].radius;
+            fp.sharpen_iterations = bad[i].iterations;
+            fp.sharpen_contrast = bad[i].contrast;
+            if (bad[i].model)
+                fp.noise_override = nm;
+            rec = craw_testdev_run(td, test_record, &run);
+            if (rec != bad[i].want) {
+                fprintf(stderr, "sharpening at radius %g, %u iterations, contrast %g%s returned "
+                        "%d, wanted %d\n", (double)bad[i].radius, bad[i].iterations,
+                        (double)bad[i].contrast, bad[i].model ? "" : " without a model", rec,
+                        bad[i].want);
+                craw_pipeline_free(&pipe);
+                goto done;
+            }
+        }
+        craw_pipeline_free(&pipe);
+    }
+
+    ret = 0;
+
+done:
+    free(plain);
+    return ret;
+}
+
 /* ----------------------------------------------------------- real frame */
 
 static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *profile,
@@ -4599,6 +5050,69 @@ static int test_real_frame(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfi
         }
     }
 
+    /* And the capture sharpening at the tools' defaults, DESIGN.md 20.5:
+     * timed on the plain RCD chain with the real profile, then, as the
+     * defringe, held against the reference run on the GPU's own
+     * unsharpened intermediate. The noise model is the shipped ISO 1000
+     * knot, which is this clip's. */
+    {
+        const CRAWNoiseModel nm = { .a = 1.30e-5f, .b = 1.0e-9f };
+        double err, cross, total_ms;
+        size_t moved = 0, beyond = 0;
+
+        pp.flags = CRAW_PIPELINE_FLAG_SHARPEN;
+        fp.defringe_strength = 0.0f;
+        fp.noise_override = nm;
+        fp.sharpen_radius = 0.8f;
+        fp.sharpen_iterations = 20;
+        fp.sharpen_contrast = 1.0f;
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, gpu, NULL, NULL, &total_ms);
+        if (ret < 0)
+            goto done;
+
+        fp.profile = identity;
+        fp.sharpen_iterations = 0;
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, ref, NULL, NULL, &ms);
+        if (ret < 0)
+            goto done;
+        fp.sharpen_iterations = 20;
+        ret = test_run_config(td, ctx, &src, &dst, &pp, &fp, gpu, NULL, NULL, &ms);
+        if (ret < 0)
+            goto done;
+        fp.profile = profile;
+
+        cross = test_max_rel(gpu, ref, npix);
+        for (size_t i = 0; i < npix; i++)
+            moved += memcmp(&gpu[i * 4], &ref[i * 4], 3 * sizeof(*gpu)) != 0;
+
+        ret = craw_ref_sharpen(ref, FRAME_W, FRAME_H, 0.8f, 20, 1.0f, &nm, identity->as_shot_wb);
+        if (ret < 0)
+            goto done;
+        err = test_max_rel(gpu, ref, npix);
+        for (size_t i = 0; i < npix; i++) {
+            double sc = 0.0;
+            for (int c = 0; c < 3; c++)
+                sc = fmax(sc, fabs((double)ref[i * 4 + c]));
+            for (int c = 0; c < 3; c++)
+                if (fabs((double)gpu[i * 4 + c] - (double)ref[i * 4 + c]) > TEST_SH_TOL * fmax(sc, 1e-3)) {
+                    beyond++;
+                    break;
+                }
+        }
+
+        printf("  rcd + sharpen x20 on %dx%d: %.2f ms, %zu px moved (%.2f%%), %.3e relative "
+               "against the unsharpened chain; on the same intermediate max rel %.3e, %zu px "
+               "past %.0e\n", FRAME_W, FRAME_H, total_ms, moved,
+               100.0 * (double)moved / (double)npix, cross, err, beyond, TEST_SH_TOL);
+
+        if (!(err <= TEST_SH_TOL) || !moved) {
+            fprintf(stderr, "sharpening on the real frame differs by %.3e relative, tolerance "
+                    "%.1e, %zu px moved\n", err, TEST_SH_TOL, moved);
+            ret = -1;
+            goto done;
+        }
+    }
+
 done:
     if (ret < 0)
         fprintf(stderr, "real frame run failed: %d\n", ret);
@@ -4810,6 +5324,12 @@ int main(void)
     if (test_highlights(&td, ctx, &identity, &src, &dst, gpu, ref) < 0)
         goto done;
     if (test_defringe(&td, ctx, &identity, &src, &dst, gpu, ref) < 0)
+        goto done;
+
+    /* On the standard scene again. */
+    if (craw_testdev_image_upload(&td, &src, mosaic, npix * sizeof(*mosaic)) < 0)
+        goto done;
+    if (test_sharpen(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
         goto done;
 
     if (test_gamut(&td, ctx, &profile, &src, &dst, gpu, ref) < 0)

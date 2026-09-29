@@ -136,6 +136,25 @@ enum CRAWDebayer {
  * at craw_pipeline_record() for the rules that makes. */
 #define CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE (1 << 7)
 
+/* Build the capture sharpening pass, DESIGN.md 20: Richardson-Lucy
+ * deconvolution of the luma of the camera RGB intermediate by a Gaussian
+ * of the frame's chosen radius, after every other stage on the camera RGB,
+ * with the luma's ratio applied to all three channels so that no colour
+ * moves, a local contrast mask in units of the modelled noise that leaves
+ * flat and noisy areas alone, and a clamp to the local range that keeps
+ * dark rings out of the surroundings of bright lights. It costs three full
+ * resolution fp16 planes, 105 MB at 5.8K, and 1 ms plus 0.4 ms an
+ * iteration at 5.8K on an RX 6900 XT. Once built it is switched per frame
+ * with CRAWFrameParams.sharpen_iterations and sharpen_radius, and costs
+ * nothing when either is zero. */
+#define CRAW_PIPELINE_FLAG_SHARPEN (1 << 8)
+
+/* The widest Gaussian the sharpening pass takes, sigma in pixels, and the
+ * most iterations one frame may ask for. The radius bounds the shader's
+ * tile; the count bounds how long one recording can keep the GPU busy. */
+#define CRAW_SHARPEN_MAX_RADIUS     2.0f
+#define CRAW_SHARPEN_MAX_ITERATIONS 100
+
 /* Fixed configuration of a pipeline. Changing any of it means creating a
  * new pipeline. */
 typedef struct CRAWPipelineParams {
@@ -319,14 +338,36 @@ typedef struct CRAWFrameParams {
     float denoise_temporal_strength;
     bool denoise_temporal_replay;
 
+    /* Capture sharpening, DESIGN.md 20. Ignored unless the pipeline was
+     * created with CRAW_PIPELINE_FLAG_SHARPEN; a radius or an iteration
+     * count of zero, the defaults, skips the pass for this frame without
+     * rebuilding the pipeline.
+     *
+     * sharpen_radius is the sigma of the Gaussian blur being undone, in
+     * pixels, above 0 and at most CRAW_SHARPEN_MAX_RADIUS.
+     * sharpen_iterations is the number of Richardson-Lucy iterations, at
+     * most CRAW_SHARPEN_MAX_ITERATIONS: each costs about the same, and a
+     * viewer can run fewer while playing than it does for a still.
+     * sharpen_contrast is the local contrast below which nothing is
+     * sharpened, in units of the modelled noise the way denoise_strength
+     * is: 0 sharpens everything, noise included, and a positive value
+     * needs a noise model exactly as the denoise does (noise_override, or
+     * the profile's table), failing with CRAW_ERROR(ENOTSUP) without one.
+     * Anything out of range makes craw_pipeline_record() fail with
+     * CRAW_ERROR(EINVAL). */
+    float    sharpen_radius;
+    uint32_t sharpen_iterations;
+    float    sharpen_contrast;
+
     /* Padding to allow for future options. Must always be set to 0. The
      * `- 8` after the 64 is out_space, out_space_set and the alignment hole
      * after it, the three `- 4` after that are false_color_passes,
-     * denoise_chroma_strength and defringe_strength, and the last `- 4 - 4`
-     * are denoise_temporal_strength, then denoise_temporal_replay with the
-     * three bytes after it, all taken out of the tail so that sizeof stays
-     * what it was. */
-    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8 - 4 - 4 - 4 - 4 - 4];
+     * denoise_chroma_strength and defringe_strength, the `- 4 - 4` after
+     * those are denoise_temporal_strength, then denoise_temporal_replay
+     * with the three bytes after it, and the `- 12` at the end the three
+     * sharpen_ fields, all taken out of the tail so that sizeof stays what
+     * it was. */
+    uint8_t padding[256 - 4*4 - 8 - 12 - 64 - 8 - 4 - 4 - 4 - 4 - 4 - 12];
 } CRAWFrameParams;
 
 /* Fills `p` with defaults: RGGB, RCD, XYZ D65 output, RGBA16F, no flags.
@@ -336,8 +377,8 @@ CRAW_API void craw_pipeline_params_init(CRAWPipelineParams *p);
 /* Fills `fp` with defaults: as-shot white balance, the pipeline's own
  * output colour space, no exposure change, no denoising of any kind, no
  * noise model override, no highlight reconstruction, no false colour
- * suppression, no defringe, no lens correction. The profile pointer is left NULL and
- * must be set by the caller. */
+ * suppression, no defringe, no lens correction, no sharpening. The profile
+ * pointer is left NULL and must be set by the caller. */
 CRAW_API void craw_frame_params_init(CRAWFrameParams *fp);
 
 /* Allocates the pipeline's intermediate images and histogram buffers for
@@ -360,6 +401,7 @@ CRAW_API void craw_pipeline_free(CRAWPipeline **pipe);
  *     -> [per-channel lens correction warp]
  *     -> [defringe, colour along strong edges held to what both sides have]
  *     -> [chroma denoise, the quarter resolution chroma band smoothed]
+ *     -> [capture sharpening, Richardson-Lucy on the luma, as a ratio]
  *     -> [auto white balance histogram]
  *     -> white balance re-balance, camera matrix, gain and exposure
  *     -> XYZ to the frame's output space (CRAWFrameParams.out_space when

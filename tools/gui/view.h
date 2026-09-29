@@ -171,6 +171,13 @@ struct view_pipeline_look {
      * record. */
     bool lens;
     bool lens_keep;
+    /* The sharpening as it ran, all zero when it did not. The iteration
+     * count is the one the pass ran with, which is fewer while playing than
+     * while paused: pausing is a change of look, so the held picture is put
+     * through again at the full count. */
+    float sharpen_radius;
+    int sharpen_iterations;
+    float sharpen_contrast;
 };
 
 struct view_name_map {
@@ -987,6 +994,23 @@ struct view_lens {
     double ms_on, ms_off;
 };
 
+/* Capture sharpening, as the panel holds it, DESIGN.md 20. `iterations` is
+ * the full count, the one a paused picture and every exported frame are
+ * developed with; a playing picture runs at most
+ * VIEW_SHARPEN_PLAY_ITERATIONS of them, view_sharpen_iterations() says
+ * which applies. All three numbers are kept across an off. */
+struct view_sharpen {
+    bool on;
+    float radius;               /* sigma of the blur undone, in pixels */
+    int iterations;             /* an int because nuklear's property wants one */
+    float contrast;             /* the mask's threshold, in modelled noise */
+};
+
+/* What a playing picture can afford: each iteration costs 0.4 ms at 5.8K
+ * on the 6900 XT on top of 1 ms for the stage itself, and five of them
+ * make three quarters of the edge sharpening twenty do. DESIGN.md 20.4. */
+#define VIEW_SHARPEN_PLAY_ITERATIONS 5
+
 /* Film grain, as the panel holds it. grain.c turns this into the parameters
  * libplacebo's grain shaders take and grain_ui.c does the turning; nothing
  * here reaches the raw pipeline, because the grain is applied at
@@ -1025,6 +1049,7 @@ enum view_section {
     VIEW_SEC_DEBAYER,
     VIEW_SEC_DENOISE,
     VIEW_SEC_LENS,
+    VIEW_SEC_SHARPEN,
     VIEW_SEC_LOOK,
     VIEW_SEC_ADJUST,
     VIEW_SEC_GRAIN,
@@ -1041,8 +1066,8 @@ enum view_section {
  * table because these headers are not nk_tree_push()es any more: a nuklear
  * tree header owns its whole row and cannot hold a switch beside its title.
  *
- * Four of the switches are the sections' own existing flags - denoise.on,
- * lens.on, grain.on and crop.on - which the header now shows instead of a
+ * Five of the switches are the sections' own flags - denoise.on, lens.on,
+ * sharpen.on, grain.on and crop.on - which the header shows instead of a
  * row inside the body. The three below are the new ones, and like every
  * other setting they carry from clip to clip. */
 struct view_sections {
@@ -1096,6 +1121,7 @@ struct view_state {
     struct view_grain grain;
     struct view_denoise denoise;
     struct view_lens lens;
+    struct view_sharpen sharpen;
     struct view_adjust adjustments;
 
     /* The panel is worked with the pointer alone: there is no keyboard
@@ -1542,6 +1568,15 @@ float view_chroma_strength(const struct view_state *st);
 /* The temporal denoise's alpha_max for the next frame: zero unless the
  * switch is on, the control is positive and a model exists. */
 float view_temporal_strength(const struct view_state *st);
+
+/* The number of sharpening iterations the pass will run: zero unless the
+ * switch is on, the full count on a paused picture and on every exported
+ * frame, and at most VIEW_SHARPEN_PLAY_ITERATIONS while playing. */
+int view_sharpen_iterations(const struct view_state *st);
+
+/* The mask's threshold the pass will run with: the panel's, or zero on a
+ * camera without a noise model, whose noise the mask cannot know. */
+float view_sharpen_contrast(const struct view_state *st);
 
 /* The pipeline-relevant part of the current look, and whether two of them
  * would give the same picture. */
