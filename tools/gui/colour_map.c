@@ -570,6 +570,25 @@ static size_t view_colour_cat_prim(char *buf, size_t size, size_t at, int named,
         return view_colour_cat(buf, size, at, "custom (%s)",
                                view_colour_primaries_name(match));
 
+    /* Near one, which is what a target clipped into its container is: P3
+     * in BT.2020 is a few thousandths off P3. For the log only. */
+    for (int p = VIEW_WP_PRIM_SRGB; p <= VIEW_WP_PRIM_ADOBE_RGB; p++) {
+        enum pl_color_primaries pl = view_colour_prim_pl(p);
+        const struct pl_raw_primaries *r;
+        float d;
+
+        if (pl == PL_COLOR_PRIM_UNKNOWN)
+            continue;
+        r = pl_raw_primaries_get(pl);
+        d = fabsf(xy->red.x - r->red.x)     + fabsf(xy->red.y - r->red.y) +
+            fabsf(xy->green.x - r->green.x) + fabsf(xy->green.y - r->green.y) +
+            fabsf(xy->blue.x - r->blue.x)   + fabsf(xy->blue.y - r->blue.y) +
+            fabsf(xy->white.x - r->white.x) + fabsf(xy->white.y - r->white.y);
+        if (d < 0.01f)
+            return view_colour_cat(buf, size, at, "custom (near %s)",
+                                   view_colour_primaries_name(p));
+    }
+
     return view_colour_cat(buf, size, at, "custom");
 }
 
@@ -622,13 +641,13 @@ void view_colour_describe_desc(const struct view_colour_desc *d,
     if (d->tf_named)
         at = view_colour_cat(buf, size, at, " %s", view_colour_tf_name(d->tf_named));
     else
-        at = view_colour_cat(buf, size, at, " power %.4g", d->tf_power);
-    at = view_colour_cat(buf, size, at, " %.4g/%.4g/%.4g cd/m², target ",
+        at = view_colour_cat(buf, size, at, " power %.5g", d->tf_power);
+    at = view_colour_cat(buf, size, at, " %.5g/%.5g/%.5g cd/m², target ",
                          d->min_lum, d->max_lum, d->ref_lum);
     at = view_colour_cat_prim(buf, size, at, 0, &d->target);
-    at = view_colour_cat(buf, size, at, " %.4g/%.4g", d->target_min, d->target_max);
+    at = view_colour_cat(buf, size, at, " %.5g/%.5g", d->target_min, d->target_max);
     if (d->max_cll > 0.0f || d->max_fall > 0.0f)
-        at = view_colour_cat(buf, size, at, ", cll %.4g fall %.4g",
+        at = view_colour_cat(buf, size, at, ", cll %.5g fall %.5g",
                              d->max_cll, d->max_fall);
     (void)at;
 }
@@ -639,7 +658,7 @@ void view_colour_describe_choice(const struct view_colour_choice *c,
     const struct pl_raw_primaries *container = pl_raw_primaries_get(c->target.primaries);
     size_t at = 0;
 
-    at = view_colour_cat(buf, size, at, "%s %s %.4g to %.4g cd/m²",
+    at = view_colour_cat(buf, size, at, "%s %s %.5g to %.5g cd/m²",
                          view_colour_pl_prim_name(c->target.primaries),
                          view_colour_pl_trc_name(c->target.transfer),
                          c->target.hdr.min_luma, c->target.hdr.max_luma);
@@ -660,15 +679,15 @@ void view_colour_describe_choice(const struct view_colour_choice *c,
     if (c->tf_named)
         at = view_colour_cat(buf, size, at, "%s", view_colour_tf_name(c->tf_named));
     else
-        at = view_colour_cat(buf, size, at, "power %.4g", c->tf_power);
+        at = view_colour_cat(buf, size, at, "power %.5g", c->tf_power);
     if (c->set_luminances)
-        at = view_colour_cat(buf, size, at, " %.4g/%.4g/%.4g cd/m²",
+        at = view_colour_cat(buf, size, at, " %.5g/%.5g/%.5g cd/m²",
                              c->min_lum, c->max_lum, c->ref_lum);
     if (c->set_mastering) {
         at = view_colour_cat(buf, size, at, ", mastering ");
         at = view_colour_cat_prim(buf, size, at, 0, &c->mastering);
         if (c->mastering_max > 0.0f)
-            at = view_colour_cat(buf, size, at, " %.4g/%.4g",
+            at = view_colour_cat(buf, size, at, " %.5g/%.5g",
                                  c->mastering_min, c->mastering_max);
     }
     at = view_colour_cat(buf, size, at, ", intent %s", view_colour_intent_name(c->intent));
