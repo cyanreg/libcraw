@@ -24,6 +24,7 @@
 
 #include "view.h"
 #include "grain_ui.h"
+#include "colour.h"
 #include "../profiles.h"
 
 /* The embedded film simulation collection is optional; without it --lut
@@ -2203,6 +2204,14 @@ static void view_usage(FILE *f)
 "                      hable, gamma, linear, linearlight or clip. A\n"
 "                      display-referred export is mapped with the same one,\n"
 "                      so the file keeps matching the window\n"
+"  --no-colour-management\n"
+"                      leave the window untagged sRGB. On Wayland it\n"
+"                      otherwise follows the compositor's preferred image\n"
+"                      description: the picture is rendered into it and the\n"
+"                      window tagged with it, so the compositor has nothing\n"
+"                      left to convert, and again whenever the preference\n"
+"                      changes - another output, HDR switched on. On X11\n"
+"                      the window is untagged sRGB either way\n"
 "  --softlight PERCENT blend the picture with itself through the soft light\n"
 "                      blend mode, 0 to 100 (default: 0, off)\n"
 "  --vibrance PASTELS[,SATURATED[,THRESHOLD]]\n"
@@ -2398,6 +2407,7 @@ enum {
     VIEW_OPT_BYPASS,
     VIEW_OPT_THREADS,
     VIEW_OPT_TONE_MAP,
+    VIEW_OPT_NO_COLOUR_MANAGEMENT,
 };
 
 static int view_parse_args(struct view_state *st, int argc, char **argv,
@@ -2449,6 +2459,8 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "bypass",   required_argument, NULL, VIEW_OPT_BYPASS    },
         { "threads",  required_argument, NULL, VIEW_OPT_THREADS   },
         { "tone-map", required_argument, NULL, VIEW_OPT_TONE_MAP  },
+        { "no-colour-management", no_argument, NULL, VIEW_OPT_NO_COLOUR_MANAGEMENT },
+        { "no-color-management",  no_argument, NULL, VIEW_OPT_NO_COLOUR_MANAGEMENT },
         { "help",     no_argument,       NULL, 'h'                },
         { NULL,       0,                 NULL, 0                  },
     };
@@ -2473,6 +2485,9 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             break;
         case VIEW_OPT_BENCH:
             st->cfg.bench = true;
+            break;
+        case VIEW_OPT_NO_COLOUR_MANAGEMENT:
+            st->cfg.no_colour_management = true;
             break;
         case VIEW_OPT_TRACE:
             st->cfg.trace = optarg;
@@ -3518,6 +3533,24 @@ static int view_run_window(struct view_state *st)
         return CRAW_ERROR(EIO);
     }
 
+    /* The window's colour (DESIGN.md 22): on Wayland, the compositor's
+     * preferred image description, rendered into and tagged. It needs the
+     * swapchain to exist, because it switches it to pass-through, which
+     * recreates it at the size it had; sized again here all the same, so
+     * that the image is the window's own size whatever happened. Not
+     * being able to is not an error: the window is then untagged sRGB, as
+     * it is on X11 and with --no-colour-management. */
+    if (!st->cfg.no_colour_management) {
+        ret = view_colour_open(&st->gpu, win, st->cfg.verbose);
+        if (ret < 0)
+            return ret;
+        SDL_GetWindowSizeInPixels(win, &w, &h);
+        if (view_colour_active(&st->gpu) && !pl_swapchain_resize(st->gpu.sw, &w, &h)) {
+            fprintf(stderr, "cannot size the swapchain to %dx%d\n", w, h);
+            return CRAW_ERROR(EIO);
+        }
+    }
+
     /* Before the first clip: a LUT is a setting, and nothing about
      * resolving one - a file or a name out of the embedded pack - has
      * anything to do with which clip is open. */
@@ -3558,6 +3591,15 @@ static int view_run_window(struct view_state *st)
         int64_t now;
 
         view_trace_iter(st, av_gettime_relative());
+
+        /* Whatever the compositor has said about the window's colour since
+         * the last iteration - SDL's own reads of the socket queue it - is
+         * acted on here, without waiting for anything. A new target colour
+         * is a reason to draw: the picture pass's signature has the target
+         * in it, so the picture is rendered again against it, and the frame
+         * that carries it is the commit the new tag lands with. */
+        if (view_colour_dispatch(&st->gpu))
+            st->present_due = true;
 
         if (ui_input_consumed) {
             view_ui_input_begin();
