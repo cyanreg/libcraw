@@ -47,6 +47,20 @@ libxml = dependency('libxml-2.0', required: false)
 # is the one place that knows: the same lookup every desktop application
 # makes, so the panel reads in the face the rest of the screen does.
 fontconfig = dependency('fontconfig', required: false)
+# The window's colour on Wayland (DESIGN.md 22): the colour management
+# protocol's client code is generated from the machine's own
+# wayland-protocols. Without any of the three cineview still builds, and its
+# window is untagged sRGB as on X11.
+wayland_client = dependency('wayland-client', required: false)
+wayland_protocols = dependency('wayland-protocols', required: false)
+wayland_scanner = find_program('wayland-scanner', native: true, required: false)
+wl_colour_xml = ''
+if wayland_protocols.found()
+    wl_colour_xml = wayland_protocols.get_variable(pkgconfig: 'pkgdatadir') / \
+                    'staging' / 'color-management' / 'color-management-v1.xml'
+endif
+have_wl_colour = wayland_client.found() and wayland_scanner.found() and \
+                 wl_colour_xml != '' and import('fs').is_file(wl_colour_xml)
 
 craw_tools_ffmpeg = libavformat_dep.found() and libavcodec_dep.found() and libavutil_dep.found()
 craw_tools_gui = craw_tools_ffmpeg and sdl3.found() and placebo.found() and \
@@ -91,6 +105,24 @@ if craw_tools_ffmpeg
         gui_args += '-DCINEVIEW_HAVE_LUTS=0'
     endif
 
+    gui_wl_sources = []
+    if have_wl_colour
+        gui_args += '-DCINEVIEW_HAVE_WAYLAND_COLOUR=1'
+        gui_deps += wayland_client
+        gui_wl_sources += custom_target('color-management-v1-client-header',
+            input: wl_colour_xml,
+            output: 'color-management-v1-client-protocol.h',
+            command: [ wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@' ],
+        )
+        gui_wl_sources += custom_target('color-management-v1-protocol-code',
+            input: wl_colour_xml,
+            output: 'color-management-v1-protocol.c',
+            command: [ wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@' ],
+        )
+    else
+        gui_args += '-DCINEVIEW_HAVE_WAYLAND_COLOUR=0'
+    endif
+
     executable('cineraw',
         'cineraw.c',
         'profiles.c',
@@ -127,7 +159,10 @@ if craw_tools_ffmpeg
             'gui/pick.c',
             'gui/pana.c',
             'gui/videowb.c',
+            'gui/colour.c',
+            'gui/colour_map.c',
             'profiles.c',
+            gui_wl_sources,
             c_args: gui_args,
             include_directories: [ craw_inc ],
             dependencies: [
@@ -149,4 +184,5 @@ summary({
     'cineraw': craw_tools_ffmpeg,
     'cineview': craw_tools_gui,
     'cineview audio': craw_tools_gui and swresample.found(),
+    'cineview Wayland colour': craw_tools_gui and have_wl_colour,
 }, section: 'tools', bool_yn: true)

@@ -33,6 +33,7 @@
 #include "view.h"
 #include "adjust.h"
 #include "grain_ui.h"
+#include "colour.h"
 
 /* BT.2408 diffuse white; a pipeline value of 1.0 is diffuse white, so the
  * sensor clip lands at this times the profile gain. */
@@ -556,18 +557,32 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
                                        : VK_PRESENT_MODE_FIFO_KHR,
             /* Eight bits per channel for an SDR window, even where the
              * surface offers ten. What the renderer dithers to is the
-             * depth of this image, and a Wayland compositor does not put
-             * this image on the screen: it composites it into a
-             * framebuffer of its own, eight bits deep unless it was told
-             * otherwise (sway's render_bit_depth, which defaults to 8),
-             * rounding to it without dithering. A ten-bit window is then
-             * dithered against a grid two bits finer than the one it
-             * lands on, which leaves exactly the eight-bit contours the
-             * dither is there to break: faint lines that follow the
-             * gradients of a smooth picture. This asks for the depth that
-             * is actually presented, so the dither meets it. Only the SDR
-             * formats are given up - an HDR surface still gets ten bits,
-             * and a compositor that accepts one presents them. */
+             * depth it is told the image has, and a Wayland compositor
+             * does not put this image on the screen: it composites it
+             * into a framebuffer of its own, eight bits deep unless it
+             * was told otherwise (sway's render_bit_depth, which defaults
+             * to 8; an HDR output makes it 10), rounding to it without
+             * dithering. A ten-bit window is then dithered against a grid
+             * two bits finer than the one it lands on, which leaves
+             * exactly the eight-bit contours the dither is there to
+             * break: faint lines that follow the gradients of a smooth
+             * picture. So the dither has to meet the depth that is
+             * actually presented, and there are two ways it is made to.
+             *
+             * This one is for the untagged sRGB window - X11, a
+             * compositor without colour management, or
+             * --no-colour-management: an eight-bit format, whose depth
+             * libplacebo takes as the dither's. Only the SDR formats are
+             * given up; an HDR surface still gets ten bits.
+             *
+             * The other is for a window following the compositor's
+             * preferred description (colour.c): its swapchain is
+             * pass-through, which libplacebo gives the deepest format the
+             * surface has, RGBA16 UNORM, and this flag has no say in.
+             * There the frame's bit encoding is set by hand to eight bits
+             * in sixteen for SDR and ten for PQ or HLG, and the renderer
+             * dithers to that and lands on exact codes of the
+             * compositor's grid. */
             .disable_10bit_sdr = true,
         ));
         if (!g->sw) {
@@ -707,6 +722,9 @@ void view_gpu_close(struct view_gpu *g)
     g->probe_busy = false;
     pl_renderer_destroy(&g->rr_compose);
     pl_renderer_destroy(&g->rr);
+    /* The surface's colour management object before the swapchain whose
+     * frames it describes, and both before SDL's window and wl_surface. */
+    view_colour_close(g);
     pl_swapchain_destroy(&g->sw);
     pl_vulkan_destroy(&g->vk);
 
@@ -2146,9 +2164,17 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
     tw = sw_frame.fbo->params.w;
     th = sw_frame.fbo->params.h;
 
+    /* On a colour managed Wayland window the swapchain is pass-through and
+     * says nothing about its colour: the compositor's preferred
+     * description, as colour_map.c resolved it, is what the frame is
+     * rendered as, and the dither depth is the compositor's framebuffer's
+     * rather than the image's. Untouched otherwise. */
+    view_colour_target(g, &target.color, &target.repr.bits);
+
     /* Remembered for view_gpu_prepare(), which has no swapchain frame of
-     * its own to ask. Only a resize or a format change moves any of it, and
-     * both are in the picture pass's signature. */
+     * its own to ask. Only a resize, a format change or a new preferred
+     * description moves any of it, and all three are in the picture pass's
+     * signature. */
     g->pic_repr = target.repr;
     g->pic_color = target.color;
     g->pic_tw = tw;
@@ -2172,10 +2198,13 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
                  * colour already multiplied by coverage. */
                 .alpha  = PL_ALPHA_PREMULTIPLIED,
             },
-            .color     = pl_color_space_srgb,
             .parts     = &part,
             .num_parts = 1,
         };
+        /* sRGB on an untagged window, and on a colour managed one
+         * whatever lets the panel's code values through unchanged, or,
+         * on an HDR target, an SDR element at 203 cd/m². */
+        view_colour_overlay(g, &overlay.color);
         target.overlays = &overlay;
         target.num_overlays = 1;
     }
