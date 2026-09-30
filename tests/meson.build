@@ -113,3 +113,18 @@ if grain_placebo.found()
         dependencies: [ grain_placebo, cc.find_library('m', required: false) ])
     test('test_grain', exe, timeout: 300)
 endif
+
+# The window's colour choice (DESIGN.md 22): what cineview renders and what
+# it tags its Wayland surface with, for what a compositor offers and
+# prefers. Like the grain model it lives in tools/gui/ and needs nothing
+# there but libplacebo, which is asked for again here because meson walks
+# tests/ first; the protocol half, colour.c, is not built in.
+colour_placebo = dependency('libplacebo', version: '>=7.349', required: false)
+if colour_placebo.found()
+    exe = executable('test_colour',
+        'test_colour.c',
+        '../tools/gui/colour_map.c',
+        include_directories: [ craw_inc, include_directories('../tools/gui') ],
+        dependencies: [ colour_placebo, cc.find_library('m', required: false) ])
+    test('test_colour', exe, timeout: 60)
+endif
