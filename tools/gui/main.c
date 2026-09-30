@@ -2199,8 +2199,8 @@ static void view_usage(FILE *f)
 "                      V-Log to V-709 cubes take). Anything but native\n"
 "                      makes it a conversion LUT to a BT.709 display.\n"
 "  --tone-map NAME     the curve the window is tone mapped with, out of\n"
-"                      libplacebo's own list: spline (the default), bt2390,\n"
-"                      bt2446a, st2094-40, st2094-10, reinhard, mobius,\n"
+"                      libplacebo's own list: st2094-10 (the default),\n"
+"                      st2094-40, spline, bt2390, bt2446a, reinhard, mobius,\n"
 "                      hable, gamma, linear, linearlight or clip. A\n"
 "                      display-referred export is mapped with the same one,\n"
 "                      so the file keeps matching the window\n"
@@ -4229,7 +4229,8 @@ int main(int argc, char **argv)
         .defringe  = 1.0f,
         .lut_type  = PL_LUT_NATIVE,
         .film_sim  = -1,
-        /* libplacebo's own default curve, spline; --tone-map overrides. */
+        /* ST 2094-10 (view_tone_map_default() says why); --tone-map
+         * overrides. */
         .tone_map  = view_tone_map_default(),
     };
     /* Before the arguments, so that --preset, --colour, --size and

@@ -336,9 +336,14 @@ compact pack that ends up in the executable is built by
 `tools/luts_build.py` at build time.
 
 The Look section also holds the "tone map" row: the curve the window is
-tone mapped with, out of libplacebo's own list — spline, the default;
-bt2390; bt2446a; st2094-40; st2094-10; reinhard; mobius; hable; gamma;
+tone mapped with, out of libplacebo's own list — st2094-10, the default;
+st2094-40; spline; bt2390; bt2446a; reinhard; mobius; hable; gamma;
 linear; linearlight; clip — with `--tone-map NAME` as the starting value.
+The default is ST 2094-10 because its curve runs through the black, the
+knee and the peak and nothing else, so highlights keep their separation
+up to the display's white where ST 2094-40's Bézier flattens everything
+above about a thousand nits into one white and the spline sits darker
+through the mid-tones.
 It is a display setting rather than a look: it sits above the section's
 switch and is applied whatever else is bypassed, and every display-referred
 export is mapped with the same curve, so the file keeps matching the window
@@ -463,9 +468,9 @@ cent brighter in the mid-tones than the frame on screen is what that
 bought.) One caveat is libplacebo's: when the window shows the picture
 downscaled it measures the peak after the scaler, on the smaller picture,
 while a full-size export measures it on every pixel, so a curve that leans
-on the peak — bt2390 above all — can come out a percent or two brighter in
-the file than on a fitted window; spline, the default, is all but
-insensitive to it.
+on the peak — bt2390 above all, and st2094-10, the default, which also
+follows the frame's average — can come out a percent or two brighter in
+the file than on a fitted window; spline is all but insensitive to it.
 
 A **scene-referred** export — ACEScg, ACES2065-1, CIE XYZ D65 — never goes
 near the renderer. The frame is put through the pipeline a second time with

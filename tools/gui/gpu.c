@@ -1737,8 +1737,30 @@ const char *view_tone_map_name(int i)
     return pl_tone_map_functions[i]->name;
 }
 
+/* ST 2094-10, and libplacebo's own default (spline) only if the library
+ * has lost it. The rational curve of ST 2094-10 Annex B.2 goes through the
+ * black, the knee and the peak and nothing else, so what is above the knee
+ * keeps its separation all the way to the display's white: a 2000 cd/m²
+ * night street puts diffuse white at 101 cd/m², 1000 at 182 and only the
+ * peak itself at 203. The spline, with the same knee, lands diffuse white
+ * at 77 and is darker throughout the mid-tones; ST 2094-40's Bézier,
+ * built without HDR10+ metadata, matches the knee's slope with a polygon
+ * that flattens out early, so everything from 1000 cd/m² up is the same
+ * white, and it lifts the shadows besides (2.2 against 0.9 cd/m² at 0.5).
+ * Those were sampled with pl_tone_map_sample() into the window's 0.51 to
+ * 203 cd/m² target; on frame 60 of P1094366, the night street, the three
+ * come out as: median 79 for both the spline and 2094-10, but 2094-10 with
+ * the ends stretched (1st percentile 30 against 36, 95th 147 against 136),
+ * and 2094-40 lifted throughout (median 89, 1st percentile 40) with the
+ * same share of the frame at white. Lynne's eye said 2094-10 over 2094-40
+ * before the numbers did. */
 int view_tone_map_default(void)
 {
+    int def = view_tone_map_find("st2094-10");
+
+    if (def >= 0)
+        return def;
+
     for (int i = 0; i < pl_num_tone_map_functions; i++)
         if (pl_tone_map_functions[i] ==
             pl_color_map_default_params.tone_mapping_function)
@@ -1775,7 +1797,7 @@ static void view_render_params(struct view_state *st,
     int tm = CRAW_CLAMP(st->look.tone_map, 0, pl_num_tone_map_functions - 1);
 
     /* One mapping for the window and the file: the tone map the Look
-     * section picks, spline unless it is told otherwise, and libplacebo's
+     * section picks, ST 2094-10 unless it is told otherwise, and libplacebo's
      * own defaults for the rest - the perceptual gamut map, the peak
      * detection - into whatever the target is, which for the window is
      * what the compositor negotiated and for an export is the colour space
