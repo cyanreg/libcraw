@@ -1084,7 +1084,8 @@ enum view_section {
     VIEW_SEC_ADJUST,
     VIEW_SEC_GRAIN,
     VIEW_SEC_CROP,
-    VIEW_SEC_EXPORT,
+    VIEW_SEC_EXPORT_IMAGE,
+    VIEW_SEC_EXPORT_VIDEO,
     VIEW_NB_SECTIONS,
 };
 
@@ -1102,12 +1103,6 @@ enum view_section {
  * other setting they carry from clip to clip. */
 struct view_sections {
     bool open[VIEW_NB_SECTIONS];
-
-    /* Which of the Export section's two tabs is up: the video export, or
-     * the screenshot when false, which is where a session starts. Kept for
-     * the session like the folds above; a running video export holds it on
-     * Video, where the stop button and the progress are. */
-    bool export_video;
 
     /* Off: the bias is zero and the working index is the as-shot one, with
      * the slider and the combo left where they were set. */

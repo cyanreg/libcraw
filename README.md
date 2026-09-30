@@ -187,7 +187,7 @@ than as a tag. `-v` prints the same rows once per clip, and the maker
 note's white balance multipliers with them.
 
 The panel is a column of sections — White balance, Exposure, Debayer,
-Denoise, Lens, Sharpen, Look, Adjustments, Film grain, Crop, Export — each behind a
+Denoise, Lens, Sharpen, Look, Adjustments, Film grain, Crop, Export image, Export video — each behind a
 header with a power switch at the left of its title, the way RawTherapee
 puts an enable button on every tool. Off bypasses that section while every
 setting in it is kept, so switching it back on returns the picture it had:
@@ -395,27 +395,24 @@ was drawn and the file holds exactly that region, upright. `--crop WxH+X+Y`
 sets the same rectangle from the command line, in source pixels — which on a
 rotated clip is the readout's rectangle turned back.
 
-The Export section holds two exports on two tabs, **Screenshot** and
-**Video**, independent of each other: the screenshot is the frame on
-screen, one image, and the video is a range, whose start and end fields
-are bounded by the clip's last frame — Ctrl+1, Ctrl+2 and `--export-video`
-hold to it the same way, so a range cannot reach past the clip. The tab
-row sits at the top of the section, the chosen tab lit and the other
-dimmed, and only the chosen tab's rows are laid out under it; the choice
-is kept for the session and starts on Screenshot. Each tab has its own
-file field, its own button and its own status line, neither field names
-the other's file, and a field keeps what was typed into it while the other
-tab is up. Each field follows its own default name until it is typed into
-— the screenshot's the clip and the frame, the video's the clip and the
-range in the clip's directory — and once a path is typed it is the user's
-and is kept, across clips too. A typed path always wins. Nothing judges a
-name while it is being typed: the extension picks the container when the
-button is pressed, a name with no extension libavformat knows gets the
-family's container appended (`.png` on the Screenshot tab) in the field
-itself, and a container that will not carry the encoder or the sound is
-refused on the status line under the button, in a sentence.
+Two sections hold two exports, **Export image** and **Export video**,
+independent of each other: the image is the frame on screen, one file, and
+the video is a range, whose start and end fields are bounded by the clip's
+last frame — Ctrl+1, Ctrl+2 and `--export-video` hold to it the same way,
+so a range cannot reach past the clip. Each section has its own file
+field, its own button and its own status line, neither field names the
+other's file, and a field keeps what was typed into it while its section
+is folded. Each field follows its own default name until it is typed into
+— the image's the clip and the frame, the video's the clip and the range
+in the clip's directory — and once a path is typed it is the user's and is
+kept, across clips too. A typed path always wins. Nothing judges a name
+while it is being typed: the extension picks the container when the button
+is pressed, a name with no extension libavformat knows gets the family's
+container appended (`.png` for the image) in the field itself, and a
+container that will not carry the encoder or the sound is refused on the
+status line under the button, in a sentence.
 
-`--export FRAME OUT` is the screenshot from the command line: it writes one frame
+`--export FRAME OUT` is the image export from the command line: it writes one frame
 to one file and exits without opening a window, upright and at the crop
 rectangle's own size. The file name picks the format through libavformat,
 which knows both the muxer and the codec an extension implies: `.png` and
@@ -428,20 +425,20 @@ cent of the size) and TIFF uncompressed. The stream is tagged as what the
 export really is: full range, BT.709 primaries, sRGB transfer, display
 referred. A sequence of stills is deliberately not offered — that is a video
 encode. `--export-video START END OUT` is the video export headless. The
-Screenshot tab has no codec box: the extension is the choice.
+image export has no codec box: the extension is the choice.
 
 Every video export into an `.mp4` or `.mov` is written with `movflags
 +faststart`, always: the `moov` atom is moved ahead of the media so the file
 plays before it has finished downloading. There is no option to turn it off.
 
-The **Video** block also carries the sound (see below), the number of
+The **Export video** section also carries the sound (see below), the number of
 encoder **threads** — 0 for FFmpeg's own auto, 1 to the machine's core
 count, applied to the software encoders and greyed for a Vulkan one, which
 has none; `--threads N` sets it and `-v` prints the count the encoder
 settled on since some clamp it — and, while a run is going, an *exporting: N
 of M frames* line, a progress bar and a stop button. From the moment the
 export starts until it ends or is stopped, every panel section and every row
-but the stop button is disabled, the tab row with them, held on Video:
+but the stop button is disabled and the Export video section held open:
 nothing can be scrubbed, seeked or changed by mouse, wheel or keyboard, the
 scrub bar takes no input, and the key
 handler ignores everything but `q` (which stops the export cleanly and then
