@@ -2225,7 +2225,7 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         codec = fam->encoder;
 
     /* The file field follows its default - the clip's name, the range and
-     * the family's container, next to the clip - until it differs from the
+     * the family's container, in ~/Processed - until it differs from the
      * default it was last given: once it does, it is the user's and is
      * left alone, on this clip and the next. Not while a run is on: the
      * name the run is writing is the one to show. And not while the field

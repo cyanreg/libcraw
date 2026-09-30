@@ -2132,7 +2132,9 @@ void view_encode_default_path(const struct view_state *st, int64_t start,
     memcpy(base, file, n);
     base[n] = '\0';
 
-    snprintf(out, size, "%s/%s-%05d-%05d.%s", view_clip_dir(st), base,
+    /* In ~/Processed (view_export_dir()), named after the clip and the
+     * range. */
+    snprintf(out, size, "%s/%s-%05d-%05d.%s", view_export_dir(st), base,
              (int)start, (int)end, view_enc_ext(sel, codec));
 }
 

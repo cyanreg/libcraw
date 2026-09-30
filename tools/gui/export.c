@@ -37,10 +37,11 @@ void view_export_default_path(const struct view_state *st, int64_t frame,
     memcpy(base, file, n);
     base[n] = '\0';
 
-    /* Next to the clip and named after it and the frame, so that two
-     * frames of one clip never land on the same file. PNG, because it is
-     * the one format that holds what was rendered without a decision. */
-    snprintf(out, size, "%s/%s-%05d.png", view_clip_dir(st), base, (int)frame);
+    /* In ~/Processed (view_export_dir()), named after the clip and the
+     * frame, so that two frames of one clip never land on the same file.
+     * PNG, because it is the one format that holds what was rendered
+     * without a decision. */
+    snprintf(out, size, "%s/%s-%05d.png", view_export_dir(st), base, (int)frame);
 }
 
 void view_export_complete_path(char *path, size_t size)

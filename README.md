@@ -403,9 +403,10 @@ so a range cannot reach past the clip. Each section has its own file
 field, its own button and its own status line, neither field names the
 other's file, and a field keeps what was typed into it while its section
 is folded. Each field follows its own default name until it is typed into
-— the image's the clip and the frame, the video's the clip and the range
-in the clip's directory — and once a path is typed it is the user's and is
-kept, across clips too. A typed path always wins. Nothing judges a name
+— the image's the clip and the frame, the video's the clip and the range,
+both in `~/Processed`, which is made on first use (the clip's own directory
+when there is no home to put it under) — and once a path is typed it is the
+user's and is kept, across clips too. A typed path always wins. Nothing judges a name
 while it is being typed: the extension picks the container when the button
 is pressed, a name with no extension libavformat knows gets the family's
 container appended (`.png` for the image) in the field itself, and a

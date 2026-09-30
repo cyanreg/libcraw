@@ -1688,8 +1688,11 @@ void view_lut_preview(struct view_state *st, int index);
 /* The name to print for the current selection, or "none". */
 const char *view_lut_film_name(const struct view_state *st);
 
-/* The directory the clip lives in, for the default export target. */
+/* The directory the clip lives in. */
 const char *view_clip_dir(const struct view_state *st);
+/* The default export target's directory: ~/Processed, made on first use,
+ * or the clip's own when there is no home to put it under. */
+const char *view_export_dir(const struct view_state *st);
 
 /* The part of the window the picture gets: everything left of the panel. */
 void view_picture_area(const struct view_state *st, pl_rect2df *out);

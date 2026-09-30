@@ -15,6 +15,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <string.h>
 
 #include <SDL3/SDL.h>
@@ -466,6 +468,27 @@ const char *view_clip_dir(const struct view_state *st)
     n = CRAW_MIN((size_t)(slash - st->cfg.input), sizeof(dir) - 1);
     memcpy(dir, st->cfg.input, n);
     dir[n] = '\0';
+
+    return dir;
+}
+
+/* Where an export lands when its field was never typed into: ~/Processed,
+ * made on first use, and the clip's own directory only when there is no
+ * home or the directory cannot be made. One place for everything that
+ * comes out of the viewer whichever card or disk the clip is read from: a
+ * card is read-only anyway, and a picture written beside its source is a
+ * picture lost among sources. */
+const char *view_export_dir(const struct view_state *st)
+{
+    static char dir[VIEW_MAX_PATH];
+    const char *home = getenv("HOME");
+
+    if (!home || !home[0])
+        return view_clip_dir(st);
+
+    snprintf(dir, sizeof(dir), "%s/Processed", home);
+    if (mkdir(dir, 0755) < 0 && errno != EEXIST)
+        return view_clip_dir(st);
 
     return dir;
 }
