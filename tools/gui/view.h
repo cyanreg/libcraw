@@ -516,6 +516,13 @@ struct view_gpu {
      * come back and look again. */
     bool pic_redrew;
 
+    /* The window's colour on Wayland (colour.c, DESIGN.md 22): what the
+     * compositor prefers, what the swapchain frames are rendered as and
+     * what the surface is tagged with. NULL when the window is left
+     * untagged sRGB: no Wayland, no colour manager, nothing that can be
+     * rendered, or --no-colour-management. */
+    struct view_wl_colour *wl_colour;
+
     /* The single queue family everything runs on: libplacebo's async
      * transfer and compute are turned off so that graphics, compute and
      * transfer are all the same family and no image ever changes owner. */
@@ -704,6 +711,9 @@ struct view_cfg {
     bool debug;                 /* validation layer */
     bool bench;                 /* decode as fast as the GPU allows */
     const char *trace;          /* --trace FILE: one line per present */
+    /* --no-colour-management: the window stays untagged sRGB on Wayland
+     * too, as it is on X11. */
+    bool no_colour_management;
 
     const char *profile;        /* built-in per-CCT table set */
     const char *tables;         /* per-CCT tables from a text file */
