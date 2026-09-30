@@ -4572,3 +4572,262 @@ warm), which is why the cold total fell less.
   would save a read of the frame, 0.3 ms, at the price of coupling them.
 - The denoise's temporal pass is bound by its state's bandwidth, R32F
   read and written; nothing here changes that.
+
+## 22. The window's colour
+
+### 22.1 The model
+
+A Wayland compositor composites every window into a framebuffer of its
+own, and with `wp_color_manager_v1` it knows what that framebuffer is and
+what each window's pixels are: it converts from the one to the other. A
+window that says nothing is "compositor implementation defined, should be
+sRGB", and wlroots takes it as sRGB primaries with the gamma 2.2 display
+curve (`types/scene/surface.c`), which is also what its SDR outputs are.
+cineview used to render that untagged window with libplacebo's target for
+`VK_COLOR_SPACE_SRGB_NONLINEAR_KHR`, which is the piecewise sRGB curve at
+libplacebo's assumed 1000:1: a picture encoded for one curve and one black
+level, shown through another.
+
+Now the window asks the compositor for the surface's *preferred* image
+description (`get_surface_feedback`, `get_preferred_parametric`,
+`get_information`), decides what of it can be rendered
+(`view_colour_resolve()` in `tools/gui/colour_map.c`), renders
+libplacebo's target into exactly that - primaries, curve, luminances,
+target gamut - and tags the surface with a parametric description saying
+so (`get_surface`, `set_image_description`). When the preference is
+rendered as it is, the compositor has nothing left to convert. When it
+changes - the window moved to another output, HDR switched on - the
+feedback object says `preferred_changed2` and the same happens again while
+the window keeps playing. Everything protocol-side is `tools/gui/colour.c`,
+on a `wl_event_queue` of its own made off SDL's `wl_display` (a proxy
+wrapper of the display on that queue gets the registry, and everything
+made from the manager inherits the queue), so SDL, Mesa's WSI and the
+module read one socket and see only their own events. Opening waits on
+roundtrips of that queue; at run time nothing waits: the loop dispatches
+what has arrived at the top of every iteration, and each step sends its
+requests and returns.
+
+X11 (XWayland included: SDL hands out no `wl_display` there), a
+compositor without the manager, without parametric descriptions or
+preferring nothing renderable, a surface without a pass-through format,
+and `--no-colour-management` all leave the window as it was: untagged
+sRGB on an eight-bit swapchain.
+
+### 22.2 Pass-through, 16-bit UNORM, and the one colour surface
+
+A `wl_surface` may have one `wp_color_management_surface_v1` and no more;
+a second is a protocol error, which ends the connection and SDL's window
+with it. Mesa's Wayland WSI creates one of its own for every swapchain
+colour space except `VK_COLOR_SPACE_PASS_THROUGH_EXT` (and sRGB, on a
+compositor without the deprecated `srgb` curve, which sway is), parented to
+the swapchain; with pass-through it never touches colour management. So
+the swapchain is switched to pass-through before our surface object is
+made. libplacebo does that for a `pl_swapchain_colorspace_hint()` with
+unknown primaries and unknown transfer, and only then: it recreates the
+swapchain on the spot and destroys the retired one at once, and Mesa
+destroys the old swapchain's colour surface with it. The frame's
+`color_space` is then unknown/unknown, and cineview overrides the target's
+colour itself. The order at opening is: read everything, decide, create
+the description and wait for `ready2`, and only then hint the swapchain
+and create the surface object - so that every refusal on the way leaves
+the window exactly as it was, and the one step after the hint cannot fail.
+
+libplacebo scores pass-through formats 16-bit over 10 over 8 and UNORM
+over float, and there is no parameter to ask for another, so on this
+machine the window becomes `VK_FORMAT_R16G16B16A16_UNORM` (Mesa offers
+B8G8R8A8/R8G8B8A8 UNORM and SRGB, A2B10G10R10, A2R10G10B10 and RGBA16
+UNORM and SFLOAT with pass-through). That holds 0 to 1 and nothing
+outside it, so extended linear - scRGB - is not a target: a compositor's
+HDR is reached through PQ or HLG instead.
+
+### 22.3 The dither depth
+
+The dither has to meet the grid the compositor rounds to, not the
+image's: sway composites into an eight-bit framebuffer (render_bit_depth
+8, and 10 once an output is HDR) and rounds without dithering, so a
+picture dithered against a finer grid lands with exactly the contours
+the dither was there to break. For the untagged window that is had with
+an eight-bit format (`disable_10bit_sdr`, whose comment in `gpu.c` tells
+both halves). With RGBA16 the frame's bit encoding is set by hand:
+`sample_depth = color_depth = 8`, `bit_shift = 0` for an SDR description,
+10 for PQ and HLG. libplacebo's output stage then dithers to that depth
+and floors onto its grid (`floor(scale * color + bias) / scale`, with no
+further normalisation since the two depths are equal), so each sixteen-bit
+texel holds an exact code k/255 (k x 257), which the compositor's rounding
+reproduces.
+
+### 22.4 The choice
+
+The candidates, first acceptable wins, where acceptable means a curve
+libplacebo can encode into a UNORM image that the compositor advertises
+(a named one, or a power with `set_tf_power`), and named primaries the
+compositor advertises and libplacebo has:
+
+1. the preferred description as it is (exact);
+2. BT.2020 PQ, when the preference is HDR: PQ or HLG, or a maximum above
+   the reference white;
+3. sRGB primaries, gamma 2.2;
+4. sRGB primaries, BT.1886;
+5. sRGB primaries, the `srgb` curve, which only a version 1 compositor
+   still names.
+
+Renderable are bt1886, gamma22, gamma28, srgb and compound_power_2_4 (the
+piecewise IEC 61966-2-1 curve, which is libplacebo's `PL_COLOR_TRC_SRGB`
+exactly), st2084_pq, hlg, and a power within 1e-3 of 1.8, 2.0, ... 2.8.
+Not renderable: ext_linear (no values above 1), st428 (XYZ, a colour
+system rather than a curve), the log curves, st240, xvYCC and ext_srgb.
+The named primaries map to libplacebo's by their xy - srgb is BT.709, pal
+BT.601-625, ntsc BT.601-525, pal_m BT.470M, generic_film film C, and
+bt2020, dci_p3, display_p3 and adobe_rgb their namesakes - with one
+exception: the protocol's cie1931_xyz is ST 428-1's XYZ "primaries", (1,
+0), (0, 1), (0, 0) with the equal-energy white, while
+`PL_COLOR_PRIM_CIE_1931` is CIE 1931 RGB, 700, 546.1 and 435.8 nm, another
+triangle altogether (the two only share a name, and libplacebo's libav
+mapping of AVCOL_PRI_SMPTE428). It goes with st428 anyway. A preference
+that sends only xy is taken as the named set it matches within
+`pl_raw_primaries_similar()`.
+
+The gamut libplacebo maps into, `hdr.prim`, is the compositor's target
+gamut where that is smaller than the container, the container otherwise,
+and the same primaries go out as the mastering display's, so that what the
+compositor is told is what was mapped into. A target reaching outside the
+container cannot be encoded in UNORM or sent without
+extended_target_volume, and is clipped into the container rather than
+dropped (`pl_primaries_clip()`, then pulled a ten-thousandth of the way to
+white so it stays strictly inside once rounded to the protocol's
+millionths). The case that matters is the one that needs it: a P3 panel
+behind a BT.2020 container. Both reds lie on the spectral locus, P3's near
+615 nm and BT.2020's at 630, and the locus bulges between them, so P3's red
+is outside BT.2020's red-green edge by 0.0017 in y; refused, the picture
+would be mapped into all of BT.2020 and left to the panel to clip.
+
+The intent is relative colorimetric where the compositor offers it,
+perceptual (which every compositor must) otherwise: the picture is already
+tone and gamut mapped into the target volume, and a second perceptual
+squeeze is not wanted.
+
+### 22.5 Luminances, and why nothing is scaled
+
+libplacebo's conventions decide the rest. Its SDR white is
+`PL_COLOR_SDR_WHITE`, 203 cd/m², the linear 1.0; PQ is absolute, nits in
+and nits out; an SDR curve and HLG are relative and "black scaled": the
+target's [min, max] is mapped onto the signal's [0, 1] (BT.1886 builds its
+black lift from the same two, and HLG its system gamma from the peak). So
+libplacebo is given the luminances of the description the surface will
+actually carry:
+
+- SDR: the compositor's own when they can be sent (`set_luminances`, on
+  an exact match), else the ones the chosen curve implies, since those are
+  what the compositor reads the surface with - BT.1886's 0.01/100/100 from
+  BT.2035, everything else's 0.2/80/80 from srgb.xalter - scaled so that
+  the reference white is 203: `max = 203 * max / ref`, `min = 203 * min /
+  ref` (at least `PL_COLOR_HDR_BLACK`). For sway's 0.2/80/80 that is 203
+  and 0.5075 cd/m², 400:1 and no headroom; a preference with its maximum
+  above its reference white gets that headroom as a target above 203.
+- PQ: the compositor's target volume, which is where the tone mapper aims.
+  A peak of 10000, PQ's own reach, or a range upside down means the
+  compositor has no idea - wlroots sends the curve's defaults as the
+  target, 10000 included - and a 1000 cd/m² display is assumed and logged.
+  Luminances, where they can be sent, are 0.0001/10000/203: the protocol
+  takes PQ's maximum as the minimum plus 10000, i.e. the minimum is an
+  offset under the whole curve, while libplacebo's PQ is the absolute one,
+  so the pair only agrees at a minimum of zero, of which 1e-4 cd/m² is the
+  smallest step. The display's real black goes out as the mastering
+  luminance instead.
+- HLG: encoded for the display the description names: the compositor's
+  target, sent as the luminances, where `set_luminances` exists; the
+  protocol's nominal 0.005 to 1000 cd/m² HLG display otherwise.
+
+Nothing needs scaling between the two sides: 203 is libplacebo's SDR
+white, BT.2408's reference and the protocol's default reference for PQ
+and HLG.
+
+### 22.6 What is sent, and what is not
+
+`set_primaries_named` and `set_tf_named` (or `set_tf_power`) always;
+`set_luminances` in the cases above, and only with the feature;
+`set_mastering_display_primaries`, with the feature, for HDR and for an SDR
+target gamut smaller than the container; `set_mastering_luminance` with it,
+for HDR only. Never `set_max_cll` or `set_max_fall`: this is a window, not
+a mastered stream, and its peak moves with every frame and every grade.
+Never a target volume outside the container. Every request is checked
+against what the manager advertised before the first of a creator's goes
+out, because a property skipped half way leaves the set incomplete, and
+`create` on an incomplete set is itself a protocol error: a guard that is
+missing is not a graceful failure but a dead window.
+
+### 22.7 Run time
+
+`preferred_changed2` (or version 1's `preferred_changed`) with an identity
+other than the one held starts the same sequence without a single
+roundtrip: `get_preferred_parametric`, on `ready2` `get_information`, on
+`done` the resolver. wlroots does not de-duplicate identities (every copy
+gets a new one), so the comparison that actually keeps a repeat from
+re-tagging the surface is of the choices: protocol-side fields and the
+whole target colour. A different choice makes a new description; on its
+`ready2` it is set on the surface, the old one destroyed, and the new
+target colour and depth published, which the picture pass's signature
+notices and renders again. `failed`, on either description, is logged and
+the old one kept.
+
+`set_image_description` is double-buffered and lands with the next
+`wl_surface.commit`, which is normally the present of the frame rendered
+next against the new target, so colour and tag arrive together. A commit
+of SDL's in between - a configure being acknowledged - can show one frame
+of the old picture under the new tag; that is the price of not owning the
+commits, and one frame is all it can cost.
+
+The panel overlay is tagged with the target itself on an SDR target, so
+its code values pass straight through as they always did (a target with
+headroom has its peak brought down to 203 first), and on an HDR target as
+BT.709 gamma 2.2, which libplacebo puts at 203 cd/m²: an SDR element, what
+the compositor would make of an SDR window there.
+
+### 22.8 Verified, and what is not
+
+On sway 1.13 (wlroots, Vulkan renderer) with its headless 1280x720 SDR
+output, nested, on the RX 6900 XT: the manager at version 2 with
+parametric and set_mastering_display_primaries, curves gamma22, st2084_pq,
+ext_linear, bt1886 and compound_power_2_4, primaries srgb and bt2020,
+perceptual only; the output and the surface prefer srgb gamma22 0.2/80/80,
+target the same. The window resolves that exactly, renders BT.709 gamma 2.2
+from 0.5075 to 203 cd/m² with an eight-bit dither into RGBA16 UNORM
+pass-through, and is tagged srgb gamma22, perceptual, with nothing else
+sent. No protocol error, and no colour surface but ours on the connection.
+
+Screenshots of the last frame of P1094366 (`--no-loop`), grim on the
+output, tagged against `--no-colour-management`: the panel is identical
+(0 of 227430 pixels outside its two live readout rows differ), which also
+shows sway converts neither window - it takes the untagged one as the same
+sRGB/gamma 2.2 it is told for the tagged one. The picture differs where the
+two renders do: a dark patch goes from luma 34.4 to 42.9 codes, a mid grey
+from 107.1 to 109.6, and nothing above code 160 moves by more than one.
+That is the curve (piecewise sRGB against gamma 2.2) and the target's
+black level (libplacebo's 1000:1 for an untagged sRGB target against the
+output's 400:1, which moves the spline's black point): the spline sampled
+from the clip's 9995 cd/m² to both targets and encoded both ways predicts
++8.5 codes at code 35 and +2.4 at 111. After resizing the window
+(floating, 900x600) the swapchain is recreated twice, stays pass-through,
+no second `get_surface` is sent, and the same comparison gives the same
+table (dark +8.3, mid grey +2.4).
+
+`--bench --loops 1`, three runs each, alternated: 39.0, 39.0 and 39.6 fps
+tagged against 39.1, 39.1 and 39.2 untagged, the display running at the
+pipeline's rate either way; the compose's overlay pass costs 0.021 ms of GPU
+on RGBA16 against 0.010 on RGBA8, its dither pass 0.018 against 0.017.
+
+The run-time path was exercised by a scratch build (not committed) that
+announced a preferred change at 3, 7 and 11 seconds and replaced the
+parsed preference with BT.2020 PQ, 0.005/10000/203, target Display P3
+0.005 to 800 cd/m², for the first: the window went through
+`get_preferred_parametric`, `get_information`, a new description with the
+clipped P3 as mastering primaries (red 0.678762, 0.319411) and mastering
+luminance 50/800, `set_image_description` and a ten-bit dither, back to
+srgb gamma22 at 7 s, and the third announcement changed nothing. sway
+converted the PQ window back to its SDR output and anchored 203 cd/m² to
+its white: the panel's static pixels came out identical under both tags.
+
+Untested: a real HDR output (sway's headless output refuses `hdr on`, and
+only wlroots' DRM backend has output image descriptions, so the preferred
+never changes on its own here), HLG, set_luminances, set_tf_power, the
+relative intent and the version 1 events, none of which sway offers.

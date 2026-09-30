@@ -145,6 +145,23 @@ only touch the view, never the export. While a video export runs the whole panel
 locked, the picture is the export's; `q` then stops the export, finishes
 the file and quits.
 
+On Wayland the window follows the compositor's colour management
+(`wp_color_manager_v1`): it asks for the image description the compositor
+would like the window in, renders the picture into exactly that - the
+primaries, the curve, the black level and peak, the display's own gamut -
+and tags the window with it, so the compositor has nothing left to
+convert, and does it again when the preference changes, when the window
+goes to another output or HDR is switched on, without a restart. What the
+compositor asks for is rendered as it is when it can be (sway's SDR outputs
+want sRGB primaries in gamma 2.2, which is what the window then is), an HDR
+preference that cannot be falls back to BT.2020 PQ, and anything else to
+the sRGB display in gamma 2.2; `-v` prints what was offered, what was
+preferred and what was made of it (DESIGN.md 22). The panel's colours are
+the same either way. `--no-colour-management` turns this off and leaves the
+window untagged sRGB, which is what it is on X11 (XWayland included) and on
+a compositor without colour management: the compositor then decides what
+the picture's pixels mean, and on sway that is gamma 2.2.
+
 The panel is set in whatever face fontconfig names for `sans-serif` on the
 machine, at 15 px, the way every other desktop application finds its UI
 font: there is no option and nothing to configure, and nuklear's own
