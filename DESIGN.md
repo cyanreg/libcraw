@@ -4831,3 +4831,179 @@ Untested: a real HDR output (sway's headless output refuses `hdr on`, and
 only wlroots' DRM backend has output image descriptions, so the preferred
 never changes on its own here), HLG, set_luminances, set_tf_power, the
 relative intent and the version 1 events, none of which sway offers.
+
+## 23. Retiming
+
+### 23.1 The model
+
+A clip shot at 59.94 or 29.97 fps can be conformed to a lower frame rate:
+every source frame becomes one output frame, shown and written at the
+chosen rate. A 59.94 clip at 23.976 plays 2.5 times slower and a range of
+it exports as a 23.976 file 2.5 times as long. No frame is dropped,
+repeated or synthesised, and nothing about the picture changes; the still
+export does not see the rate at all.
+
+The retime is two numbers. The output rate R is the rate the picture is
+shown and written at. The speed S is the clip seconds that pass per output
+second. Today S = R / the clip's own rate and is at most 1, one source
+frame per output frame, so the picture for output frame k is source frame
+k. Both mappings, output frame to clip time and clip time to output time,
+are worked out in a handful of helpers in `tools/gui/main.c` and nowhere
+else: `view_rate_native()` (the clip's own rate, 29.97 when it says none,
+as `view_frame_duration()` assumes), `view_rate_out()` (R),
+`view_speed()` (S, 1 when not slowed), `view_slowed()` (S != 1) and
+`view_out_frame_duration()` (1/R, in seconds of what is watched).
+
+The fixed rates are 23.976, 24, 25, 29.97, 30, 48, 50, 59.94 and 60. A
+clip's stops are every one of them strictly below its own rate, compared
+with `av_cmp_q`, and then the clip's own as the last; a fixed rate within
+1/1000 fps of the clip's own is the clip's own, because the stream says
+30000/1001 where a container may say 2997/100, while 30 and 29.97, 0.03
+apart, stay two. A 59.94 clip has eight stops, a 29.97 one four, a 23.976
+one only its own, and that row is greyed.
+
+What is chosen - by the panel's row or `--rate` - is kept apart from what
+is in effect: the choice carries from clip to clip, and each clip that
+opens is set to it if it is below its own rate and to its own otherwise.
+Kept as one value, the clamp would become the choice: a 23.976 clip in a
+playlist of 59.94 ones would set it to 23.976's own, and the next 59.94
+clip would play at its own. A `--rate` above a clip's own is refused when
+that clip opens, with the clip's rate in the message; a headless run exits
+non-zero, a window plays the clip at its own rate. The rate is the clip's
+transport, not its look: it is in `struct view_state` rather than in
+`struct view_look`, so neither the picture pass's signature, which hashes
+the look, nor anything that kept a look would carry it.
+
+The frame readout stays in clip frames and clip seconds, the clip's own
+timeline. Left and Right step five seconds and Shift with them one second
+as watched: frames = seconds x R, rounded as before, so five seconds of a
+59.94 clip at 23.976 is 120 frames, two seconds of the clip.
+
+### 23.2 The clock
+
+The master clock stays in clip seconds: `st->pts` is clip time, the
+decoder's timestamps are clip time and every seek is a clip frame number.
+It runs at S. On the wall path `view_clock()` is `wall_pts + S x elapsed`,
+and the smoother that steps the clock between reads steps at S as well:
+stepped at one clip second per wall second under a raw clock running at 0.4
+it would drift ahead towards (1 - S) times its 0.3 s time constant, 0.18 s,
+and cross its 0.1 s jump threshold on the way. Everything that compares
+`st->pts` with the clock - the drop threshold in `view_step_frame()`, the
+catch-up loop and the hold in the run loop - is unchanged, because a clip
+frame period of lag in clip time is an output frame period of lag in wall
+time. The one conversion is the hold, which is in clip seconds while the
+wait is in wall milliseconds: `ms = hold / S x 1000`. The pause folds the
+wall time since the start into `wall_pts` times S.
+
+The wall clock no longer runs before the first picture is up, which the
+audio clock never did. Running from the clip's opening, it had put 0.25 s
+of clip behind the first picture of P1081307 at 23.976 by the time it was
+drawn, and fifteen frames were dropped to catch up.
+
+The panel writes only the choice. The run loop makes it the rate at the
+top of an iteration, before anything in it reads the clock, and in the
+same step moves the sound and the clock (`view_rate_follow()`): to a
+slowed rate the track is paused and the wall clock restarted from the
+picture on screen at the new speed; back to the clip's own the track is
+sought to that picture, and the loop's own start logic plays it. Neither
+seeks the picture nor pauses it. Acted on an iteration after the panel set
+it, a change ran the wall clock at the new speed from the old anchor in
+between - 0.23 s ahead on going from 24 to 25 fps after 14 s at 24,
+fifteen frames dropped - and read the paused track as the clock on the way
+back, 14.3 s behind.
+
+A slowed clip has no sound. The camera's own slow and quick motion and
+variable frame rate modes record none, and a track slowed 1.25 times with
+the picture is 12 log2 1.25 = 3.9 semitones down, slowed 2.5 times 15.9.
+Its track is still opened, and neither pumped nor played. `view_audio_live()`,
+a track and not slowed, stands in for "there is a track" wherever the
+audio is driven or read as the clock: `view_clock()`, `view_audio_start()`,
+the pump, the end of the clip (a slowed clip ends when its last picture
+has been shown; its paused ring would never drain), the play and pause
+block and the pause's fold. The seek in `view_step_frame()` still sends the
+paused track to its target, which costs a demuxer seek and is undone by
+the seek on the way back; closing a clip still pauses a playing device; the
+mute and volume rows stay as they are, shown when the clip has a track.
+
+### 23.3 The export
+
+The file's frame rate is R: `e->fr = view_rate_out()`, and 25/1 as before
+for a clip that says no rate and is not slowed. A frame's pts is its place
+in the range, the frame counter, so the time base, `avc->framerate` and the
+stream's `avg_frame_rate` follow R as they followed the clip's rate, and
+the clip's own timestamps never reach the file. A slowed run writes no
+audio stream at all, whatever the mode says. The mode is not changed - the
+panel greys its rows with `no sound while slowed`, and the next run at the
+clip's own rate has it again - and `view_encode_begin()` does not refuse a
+container that cannot carry the mode, since nothing will be written to it.
+The status line ends `no sound at 23.98 fps` and `-v` says `24000/1001 fps,
+slowed from 60000/1001 ... no sound (slowed)`. The default file name is
+unchanged.
+
+What the file says: QuickTime keeps the time base, so 150 frames of
+P1081307 at 23.976 are r_frame_rate 24000/1001, time base 1/24000, 6.25625
+s, against 60000/1001 and 2.5025 s at its own rate; Matroska rounds its
+timestamps to milliseconds, so the same range is 6.257 s there, and
+ffprobe guesses the unslowed one's rate as 19001/317.
+
+### 23.4 What motion estimation would change
+
+libplacebo is growing motion estimation (merge request 876,
+`pl_motion_estimate` in `libplacebo/shaders/motion.h`): block-matching
+flow fields between a pair of frames, forward and backward, at block
+granularity. With a frame interpolator on top of it, S stops following
+from R and is chosen on its own - a 24 fps clip at 24 fps at half speed -
+and the picture for output frame k is the clip at t0 + k x S / R,
+synthesised between the two source frames either side of that time. The
+sampler is the only thing that changes: which source frames an output
+frame needs, two rather than one, and the pass that makes it from them.
+The clock is already in clip seconds running at S, the hold already
+converts at S, every seek is already a clip frame, the export's pts are
+already output frames, and `view_rate_out()`, `view_speed()`,
+`view_slowed()` and `view_out_frame_duration()` keep their meaning; only
+what sets S changes. Nothing of it is built.
+
+### 23.5 Verified
+
+On the RX 6900 XT, with P1081307 (HEVC, 59.94 fps, 1440 frames) and
+P1081308 (ProRes RAW, 29.97, 720 frames):
+
+- Headless, frames 0 to 149 of P1081307, the default FFv1 (Vulkan) L3
+  preset into `.mkv` (QuickTime does not carry FFV1): at 23.976 150
+  packets, r_frame_rate 24000/1001, 6.257 s, no audio stream; at its own
+  rate 150 packets, 2.503 s and the copied pcm_s24be. Frame 0 of the two,
+  decoded to rgb48le, is the same 117006336 bytes; so is frame 149. The
+  same range through ProRes (prores_ks) HQ at 1920 wide into `.mov`:
+  24000/1001, 150 frames, 6.25625 s, no audio, against 60000/1001, 2.5025
+  s and 120120 samples of sound; all 150 frames identical between the two
+  (PSNR infinite).
+- P1081308, frames 0 to 59 at 24: 60 frames at 24/1, 2.500 s, no audio.
+  `--rate 60` on it is refused, `runs at 29.97 fps; --rate can only slow a
+  clip down`, exit 1, no file. `--rate 23.98` writes 24000/1001;
+  `--rate 26` is refused with the nine names and `clip`.
+- In a window on sway's headless 1280x720 output at 60 Hz, nested, with
+  SDL's dummy audio driver: P1081307 at `--rate 23.976` for 23 s, 541
+  pictures, none dropped, one to the next 41.709 ms on average with a
+  standard deviation of 0.477 ms (1/23.976 is 41.708), the clock
+  advancing 0.40000 clip seconds per wall second, |a/v| at most 1.86 ms
+  of clip time. At its own rate 16.699 ms, sd 0.873 ms; there the dummy
+  driver's clock ran 1.0083 clip seconds per wall second, more than a 60
+  Hz output can show of a 59.94 clip, and 9 frames were dropped in 22 s,
+  as a build without this section dropped 9 in 16 s with its clock at
+  1.0081.
+- The row, dragged with a virtual pointer while playing with sound: from
+  the clip's own rate to 24 (the drag passes 50, 30 and 25 on the way) and
+  back (through 25 and 48), seven changes, every frame shown in order
+  across them and |a/v| at most 4.7 ms around them, under a third of a
+  frame; at 24, 41.667 ms with sd 0.435 ms and 0.4004 clip seconds per
+  wall second (24/59.94 is 0.40040); at the clip's own rate before and
+  after, 16.562 and 16.667 ms. `-v` says the sound was paused and resumed
+  at the picture on screen.
+- A 23.976 clip (P1000350) shows its one stop greyed, `23.98 fps, the
+  clip's own`; `--rate 24` on it in a window prints the refusal and plays
+  it at its own rate.
+
+Not verified: an export started from the panel while slowed (the engine is
+the same as the headless one, which was run), and a playlist switch
+between clips of different rates, for want of a way to send keys to the
+nested compositor.

@@ -1623,6 +1623,87 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
     view_menu_draw(ctx, st);
 }
 
+/* The rate row under the scrub bar, DESIGN.md 23: the clip shown and
+ * written at a lower fixed rate, frame for frame, so that a 59.94 clip at
+ * 23.976 plays two and a half times slower and exports as a 23.976 file two
+ * and a half times as long. A slider over the stops - the fixed rates below
+ * the clip's own, slowest at the left, and the clip's own at the right -
+ * with its label at the left and what the stop means at the right, in one
+ * row. The readout's column is as wide as the widest of this clip's stops,
+ * so the slider does not change length under the pointer while it is
+ * dragged; at 15 px Noto Sans a 59.94 clip's eight stops leave it 153 px,
+ * 22 a stop.
+ *
+ * Moving it chooses the rate and nothing else: no seek, no pause. The run
+ * loop makes the choice the rate, and does what that means for the sound
+ * and the clock, in one step. A clip at 23.976 has nothing slower to go
+ * to, and its row is greyed with the knob at the right, where the clip's
+ * own rate is. */
+static void view_panel_rate(struct nk_context *ctx, struct view_state *st)
+{
+    const struct nk_user_font *f = ctx->style.font;
+    AVRational stops[VIEW_RATE_MAX_STOPS];
+    char text[64], shown[64];
+    int n = view_rate_stops(st, stops, VIEW_RATE_MAX_STOPS);
+    int cur = n - 1, pos;
+    float label_w, read_w = 0.0f, gap, avail;
+
+    if (view_slowed(st))
+        for (int i = 0; i < n - 1; i++)
+            if (!av_cmp_q(stops[i], st->rate))
+                cur = i;
+
+    for (int i = 0; i < n; i++) {
+        view_rate_label(st, stops[i], text, sizeof(text));
+        read_w = CRAW_MAX(read_w, f->width(f->userdata, f->height, text,
+                                           (int)strlen(text)));
+    }
+    label_w = f->width(f->userdata, f->height, "rate", 4) + 12.0f;
+    /* The knob at either end hangs half its width past the slider's cell,
+     * which at the right end is over the readout's first digits; a column
+     * of that width between the two keeps them apart. */
+    gap = ctx->style.slider.cursor_size.x * 0.5f;
+    read_w += 4.0f;
+    /* A face wider than this one still leaves the slider something to be
+     * dragged along; the readout is cut with an ellipsis instead. */
+    avail = nk_window_get_content_region(ctx).w
+          - 2.0f * ctx->style.window.padding.x - 3.0f * ctx->style.window.spacing.x;
+    read_w = CRAW_MAX(CRAW_MIN(read_w, avail - label_w - gap - 96.0f), 32.0f);
+
+    if (n < 2)
+        view_disable_begin(ctx);
+
+    nk_layout_row_template_begin(ctx, VIEW_ROW);
+    nk_layout_row_template_push_static(ctx, label_w);
+    nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_push_static(ctx, gap);
+    nk_layout_row_template_push_static(ctx, read_w);
+    nk_layout_row_template_end(ctx);
+
+    nk_label(ctx, "rate", NK_TEXT_LEFT);
+
+    if (n < 2) {
+        /* Drawn as a slider of two stops at its right end: nuklear's slider
+         * divides by its range, and a range of nothing is a NaN knob. */
+        pos = 1;
+        nk_slider_int(ctx, 0, &pos, 1, 1);
+        pos = 0;
+    } else {
+        /* The choice, and only the choice: the run loop makes it the rate
+         * before the clock is next read (view_rate_follow()). */
+        pos = cur;
+        if (nk_slider_int(ctx, 0, &pos, n - 1, 1) && pos != cur)
+            st->rate_choice = pos == n - 1 ? (AVRational) { 0, 0 } : stops[pos];
+    }
+    nk_spacing(ctx, 1);
+
+    view_rate_label(st, stops[pos], text, sizeof(text));
+    view_fit_text(f, nk_widget_bounds(ctx).w - 2.0f, text, shown, sizeof(shown));
+    nk_label(ctx, shown, NK_TEXT_LEFT);
+
+    if (n < 2)
+        view_disable_end(st, ctx);
+}
 
 static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
 {
@@ -1633,7 +1714,7 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
      * pauses, Shift with Page Up and Page Down are the ends of the clip,
      * Left and Right step five seconds and Shift with them one. The scrub
      * bar stays, because dragging to a frame is the one thing keys are bad
-     * at. */
+     * at, and under it the rate, which no key has. */
     if (total > 1) {
         bool held = ctx->input.mouse.buttons[NK_BUTTON_LEFT].down != 0;
 
@@ -1660,6 +1741,9 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
             }
         }
     }
+
+    if (st->dec.fmt)
+        view_panel_rate(ctx, st);
 }
 
 /* One section for both kinds of clip. A raw clip is balanced by libcraw
@@ -2114,7 +2198,13 @@ static void view_status_rows(struct nk_context *ctx, const char *text)
  * ones the file's container will not carry greyed and labelled with the
  * muxer's own reason, and under it the one number the mode takes. What the
  * container is comes from the file field: the popup, which only opens once
- * the field is left, greys opus and flac under a `.mov`. */
+ * the field is left, greys opus and flac under a `.mov`.
+ *
+ * A slowed clip is exported without sound (DESIGN.md 23.3), so while it is
+ * both rows are greyed and the line under the combo says that instead of
+ * what the mode does. The mode is left as it was chosen, on the combo where
+ * it can be seen, and it is what the next export at the clip's own rate
+ * writes. */
 static void view_panel_export_audio(struct nk_context *ctx, struct view_state *st,
                                     const char *path)
 {
@@ -2122,6 +2212,10 @@ static void view_panel_export_audio(struct nk_context *ctx, struct view_state *s
     const struct view_audio_spec *m;
     char label[160];
     int mode = CRAW_CLAMP(sel->audio_mode, 0, VIEW_NB_AUDIO_MODES - 1);
+    bool slowed = view_slowed(st);
+
+    if (slowed)
+        view_disable_begin(ctx);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
     nk_label(ctx, "audio", NK_TEXT_LEFT);
@@ -2164,15 +2258,20 @@ static void view_panel_export_audio(struct nk_context *ctx, struct view_state *s
         snprintf(label, sizeof(label), "#%s", m->field);
         nk_property_int(ctx, label, m->min, &sel->audio_q[mode], m->max, step,
                         (float)step * 0.2f);
-        nk_label(ctx, mode == VIEW_AUDIO_OPUS ? "120 ms frames" : "", NK_TEXT_LEFT);
+        nk_label(ctx, slowed                  ? "no sound while slowed"
+                    : mode == VIEW_AUDIO_OPUS ? "120 ms frames" : "", NK_TEXT_LEFT);
     } else {
         /* The second column is simply left empty: nk_spacing() over the
          * last column of a row opens a whole new row, which is a blank
          * line in the panel. */
-        nk_label(ctx, mode == VIEW_AUDIO_COPY ? "the clip's own track"
+        nk_label(ctx, slowed                 ? "no sound while slowed"
+               : mode == VIEW_AUDIO_COPY ? "the clip's own track"
                : mode == VIEW_AUDIO_WAV  ? "PCM at the clip's depth"
                : "no sound", NK_TEXT_LEFT);
     }
+
+    if (slowed)
+        view_disable_end(st, ctx);
 }
 
 /* The Export video section: the codec preset and the colour

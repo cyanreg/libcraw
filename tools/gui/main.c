@@ -758,6 +758,193 @@ fail:
     return ret;
 }
 
+/* -------------------------------------------------------------- the rate */
+
+/* The retime, DESIGN.md 23. Two numbers: the output rate R, at which the
+ * picture is shown and written, and the speed S, the clip seconds that pass
+ * per second of what is watched. Today the one follows from the other,
+ * S = R / the clip's own rate, never above 1: every source frame becomes
+ * one output frame, so output frame k is source frame k and a 59.94 clip at
+ * 23.976 is the same pictures over two and a half times as long. Nothing is
+ * dropped, repeated or made up.
+ *
+ * Both mappings - an output frame to clip time, clip time to output time -
+ * are worked out here and nowhere else, because the first of them is going
+ * to stop being the identity. libplacebo is growing motion estimation
+ * (merge request 876, pl_motion_estimate() in libplacebo/shaders/motion.h:
+ * block-matching flow fields between a pair of frames, forward and
+ * backward, at block granularity). Once cineview has a frame interpolator
+ * on top of it, S can be chosen apart from R - a 24 fps clip at 24 fps at
+ * half speed - and output frame k is the clip at t0 + k * S / R, made
+ * between the two source frames either side of that time. What changes then
+ * is the sampler and nothing else: the master clock is already in clip
+ * seconds running at S, every seek is already a clip frame, and the export's
+ * pts are already output frames. None of that is built yet. */
+
+/* The fixed stops, as --rate spells them. Every one strictly below the
+ * clip's own rate is a stop of the panel's row. */
+static const struct {
+    const char *name;
+    AVRational rate;
+} view_rates[] = {
+    { "23.976", { 24000, 1001 } },
+    { "24",     {    24,    1 } },
+    { "25",     {    25,    1 } },
+    { "29.97",  { 30000, 1001 } },
+    { "30",     {    30,    1 } },
+    { "48",     {    48,    1 } },
+    { "50",     {    50,    1 } },
+    { "59.94",  { 60000, 1001 } },
+    { "60",     {    60,    1 } },
+};
+
+AVRational view_rate_native(const struct view_state *st)
+{
+    if (st->dec.frame_rate.num > 0 && st->dec.frame_rate.den > 0)
+        return st->dec.frame_rate;
+
+    return (AVRational) { 30000, 1001 };
+}
+
+/* -1, 0 or 1 as `r` is below, at or above the clip's own rate `own`, where
+ * anything within a thousandth of a frame a second of it is it: the stream
+ * says 30000/1001 where a container may say 2997/100, while 30 and 29.97,
+ * three hundredths apart, stay two rates. */
+static int view_rate_cmp(AVRational r, AVRational own)
+{
+    AVRational d = av_sub_q(r, own);
+
+    d.num = abs(d.num);
+    if (av_cmp_q(d, (AVRational) { 1, 1000 }) < 0)
+        return 0;
+
+    return av_cmp_q(r, own);
+}
+
+double view_speed(const struct view_state *st)
+{
+    if (st->rate.num <= 0 || st->rate.den <= 0)
+        return 1.0;
+
+    return av_q2d(av_div_q(st->rate, view_rate_native(st)));
+}
+
+bool view_slowed(const struct view_state *st)
+{
+    return view_speed(st) != 1.0;
+}
+
+AVRational view_rate_out(const struct view_state *st)
+{
+    return view_slowed(st) ? st->rate : view_rate_native(st);
+}
+
+double view_out_frame_duration(const struct view_state *st)
+{
+    return 1.0 / av_q2d(view_rate_out(st));
+}
+
+int view_rate_stops(const struct view_state *st, AVRational *stops, int max)
+{
+    AVRational own = view_rate_native(st);
+    int n = 0;
+
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_rates) && n < max - 1; i++)
+        if (view_rate_cmp(view_rates[i].rate, own) < 0)
+            stops[n++] = view_rates[i].rate;
+    if (n < max)
+        stops[n++] = own;
+
+    return n;
+}
+
+void view_rate_name(AVRational r, char *buf, size_t n)
+{
+    if (r.den > 0 && !(r.num % r.den))
+        snprintf(buf, n, "%d", r.num / r.den);
+    else
+        snprintf(buf, n, "%.2f", av_q2d(r));
+}
+
+void view_rate_label(const struct view_state *st, AVRational r, char *buf,
+                     size_t n)
+{
+    AVRational own = view_rate_native(st);
+    char name[16], x[16];
+    size_t len;
+
+    view_rate_name(r, name, sizeof(name));
+    if (view_rate_cmp(r, own) >= 0) {
+        snprintf(buf, n, "%s fps, the clip's own", name);
+        return;
+    }
+
+    /* Two decimals with the zeros taken off, 2.5 and 1.25, except where
+     * that would say 1: a 30 fps clip at 29.97 is 1.001 times slower, and
+     * "1x slower" is not a thing. */
+    snprintf(x, sizeof(x), "%.2f", av_q2d(own) / av_q2d(r));
+    len = strlen(x);
+    while (len > 1 && x[len - 1] == '0')
+        x[--len] = '\0';
+    if (len > 1 && x[len - 1] == '.')
+        x[--len] = '\0';
+    if (!strcmp(x, "1"))
+        snprintf(x, sizeof(x), "%.3f", av_q2d(own) / av_q2d(r));
+
+    snprintf(buf, n, "%s fps, %sx slower", name, x);
+}
+
+/* The rate the open clip plays at for a chosen one: that rate if it is
+ * below the clip's own, the clip's own otherwise, so that a choice carries
+ * from clip to clip and each one is clamped to what it has. */
+static AVRational view_rate_clamp(const struct view_state *st, AVRational want)
+{
+    if (want.num > 0 && want.den > 0 &&
+        view_rate_cmp(want, view_rate_native(st)) < 0)
+        return want;
+
+    return (AVRational) { 0, 0 };
+}
+
+static bool view_rate_same(AVRational a, AVRational b)
+{
+    return a.num == b.num && a.den == b.den;
+}
+
+/* Sets the open clip's rate from the one last chosen. A --rate above the
+ * clip's own is refused rather than clamped without a word, since it was
+ * typed: a headless run ends there, and a window plays the clip at its own
+ * rate and says so. A choice made on the panel is clamped quietly; the row
+ * shows what came of it. */
+static int view_rate_open(struct view_state *st)
+{
+    AVRational want = st->rate_choice, own = view_rate_native(st);
+    char name[16];
+
+    st->rate = view_rate_clamp(st, want);
+    if (view_slowed(st) || want.num <= 0 || want.den <= 0)
+        return 0;
+
+    if (view_rate_cmp(want, own) > 0 && view_rate_same(want, st->cfg.rate)) {
+        view_rate_name(own, name, sizeof(name));
+        fprintf(stderr, "`%s` runs at %s fps; --rate can only slow a clip down\n",
+                st->cfg.input, name);
+        if (st->cfg.headless)
+            return CRAW_ERROR(EINVAL);
+    }
+
+    return 0;
+}
+
+/* Whether the sound is the master clock and is being played: there is a
+ * track, and the clip is not slowed. A slowed clip has no sound (DESIGN.md
+ * 23.2), so everything that drives the audio or reads it as the clock asks
+ * this rather than whether a track exists. */
+static bool view_audio_live(const struct view_state *st)
+{
+    return st->audio.available && !view_slowed(st);
+}
+
 /* ------------------------------------------------------------- the clock */
 
 /* How fast the smoother below closes on the audio device's own cursor, and
@@ -766,17 +953,29 @@ fail:
 #define VIEW_CLOCK_TAU  0.30            /* seconds */
 #define VIEW_CLOCK_JUMP 0.10
 
+/* The clock is in clip seconds whatever the rate, and on a slowed clip it
+ * runs at the speed S (DESIGN.md 23.2): wall time since the last start,
+ * times S. Everything that holds the picture against it - the drop
+ * threshold in view_step_frame(), the catch-up in the run loop, the hold -
+ * then works unchanged, because a clip frame period of lag in clip time is
+ * an output frame period of lag in wall time. */
 double view_clock(struct view_state *st)
 {
     double raw, dt, err;
     int64_t now;
 
-    if (st->audio.available)
+    /* Not before the first picture is up, either: the audio is only started
+     * then (struct view_state's `warm`), and a wall clock that ran from the
+     * clip's opening had put a quarter of a second of clip behind the first
+     * picture of a 59.94 clip slowed to 23.976 by the time it was drawn -
+     * fifteen frames thrown away to catch up with a clock nobody was
+     * watching yet. The loop restarts it from that picture. */
+    if (view_audio_live(st))
         raw = view_audio_clock(&st->audio);
-    else if (!st->playing)
-        raw = st->wall_pts;             /* a silent clip, stopped */
+    else if (!st->playing || !st->warm)
+        raw = st->wall_pts;             /* silent or slowed, stopped or not started */
     else
-        raw = st->wall_pts +
+        raw = st->wall_pts + view_speed(st) *
               (double)(av_gettime_relative() - st->wall_t0) / 1.0e6;
 
     now = av_gettime_relative();
@@ -799,10 +998,18 @@ double view_clock(struct view_state *st)
      * runs on wall time and is pulled towards the cursor over a third of a
      * second: still locked to the sound, no longer shaking. A jump - a
      * seek, a loop point, the first frames of a run - is not noise and is
-     * taken whole. */
+     * taken whole.
+     *
+     * The smoother's own step is wall time at the speed S too. Stepped at
+     * one clip second per wall second under a raw clock running at 0.4, it
+     * would drift ahead towards (1 - S) times its time constant, 0.18 s,
+     * and cross the jump threshold on the way: a clock that leapt back
+     * every few frames. The pull towards the cursor stays in wall time; on
+     * a slowed clip there is nothing for it to pull, since the raw clock is
+     * the same wall time at the same speed. */
     dt = (double)(now - st->clk_wall) / 1.0e6;
     st->clk_wall = now;
-    st->clk_t += dt;
+    st->clk_t += dt * view_speed(st);
 
     err = raw - st->clk_t;
     if (fabs(err) > VIEW_CLOCK_JUMP)
@@ -848,7 +1055,7 @@ static bool view_frame_due(struct view_state *st)
  * on an underrun. */
 static void view_audio_start(struct view_state *st)
 {
-    if (!st->audio.available || !st->playing)
+    if (!view_audio_live(st) || !st->playing)
         return;
 
     view_audio_pump(&st->audio);
@@ -2098,6 +2305,33 @@ static int view_parse_bypass(struct view_sections *s, const char *arg)
     return 0;
 }
 
+/* `--rate FPS`: one of the fixed rates as view_rates[] spells it, 23.98 for
+ * 23.976 the way the panel spells that one, or `clip` for the clip's own.
+ * Whether it is below the clip's own can only be said once a clip is open
+ * (view_rate_open()). */
+static int view_parse_rate(struct view_state *st, const char *arg)
+{
+    const char *names[CRAW_ARRAY_ELEMS(view_rates) + 1];
+    const int nb = (int)CRAW_ARRAY_ELEMS(view_rates);
+    int v, ret;
+
+    for (int i = 0; i < nb; i++)
+        names[i] = view_rates[i].name;
+    names[nb] = "clip";
+
+    if (!strcmp(arg, "23.98"))
+        arg = view_rates[0].name;
+
+    ret = view_lookup(names, nb + 1, "--rate", arg, &v);
+    if (ret < 0)
+        return ret;
+
+    st->cfg.rate = v < nb ? view_rates[v].rate : (AVRational) { 0, 0 };
+    st->rate_choice = st->cfg.rate;
+
+    return 0;
+}
+
 static void view_usage(FILE *f)
 {
     fprintf(f,
@@ -2125,6 +2359,9 @@ static void view_usage(FILE *f)
 "  --no-loop           stop at the end of the clip instead of starting over\n"
 "  --loops N           play the clip N times and quit, printing the A/V\n"
 "                      statistics (default: loop for ever)\n"
+"  --rate FPS          play and export every frame at FPS, slower than the\n"
+"                      clip and without its sound: 23.976, 24, 25, 29.97, 30,\n"
+"                      48, 50, 59.94, 60, or clip (the default)\n"
 "  --audio-dump FILE   write exactly the float samples handed to the audio\n"
 "                      device, raw interleaved float32 48 kHz stereo. The\n"
 "                      file is the clip\'s: switching clips starts it again\n"
@@ -2279,7 +2516,9 @@ static void view_usage(FILE *f)
 "                      read-back, anything else through libswscale. The\n"
 "                      picture is what --export writes. A .mp4 or .mov is\n"
 "                      always written with movflags +faststart, its moov\n"
-"                      atom ahead of the media.\n"
+"                      atom ahead of the media. With --rate the file runs at\n"
+"                      that rate, one frame for every frame of the range,\n"
+"                      and carries no sound.\n"
 "  --list-encoders     print every video encoder this FFmpeg has, marking\n"
 "                      the ones that take Vulkan frames, and exit\n"
 "  --size SIZE         how large the export is written: full (the default,\n"
@@ -2305,7 +2544,8 @@ static void view_usage(FILE *f)
 "                      to the pair the speakers get. A mode the container\n"
 "                      cannot carry is refused with the muxer's reason:\n"
 "                      .mov takes neither opus nor flac, .mp4 and .mkv take\n"
-"                      all of them\n"
+"                      all of them. A clip slowed by --rate or the panel is\n"
+"                      written without sound, whatever the mode\n"
 "  --threads N         threads for a software video encoder, 0 (the default)\n"
 "                      for FFmpeg's own auto, 1 to the machine's core\n"
 "                      count; the Vulkan encoders have none. -v prints what\n"
@@ -2363,24 +2603,26 @@ static void view_usage(FILE *f)
 "of their own. Anything but a quarter turn is reported and left alone.\n"
 "\n"
 "Audio is the master clock. The clip's PCM track plays through SDL3 with\n"
-"5 ms fades at every boundary; a silent clip falls back to wall time.\n"
+"5 ms fades at every boundary; a silent clip falls back to wall time, and\n"
+"so does a slowed one, which plays without its sound.\n"
 "\n"
 "The panel is worked with the pointer: the section headers' switches and\n"
 "expanders, the sliders, the fields and the cascading menus are clicked,\n"
 "and no key reaches a panel row. Keys: space play/pause; left/right seek\n"
-"five seconds back and forward, shift with them one second; page up/down\n"
-"zoom in and out; shift with page up/down goes to the first and last\n"
-"frame; control with the arrows pans; tab or 0 fits the picture again, 1\n"
-"is one to one; the wheel zooms about the pointer and dragging pans; c\n"
-"turns crop mode on, clearing any rectangle, and off again keeping the\n"
-"one that was drawn, where a left drag draws the rectangle the export is\n"
-"cut to; ctrl+1 and ctrl+2 mark the video export's start and end at the\n"
-"frame on screen; r and t go to the previous and the next file on the\n"
-"command line; m mutes; escape disarms the White balance section's \"pick\n"
-"white\" (whose next click on the picture samples instead of panning or\n"
-"cropping), closes an open menu, and otherwise quits, as q does. While a\n"
-"video export runs the panel and every key but q are locked; q stops the\n"
-"export, finishes the file and quits.\n",
+"five seconds back and forward, shift with them one second, seconds as\n"
+"watched at the rate the clip plays at; page up/down zoom in and out;\n"
+"shift with page up/down goes to the first and last frame; control with\n"
+"the arrows pans; tab or 0 fits the picture again, 1 is one to one; the\n"
+"wheel zooms about the pointer and dragging pans; c turns crop mode on,\n"
+"clearing any rectangle, and off again keeping the one that was drawn,\n"
+"where a left drag draws the rectangle the export is cut to; ctrl+1 and\n"
+"ctrl+2 mark the video export's start and end at the frame on screen; r\n"
+"and t go to the previous and the next file on the command line; m mutes;\n"
+"escape disarms the White balance section's \"pick white\" (whose next\n"
+"click on the picture samples instead of panning or cropping), closes an\n"
+"open menu, and otherwise quits, as q does. While a video export runs the\n"
+"panel and every key but q are locked; q stops the export, finishes the\n"
+"file and quits.\n",
     (double)CRAW_SHARPEN_MAX_RADIUS, CRAW_SHARPEN_MAX_ITERATIONS, VIEW_SHARPEN_PLAY_ITERATIONS,
     craw_tool_profile_builtin_list());
 }
@@ -2412,6 +2654,7 @@ enum {
     VIEW_OPT_CROP,
     VIEW_OPT_LOOPS,
     VIEW_OPT_NO_LOOP,
+    VIEW_OPT_RATE,
     VIEW_OPT_AUDIO_DUMP,
     VIEW_OPT_AUDIO_MAP,
     VIEW_OPT_ZOOM,
@@ -2466,6 +2709,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "crop",     required_argument, NULL, VIEW_OPT_CROP      },
         { "loops",    required_argument, NULL, VIEW_OPT_LOOPS     },
         { "no-loop",  no_argument,       NULL, VIEW_OPT_NO_LOOP   },
+        { "rate",     required_argument, NULL, VIEW_OPT_RATE      },
         { "audio-dump", required_argument, NULL, VIEW_OPT_AUDIO_DUMP },
         { "audio-map", required_argument,  NULL, VIEW_OPT_AUDIO_MAP },
         { "zoom",     required_argument, NULL, VIEW_OPT_ZOOM      },
@@ -2524,6 +2768,10 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 fprintf(stderr, "--loops: `%s` is not a pass count\n", optarg);
                 return CRAW_ERROR(EINVAL);
             }
+            break;
+        case VIEW_OPT_RATE:
+            if ((ret = view_parse_rate(st, optarg)) < 0)
+                return ret;
             break;
         case VIEW_OPT_AUDIO_DUMP:
             st->cfg.audio_dump = optarg;
@@ -3061,6 +3309,14 @@ static void view_log_look(const struct view_state *st)
      * the last build: what carries across a clip is the setting. */
     fprintf(stderr, ", grain %s", view_grain_setting(&st->grain, gr, sizeof(gr)));
     fprintf(stderr, ", zoom %s", st->view.fit ? "fit" : "set");
+    /* The rate as it was chosen, not as this clip clamps it, which is what
+     * carries. */
+    if (st->rate_choice.num > 0 && st->rate_choice.den > 0) {
+        view_rate_name(st->rate_choice, gr, sizeof(gr));
+        fprintf(stderr, ", rate %s", gr);
+    } else {
+        fprintf(stderr, ", rate the clip's own");
+    }
     fprintf(stderr, ", volume %.0f%%%s\n", st->volume * 100.0f,
             st->mute ? ", muted" : "");
 }
@@ -3082,6 +3338,13 @@ static int view_open_clip(struct view_state *st, int index, bool first)
     view_log(st, "clip %d/%d: %s\n", index + 1, st->cfg.nb_inputs, st->cfg.input);
 
     ret = view_decoder_open(&st->dec, st->cfg.input, &st->gpu, st->cfg.verbose);
+    if (ret < 0)
+        return ret;
+
+    /* The rate last chosen, clamped to this clip's own, now that its own is
+     * known. The sound is still opened on a slowed clip: it is not played,
+     * but it is there for the moment the row goes back to the top. */
+    ret = view_rate_open(st);
     if (ret < 0)
         return ret;
 
@@ -3289,12 +3552,13 @@ static bool view_over_picture(const struct view_state *st, float x, float y)
 
 /* A stretch of the clip in frames: five seconds for Left and Right, one
  * for Shift with them. Rounded, so that five seconds of 29.97 is 150
- * frames and not 149. */
+ * frames and not 149. The seconds are the ones watched, at the output rate
+ * R rather than the clip's own (DESIGN.md 23): five seconds of a 59.94 clip
+ * slowed to 23.976 is 120 frames, two seconds of the clip, which is what
+ * five seconds of the picture on screen are. */
 static int64_t view_seek_frames(const struct view_state *st, double seconds)
 {
-    double fps = av_q2d(st->dec.frame_rate);
-
-    return (int64_t)((fps > 0.0 ? fps : 25.0) * seconds + 0.5);
+    return (int64_t)(seconds / view_out_frame_duration(st) + 0.5);
 }
 
 /* `frame` held to the clip: never past its last frame when the count is
@@ -3499,6 +3763,50 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
     }
 }
 
+/* The rate row moved, or a clip that opened clamped the choice (DESIGN.md
+ * 23.2). The panel only writes the choice; this is where it becomes the
+ * rate, in one step with everything the rate means for the sound and the
+ * clock, the way the transport drives the audio rather than the panel.
+ * Slowed, the sound stops and the wall clock takes over from the picture on
+ * screen at the new speed; back at the clip's own rate the track is sent to
+ * that picture, and the loop's own start logic plays it again. Neither
+ * seeks the picture or stops it: the next frame is due one output frame
+ * after this one, at whichever rate that now is.
+ *
+ * In one step because the clock reads the rate directly. The panel is laid
+ * out late in an iteration, after the clock has been read for the next
+ * picture's hold and before it is read again for that picture's a/v; a rate
+ * set there and acted on an iteration later ran the wall clock at the new
+ * speed from the old anchor in between - on P1081307, 0.23 s ahead from 24
+ * to 25 fps after 14 s at 24, and fifteen frames dropped to catch up - and
+ * read the paused track as the clock on the way back, fourteen seconds
+ * behind. */
+static void view_rate_follow(struct view_state *st, AVRational *choice_seen,
+                             AVRational *rate_seen)
+{
+    char label[64];
+
+    if (!view_rate_same(st->rate_choice, *choice_seen)) {
+        *choice_seen = st->rate_choice;
+        st->rate = view_rate_clamp(st, st->rate_choice);
+    }
+    if (view_rate_same(st->rate, *rate_seen))
+        return;
+    *rate_seen = st->rate;
+
+    if (view_slowed(st))
+        view_audio_pause(&st->audio);
+    else
+        view_audio_seek(&st->audio, st->pts);
+    view_wall_restart(st, st->pts);
+
+    view_rate_label(st, view_rate_out(st), label, sizeof(label));
+    view_log(st, "rate: %s from %.3f s; %s\n", label, st->pts,
+             !st->audio.available ? "no sound in the clip"
+             : view_slowed(st)    ? "the sound is paused"
+                                  : "the sound resumes there");
+}
+
 static int view_run_window(struct view_state *st)
 {
     SDL_Window *win = NULL;
@@ -3517,6 +3825,9 @@ static int view_run_window(struct view_state *st)
      * hold - which while playing is nearly always - is wiped before any
      * button sees it. */
     bool ui_input_consumed = true;
+    /* The rate choice and the rate as the loop last acted on them; see
+     * view_rate_follow(). */
+    AVRational choice_seen = { 0, 0 }, rate_seen = { 0, 0 };
     int w = VIEW_WINDOW_W, h = VIEW_WINDOW_H;
     int ret;
 
@@ -3585,6 +3896,8 @@ static int view_run_window(struct view_state *st)
     ret = view_open_clip(st, 0, true);
     if (ret < 0)
         return ret;
+    choice_seen = st->rate_choice;
+    rate_seen = st->rate;
 
     ret = view_ui_open(st, win);
     if (ret < 0)
@@ -3773,10 +4086,17 @@ static int view_run_window(struct view_state *st)
         }
         view_ui_input_end();
 
+        /* Before anything this iteration reads the clock: a key may have
+         * opened another clip, and the panel may have moved the rate row
+         * when it was laid out last time round. */
+        view_rate_follow(st, &choice_seen, &rate_seen);
+
         /* Keeps the audio ring topped up whatever the picture is doing.
          * An export owns the decoder while it runs, so the clock and the
-         * ring are left alone until it is done. */
-        if (!st->exp.active && !st->video.active &&
+         * ring are left alone until it is done. A slowed clip's track is
+         * not being played, and is sent back to the picture before it is
+         * again, so there is nothing to keep topped up. */
+        if (!st->exp.active && !st->video.active && view_audio_live(st) &&
             view_audio_pump(&st->audio) < 0)
             break;
 
@@ -3812,8 +4132,10 @@ static int view_run_window(struct view_state *st)
                  * is and try again next time round; this is not a drop. */
             } else if (ret > 0) {
                 /* End of the clip. The last picture stays up while the
-                 * audio tail plays out; only then does it loop or stop. */
-                if (view_audio_drained(&st->audio)) {
+                 * audio tail plays out; only then does it loop or stop. A
+                 * slowed clip has no tail playing - its paused ring would
+                 * never drain - and ends once its last picture is shown. */
+                if (!view_audio_live(st) || view_audio_drained(&st->audio)) {
                     st->loops_done++;
                     if (st->cfg.loops && st->loops_done >= st->cfg.loops) {
                         st->playing = false;
@@ -3891,17 +4213,20 @@ static int view_run_window(struct view_state *st)
             st->seek_to >= 0 || now - st->last_present >= VIEW_IDLE_PRESENT)
             st->present_due = true;
 
-        /* The transport drives the audio, never the other way round. */
+        /* The transport drives the audio, never the other way round. A
+         * pause folds the wall time since the start into the wall clock at
+         * the speed it was running at, so that it stops where it was. */
         if (st->playing != was_playing) {
             if (st->playing)
                 view_wall_restart(st, st->pts);
-            else if (!st->audio.available)
-                st->wall_pts += (double)(av_gettime_relative() - st->wall_t0) / 1.0e6;
+            else if (!view_audio_live(st))
+                st->wall_pts += view_speed(st) *
+                                (double)(av_gettime_relative() - st->wall_t0) / 1.0e6;
         }
 
         view_audio_set_volume(&st->audio, st->volume, st->mute);
 
-        if (!st->exp.active && st->audio.available) {
+        if (!st->exp.active && view_audio_live(st)) {
             if (st->playing && st->warm && !st->audio.playing)
                 view_audio_start(st);
             else if ((!st->playing || !st->warm) && st->audio.playing)
@@ -4004,8 +4329,12 @@ static int view_run_window(struct view_state *st)
              * input and never runs past the moment something is wanted:
              * either the held picture's own time, or the point at which the
              * next one has to start being decoded. The cap keeps the audio
-             * ring topped up whatever the clip's frame rate is. */
-            int ms = hold > 0.0 ? (int)(hold * 1000.0) : VIEW_IDLE_WAIT_MS;
+             * ring topped up whatever the clip's frame rate is. The hold is
+             * in clip seconds and the wait in wall ones, which on a slowed
+             * clip are 1 / S of them (DESIGN.md 23.2): the one place the
+             * clock's time is turned back into time that passes. */
+            int ms = hold > 0.0 ? (int)(hold / view_speed(st) * 1000.0)
+                                : VIEW_IDLE_WAIT_MS;
 
             ms = CRAW_MIN(ms, VIEW_IDLE_WAIT_MS);
             if (ms > 0)

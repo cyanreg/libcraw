@@ -124,7 +124,16 @@ struct view_encode {
      * written upright and carries no matrix of its own, so `w` and `h`
      * above are the turned ones and the crop rectangle is not. */
     pl_rotation rotation;
+    /* The file's frame rate, which is the output rate R (DESIGN.md 23.3):
+     * the clip's own, or the one it is slowed to. A frame's pts is its
+     * place in the range, in 1 / R; the clip's own timestamps never reach
+     * the file. */
     AVRational fr;
+    /* Whether the run is slowed, and the clip's own rate it is slowed from,
+     * taken at the start of the run with the rest of the selection. A slowed
+     * run carries no sound. */
+    bool slowed;
+    AVRational own;
     int64_t start, end, next;
     int64_t encoded;
     /* The output cannot be opened until a frame has been decoded: the
@@ -1073,14 +1082,21 @@ static int view_enc_audio_open_enc(struct view_encode *e, struct view_enc_audio 
  * output. A clip with no sound is not an error: the video is still worth
  * writing, and the mode is greyed in the panel for the same reason. A
  * container that will not carry the mode's codec has already been refused
- * by view_encode_begin(); this is where the muxer gets the last word. */
+ * by view_encode_begin(); this is where the muxer gets the last word.
+ *
+ * A slowed run (DESIGN.md 23.3) writes no sound stream at all, whatever the
+ * mode says, and the mode is left as it is for the next run at the clip's
+ * own rate. Cut to the range as it is, the track would end at 40% of a file
+ * slowed 2.5 times; slowed with the picture, it is 12 log2 2.5 = 15.9
+ * semitones down. The camera's own slow and quick and variable frame rate
+ * modes record no sound either. */
 static int view_enc_audio_open(struct view_encode *e, struct view_state *st)
 {
     int mode = e->sel.audio_mode;
     int in[2], nb;
     int ret;
 
-    if (mode == VIEW_AUDIO_NONE)
+    if (mode == VIEW_AUDIO_NONE || e->slowed)
         return 0;
 
     ret = avformat_open_input(&e->aic, st->cfg.input, NULL, NULL);
@@ -2188,6 +2204,11 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     else
         view_presets_default(&e->sel);
 
+    /* The rate goes with it: the panel is locked for the run, but the file
+     * is what was asked for at the press, all of it. */
+    e->slowed = view_slowed(st);
+    e->own = view_rate_native(st);
+
     if (e->sel.colour < 0 || e->sel.colour >= VIEW_NB_COLOURS)
         e->sel.colour = VIEW_COLOUR_709;
     e->col = &view_colours[e->sel.colour];
@@ -2283,8 +2304,10 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
         const char *why = view_encode_video_why_not(st, v->path, &e->sel,
                                                     o->codec);
 
-        /* A clip with no sound is not a reason to refuse the picture. */
-        if (!why && view_encode_has_audio(st))
+        /* A clip with no sound is not a reason to refuse the picture, and
+         * neither is a mode the container will not carry on a slowed run,
+         * which writes no sound to carry (view_enc_audio_open()). */
+        if (!why && !e->slowed && view_encode_has_audio(st))
             why = view_encode_audio_why_not(st, v->path, e->sel.audio_mode);
         if (why) {
             fprintf(stderr, "%s: %s\n", v->path, why);
@@ -2367,8 +2390,12 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     v->out_w = e->w;
     v->out_h = e->h;
 
-    e->fr = st->dec.frame_rate;
-    if (e->fr.num <= 0 || e->fr.den <= 0)
+    /* R, frame for frame: a range of 150 frames of a 59.94 clip slowed to
+     * 23.976 is 150 frames at 24000/1001, 6.25625 s where the clip's own
+     * rate makes it 2.5025. A clip that says no rate at all and is not
+     * slowed is written at 25, as it always was. */
+    e->fr = view_rate_out(st);
+    if (!e->slowed && (st->dec.frame_rate.num <= 0 || st->dec.frame_rate.den <= 0))
         e->fr = (AVRational) { 25, 1 };
 
     ret = avformat_alloc_output_context2(&e->oc, NULL, NULL, v->path);
@@ -2623,27 +2650,36 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     /* The threads the encoder ended up with, in the status line and the
      * log, because what was asked for is not always what it took. */
     {
-        char threads[32] = "", audio[64] = "";
+        char threads[32] = "", audio[64] = "", slowed[48] = "";
 
         if (!e->hw)
             snprintf(threads, sizeof(threads), ", %s%d thread%s",
                      e->threads ? "" : "auto: ", e->threads,
                      e->threads == 1 ? "" : "s");
-        if (e->nb_audio)
+        if (e->slowed) {
+            char name[16];
+
+            view_rate_name(e->fr, name, sizeof(name));
+            snprintf(audio, sizeof(audio), ", no sound at %s fps", name);
+            snprintf(slowed, sizeof(slowed), ", slowed from %d/%d",
+                     e->own.num, e->own.den);
+        } else if (e->nb_audio) {
             snprintf(audio, sizeof(audio), ", audio %s",
                      view_presets_audio_label(&e->sel, label, sizeof(label)));
+        }
 
         snprintf(v->status, sizeof(v->status), "%s %dx%d %s, %" PRId64
                  " frames%s%s", e->codec->name, e->w, e->h,
                  av_get_pix_fmt_name(e->sw_fmt), e->end - e->start + 1,
                  threads, audio);
         view_log(st, "encoding frames %" PRId64 " to %" PRId64 " into %s: %s %s "
-                     "%dx%d %s, %d/%d fps%s%s%s%s\n",
+                     "%dx%d %s, %d/%d fps%s%s%s%s%s\n",
                  e->start, e->end, v->path, e->oc->oformat->name,
                  e->codec->name, e->w, e->h, av_get_pix_fmt_name(e->sw_fmt),
-                 e->fr.num, e->fr.den, e->hw ? ", Vulkan frames" : "",
+                 e->fr.num, e->fr.den, slowed, e->hw ? ", Vulkan frames" : "",
                  e->direct ? ", straight from the pipeline" : "",
-                 threads, e->nb_audio ? audio : ", no audio");
+                 threads, e->slowed   ? ", no sound (slowed)"
+                        : e->nb_audio ? audio : ", no audio");
     }
 
     return 0;
@@ -2887,9 +2923,20 @@ finish:
     if (e->oc->pb)
         mb = (double)avio_size(e->oc->pb) / 1e6;
 
-    snprintf(v->status, sizeof(v->status),
-             "%" PRId64 " frames, %.1f fps, %.1f MB", total,
-             el > 0.0 ? (double)total / el : 0.0, mb);
+    /* The line the panel keeps once the run is over, so a slowed file says
+     * there that it has no sound and what rate it runs at; the rate before
+     * it is how fast the export went. */
+    {
+        char name[16] = "";
+
+        if (e->slowed)
+            view_rate_name(e->fr, name, sizeof(name));
+        snprintf(v->status, sizeof(v->status),
+                 "%" PRId64 " frames, %.1f fps, %.1f MB%s%s%s", total,
+                 el > 0.0 ? (double)total / el : 0.0, mb,
+                 e->slowed ? ", no sound at " : "", name,
+                 e->slowed ? " fps" : "");
+    }
     view_log(st, "%s: %s in %.1f s\n", v->path, v->status, el);
 
     /* Where the direct path's time went, per frame. The decode and the

@@ -720,6 +720,9 @@ struct view_cfg {
 
     bool loop;                  /* start again at the end; --no-loop turns it off */
     int64_t loops;              /* stop and quit after N passes, 0: endless */
+    /* --rate FPS: the output rate every clip of the playlist opens at,
+     * clamped to its own (DESIGN.md 23); 0/0 for the clip's own. */
+    AVRational rate;
     const char *audio_dump;
     const char *audio_map;
 
@@ -1190,6 +1193,21 @@ struct view_state {
     bool have_frame;
     struct view_pipeline_look processed;    /* what it was processed with */
     bool playing;
+    /* The output frame rate the clip is shown and written at, 0/0 for the
+     * clip's own. Only rates at or below the clip's own are ever set: the
+     * clip is slowed, frame for frame, never sped up. Carries across clips,
+     * clamped to each one's own rate. Not in the look, and not saved or
+     * restored with one: it is about the clip's transport, not about the
+     * picture, which is the same frame by frame at any rate. DESIGN.md 23. */
+    AVRational rate;
+    /* What `rate` was last chosen as - by --rate, or by moving the panel's
+     * row - which is what each clip that opens is clamped from. Without it
+     * the clamp would be the choice: a 23.976 clip in a playlist of 59.94
+     * ones would set it to its own rate, and the next 59.94 clip would no
+     * longer be slowed. The panel writes only this; the run loop makes it
+     * `rate`, in the same step as it moves the clock and the sound. 0/0 for
+     * the clip's own. */
+    AVRational rate_choice;
     bool need_frame;            /* decode one more even while paused */
     int64_t seek_to;            /* >= 0: seek before the next decode */
     int64_t seek_target;        /* the frame a seek is still looking for */
@@ -1222,7 +1240,9 @@ struct view_state {
     bool mute;
     int mute_flag;
 
-    /* The wall clock that stands in for the audio clock on a silent clip. */
+    /* The wall clock that stands in for the audio clock on a silent clip
+     * and on a slowed one: `wall_pts` is in clip seconds, and the wall time
+     * since `wall_t0` is folded into it at the speed S. */
     double wall_pts;
     int64_t wall_t0;
     /* The master clock's smoother: see view_clock(). */
@@ -1658,6 +1678,37 @@ void view_log(const struct view_state *st, const char *fmt, ...)
 /* One frame period of the clip, in seconds; 29.97 fps when it says none. */
 double view_frame_duration(const struct view_state *st);
 
+/* The retime, DESIGN.md 23: the output rate R the picture is shown and
+ * written at, and the speed S, the clip seconds that pass per second of what
+ * is watched. Today S = R / the clip's own rate, never above 1, and output
+ * frame k is source frame k. These are the only places either mapping - an
+ * output frame to clip time, clip time to output time - is worked out; the
+ * comment above them in main.c says why. */
+
+/* The clip's own rate, 29.97 when it says none, as view_frame_duration()
+ * assumes. */
+AVRational view_rate_native(const struct view_state *st);
+/* R: the chosen rate, or the clip's own when none is. */
+AVRational view_rate_out(const struct view_state *st);
+/* S, 1.0 when the clip is not slowed. */
+double view_speed(const struct view_state *st);
+/* S != 1. */
+bool view_slowed(const struct view_state *st);
+/* 1 / R, in seconds of what is watched. */
+double view_out_frame_duration(const struct view_state *st);
+
+/* The panel row's stops for the open clip: every fixed rate strictly below
+ * the clip's own, slowest first, then the clip's own as the last. Fills up
+ * to `max` and returns how many; one for a clip at 23.976 or slower. */
+#define VIEW_RATE_MAX_STOPS 10
+int  view_rate_stops(const struct view_state *st, AVRational *stops, int max);
+/* A rate the way the Clip block spells one: "24", "23.98", "59.94". */
+void view_rate_name(AVRational r, char *buf, size_t n);
+/* A stop as the panel reads it: "23.98 fps, 2.5x slower", or "29.97 fps,
+ * the clip's own" for the clip's own rate. */
+void view_rate_label(const struct view_state *st, AVRational r, char *buf,
+                     size_t n);
+
 /* The illuminant the picture on screen is balanced for, in the clip's own
  * terms - the raw profile's locus or the developed clip's - whichever mode
  * put it there: what the Manual row starts from when it is picked. False
@@ -1671,7 +1722,8 @@ bool view_wb_applied(const struct view_state *st, CRAWIlluminant *out);
 int  view_step_frame(struct view_state *st);
 
 /* The master clock, in seconds on the clip's timeline: the audio clock
- * when there is audio, wall time since the last start or seek otherwise. */
+ * when there is audio and the clip is not slowed, otherwise wall time
+ * since the last start or seek, run at the speed view_speed() says. */
 double view_clock(struct view_state *st);
 
 /* The .cube LUT named by look.lut_path. */

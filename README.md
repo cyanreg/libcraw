@@ -145,6 +145,23 @@ only touch the view, never the export. While a video export runs the whole panel
 locked, the picture is the export's; `q` then stops the export, finishes
 the file and quits.
 
+Under the scrub bar the "rate" row slows the clip down, frame for frame.
+Its stops are those of 23.976, 24, 25, 29.97, 30, 48, 50, 59.94 and 60
+that are below the clip's own rate, and the clip's own at the right: a
+59.94 clip at 23.976 shows every one of its frames two and a half times
+slower, and the video export writes them as a 23.976 file two and a half
+times as long. Nothing is dropped, repeated or made up, and nothing about
+the picture changes. While the clip is slowed its sound is left out, as the
+camera leaves it out of its own slow and quick motion; moving the row
+neither seeks nor pauses, and back at the clip's own rate the sound picks
+up at the picture on screen. Left and Right then step five seconds as
+watched, and the frame readout above stays in the clip's own frames and
+seconds. A 23.976 clip has nothing slower to go to and its row is greyed.
+`--rate FPS` sets the same from the command line, one of those nine or
+`clip`, for every clip of a playlist, and a rate above a clip's own is
+refused when that clip opens: a headless run stops there, a window plays
+the clip at its own rate (DESIGN.md 23).
+
 On Wayland the window follows the compositor's colour management
 (`wp_color_manager_v1`): it asks for the image description the compositor
 would like the window in, renders the picture into exactly that - the
@@ -307,7 +324,9 @@ and its fit, the sharpening, the
 export's colour space, size,
 pixel format, audio mode and threads, the two export file paths once typed,
 the film simulation, the tone map, the adjustments, the grain, every
-section's switch and the zoom. A setting a clip's kind
+section's switch, the zoom and the rate, which each clip clamps to its own
+without forgetting it: a 23.976 clip among 59.94 ones plays at its own
+rate, and the next 59.94 one is slowed again. A setting a clip's kind
 cannot use is kept rather than dropped, so the debayer method and the lens
 correction a raw clip was graded with are still there after a developed
 one. Only what is read from the
@@ -425,8 +444,9 @@ written at zlib level 1 (a fifth of the time of the default level for a per
 cent of the size) and TIFF uncompressed. The stream is tagged as what the
 export really is: full range, BT.709 primaries, sRGB transfer, display
 referred. A sequence of stills is deliberately not offered — that is a video
-encode. `--export-video START END OUT` is the video export headless. The
-image export has no codec box: the extension is the choice.
+encode. `--export-video START END OUT` is the video export headless, and
+honours `--rate`: the range is written frame for frame at that rate, with no
+sound. The image export has no codec box: the extension is the choice.
 
 Every video export into an `.mp4` or `.mov` is written with `movflags
 +faststart`, always: the `moov` atom is moved ahead of the media so the file
@@ -528,6 +548,15 @@ reason: this FFmpeg's QuickTime muxer takes neither Opus nor FLAC (*only
 supported in MP4*), while `.mp4` and `.mkv` carry all of aac, opus, flac and
 PCM. The four-mono-track rule holds — the last two of four are the stereo
 pair — and a single four-channel stream is taken whole.
+
+A slowed clip — the rate row below the scrub bar, or `--rate` — is written
+with no sound stream at all, whatever the mode says. The rows are greyed and
+say so, `no sound while slowed`; the mode itself is kept, and a container
+that could not carry it is no reason to refuse a run that writes no sound.
+At the clip's own rate it is there again. The file runs at the slowed rate,
+its frames numbered in it: 150 frames of a 59.94 clip at 23.976 are a
+6.25625 s file, where the clip's own rate makes them 2.5025 s. The status
+line and `-v` say `no sound at 23.98 fps` and `slowed from 60000/1001`.
 
 ### The pixel format
 
