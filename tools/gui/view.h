@@ -322,12 +322,17 @@ struct view_pana {
  * own parameter sets on its first packet when its container keeps them out
  * of band - and reads a change of size or format off the bitstream, setting
  * its hwaccel up again only then. So the device is wrapped once for the
- * program, and the decoder stays open for as long as the clips are of its
- * codec: a playlist of ProRes RAW never builds a second one, and a loop
- * point never needed to. The hwaccel's shaders and its frame pool stay with
- * it. See view_decoder_codec_open(). */
+ * program, and every decoder opened stays open until the program ends, one
+ * per codec: a clip of a codec seen before gets its decoder back flushed, a
+ * codec not seen yet opens one more, and a loop point is a flush. The
+ * hwaccel's shaders and its frame pool stay with each. See
+ * view_decoder_codec_open(). */
 struct view_codec {
     AVBufferRef *hw_device;
+    /* The pool, and the one the clip on screen decodes with, which is one
+     * of them. */
+    AVCodecContext **pool;
+    int nb_pool;
     AVCodecContext *avc;
 };
 

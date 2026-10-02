@@ -3243,9 +3243,8 @@ static void view_close_clip(struct view_state *st)
     st->have_frame = false;
     view_gpu_release_frames(&st->gpu);
 
-    /* Closes the clip and forgets what it said; the decoder itself stays
-     * for the next clip when that is of the same codec (view.h,
-     * view_codec). */
+    /* Closes the clip and forgets what it said; the decoders stay in their
+     * pool for the next clip (view.h, view_codec). */
     view_decoder_close(&st->dec);
 }
 

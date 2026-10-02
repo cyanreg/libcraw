@@ -35,57 +35,62 @@
 static enum AVPixelFormat view_get_format(AVCodecContext *avc,
                                           const enum AVPixelFormat *fmts);
 
-/* Opens the decoder for the clip's stream, or keeps the one that is open
- * when it is of the same codec. libavcodec takes one stream after another
- * through a context: flushed between them, handed the new stream's
- * extradata on its first packet (view_decoder_feed()), and reading a change
- * of size or format off the bitstream itself, which is the one case where
- * it sets the hwaccel up again. Building a context per clip instead cost
- * the hwaccel's two shaders and its frame pool every time: 25 to 80 ms and
- * the first two or three pictures, measured at every switch of a playlist
- * and at every loop point - the seek used to rebuild the context after end
- * of stream, on a report that this hwaccel did not come back from a flush,
- * which it does (see view_decoder_seek()). */
+/* Opens the decoder for the clip's stream, or takes the one the pool holds
+ * for its codec. libavcodec takes one stream after another through a
+ * context: flushed between them, handed the new stream's extradata on its
+ * first packet (view_decoder_feed()), and reading a change of size or
+ * format off the bitstream itself, which is the one case where it sets the
+ * hwaccel up again. Building a context per clip instead cost the hwaccel's
+ * two shaders and its frame pool every time: 25 to 80 ms and the first two
+ * or three pictures, measured at every switch of a playlist and at every
+ * loop point - the seek used to rebuild the context after end of stream,
+ * on a report that this hwaccel did not come back from a flush, which it
+ * does (see view_decoder_seek()). */
 static int view_decoder_codec_open(struct view_decoder *d)
 {
     AVStream *st = d->fmt->streams[d->stream_index];
     const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
+    AVCodecContext *avc, **pool;
     int ret;
 
     if (!codec)
         return CRAW_ERROR(ENOSYS);
 
-    if (d->codec.avc && d->codec.avc->codec_id == st->codecpar->codec_id) {
+    for (int i = 0; i < d->codec.nb_pool; i++) {
+        if (d->codec.pool[i]->codec_id != st->codecpar->codec_id)
+            continue;
+        d->codec.avc = d->codec.pool[i];
         avcodec_flush_buffers(d->codec.avc);
         d->new_extradata = st->codecpar->extradata_size > 0;
         if (d->verbose)
-            fprintf(stderr, "decoder: %s kept from the last clip and flushed%s\n",
-                    codec->name, d->new_extradata
-                                 ? ", the stream's extradata goes on its first packet"
-                                 : "");
+            fprintf(stderr, "decoder: %s from the pool, flushed%s\n", codec->name,
+                    d->new_extradata ? ", the stream's extradata goes on its first packet"
+                                     : "");
         return 0;
     }
 
-    avcodec_free_context(&d->codec.avc);
-
-    d->codec.avc = avcodec_alloc_context3(codec);
-    if (!d->codec.avc)
+    avc = avcodec_alloc_context3(codec);
+    if (!avc)
         return CRAW_ERROR(ENOMEM);
 
-    ret = avcodec_parameters_to_context(d->codec.avc, st->codecpar);
-    if (ret < 0)
-        return CRAW_ERROR(EINVAL);
+    ret = avcodec_parameters_to_context(avc, st->codecpar);
+    if (ret < 0) {
+        ret = CRAW_ERROR(EINVAL);
+        goto fail;
+    }
 
-    d->codec.avc->hw_device_ctx = av_buffer_ref(d->codec.hw_device);
-    if (!d->codec.avc->hw_device_ctx)
-        return CRAW_ERROR(ENOMEM);
-    d->codec.avc->opaque = d;
-    d->codec.avc->get_format = view_get_format;
+    avc->hw_device_ctx = av_buffer_ref(d->codec.hw_device);
+    if (!avc->hw_device_ctx) {
+        ret = CRAW_ERROR(ENOMEM);
+        goto fail;
+    }
+    avc->opaque = d;
+    avc->get_format = view_get_format;
     /* On the raw path the hwaccel does the work on the GPU and extra CPU
      * threads would only race the frame properties read under the frames
      * context lock. A non-raw clip may end up decoding in software, where
      * threads are the difference between real time and not. */
-    d->codec.avc->thread_count = d->raw ? 1 : 0;
+    avc->thread_count = d->raw ? 1 : 0;
 
     /* A ProRes RAW frame header can carry a crop (the Sony FX6 clips mark
      * 3840x2160 inside a 3872x2192 readout), and for this camera the
@@ -96,19 +101,34 @@ static int view_decoder_codec_open(struct view_decoder *d)
      * clear to see the whole readout. A non-raw clip keeps FFmpeg's own
      * behaviour, where a crop is a container's business and not a look. */
     if (d->raw)
-        d->codec.avc->apply_cropping = 0;
+        avc->apply_cropping = 0;
 
-    ret = avcodec_open2(d->codec.avc, codec, NULL);
+    ret = avcodec_open2(avc, codec, NULL);
     if (ret < 0) {
         fprintf(stderr, "cannot open the %s decoder: %s\n", codec->name,
                 av_err2str(ret));
-        return CRAW_ERROR(EINVAL);
+        ret = CRAW_ERROR(EINVAL);
+        goto fail;
     }
 
+    pool = realloc(d->codec.pool, (size_t)(d->codec.nb_pool + 1) * sizeof(*pool));
+    if (!pool) {
+        ret = CRAW_ERROR(ENOMEM);
+        goto fail;
+    }
+    d->codec.pool = pool;
+    d->codec.pool[d->codec.nb_pool++] = avc;
+    d->codec.avc = avc;
+
     if (d->verbose)
-        fprintf(stderr, "decoder: %s opened\n", codec->name);
+        fprintf(stderr, "decoder: %s opened, %d in the pool\n", codec->name,
+                d->codec.nb_pool);
 
     return 0;
+
+fail:
+    avcodec_free_context(&avc);
+    return ret;
 }
 
 static int  view_reader_start(struct view_decoder *d);
@@ -924,16 +944,23 @@ void view_decoder_close(struct view_decoder *d)
     /* view_decoder_open() fills what it needs and nothing else, so what the
      * clip said - its model, its metadata, its V-Log flag, whether its
      * frames carried lens records - goes here rather than linger into the
-     * next one's panel. The decoder keeps whatever pictures it still held;
-     * the flush that reuses it, or view_decoder_free(), lets them go. */
+     * next one's panel. The decoders keep whatever pictures they still
+     * hold; the flush that reuses one, or view_decoder_free(), lets them
+     * go. */
     *d = (struct view_decoder) { 0 };
     d->codec = codec;
+    d->codec.avc = NULL;
 }
 
 void view_decoder_free(struct view_decoder *d)
 {
     view_decoder_close(d);
-    avcodec_free_context(&d->codec.avc);
+    for (int i = 0; i < d->codec.nb_pool; i++)
+        avcodec_free_context(&d->codec.pool[i]);
+    free(d->codec.pool);
+    d->codec.pool = NULL;
+    d->codec.nb_pool = 0;
+    d->codec.avc = NULL;
     av_buffer_unref(&d->codec.hw_device);
 
     /* Pairs with the xmlInitParser() in view_read_clip_xml(), once per
