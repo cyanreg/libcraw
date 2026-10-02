@@ -342,11 +342,10 @@ static bool view_vwb_estimate(struct view_state *st, float *rgba, int w, int h)
     static const float unity[3] = { 1.0f, 1.0f, 1.0f };
     enum pl_color_primaries prim;
     CRAWAwbHistogram hist;
-    CRAWIlluminant out, before = st->awb.illum;
+    CRAWIlluminant before = st->awb.illum;
     bool had = st->awb.have_illum;
     CRAWProfile p;
     float peak;
-    int ret;
 
     if (!view_gpu_source_space(&st->gpu, &prim, &peak) || !(peak > 0.0f) ||
         !view_vwb_profile(st, prim, &p))
@@ -378,26 +377,11 @@ static bool view_vwb_estimate(struct view_state *st, float *rgba, int w, int h)
     if (craw_awb_estimate(&p, &hist, &st->awb.params, &st->awb.last) < 0)
         return false;
 
-    st->awb.clock += view_frame_duration(st);
-    ret = craw_awb_smoother_push(st->awb.smoother, st->awb.clock,
-                                 &st->awb.last, false, &out);
-    if (ret >= 0) {
-        st->awb.illum = out;
-        st->awb.have_illum = true;
-    }
-
-    if (st->cfg.verbose)
-        view_log(st, "awb: frame %" PRId64 " est %s cct %5.0f tint %+.4f conf %.2f"
-                     " -> track %s cct %5.0f tint %+.4f\n",
-                 st->index, st->awb.last.valid ? "ok" : "invalid",
-                 st->awb.last.illuminant.cct, st->awb.last.illuminant.tint,
-                 st->awb.last.confidence, ret >= 0 ? "moved" : "held",
-                 st->awb.have_illum ? st->awb.illum.cct : 0.0f,
-                 st->awb.have_illum ? st->awb.illum.tint : 0.0f);
+    view_awb_follow(st);
 
     return st->awb.have_illum &&
-           (!had || fabsf(out.cct - before.cct) >= 0.5f ||
-            fabsf(out.tint - before.tint) >= 1e-4f);
+           (!had || fabsf(st->awb.illum.cct - before.cct) >= 0.5f ||
+            fabsf(st->awb.illum.tint - before.tint) >= 1e-4f);
 }
 
 void view_vwb_step(struct view_state *st, bool wait)
@@ -416,10 +400,16 @@ void view_vwb_step(struct view_state *st, bool wait)
 
         v->converging = false;
         /* A probe of the picture a seek left behind, like the raw path's
-         * one stale histogram (struct view_awb). */
+         * one stale histogram (struct view_awb). Whichever picture it was
+         * of, the one on screen is probed again: when the old probe's
+         * result had already been read before the seek, the one thrown
+         * away here was the new picture's own, and nothing else would ask
+         * for another while paused. */
         if (mine && st->awb.skip > 0) {
             st->awb.skip--;
             mine = false;
+            v->converging = true;
+            st->present_due = true;
         }
         if (mine && view_vwb_estimate(st, rgba, w, h)) {
             /* While paused the same picture is probed again until the

@@ -1556,10 +1556,55 @@ bool view_crop_screen(const struct view_state *st, pl_rect2df *out)
 
 /* ------------------------------------------------------------- one frame */
 
+/* Whether the picture on screen is a paused one being looked at, as opposed
+ * to one of a run - playing, exporting, headless - whose balance has to
+ * stay continuous from frame to frame. */
+static bool view_awb_paused(const struct view_state *st)
+{
+    return !st->playing && !st->exp.active && !st->video.active &&
+           !st->cfg.headless;
+}
+
+void view_awb_follow(struct view_state *st)
+{
+    const CRAWAwbEstimate *est = &st->awb.last;
+    CRAWIlluminant out;
+    const char *how;
+    int ret;
+
+    /* One frame period per estimate rather than the clip's pts: the filter
+     * smooths what the eye sees, and a seek's jump in pts is not elapsed
+     * time (see struct view_awb). */
+    st->awb.clock += view_frame_duration(st);
+
+    if (view_awb_paused(st) && est->valid) {
+        craw_awb_smoother_set(st->awb.smoother, st->awb.clock, &est->illuminant);
+        st->awb.illum = est->illuminant;
+        st->awb.have_illum = true;
+        how = "set";
+    } else {
+        ret = craw_awb_smoother_push(st->awb.smoother, st->awb.clock, est, false,
+                                     &out);
+        /* EAGAIN means there is no track yet and this estimate cannot start
+         * one, so the picture stays on whatever the last good one left. */
+        if (ret >= 0) {
+            st->awb.illum = out;
+            st->awb.have_illum = true;
+        }
+        how = ret >= 0 ? "moved" : "held";
+    }
+
+    view_log(st, "awb: frame %" PRId64 " est %s cct %5.0f tint %+.4f conf %.2f"
+                 " -> track %s cct %5.0f tint %+.4f\n",
+             st->index, est->valid ? "ok" : "invalid",
+             est->illuminant.cct, est->illuminant.tint, est->confidence, how,
+             st->awb.have_illum ? st->awb.illum.cct : 0.0f,
+             st->awb.have_illum ? st->awb.illum.tint : 0.0f);
+}
+
 static int view_awb_step(struct view_state *st)
 {
     CRAWAwbHistogram hist;
-    CRAWIlluminant out;
     int ret;
 
     /* The histogram read is of the frame before the one just submitted, so
@@ -1572,13 +1617,20 @@ static int view_awb_step(struct view_state *st)
     if (ret < 0)
         return ret;
 
-    if (st->gpu.submitted < 2)
+    /* A step that reads nothing is the end of it while playing - the next
+     * frame's step reads this frame - and not while paused, where there is
+     * no next frame: the picture asks for one replay, whose step then reads
+     * the histogram this one has just recorded. */
+    if (st->gpu.submitted < 2) {
+        st->awb.pending = view_awb_paused(st);
         return 0;
+    }
 
     /* The histogram this step would read belongs to the frame a seek left
      * behind; the next one is the first of the new position. */
     if (st->awb.skip > 0) {
         st->awb.skip--;
+        st->awb.pending = view_awb_paused(st);
         return 0;
     }
 
@@ -1586,8 +1638,10 @@ static int view_awb_step(struct view_state *st)
      * which happens right after a rebuild for another debayer method: there
      * is simply no histogram to read this time round. */
     ret = craw_pipeline_get_awb_histogram_n(st->gpu.pipe, 1, &hist);
-    if (ret == CRAW_ERROR(EINVAL))
+    if (ret == CRAW_ERROR(EINVAL)) {
+        st->awb.pending = view_awb_paused(st);
         return 0;
+    }
     if (ret < 0)
         return ret;
 
@@ -1595,30 +1649,7 @@ static int view_awb_step(struct view_state *st)
     if (ret < 0)
         return ret;
 
-    /* One frame period per estimate rather than the clip's pts: the filter
-     * smooths what the eye sees, and a seek's jump in pts is not elapsed
-     * time (see struct view_awb). */
-    st->awb.clock += view_frame_duration(st);
-    ret = craw_awb_smoother_push(st->awb.smoother, st->awb.clock, &st->awb.last, false, &out);
-    if (ret < 0 && ret != CRAW_ERROR(EAGAIN))
-        return ret;
-
-    /* EAGAIN means there is no track yet and this estimate cannot start one,
-     * so the next frame stays on whatever the last good one left. */
-    if (ret >= 0) {
-        st->awb.illum = out;
-        st->awb.have_illum = true;
-    }
-
-    if (st->cfg.verbose)
-        view_log(st, "awb: frame %" PRId64 " est %s cct %5.0f tint %+.4f conf %.2f"
-                     " -> track %s cct %5.0f tint %+.4f\n",
-                 st->index, st->awb.last.valid ? "ok" : "invalid",
-                 st->awb.last.illuminant.cct, st->awb.last.illuminant.tint,
-                 st->awb.last.confidence,
-                 ret >= 0 ? "moved" : "held",
-                 st->awb.have_illum ? st->awb.illum.cct : 0.0f,
-                 st->awb.have_illum ? st->awb.illum.tint : 0.0f);
+    view_awb_follow(st);
 
     return 0;
 }
@@ -3829,6 +3860,7 @@ static int view_run_window(struct view_state *st)
     /* The rate choice and the rate as the loop last acted on them; see
      * view_rate_follow(). */
     AVRational choice_seen = { 0, 0 }, rate_seen = { 0, 0 };
+    bool playing_seen = false;
     int w = VIEW_WINDOW_W, h = VIEW_WINDOW_H;
     int ret;
 
@@ -3899,6 +3931,7 @@ static int view_run_window(struct view_state *st)
         return ret;
     choice_seen = st->rate_choice;
     rate_seen = st->rate;
+    playing_seen = st->playing;
 
     ret = view_ui_open(st, win);
     if (ret < 0)
@@ -4092,6 +4125,18 @@ static int view_run_window(struct view_state *st)
          * when it was laid out last time round. */
         view_rate_follow(st, &choice_seen, &rate_seen);
 
+        /* A pause with Auto on: the picture that stopped gets its own
+         * estimate (view_awb_follow()), which is what Auto on a paused
+         * picture means - a track the run was still slewing towards it
+         * arrives at once, one that never started (a clip the estimator is
+         * unsure of throughout) starts from it. */
+        if (playing_seen && !st->playing && st->look.wb == VIEW_WB_AUTO) {
+            st->awb.pending = true;
+            st->vwb.converging = true;
+            st->present_due = true;
+        }
+        playing_seen = st->playing;
+
         /* Keeps the audio ring topped up whatever the picture is doing.
          * An export owns the decoder while it runs, so the clock and the
          * ring are left alone until it is done. A slowed clip's track is
@@ -4261,12 +4306,16 @@ static int view_run_window(struct view_state *st)
 
             /* A grade change while paused replays the picture on screen;
              * while playing the next frame simply uses the current look,
-             * and so does a decode that is already pending. */
+             * and so does a decode that is already pending. So does a
+             * paused picture whose white balance step read no histogram
+             * (struct view_awb, `pending`), once. */
             if (!st->playing && !st->exp.active && st->have_frame &&
                 !st->need_frame && st->seek_to < 0) {
                 struct view_pipeline_look look = view_pipeline_look(st);
+                bool awb = st->awb.pending && st->look.wb == VIEW_WB_AUTO;
 
-                if (!view_pipeline_look_equal(&look, &st->processed)) {
+                st->awb.pending = false;
+                if (awb || !view_pipeline_look_equal(&look, &st->processed)) {
                     ret = view_replay_frame(st);
                     if (ret < 0)
                         break;

@@ -506,7 +506,14 @@ the change if
 target by `1 - exp(-dt / time_constant)` of the difference, limited to
 `max_slew_mired_per_s * dt`. Tint follows the same rule with the same
 fractions. `dt` is the difference in `pts_s` to the previous push, clamped
-to [0, 1] seconds.
+to [0, 1] seconds. `craw_awb_smoother_set` puts the track where the caller
+says, confidence or not, for a caller that has judged the reading itself:
+cineview shows a paused picture its own frame's estimate that way (the
+viewer is the gate there, and the panel shows the confidence beside the
+result) and continues under the rules above when playing resumes. Before
+it, Auto on a frame the estimator was unsure of stayed as shot for as long
+as the picture was paused, and a paused seek kept the balance of the
+picture it came from.
 
 ## 8. Colour spaces
 

@@ -230,6 +230,20 @@ exposure,look,adjustments` pins the other three off whatever the other
 options set, which is how a headless export is handed the state the panel
 is in.
 
+Auto white balance follows the smoother while the clip plays: the track
+starts and moves only on readings the estimator is confident of, and slews
+between them, so a run never jumps after a reading that might be wrong. A
+paused picture is shown its own frame's estimate whatever the confidence
+— the one looking at it is the gate, and the section shows the estimate,
+its confidence and the track — and a seek while paused re-estimates for
+the frame it lands on.
+
+Auto on a paused picture shows the frame's own estimate, whatever the
+estimator's confidence in it (the panel prints the confidence beside the
+result), and a seek while paused shows the new frame's. While playing, the
+track starts and moves only on readings confident enough to be worth a
+visible change, and slews between them rather than jumping.
+
 The White balance section's "pick white" button is the spot white balance
 of every raw developer: press it, and the next left click on the picture
 — the pointer is a crosshair while it waits, and Escape or a second press

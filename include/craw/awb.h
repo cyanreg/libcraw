@@ -153,6 +153,15 @@ CRAW_API void craw_awb_smoother_free(CRAWAwbSmoother **sm);
 /* Forgets the track; the next push starts from its estimate. */
 CRAW_API void craw_awb_smoother_reset(CRAWAwbSmoother *sm);
 
+/* Puts the track at `illum` as of `pts_s`, starting one when there was
+ * none, whatever any estimate's confidence: for a caller that has judged
+ * the reading itself. A viewer shows a paused picture its own frame's
+ * estimate this way - the one looking at it is the gate there - and the
+ * next push continues from it under the usual rules. An illuminant that is
+ * not finite and positive is ignored. */
+CRAW_API void craw_awb_smoother_set(CRAWAwbSmoother *sm, double pts_s,
+                                    const CRAWIlluminant *illum);
+
 /* Feeds one frame's estimate at presentation time `pts_s` and returns the
  * smoothed illuminant to apply to that frame. `scene_cut` resets the track
  * to the new estimate immediately. Estimates flagged invalid or below
