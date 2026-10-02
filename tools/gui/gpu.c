@@ -1389,6 +1389,22 @@ static bool view_gpu_linear_pass(struct view_gpu *g, const pl_rect2df *crop,
     if (crop)
         image.crop = *crop;
 
+    /* The mapped frame carries the clip's display matrix as its rotation
+     * (pl_map_avframe_ex() reads AV_FRAME_DATA_DISPLAYMATRIX off the
+     * frame), and the window turns the picture by it. Not here: `tex` is
+     * sized from the frame as the sensor read it out, and a renderer asked
+     * to turn a landscape frame a quarter turn into a landscape texture
+     * counter-rotates the target rectangle, which then no longer covers
+     * the texture. It clears what it takes for the border - which a
+     * texture without blit_dst refuses, one validation error per frame -
+     * and draws the picture into the part it does cover, the rest holding
+     * whatever it held, so on every portrait developed clip the probe read
+     * back a texture the picture only partly filled (P1080587's first
+     * estimate moved from 4512 K to 4492 K once all of it got there). The
+     * histogram and the patch average are the same whichever way up the
+     * picture is, and a pick's crop is in source pixels. */
+    image.rotation = PL_ROTATION_0;
+
     target = (struct pl_frame) {
         .num_planes = 1,
         .planes[0] = {
