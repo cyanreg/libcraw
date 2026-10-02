@@ -2042,7 +2042,15 @@ int view_step_frame(struct view_state *st)
         /* Both readers go with the seek: the audio fades out, drops
          * everything in front of the target and arms the new run. */
         view_audio_seek(&st->audio, target);
-        view_gpu_reset_peak(&st->gpu, false);
+        /* The renderer's peak track and its caches go with a jump, so the
+         * first frames after it are not tone mapped against the scene
+         * before it - except under the scrub bar, where every step of the
+         * pointer is a jump: the renderer rebuilt its intermediates for
+         * every one of them, 25 ms of the 40 a scrubbed frame cost, and the
+         * track follows the pointer through the clip's own smoothing
+         * instead, like everything else that is scrubbed. */
+        if (!st->scrubbing)
+            view_gpu_reset_peak(&st->gpu, false);
         st->sync.run_frames = 0;
         st->seek_target = jump ? want : -1;
         st->seek_tries = 0;
@@ -2078,6 +2086,13 @@ int view_step_frame(struct view_state *st)
     t0 = av_gettime_relative();
     st->dec.read_ms = 0.0;
     ret = held ? 0 : view_decoder_next(&st->dec, st->frame);
+    /* Under the scrub bar the one thing wanted is the frame under the
+     * pointer, now: the reader has just been sent for it, and giving it a
+     * moment beats presenting the old picture once more and coming back a
+     * display refresh later. Bounded, and only here - the render loop
+     * never blocks on a read while playing. */
+    if (ret == 2 && st->scrubbing && view_decoder_wait(&st->dec, 40))
+        ret = view_decoder_next(&st->dec, st->frame);
     st->decode_ms = (double)(av_gettime_relative() - t0) / 1000.0;
     st->timing.read += st->dec.read_ms;
     st->timing.decode += st->decode_ms - st->dec.read_ms;
@@ -3829,6 +3844,90 @@ static void view_rate_follow(struct view_state *st, AVRational *choice_seen,
                                   : "the sound resumes there");
 }
 
+/* One step of the transport: the next frame, a seek, a loop point. The
+ * body of the run loop's step, as a function so that the scrub bar's seek
+ * can be taken a second time in an iteration, right after the panel build
+ * that asked for it and before the present: taken on the next iteration
+ * instead, the frame under the pointer was two display refreshes away
+ * rather than one. Returns a negative error, 1 when the run is over (the
+ * last of --loops), 0 otherwise. */
+static int view_loop_step(struct view_state *st, bool *stepped, int *proc_frames)
+{
+    bool stop = false;
+    int ret;
+
+    int64_t step_t0 = av_gettime_relative();
+
+    do {
+        ret = view_step_frame(st);
+    } while (ret == 2);     /* late frames, dropped to catch up */
+
+    /* A starved step keeps its request: right after a seek the
+     * reader has just been flushed and its first packet lands a few
+     * milliseconds later, and while paused nothing else would ask
+     * again. */
+    if (ret != 3)
+        st->need_frame = false;
+
+    if (ret < 0)
+        return ret;
+
+    if (ret == 3) {
+        /* The medium has not caught up. Leave the picture where it
+         * is and try again next time round; this is not a drop. */
+    } else if (ret > 0) {
+        /* End of the clip. The last picture stays up while the
+         * audio tail plays out; only then does it loop or stop. A
+         * slowed clip has no tail playing - its paused ring would
+         * never drain - and ends once its last picture is shown. */
+        if (!view_audio_live(st) || view_audio_drained(&st->audio)) {
+            st->loops_done++;
+            if (st->cfg.loops && st->loops_done >= st->cfg.loops) {
+                st->playing = false;
+                stop = true;
+            } else if (st->cfg.loop) {
+                st->seek_to = 0;
+                st->need_frame = true;
+            } else {
+                st->playing = false;
+            }
+        }
+    } else {
+        double cost = (double)(av_gettime_relative() - step_t0) / 1.0e6;
+
+        *stepped = true;
+        (*proc_frames)++;
+        if (st->trace.on) {
+            st->trace.cur.t_step = av_gettime_relative();
+            st->trace.cur.t_pkt = st->dec.frame_arrive;
+        }
+        /* The first picture of a run pays for everything that is
+         * set up once, so it is no guide to what the next one will
+         * cost. */
+        if (st->sync.run_frames > 1)
+            st->step_cost = st->step_cost > 0.0
+                          ? st->step_cost * 0.9 + cost * 0.1 : cost;
+
+        /* One step per iteration is not enough to recover from a
+         * stall when the clip runs near the display's own rate, so
+         * a second one is taken while the picture is clearly
+         * behind - clearly, because a clip at exactly the refresh
+         * rate sits a fraction of a frame behind by nature and
+         * trading frames away for that would be a bad bargain. */
+        while (st->playing && !st->cfg.bench &&
+               view_clock(st) - st->pts >= 1.5 * view_frame_duration(st)) {
+            st->sync.dropped++;
+            do {
+                ret = view_step_frame(st);
+            } while (ret == 2);
+            if (ret)
+                break;
+        }
+    }
+
+    return stop ? 1 : 0;
+}
+
 static int view_run_window(struct view_state *st)
 {
     SDL_Window *win = NULL;
@@ -4145,74 +4244,11 @@ static int view_run_window(struct view_state *st)
                 st->exp.active = false;
         } else if (st->need_frame || !st->have_frame ||
                    (st->playing && view_frame_due(st))) {
-            int64_t step_t0 = av_gettime_relative();
-
-            do {
-                ret = view_step_frame(st);
-            } while (ret == 2);     /* late frames, dropped to catch up */
-
-            /* A starved step keeps its request: right after a seek the
-             * reader has just been flushed and its first packet lands a few
-             * milliseconds later, and while paused nothing else would ask
-             * again. */
-            if (ret != 3)
-                st->need_frame = false;
-
+            ret = view_loop_step(st, &stepped, &proc_frames);
             if (ret < 0)
                 break;
-
-            if (ret == 3) {
-                /* The medium has not caught up. Leave the picture where it
-                 * is and try again next time round; this is not a drop. */
-            } else if (ret > 0) {
-                /* End of the clip. The last picture stays up while the
-                 * audio tail plays out; only then does it loop or stop. A
-                 * slowed clip has no tail playing - its paused ring would
-                 * never drain - and ends once its last picture is shown. */
-                if (!view_audio_live(st) || view_audio_drained(&st->audio)) {
-                    st->loops_done++;
-                    if (st->cfg.loops && st->loops_done >= st->cfg.loops) {
-                        st->playing = false;
-                        running = false;
-                    } else if (st->cfg.loop) {
-                        st->seek_to = 0;
-                        st->need_frame = true;
-                    } else {
-                        st->playing = false;
-                    }
-                }
-            } else {
-                double cost = (double)(av_gettime_relative() - step_t0) / 1.0e6;
-
-                stepped = true;
-                proc_frames++;
-                if (st->trace.on) {
-                    st->trace.cur.t_step = av_gettime_relative();
-                    st->trace.cur.t_pkt = st->dec.frame_arrive;
-                }
-                /* The first picture of a run pays for everything that is
-                 * set up once, so it is no guide to what the next one will
-                 * cost. */
-                if (st->sync.run_frames > 1)
-                    st->step_cost = st->step_cost > 0.0
-                                  ? st->step_cost * 0.9 + cost * 0.1 : cost;
-
-                /* One step per iteration is not enough to recover from a
-                 * stall when the clip runs near the display's own rate, so
-                 * a second one is taken while the picture is clearly
-                 * behind - clearly, because a clip at exactly the refresh
-                 * rate sits a fraction of a frame behind by nature and
-                 * trading frames away for that would be a bad bargain. */
-                while (st->playing && !st->cfg.bench &&
-                       view_clock(st) - st->pts >= 1.5 * view_frame_duration(st)) {
-                    st->sync.dropped++;
-                    do {
-                        ret = view_step_frame(st);
-                    } while (ret == 2);
-                    if (ret)
-                        break;
-                }
-            }
+            if (ret > 0)
+                running = false;
         }
 
         /* A pick that is waiting - a click that landed, or --wb pick:X,Y
@@ -4308,6 +4344,24 @@ static int view_run_window(struct view_state *st)
                     if (ret < 0)
                         break;
                 }
+            }
+
+            /* The scrub bar's seek, taken now rather than next time round,
+             * so that this iteration's present shows the frame under the
+             * pointer (view_loop_step()). */
+            if (st->scrubbing && st->seek_to >= 0 && st->need_frame &&
+                !st->exp.active && !st->video.active) {
+                bool took = false;
+
+                ret = view_loop_step(st, &took, &proc_frames);
+                if (ret < 0)
+                    break;
+                if (ret > 0)
+                    running = false;
+                /* What the present below shows is this step's picture, so
+                 * the frame line and the sync figures are its. */
+                if (took)
+                    stepped = stepped_pending = true;
             }
 
             ret = view_ui_render(st);

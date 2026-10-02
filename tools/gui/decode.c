@@ -1034,7 +1034,7 @@ static int view_reader_thread(void *opaque)
             continue;
         }
 
-        if (r->eof || r->count == VIEW_PKTQ_MAX || r->bytes >= VIEW_PKTQ_BYTES) {
+        if (r->eof || r->count >= r->limit || r->bytes >= VIEW_PKTQ_BYTES) {
             SDL_WaitCondition(r->wake, r->lock);
             continue;
         }
@@ -1087,6 +1087,7 @@ static int view_reader_start(struct view_decoder *d)
 {
     struct view_reader *r = &d->reader;
 
+    r->limit = VIEW_PKTQ_MAX;
     r->lock = SDL_CreateMutex();
     r->wake = SDL_CreateCondition();
     r->ready = SDL_CreateCondition();
@@ -1366,6 +1367,19 @@ void view_decoder_lens(struct view_decoder *d, int64_t pts,
         d->lens_any = true;
     else
         d->lens_none = true;
+}
+
+void view_decoder_readahead(struct view_decoder *d, int packets)
+{
+    struct view_reader *r = &d->reader;
+
+    if (!r->lock)
+        return;
+
+    SDL_LockMutex(r->lock);
+    r->limit = CRAW_CLAMP(packets, 1, VIEW_PKTQ_MAX);
+    SDL_BroadcastCondition(r->wake);
+    SDL_UnlockMutex(r->lock);
 }
 
 int view_decoder_seek(struct view_decoder *d, int64_t frame_index)

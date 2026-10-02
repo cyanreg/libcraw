@@ -280,6 +280,12 @@ struct view_reader {
     int64_t arrive[VIEW_PKTQ_MAX];
     int head, count;
     size_t bytes;
+    /* How many packets the reader runs ahead by, VIEW_PKTQ_MAX normally.
+     * Two while the scrub bar is held: every step of the pointer is a
+     * seek, and a seek waits for the read the reader is in the middle of,
+     * so a reader filling a long queue off a slow disk after each one
+     * made every step wait for it (view_decoder_readahead()). */
+    int limit;
 
     /* Whether to look for records at all. Written once before the thread
      * starts and read-only afterwards. */
@@ -1509,6 +1515,10 @@ void view_decoder_free(struct view_decoder *d);
 int  view_decoder_next(struct view_decoder *d, AVFrame *frame);
 
 int  view_decoder_seek(struct view_decoder *d, int64_t frame_index);
+
+/* How far ahead of the decoder the reader reads, in packets, up to
+ * VIEW_PKTQ_MAX. */
+void view_decoder_readahead(struct view_decoder *d, int packets);
 
 /* Blocks until the reader has a packet queued or has reached the end of
  * the file, for at most `ms` milliseconds; false when it still has

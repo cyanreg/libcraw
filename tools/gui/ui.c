@@ -1751,6 +1751,7 @@ static void view_scrub_bar(struct nk_context *ctx, struct view_state *st,
             st->scrub_resume = st->playing;
             st->scrub_want = st->seek_to >= 0 ? st->seek_to : st->index;
             st->playing = false;
+            view_decoder_readahead(&st->dec, 2);
         }
         if (want != st->scrub_want) {
             st->scrub_want = want;
@@ -1770,6 +1771,7 @@ static void view_scrub_bar(struct nk_context *ctx, struct view_state *st,
      * pre-roll. */
     if (st->scrubbing && !held) {
         st->scrubbing = false;
+        view_decoder_readahead(&st->dec, VIEW_PKTQ_MAX);
         if (st->scrub_resume)
             st->playing = true;
         st->scrub_resume = false;
