@@ -130,10 +130,10 @@ container's model name; `--tables` loads others from a text file.
 and libplacebo, when those are found. It decodes with FFmpeg's Vulkan
 hwaccel on libplacebo's device, runs libcraw on the same device, reads the
 file on its own thread and loops by default (`--no-loop`). Every decoder
-it opens stays open until it quits, one per codec: a clip of a codec seen
-before gets its decoder back flushed, only a codec not seen yet opens a
-new one, and a loop point is a flush too, the way libavcodec takes one
-stream after another. The panel is
+it opens stays open until it quits, one per codec: a decoder is flushed
+when its clip closes, a clip of a codec seen before takes it back from the
+pool, only a codec not seen yet opens a new one, and a loop point is a
+flush too, the way libavcodec takes one stream after another. The panel is
 worked with the pointer: its switches, expanders, sliders, fields and
 cascading menus are clicked, and no key reaches a panel row. The keys are
 the transport's and the view's. Space plays and pauses; Left and Right

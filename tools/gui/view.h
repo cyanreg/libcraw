@@ -323,10 +323,11 @@ struct view_pana {
  * of band - and reads a change of size or format off the bitstream, setting
  * its hwaccel up again only then. So the device is wrapped once for the
  * program, and every decoder opened stays open until the program ends, one
- * per codec: a clip of a codec seen before gets its decoder back flushed, a
- * codec not seen yet opens one more, and a loop point is a flush. The
- * hwaccel's shaders and its frame pool stay with each. See
- * view_decoder_codec_open(). */
+ * per codec: a decoder is flushed when its clip closes and goes back to the
+ * pool clean, a clip of a codec seen before takes it from there, a codec
+ * not seen yet opens one more, and a loop point is a flush. The hwaccel's
+ * shaders and its frame pool stay with each. See view_decoder_codec_open()
+ * and view_decoder_close(). */
 struct view_codec {
     AVBufferRef *hw_device;
     /* The pool, and the one the clip on screen decodes with, which is one

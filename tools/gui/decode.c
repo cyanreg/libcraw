@@ -59,11 +59,11 @@ static int view_decoder_codec_open(struct view_decoder *d)
     for (int i = 0; i < d->codec.nb_pool; i++) {
         if (d->codec.pool[i]->codec_id != st->codecpar->codec_id)
             continue;
+        /* Clean since its last clip closed (view_decoder_close()). */
         d->codec.avc = d->codec.pool[i];
-        avcodec_flush_buffers(d->codec.avc);
         d->new_extradata = st->codecpar->extradata_size > 0;
         if (d->verbose)
-            fprintf(stderr, "decoder: %s from the pool, flushed%s\n", codec->name,
+            fprintf(stderr, "decoder: %s from the pool%s\n", codec->name,
                     d->new_extradata ? ", the stream's extradata goes on its first packet"
                                      : "");
         return 0;
@@ -941,12 +941,18 @@ void view_decoder_close(struct view_decoder *d)
     av_buffer_unref(&d->frames);
     avformat_close_input(&d->fmt);
 
+    /* The decoder lets go of the pictures it still held now, at the
+     * switch, rather than when a clip of its codec next comes round -
+     * which may be never: they would sit in its frame pool's memory until
+     * then. It goes back to the pool clean, and the next clip of its codec
+     * takes it as it is. */
+    if (d->codec.avc)
+        avcodec_flush_buffers(d->codec.avc);
+
     /* view_decoder_open() fills what it needs and nothing else, so what the
      * clip said - its model, its metadata, its V-Log flag, whether its
      * frames carried lens records - goes here rather than linger into the
-     * next one's panel. The decoders keep whatever pictures they still
-     * hold; the flush that reuses one, or view_decoder_free(), lets them
-     * go. */
+     * next one's panel. */
     *d = (struct view_decoder) { 0 };
     d->codec = codec;
     d->codec.avc = NULL;
