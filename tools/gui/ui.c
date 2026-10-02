@@ -1705,45 +1705,145 @@ static void view_panel_rate(struct nk_context *ctx, struct view_state *st)
         view_disable_end(st, ctx);
 }
 
+/* The scrub bar. Not nuklear's slider, whose knob has to be caught before
+ * anything moves and then goes in whole steps of the drag: a press anywhere
+ * on the bar is the frame under the pointer, the picture stays on it for as
+ * long as the button is held, and the pointer moving while held takes it
+ * along. Playback stops while the bar is held and goes on from wherever it
+ * is let go if the clip was playing before. Drawn with nuklear's own slider
+ * drawing, so it looks like every other slider on the panel, in nuklear's
+ * own geometry: the knob's centre runs from the bar's left edge to its
+ * right, as every slider's does. */
+static void view_scrub_bar(struct nk_context *ctx, struct view_state *st,
+                           int64_t total)
+{
+    struct nk_window *win = ctx->current;
+    const struct nk_style_slider *style = &ctx->style.slider;
+    struct nk_rect bounds, bar, knob;
+    struct nk_input *in;
+    nk_flags state = NK_WIDGET_STATE_INACTIVE;
+    bool held = false;
+    int64_t at = CRAW_CLAMP(st->index, 0, total - 1);
+
+    if (!nk_widget(&bounds, ctx))
+        return;
+    in = win->widgets_disabled || (win->layout->flags & NK_WINDOW_ROM)
+         ? NULL : &ctx->input;
+
+    bar = bounds;
+    bar.x += style->padding.x;
+    bar.y += style->padding.y;
+    bar.w = CRAW_MAX(bar.w, 2.0f * style->padding.x + style->cursor_size.x)
+          - 2.0f * style->padding.x;
+    bar.h = CRAW_MAX(bar.h, 2.0f * style->padding.y) - 2.0f * style->padding.y;
+
+    /* Held: the button is down and went down on the bar, wherever the
+     * pointer is now - a drag that wanders off the bar keeps scrubbing. */
+    if (in && nk_input_has_mouse_click_down_in_rect(in, NK_BUTTON_LEFT, bounds,
+                                                    nk_true)) {
+        double t = CRAW_CLAMP((in->mouse.pos.x - bar.x) / bar.w, 0.0, 1.0);
+        int64_t want = (int64_t)llrint(t * (double)(total - 1));
+
+        held = true;
+        state = NK_WIDGET_STATE_ACTIVE;
+        if (!st->scrubbing) {
+            st->scrubbing = true;
+            st->scrub_resume = st->playing;
+            st->scrub_want = st->seek_to >= 0 ? st->seek_to : st->index;
+            st->playing = false;
+        }
+        if (want != st->scrub_want) {
+            st->scrub_want = want;
+            view_log(st, "scrub: frame %" PRId64 "\n", want);
+            st->seek_to = want;
+            st->need_frame = true;
+        }
+        at = want;
+    } else if (in && nk_input_is_mouse_hovering_rect(in, bounds)) {
+        state = NK_WIDGET_STATE_HOVERED;
+    }
+
+    /* Let go. A drag was a stream of seeks, and each would have paid for
+     * the temporal denoise's pre-roll (view_step_frame()), which halves the
+     * rate the picture follows the pointer at; they started the average
+     * cold instead, and the frame let go on is sought once more, with its
+     * pre-roll. */
+    if (st->scrubbing && !held) {
+        st->scrubbing = false;
+        if (st->scrub_resume)
+            st->playing = true;
+        st->scrub_resume = false;
+        if (st->seek_to < 0 && view_temporal_strength(st) > 0.0f) {
+            st->seek_to = st->index;
+            st->seek_cold = true;
+            st->need_frame = true;
+        }
+    }
+
+    knob.w = style->cursor_size.x;
+    knob.h = style->cursor_size.y;
+    knob.x = bar.x + bar.w * (float)((double)at / (double)(total - 1)) - knob.w * 0.5f;
+    knob.y = bar.y + bar.h * 0.5f - knob.h * 0.5f;
+
+    if (style->draw_begin)
+        style->draw_begin(&win->buffer, style->userdata);
+    nk_draw_slider(&win->buffer, state, style, &bar, &knob, 0.0f, (float)at,
+                   (float)(total - 1));
+    if (style->draw_end)
+        style->draw_end(&win->buffer, style->userdata);
+}
+
 static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
 {
     int64_t total = st->dec.nb_frames;
-    int pos;
 
     /* No transport buttons: the keyboard is the transport. Space plays and
      * pauses, Shift with Page Up and Page Down are the ends of the clip,
      * Left and Right step five seconds and Shift with them one. The scrub
-     * bar stays, because dragging to a frame is the one thing keys are bad
-     * at, and under it the rate, which no key has. */
+     * bar stays, because going to a frame by eye is the one thing keys are
+     * bad at, and under it the rate, which no key has. */
     if (total > 1) {
-        bool held = ctx->input.mouse.buttons[NK_BUTTON_LEFT].down != 0;
-
-        pos = (int)CRAW_CLAMP(st->index, 0, total - 1);
         nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        if (nk_slider_int(ctx, 0, &pos, (int)(total - 1), 1) &&
-            pos != (int)st->index) {
-            st->seek_to = pos;
-            st->need_frame = true;
-            st->scrubbing = held;
-        }
-
-        /* A drag is a stream of seeks, and each would pay for the temporal
-         * denoise's pre-roll (view_step_frame()), which halves the rate the
-         * picture follows the knob at. They start the average cold
-         * instead, and the frame the knob is let go on is sought once
-         * more, with its pre-roll. */
-        if (st->scrubbing && !held) {
-            st->scrubbing = false;
-            if (st->seek_to < 0 && view_temporal_strength(st) > 0.0f) {
-                st->seek_to = st->index;
-                st->seek_cold = true;
-                st->need_frame = true;
-            }
-        }
+        view_scrub_bar(ctx, st, total);
     }
 
     if (st->dec.fmt)
         view_panel_rate(ctx, st);
+}
+
+/* A labelled slider with its value beside it, the rate row's shape: label,
+ * the slider, half a knob of air, the readout. Returns true when the value
+ * changed. */
+static bool view_slider_row(struct nk_context *ctx, const char *label,
+                            float *value, float min, float max, float step,
+                            const char *fmt)
+{
+    const struct nk_user_font *f = ctx->style.font;
+    char text[32];
+    float label_w, read_w, gap;
+    float before = *value;
+
+    snprintf(text, sizeof(text), fmt, max);
+    read_w = f->width(f->userdata, f->height, text, (int)strlen(text));
+    snprintf(text, sizeof(text), fmt, min);
+    read_w = CRAW_MAX(read_w, f->width(f->userdata, f->height, text,
+                                       (int)strlen(text))) + 4.0f;
+    label_w = f->width(f->userdata, f->height, label, (int)strlen(label)) + 12.0f;
+    gap = ctx->style.slider.cursor_size.x * 0.5f;
+
+    nk_layout_row_template_begin(ctx, VIEW_ROW);
+    nk_layout_row_template_push_static(ctx, label_w);
+    nk_layout_row_template_push_dynamic(ctx);
+    nk_layout_row_template_push_static(ctx, gap);
+    nk_layout_row_template_push_static(ctx, read_w);
+    nk_layout_row_template_end(ctx);
+
+    nk_label(ctx, label, NK_TEXT_LEFT);
+    nk_slider_float(ctx, min, value, max, step);
+    nk_spacing(ctx, 1);
+    nk_labelf(ctx, NK_TEXT_LEFT, fmt, *value);
+
+    return *value != before;
 }
 
 /* One section for both kinds of clip. A raw clip is balanced by libcraw
@@ -1831,8 +1931,8 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
         nk_labelf(ctx, NK_TEXT_LEFT, "conf %.2f, from %s, spread %.0f mired",
                   e->confidence, view_wb_source_name(e->source), e->spread_mired);
 
-        nk_property_float(ctx, "#ambience", 0.0f, &st->awb.params.ambience, 1.0f,
-                          0.05f, 0.005f);
+        view_slider_row(ctx, "ambience", &st->awb.params.ambience, 0.0f, 1.0f,
+                        0.01f, "%.2f");
         break;
     }
 

@@ -149,6 +149,10 @@ only touch the view, never the export. While a video export runs the whole panel
 locked, the picture is the export's; `q` then stops the export, finishes
 the file and quits.
 
+The scrub bar goes where it is pressed: the frame under the pointer comes
+up and stays for as long as the button is held, the pointer moving while
+held takes it along, and when it is let go the clip plays on from there if
+it was playing before.
 Under the scrub bar the "rate" row slows the clip down, frame for frame.
 Its stops are those of 23.976, 24, 25, 29.97, 30, 48, 50, 59.94 and 60
 that are below the clip's own rate, and the clip's own at the right: a
@@ -317,8 +321,8 @@ but not at the frame the seek lands on: the five frames before it are
 developed first, unseen, so that the picture is about as clean as if the
 clip had been played to it, at about a tenth of a second a seek. A video
 export does the same before its first frame, and so does a still of a
-frame that is not on screen; while the scrub bar's knob is held its seeks
-skip it, and the frame it is let go on is developed again with it. A
+frame that is not on screen; while the scrub bar is held its seeks skip
+it, and the frame it is let go on is developed again with it. A
 grade changed while paused develops the frame on screen from the same
 history it was first developed from. The "Sharpen" section is the capture
 sharpening, off until its switch is lit: the radius, the iteration count

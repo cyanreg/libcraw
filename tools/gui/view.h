@@ -1263,9 +1263,17 @@ struct view_state {
      * frame (encode.c), and the frame the scrub bar's knob was let go on
      * (ui.c). */
     bool seek_cold;
-    /* The scrub bar's knob is held: its seeks come as a stream and start
-     * the average cold, without a pre-roll. */
+    /* The scrub bar is held: its seeks come as a stream and start the
+     * average cold, without a pre-roll, and the picture stays where the
+     * pointer is. `scrub_resume` says the clip was playing when the bar
+     * was pressed, so it plays on from wherever it is let go. */
     bool scrubbing;
+    bool scrub_resume;
+    /* The frame the bar last asked for in this hold. Compared against the
+     * pointer rather than the picture, because a seek takes longer than a
+     * redraw: asked again while the reader was still fetching it, the seek
+     * started over every redraw and never landed. */
+    int64_t scrub_want;
 
     struct pl_custom_lut *lut;
     char lut_error[128];
