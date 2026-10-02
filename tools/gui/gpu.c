@@ -592,6 +592,7 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
     }
 
     g->rr = pl_renderer_create(g->log, g->gpu);
+    g->peak_fresh = true;
     g->rr_compose = pl_renderer_create(g->log, g->gpu);
     g->rr_export = pl_renderer_create(g->log, g->gpu);
     if (!g->rr || !g->rr_compose || !g->rr_export)
@@ -1851,9 +1852,15 @@ static void view_render_params(struct view_state *st,
          * wait for the GPU to get there, which on one queue means waiting
          * for the decoder's and libcraw's work as well: a full round trip
          * per displayed frame, measured at ten milliseconds on this
-         * machine. An export reads its peak the way it always did - nothing
-         * about a written file may depend on when the CPU asked. */
-        pdp->allow_delayed = true;
+         * machine. Not for the first render after the detector was reset,
+         * though - a clip opened, a seek: that one is tone mapped against
+         * nothing but the static ceiling if its measurement is late, and
+         * a clip opened paused came up at that brightness and changed to
+         * the measured one the moment it played. One round trip per reset
+         * buys the picture its own peak from its first render. An export
+         * reads its peak the way it always did - nothing about a written
+         * file may depend on when the CPU asked. */
+        pdp->allow_delayed = !st->gpu.peak_fresh;
     }
     /* A user .cube goes on the image as asked; a film simulation never
      * does: it is a display-referred sRGB look and belongs after tone
@@ -1993,6 +2000,7 @@ void view_gpu_reset_peak(struct view_gpu *g, bool export_renderer)
     pl_renderer_flush_cache(export_renderer ? g->rr_export : g->rr);
     if (!export_renderer) {
         g->measured_peak = 0.0;
+        g->peak_fresh = true;
         /* The kept picture was tone mapped against the track that has just
          * been thrown away, so it is no longer what this frame looks like. */
         g->pic_valid = false;
@@ -2147,6 +2155,7 @@ static bool view_gpu_pic_pass(struct view_gpu *g, struct view_state *st,
         g->pic_valid = false;
         return false;
     }
+    g->peak_fresh = false;
 
     /* Whatever the detector settled on for the frame just rendered - the
      * window's own, which libplacebo runs by default and nothing here turns
@@ -2320,6 +2329,7 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
             fprintf(stderr, "pl_render_image failed\n");
             return CRAW_ERROR(EIO);
         }
+        g->peak_fresh = false;
         g->pic_redrew = true;
         if (g->rec)
             g->rec->rendered = st->have_frame;

@@ -139,7 +139,8 @@ cascading menus are clicked, and no key reaches a panel row. The keys are
 the transport's and the view's. Space plays and pauses; Left and Right
 seek five seconds back and forward, and Shift with them one second; Page
 Up and Page Down zoom in and out, and Shift with them goes to the first and
-last frame; Control with the arrows pans; Tab or `0` fits the picture again
+last frame; `,` and `.` step one frame back and forward and pause the clip;
+Control with the arrows pans; Tab or `0` fits the picture again
 and `1` is one to one; the wheel zooms about the pointer and a left drag
 pans; `r` and `t` go to the previous and the next file; Ctrl+1 and Ctrl+2
 mark the start and the end of the video export at the frame on screen, the

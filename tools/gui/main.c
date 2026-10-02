@@ -2651,7 +2651,8 @@ static void view_usage(FILE *f)
 "and no key reaches a panel row. Keys: space play/pause; left/right seek\n"
 "five seconds back and forward, shift with them one second, seconds as\n"
 "watched at the rate the clip plays at; page up/down zoom in and out;\n"
-"shift with page up/down goes to the first and last frame; control with\n"
+"shift with page up/down goes to the first and last frame; , and . step\n"
+"one frame back and forward and pause; control with\n"
 "the arrows pans; tab or 0 fits the picture again, 1 is one to one; the\n"
 "wheel zooms about the pointer and dragging pans; c turns crop mode on,\n"
 "clearing any rectangle, and off again keeping the one that was drawn,\n"
@@ -3700,6 +3701,22 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
         } else {
             view_zoom_by(st, -1.0f, 0, 0, false);
         }
+        break;
+
+    /* One frame back or forward, and the clip pauses: a frame is a thing
+     * looked at. Forward is simply the next picture out of the decoder,
+     * which keeps the temporal average's history; back is a seek. Both
+     * repeat while held. */
+    case SDLK_COMMA:
+    case SDLK_LESS:
+        st->playing = false;
+        view_seek_by(st, -1);
+        break;
+    case SDLK_PERIOD:
+    case SDLK_GREATER:
+        st->playing = false;
+        if (st->seek_to < 0)
+            st->need_frame = true;
         break;
 
     case SDLK_HOME:

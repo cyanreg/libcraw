@@ -667,6 +667,10 @@ struct view_gpu {
     /* What libplacebo's peak detection measured for the last displayed
      * frame, in nits; 0 when it has nothing to report. */
     double measured_peak;
+    /* The detector has just been reset and the next render is the first
+     * since: that one reads its own measurement back before tone mapping
+     * (view_render_params()). */
+    bool peak_fresh;
 
     /* Where --trace's current record lives, or NULL. gpu.c writes the
      * moments only it knows - when libcraw's submit returned, when its
