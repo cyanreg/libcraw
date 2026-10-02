@@ -356,10 +356,10 @@ static int view_enc_frames(struct view_encode *e, struct view_state *st,
     AVVulkanFramesContext *vk;
     int ret;
 
-    if (!st->dec.hw_device)
+    if (!st->dec.codec.hw_device)
         return CRAW_ERROR(ENODEV);
 
-    ref = av_hwframe_ctx_alloc(st->dec.hw_device);
+    ref = av_hwframe_ctx_alloc(st->dec.codec.hw_device);
     if (!ref)
         return CRAW_ERROR(ENOMEM);
 

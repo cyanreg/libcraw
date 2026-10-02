@@ -317,10 +317,23 @@ struct view_pana {
     char lens[64];
 };
 
+/* What outlives a clip. libavcodec is built to take one stream after
+ * another through a context - a flush between them, and the next stream's
+ * own parameter sets on its first packet when its container keeps them out
+ * of band - and reads a change of size or format off the bitstream, setting
+ * its hwaccel up again only then. So the device is wrapped once for the
+ * program, and the decoder stays open for as long as the clips are of its
+ * codec: a playlist of ProRes RAW never builds a second one, and a loop
+ * point never needed to. The hwaccel's shaders and its frame pool stay with
+ * it. See view_decoder_codec_open(). */
+struct view_codec {
+    AVBufferRef *hw_device;
+    AVCodecContext *avc;
+};
+
 struct view_decoder {
     AVFormatContext *fmt;
-    AVCodecContext *dec;
-    AVBufferRef *hw_device;
+    struct view_codec codec;
     AVPacket *pkt;
     int stream_index;
     bool draining;
@@ -332,6 +345,10 @@ struct view_decoder {
 
     struct view_reader reader;
     bool pkt_held;              /* d->pkt holds one the decoder refused */
+    /* The first packet of a clip on a kept decoder carries the stream's
+     * extradata as AV_PKT_DATA_NEW_EXTRADATA: how a decoder is told about
+     * parameter sets a container keeps out of band (hvc1, avc1). */
+    bool new_extradata;
     CRAWLensCorrection pkt_lens;  /* and its record */
     int64_t pkt_arrive;           /* and when the reader queued it */
 
@@ -362,9 +379,16 @@ struct view_decoder {
      * built. */
     bool lens_any;
     bool lens_none;
-    /* Set when the codec context was rebuilt: its frame pool is new, so
-     * every VkImageView cached for the old images is now dangling. */
+    /* The frame pool the pictures come out of. The hwaccel allocates a new
+     * one whenever it is set up again - a clip of another size on a kept
+     * decoder - and a freed pool's image handles can come round again, so
+     * the VkImageViews cached for them have to go the moment a picture
+     * arrives from another pool: `frames_reset` says one has
+     * (view_frames_follow() in main.c acts on it). The reference held here
+     * keeps the old pool's address from being reused under the comparison. */
+    AVBufferRef *frames;
     bool frames_reset;
+    int frames_pools;           /* seen this clip, for -v */
 
     /* Bayer source that goes through libcraw, as opposed to a camera clip
      * that is already demosaiced and encoded. Decided by codec id: nothing
@@ -1443,9 +1467,12 @@ void view_gpu_unlock(struct view_gpu *g);
 
 int  view_decoder_open(struct view_decoder *d, const char *path,
                        struct view_gpu *g, bool verbose);
+/* Closes the clip and forgets everything it said; the decoder and the
+ * device (view_codec) stay for the next one. */
 void view_decoder_close(struct view_decoder *d);
-/* Once per program, after the last clip: the XML parser's globals. */
-void view_decoder_cleanup(void);
+/* Once per program, after the last clip: the decoder, the device and the
+ * XML parser's globals. */
+void view_decoder_free(struct view_decoder *d);
 
 /* 0: a frame, 1: end of stream, 2: the reader has nothing queued yet,
  * negative: an error. */

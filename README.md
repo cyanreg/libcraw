@@ -129,7 +129,10 @@ container's model name; `--tables` loads others from a text file.
 `cineview` is the interactive viewer and exporter built on SDL3, nuklear
 and libplacebo, when those are found. It decodes with FFmpeg's Vulkan
 hwaccel on libplacebo's device, runs libcraw on the same device, reads the
-file on its own thread and loops by default (`--no-loop`). The panel is
+file on its own thread and loops by default (`--no-loop`). One decoder
+serves for as long as the clips are of its codec: a playlist of ProRes RAW
+is flushed between clips rather than opened again, and so is a loop point,
+the way libavcodec takes one stream after another. The panel is
 worked with the pointer: its switches, expanders, sliders, fields and
 cascading menus are clicked, and no key reaches a panel row. The keys are
 the transport's and the view's. Space plays and pauses; Left and Right

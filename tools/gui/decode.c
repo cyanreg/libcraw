@@ -35,10 +35,17 @@
 static enum AVPixelFormat view_get_format(AVCodecContext *avc,
                                           const enum AVPixelFormat *fmts);
 
-/* Builds the codec context. Also used to rebuild it on a seek: a decoder
- * that has reported end of stream does not reliably come back from
- * avcodec_flush_buffers() with this hwaccel, and a loop point is exactly
- * that case. Re-creating it is a few milliseconds once per seek. */
+/* Opens the decoder for the clip's stream, or keeps the one that is open
+ * when it is of the same codec. libavcodec takes one stream after another
+ * through a context: flushed between them, handed the new stream's
+ * extradata on its first packet (view_decoder_feed()), and reading a change
+ * of size or format off the bitstream itself, which is the one case where
+ * it sets the hwaccel up again. Building a context per clip instead cost
+ * the hwaccel's two shaders and its frame pool every time: 25 to 80 ms and
+ * the first two or three pictures, measured at every switch of a playlist
+ * and at every loop point - the seek used to rebuild the context after end
+ * of stream, on a report that this hwaccel did not come back from a flush,
+ * which it does (see view_decoder_seek()). */
 static int view_decoder_codec_open(struct view_decoder *d)
 {
     AVStream *st = d->fmt->streams[d->stream_index];
@@ -48,26 +55,37 @@ static int view_decoder_codec_open(struct view_decoder *d)
     if (!codec)
         return CRAW_ERROR(ENOSYS);
 
-    avcodec_free_context(&d->dec);
+    if (d->codec.avc && d->codec.avc->codec_id == st->codecpar->codec_id) {
+        avcodec_flush_buffers(d->codec.avc);
+        d->new_extradata = st->codecpar->extradata_size > 0;
+        if (d->verbose)
+            fprintf(stderr, "decoder: %s kept from the last clip and flushed%s\n",
+                    codec->name, d->new_extradata
+                                 ? ", the stream's extradata goes on its first packet"
+                                 : "");
+        return 0;
+    }
 
-    d->dec = avcodec_alloc_context3(codec);
-    if (!d->dec)
+    avcodec_free_context(&d->codec.avc);
+
+    d->codec.avc = avcodec_alloc_context3(codec);
+    if (!d->codec.avc)
         return CRAW_ERROR(ENOMEM);
 
-    ret = avcodec_parameters_to_context(d->dec, st->codecpar);
+    ret = avcodec_parameters_to_context(d->codec.avc, st->codecpar);
     if (ret < 0)
         return CRAW_ERROR(EINVAL);
 
-    d->dec->hw_device_ctx = av_buffer_ref(d->hw_device);
-    if (!d->dec->hw_device_ctx)
+    d->codec.avc->hw_device_ctx = av_buffer_ref(d->codec.hw_device);
+    if (!d->codec.avc->hw_device_ctx)
         return CRAW_ERROR(ENOMEM);
-    d->dec->opaque = d;
-    d->dec->get_format = view_get_format;
+    d->codec.avc->opaque = d;
+    d->codec.avc->get_format = view_get_format;
     /* On the raw path the hwaccel does the work on the GPU and extra CPU
      * threads would only race the frame properties read under the frames
      * context lock. A non-raw clip may end up decoding in software, where
      * threads are the difference between real time and not. */
-    d->dec->thread_count = d->raw ? 1 : 0;
+    d->codec.avc->thread_count = d->raw ? 1 : 0;
 
     /* A ProRes RAW frame header can carry a crop (the Sony FX6 clips mark
      * 3840x2160 inside a 3872x2192 readout), and for this camera the
@@ -78,14 +96,17 @@ static int view_decoder_codec_open(struct view_decoder *d)
      * clear to see the whole readout. A non-raw clip keeps FFmpeg's own
      * behaviour, where a crop is a container's business and not a look. */
     if (d->raw)
-        d->dec->apply_cropping = 0;
+        d->codec.avc->apply_cropping = 0;
 
-    ret = avcodec_open2(d->dec, codec, NULL);
+    ret = avcodec_open2(d->codec.avc, codec, NULL);
     if (ret < 0) {
         fprintf(stderr, "cannot open the %s decoder: %s\n", codec->name,
                 av_err2str(ret));
         return CRAW_ERROR(EINVAL);
     }
+
+    if (d->verbose)
+        fprintf(stderr, "decoder: %s opened\n", codec->name);
 
     return 0;
 }
@@ -107,6 +128,8 @@ static void view_unlock_queue(AVHWDeviceContext *ctx, uint32_t qf, uint32_t idx)
     vk->unlock_queue(vk, qf, idx);
 }
 
+/* Once per program: the device is libplacebo's and lives as long as the
+ * window does. */
 static int view_hw_device_create(struct view_decoder *d, struct view_gpu *g)
 {
     AVHWDeviceContext *hwctx;
@@ -115,11 +138,14 @@ static int view_hw_device_create(struct view_decoder *d, struct view_gpu *g)
     uint32_t nb_q = 0;
     int ret;
 
-    d->hw_device = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN);
-    if (!d->hw_device)
+    if (d->codec.hw_device)
+        return 0;
+
+    d->codec.hw_device = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN);
+    if (!d->codec.hw_device)
         return CRAW_ERROR(ENOMEM);
 
-    hwctx = (AVHWDeviceContext *)d->hw_device->data;
+    hwctx = (AVHWDeviceContext *)d->codec.hw_device->data;
     hwctx->user_opaque = (void *)g->vk;
     vkctx = hwctx->hwctx;
 
@@ -178,7 +204,7 @@ static int view_hw_device_create(struct view_decoder *d, struct view_gpu *g)
 
     vkctx->queue_flags = g->queue_flags;
 
-    ret = av_hwdevice_ctx_init(d->hw_device);
+    ret = av_hwdevice_ctx_init(d->codec.hw_device);
     if (ret < 0) {
         fprintf(stderr, "av_hwdevice_ctx_init: %s\n", av_err2str(ret));
         ret = CRAW_ERROR(EINVAL);
@@ -320,10 +346,9 @@ static void view_read_clip_xml(struct view_decoder *d, const char *xml)
     char iso[32], num[32], date[40];
 
     /* Idempotent, and matched by the xmlCleanupParser() in
-     * view_decoder_cleanup(): the viewer opens a decoder per clip and
-     * libxml2's global state is not a per-clip thing, so it is set up
-     * whenever a document is read and released once, when the program
-     * ends. */
+     * view_decoder_free(): libxml2's global state is not a per-clip thing,
+     * so it is set up whenever a document is read and released once, when
+     * the program ends. */
     xmlInitParser();
 
     doc = xmlReadMemory(xml, (int)strlen(xml), NULL, NULL,
@@ -844,13 +869,13 @@ int view_decoder_open(struct view_decoder *d, const char *path,
         if (d->rotation)
             snprintf(rot, sizeof(rot), ", rotated %d deg -> %dx%d",
                      d->rotation_deg,
-                     d->rotation % PL_ROTATION_180 ? d->dec->height : d->dec->width,
-                     d->rotation % PL_ROTATION_180 ? d->dec->width : d->dec->height);
+                     d->rotation % PL_ROTATION_180 ? d->coded_h : d->coded_w,
+                     d->rotation % PL_ROTATION_180 ? d->coded_w : d->coded_h);
 
         fprintf(stderr, "input %s: stream %d, %s (%s), %dx%d%s, %.3f fps, "
                         "%" PRId64 " frames, model `%s`, as-shot ISO %.0f\n",
                 path, d->stream_index, codec->name, d->raw ? "raw" : "video",
-                d->dec->width, d->dec->height, rot,
+                d->coded_w, d->coded_h, rot,
                 d->frame_rate.den ? av_q2d(d->frame_rate) : 0.0, d->nb_frames,
                 d->model[0] ? d->model : "(unknown)", d->meta_as_shot_ei);
     }
@@ -889,19 +914,32 @@ int view_decoder_open(struct view_decoder *d, const char *path,
 
 void view_decoder_close(struct view_decoder *d)
 {
+    struct view_codec codec = d->codec;
+
     view_reader_stop(d);
     av_packet_free(&d->pkt);
-    avcodec_free_context(&d->dec);
-    av_buffer_unref(&d->hw_device);
+    av_buffer_unref(&d->frames);
     avformat_close_input(&d->fmt);
+
+    /* view_decoder_open() fills what it needs and nothing else, so what the
+     * clip said - its model, its metadata, its V-Log flag, whether its
+     * frames carried lens records - goes here rather than linger into the
+     * next one's panel. The decoder keeps whatever pictures it still held;
+     * the flush that reuses it, or view_decoder_free(), lets them go. */
+    *d = (struct view_decoder) { 0 };
+    d->codec = codec;
 }
 
-/* Pairs with the xmlInitParser() in view_read_clip_xml(), once per program
- * rather than once per clip: libxml2's globals are not a decoder's to
- * release while the next clip may still parse a document. Safe when none
- * ever did. */
-void view_decoder_cleanup(void)
+void view_decoder_free(struct view_decoder *d)
 {
+    view_decoder_close(d);
+    avcodec_free_context(&d->codec.avc);
+    av_buffer_unref(&d->codec.hw_device);
+
+    /* Pairs with the xmlInitParser() in view_read_clip_xml(), once per
+     * program rather than once per clip: libxml2's globals are not a
+     * clip's to release while the next one may still parse a document.
+     * Safe when none ever did. */
     xmlCleanupParser();
 }
 
@@ -1148,15 +1186,32 @@ static int view_decoder_feed(struct view_decoder *d, int budget)
                  * after a loop point the prores_raw hwaccel keeps reporting
                  * end of stream. A codec without delay has nothing held
                  * back, so it is simply left alone. */
-                if (d->dec->codec->capabilities & AV_CODEC_CAP_DELAY)
-                    avcodec_send_packet(d->dec, NULL);
+                if (d->codec.avc->codec->capabilities & AV_CODEC_CAP_DELAY)
+                    avcodec_send_packet(d->codec.avc, NULL);
                 d->draining = true;
                 return moved + 1;
             }
             d->pkt_held = true;
         }
 
-        ret = avcodec_send_packet(d->dec, d->pkt);
+        /* The stream's own parameter sets, on the first packet a kept
+         * decoder sees of it. A decoder that keeps them (H.264, HEVC)
+         * compares and keeps what is unchanged, so an identical set costs a
+         * parse and nothing else, and a packet the decoder refuses below
+         * is resent with the side data still on it. */
+        if (d->new_extradata) {
+            const AVCodecParameters *par =
+                d->fmt->streams[d->stream_index]->codecpar;
+            uint8_t *sd = av_packet_new_side_data(d->pkt, AV_PKT_DATA_NEW_EXTRADATA,
+                                                  (size_t)par->extradata_size);
+
+            if (!sd)
+                return CRAW_ERROR(ENOMEM);
+            memcpy(sd, par->extradata, (size_t)par->extradata_size);
+            d->new_extradata = false;
+        }
+
+        ret = avcodec_send_packet(d->codec.avc, d->pkt);
         if (ret == AVERROR(EAGAIN))
             break;              /* the decoder is full, which is the point */
 
@@ -1196,7 +1251,7 @@ int view_decoder_next(struct view_decoder *d, AVFrame *frame)
     int ret;
 
     while (1) {
-        ret = avcodec_receive_frame(d->dec, frame);
+        ret = avcodec_receive_frame(d->codec.avc, frame);
         if (ret >= 0) {
             if (!d->know_hwaccel) {
                 d->hwaccel = frame->format == AV_PIX_FMT_VULKAN;
@@ -1205,6 +1260,18 @@ int view_decoder_next(struct view_decoder *d, AVFrame *frame)
                     fprintf(stderr, "decoding %s: %s\n", d->codec_name,
                             d->hwaccel ? "Vulkan hwaccel, frames stay on the GPU"
                                        : "software, frames uploaded per picture");
+            }
+
+            /* A picture out of another frame pool than the last one's; see
+             * `frames` in view.h. The first of a clip always is. */
+            if (frame->hw_frames_ctx &&
+                (!d->frames || d->frames->data != frame->hw_frames_ctx->data)) {
+                av_buffer_unref(&d->frames);
+                d->frames = av_buffer_ref(frame->hw_frames_ctx);
+                d->frames_reset = true;
+                if (d->verbose && d->frames_pools++)
+                    fprintf(stderr, "decoding %s: the hwaccel was set up again, "
+                                    "new frame pool\n", d->codec_name);
             }
 
             d->frame_arrive = 0;
@@ -1306,16 +1373,14 @@ int view_decoder_seek(struct view_decoder *d, int64_t frame_index)
      * here would put an old packet's arrival on a new picture. */
     memset(d->arrive_ring, 0, sizeof(d->arrive_ring));
 
-    if (d->eof || d->draining) {
-        int ret = view_decoder_codec_open(d);
-
-        if (ret < 0)
-            return ret;
-        d->know_hwaccel = false;
-        d->frames_reset = true;
-    } else {
-        avcodec_flush_buffers(d->dec);
-    }
+    /* The flush is what undoes a drain as well: libavcodec leaves the
+     * draining state with it, whatever the codec and whether or not an
+     * hwaccel is in. The context used to be rebuilt here after end of
+     * stream instead, on a report that this hwaccel did not come back from
+     * a flush; it does, through every loop point of a ProRes RAW clip
+     * (which never drains - the codec has no delay) and of an HEVC one
+     * (which does). */
+    avcodec_flush_buffers(d->codec.avc);
 
     d->draining = false;
     d->eof = false;

@@ -1778,18 +1778,19 @@ static double view_frame_pts(const struct view_state *st, const AVFrame *f)
 
 static int view_seek_decoder(struct view_state *st, int64_t frame)
 {
-    int ret = view_decoder_seek(&st->dec, frame);
+    return view_decoder_seek(&st->dec, frame);
+}
 
-    if (ret < 0)
-        return ret;
-
-    /* A rebuilt decoder brings a whole new frame pool with it. */
+/* A picture from another frame pool than the last one's (decode.c,
+ * `frames`): every image view cached for the old pool goes before this one
+ * is developed. Called with every picture the decoder hands over, before
+ * anything is done with it. */
+static void view_frames_follow(struct view_state *st)
+{
     if (st->dec.frames_reset) {
         view_gpu_drop_src_views(&st->gpu);
         st->dec.frames_reset = false;
     }
-
-    return 0;
 }
 
 /* Whether a jump warms the temporal average before its target: the pass
@@ -1916,6 +1917,7 @@ static int view_preroll(struct view_state *st, int64_t first, int64_t want,
             goto abandon;
         }
         idle = av_gettime_relative();
+        view_frames_follow(st);
 
         index = (int64_t)llrint(view_frame_pts(st, f) * av_q2d(st->dec.frame_rate));
 
@@ -2067,6 +2069,7 @@ int view_step_frame(struct view_state *st)
     st->timing.frames++;
     if (ret)
         return ret;
+    view_frames_follow(st);
 
     /* The lens record belongs to this picture and is taken exactly once,
      * here: view_process_frame() runs again whenever a paused frame is
@@ -3218,12 +3221,10 @@ static void view_close_clip(struct view_state *st)
     st->have_frame = false;
     view_gpu_release_frames(&st->gpu);
 
+    /* Closes the clip and forgets what it said; the decoder itself stays
+     * for the next clip when that is of the same codec (view.h,
+     * view_codec). */
     view_decoder_close(&st->dec);
-    /* view_decoder_open() fills what it needs and nothing else, so what the
-     * last clip said - its model, its metadata, its V-Log flag, whether its
-     * frames carried lens records - has to go here rather than linger into
-     * the next one's panel. */
-    st->dec = (struct view_decoder) { 0 };
 }
 
 /* One -v line for everything the user has set, printed as each clip opens.
@@ -4425,9 +4426,7 @@ static void view_close(struct view_state *st)
 
     view_ui_close(st);
     view_audio_close(&st->audio);
-    view_decoder_close(&st->dec);
-    /* Once per program, whatever the playlist did. */
-    view_decoder_cleanup();
+    view_decoder_free(&st->dec);
     /* The grain hooks hold shader objects, so they go before the pl_gpu. */
     view_grain_close(&st->grain);
     view_adjust_close(&st->adjustments);
