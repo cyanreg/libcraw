@@ -69,9 +69,12 @@ typedef struct CRAWAwbParams {
     /* Below this share of total sample weight inside the band the estimate
      * is reported invalid. Default 0.02. */
     float min_zone_fraction;
-    /* Warmth retention: 0.0 corrects fully to neutral, 1.0 leaves any
-     * illuminant warmer than ambience_knee_cct uncorrected, values between
-     * blend in Kelvin. Default 0.0. */
+    /* Warmth retention: 0.0 corrects fully to neutral; 1.0 balances any
+     * illuminant warmer than ambience_knee_cct as if it were the knee, so
+     * the warmth between the two stays in the picture (a 3200 K scene is
+     * still corrected down from daylight to 4000 K, and only the last 63
+     * mired are kept); values between blend the estimate towards the knee
+     * linearly in Kelvin. Default 0.0. */
     float ambience;
     float ambience_knee_cct;   /* default 4000 */
     /* Hard limits on the reported cct; 0 means the profile's table range. */
