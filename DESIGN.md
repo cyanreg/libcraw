@@ -669,6 +669,18 @@ Container tables (identical in every clip from this camera):
     3400: 1.4477 2.2881; 5000: 1.9499 1.7195; 5500: 2.0253 1.6676;
     6300: 2.2051 1.5348; 7300: 2.3299 1.4186; 11500: 2.6469 1.2318
 
+The built-in table in `tools/profiles.c` has two knots more, 2500: 1.1055
+3.1675 and 10000: 2.5537 1.2813, which are the camera's own per-frame
+pairs from clips shot in Kelvin mode at those settings (the lamp series of
+2026-10-01, P1115218-223, two clips at each; the RW2 stills' EXIF levels
+agree to 0.5%). Between the container's knots the camera does not
+interpolate linearly: its 2500 K pair is 3.4% (r) and 5.4% (b) from the
+line between the 2000 and 3200 K knots, its 10000 K pair 1% and 2% from
+the 7300-11500 line. The pair also moves by up to 1.5% between clips shot
+at one setting, so a knot taken from one clip is good to about that. A
+clip at any other Kelvin setting is one more sample of the curve, whatever
+is in front of the lens.
+
     matrix knots (cct: row-major 3x3):
     2300:  0.6535 0.1947 0.1022  0.2831 0.6975 0.0193  0.0113 -0.1074 1.1852
     2800:  0.6601 0.1881 0.1022  0.2862 0.7073 0.0064  0.0104 -0.0857 1.1644

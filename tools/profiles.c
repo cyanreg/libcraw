@@ -9,15 +9,28 @@
 #include "profiles.h"
 
 /* Panasonic DC-S1M2, DESIGN.md section 9. Identical in every clip this
- * camera produces, so they belong to the camera and not to the clip. */
+ * camera produces, so they belong to the camera and not to the clip.
+ *
+ * The 2500 K and 10000 K knots are not in the container's table: they are
+ * the camera's own per-frame pairs from clips shot in Kelvin mode at those
+ * settings (P1115219/222 and P1115220/223, 2026-10-01, the mean of the two
+ * clips at each; the stills' EXIF agrees to 0.5%). The container table
+ * interpolated linearly in Kelvin, which is how the camera's own decoder
+ * reads it, lands 3.4% and 5.4% off the camera's pair at 2500 K and 1% and
+ * 2% off at 10000 K, so between the container's knots the camera follows
+ * a curve of its own, and each setting it was shot at is a sample of it.
+ * The same pair varies by up to 1.5% from clip to clip at one setting,
+ * which is still well inside the gap it closes. */
 static const CRAWWbKnot s1m2_wb_knots[] = {
     {  2000.0f, { 0.8454f, 1.0f, 3.9482f } },
+    {  2500.0f, { 1.1055f, 1.0f, 3.1675f } },
     {  3200.0f, { 1.3763f, 1.0f, 2.4707f } },
     {  3400.0f, { 1.4477f, 1.0f, 2.2881f } },
     {  5000.0f, { 1.9499f, 1.0f, 1.7195f } },
     {  5500.0f, { 2.0253f, 1.0f, 1.6676f } },
     {  6300.0f, { 2.2051f, 1.0f, 1.5348f } },
     {  7300.0f, { 2.3299f, 1.0f, 1.4186f } },
+    { 10000.0f, { 2.5537f, 1.0f, 1.2813f } },
     { 11500.0f, { 2.6469f, 1.0f, 1.2318f } },
 };
 
