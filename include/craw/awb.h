@@ -153,22 +153,14 @@ CRAW_API void craw_awb_smoother_free(CRAWAwbSmoother **sm);
 /* Forgets the track; the next push starts from its estimate. */
 CRAW_API void craw_awb_smoother_reset(CRAWAwbSmoother *sm);
 
-/* Puts the track at `illum` as of `pts_s`, starting one when there was
- * none, whatever any estimate's confidence: for a caller that has judged
- * the reading itself. A viewer shows a paused picture its own frame's
- * estimate this way - the one looking at it is the gate there - and the
- * next push continues from it under the usual rules. An illuminant that is
- * not finite and positive is ignored. */
-CRAW_API void craw_awb_smoother_set(CRAWAwbSmoother *sm, double pts_s,
-                                    const CRAWIlluminant *illum);
-
 /* Feeds one frame's estimate at presentation time `pts_s` and returns the
- * smoothed illuminant to apply to that frame. `scene_cut` resets the track
- * to the new estimate immediately. Estimates flagged invalid or below
- * min_confidence hold the current track, and cannot start one or restart
- * it at a cut either: before any track exists such an estimate makes the
- * call return CRAW_ERROR(EAGAIN) and leave `out` untouched, so the caller
- * stays on what it had until a confident estimate arrives. */
+ * smoothed illuminant to apply to that frame. The first valid estimate
+ * starts the track, whatever its confidence: it is the best reading there
+ * is until a better one arrives. After that an estimate below
+ * min_confidence holds the track, and so does one flagged invalid; a
+ * confident one moves it, or with `scene_cut` replaces it at once. Before
+ * any track exists an invalid estimate makes the call return
+ * CRAW_ERROR(EAGAIN) and leave `out` untouched. */
 CRAW_API int craw_awb_smoother_push(CRAWAwbSmoother *sm, double pts_s,
                                     const CRAWAwbEstimate *est, bool scene_cut,
                                     CRAWIlluminant *out);

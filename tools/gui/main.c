@@ -1556,9 +1556,9 @@ bool view_crop_screen(const struct view_state *st, pl_rect2df *out)
 
 /* ------------------------------------------------------------- one frame */
 
-/* Whether the picture on screen is a paused one being looked at, as opposed
- * to one of a run - playing, exporting, headless - whose balance has to
- * stay continuous from frame to frame. */
+/* Whether the picture on screen is a paused one, whose next reading only a
+ * replay can take, as opposed to one of a run - playing, exporting,
+ * headless - where the next frame takes it. */
 static bool view_awb_paused(const struct view_state *st)
 {
     return !st->playing && !st->exp.active && !st->video.active &&
@@ -1569,7 +1569,6 @@ void view_awb_follow(struct view_state *st)
 {
     const CRAWAwbEstimate *est = &st->awb.last;
     CRAWIlluminant out;
-    const char *how;
     int ret;
 
     /* One frame period per estimate rather than the clip's pts: the filter
@@ -1577,27 +1576,19 @@ void view_awb_follow(struct view_state *st)
      * time (see struct view_awb). */
     st->awb.clock += view_frame_duration(st);
 
-    if (view_awb_paused(st) && est->valid) {
-        craw_awb_smoother_set(st->awb.smoother, st->awb.clock, &est->illuminant);
-        st->awb.illum = est->illuminant;
+    ret = craw_awb_smoother_push(st->awb.smoother, st->awb.clock, est, false, &out);
+    /* EAGAIN means there is no track yet and this estimate cannot start
+     * one, so the picture stays on whatever the last good one left. */
+    if (ret >= 0) {
+        st->awb.illum = out;
         st->awb.have_illum = true;
-        how = "set";
-    } else {
-        ret = craw_awb_smoother_push(st->awb.smoother, st->awb.clock, est, false,
-                                     &out);
-        /* EAGAIN means there is no track yet and this estimate cannot start
-         * one, so the picture stays on whatever the last good one left. */
-        if (ret >= 0) {
-            st->awb.illum = out;
-            st->awb.have_illum = true;
-        }
-        how = ret >= 0 ? "moved" : "held";
     }
 
     view_log(st, "awb: frame %" PRId64 " est %s cct %5.0f tint %+.4f conf %.2f"
                  " -> track %s cct %5.0f tint %+.4f\n",
              st->index, est->valid ? "ok" : "invalid",
-             est->illuminant.cct, est->illuminant.tint, est->confidence, how,
+             est->illuminant.cct, est->illuminant.tint, est->confidence,
+             ret >= 0 ? "moved" : "held",
              st->awb.have_illum ? st->awb.illum.cct : 0.0f,
              st->awb.have_illum ? st->awb.illum.tint : 0.0f);
 }
@@ -4125,11 +4116,9 @@ static int view_run_window(struct view_state *st)
          * when it was laid out last time round. */
         view_rate_follow(st, &choice_seen, &rate_seen);
 
-        /* A pause with Auto on: the picture that stopped gets its own
-         * estimate (view_awb_follow()), which is what Auto on a paused
-         * picture means - a track the run was still slewing towards it
-         * arrives at once, one that never started (a clip the estimator is
-         * unsure of throughout) starts from it. */
+        /* A pause with Auto on: the picture that stopped goes on settling
+         * to its own reading through replays (struct view_awb, `pending`)
+         * instead of stopping wherever the run had got to. */
         if (playing_seen && !st->playing && st->look.wb == VIEW_WB_AUTO) {
             st->awb.pending = true;
             st->vwb.converging = true;

@@ -90,19 +90,6 @@ void craw_awb_smoother_reset(CRAWAwbSmoother *sm)
     sm->last_pts = 0.0;
 }
 
-void craw_awb_smoother_set(CRAWAwbSmoother *sm, double pts_s,
-                           const CRAWIlluminant *illum)
-{
-    if (!sm || !illum || !isfinite(illum->cct) || !(illum->cct > 0.0f) ||
-        !isfinite(illum->tint))
-        return;
-
-    sm->mired = 1e6 / (double)illum->cct;
-    sm->tint = illum->tint;
-    sm->have_state = true;
-    sm->last_pts = pts_s;
-}
-
 int craw_awb_smoother_push(CRAWAwbSmoother *sm, double pts_s,
                            const CRAWAwbEstimate *est, bool scene_cut,
                            CRAWIlluminant *out)
@@ -129,19 +116,20 @@ int craw_awb_smoother_push(CRAWAwbSmoother *sm, double pts_s,
     if (dt > 1.0)
         dt = 1.0;
 
-    /* A track starts, or restarts at a cut, only from an estimate that
-     * passes the confidence gate. On a night scene the readings that fail
-     * it swing by thousands of kelvin from one frame to the next, and
-     * adopting whichever of them came first after a reset restarted the
-     * track somewhere new at every seek; below the gate there is nothing
-     * to report until a confident one arrives. */
-    if (usable && est->confidence >= sm->params.min_confidence &&
-        (scene_cut || !sm->have_state)) {
+    /* The first usable estimate is the track, confident or not: there is
+     * nothing better to show until a confident one arrives, and the gate
+     * below keeps the unsure readings after it from moving the track
+     * about (on a night scene they swing by thousands of kelvin from one
+     * frame to the next). A cut restarts it only from a confident one. A
+     * track that waited for a confident start was never there at all on a
+     * clip the estimator is unsure of throughout. */
+    if (usable && (!sm->have_state ||
+                   (scene_cut && est->confidence >= sm->params.min_confidence))) {
         sm->mired = target_mired;
         sm->tint = target_tint;
         sm->have_state = true;
     } else if (!sm->have_state) {
-        /* Nothing to report yet: no track and no estimate worth adopting. */
+        /* Nothing to report yet: no track and no estimate to start one. */
         return CRAW_ERROR(EAGAIN);
     } else if (usable && est->confidence >= sm->params.min_confidence) {
         double delta = target_mired - sm->mired;

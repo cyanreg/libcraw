@@ -238,11 +238,12 @@ paused picture is shown its own frame's estimate whatever the confidence
 its confidence and the track — and a seek while paused re-estimates for
 the frame it lands on.
 
-Auto on a paused picture shows the frame's own estimate, whatever the
-estimator's confidence in it (the panel prints the confidence beside the
-result), and a seek while paused shows the new frame's. While playing, the
-track starts and moves only on readings confident enough to be worth a
-visible change, and slews between them rather than jumping.
+Auto never jumps: the balance glides to each new reading through the same
+smoothing whether the clip is playing or paused, so a paused picture
+settles to its own frame's reading and a seek settles to the new frame's.
+The first reading of a clip starts the balance whatever the estimator's
+confidence in it (the panel prints the confidence beside the result);
+after that only confident readings move it.
 
 The White balance section's "pick white" button is the spot white balance
 of every raw developer: press it, and the next left click on the picture

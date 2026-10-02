@@ -493,27 +493,24 @@ Ambience: if `cct < knee`, `cct = cct + ambience * (knee - cct)` after the
 estimate, i.e. warm light is only partially corrected. The estimate is
 then clamped to `[cct_min, cct_max]`.
 
-Smoother: state is a mired value and a tint. On push: if `scene_cut` or no
-state, adopt the estimate, but only when it is valid and its confidence
-reaches `min_confidence`; when there is no state and the estimate does not
-qualify there is nothing to adopt and the call fails with EAGAIN, leaving
-the output untouched (a night scene's low-confidence readings swing by
-thousands of kelvin from frame to frame, and adopting whichever came first
-after a reset restarted the track somewhere new at every seek). Else if
-`est.valid && est.confidence >= min_confidence`: target = estimate; ignore
-the change if
-`|target - state| < hysteresis_mired`; otherwise move the state towards the
-target by `1 - exp(-dt / time_constant)` of the difference, limited to
-`max_slew_mired_per_s * dt`. Tint follows the same rule with the same
-fractions. `dt` is the difference in `pts_s` to the previous push, clamped
-to [0, 1] seconds. `craw_awb_smoother_set` puts the track where the caller
-says, confidence or not, for a caller that has judged the reading itself:
-cineview shows a paused picture its own frame's estimate that way (the
-viewer is the gate there, and the panel shows the confidence beside the
-result) and continues under the rules above when playing resumes. Before
-it, Auto on a frame the estimator was unsure of stayed as shot for as long
-as the picture was paused, and a paused seek kept the balance of the
-picture it came from.
+Smoother: state is a mired value and a tint. On push: with no state, adopt
+the estimate if it is valid, whatever its confidence - the first reading is
+the track until a better one moves it; a track that waited for a confident
+start was never there at all on a clip the estimator is unsure of
+throughout - and fail with EAGAIN, output untouched, if it is invalid. With
+`scene_cut`, adopt the estimate when it is valid and its confidence reaches
+`min_confidence`. Else if `est.valid && est.confidence >= min_confidence`:
+target = estimate; ignore the change if `|target - state| <
+hysteresis_mired`; otherwise move the state towards the target by `1 -
+exp(-dt / time_constant)` of the difference, limited to `max_slew_mired_per_s
+* dt`. Tint follows the same rule with the same fractions. `dt` is the
+difference in `pts_s` to the previous push, clamped to [0, 1] seconds. A
+reading below `min_confidence` therefore holds the track (a night scene's
+unsure readings swing by thousands of kelvin from frame to frame), and
+nothing ever jumps: cineview feeds a paused picture one push per
+re-development until the track settles, so it glides to its own frame's
+reading through the same smoothing as when playing, and a seek is a glide
+from where the picture was to where it is.
 
 ## 8. Colour spaces
 

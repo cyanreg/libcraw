@@ -780,12 +780,13 @@ struct view_awb {
      * a clip; a camera original is one scene, and a track that restarted
      * from whatever frame came first jumped at every seek. */
     int skip;
-    /* A paused picture that has no estimate of its own yet - the step a
-     * seek skips, the first after a rebuild, the frame a pause stopped on
-     * - asks for one replay, whose step reads the histogram the picture
-     * recorded, so that it is balanced for itself rather than kept at
-     * whatever the run or the picture the seek came from left
-     * (view_awb_follow()). */
+    /* A paused picture whose own reading has not been taken yet - the step
+     * a seek skips, the first after a rebuild, the frame a pause stopped
+     * on - asks for one replay, whose step reads the histogram the picture
+     * recorded. The track then moves towards that reading, the look changes
+     * with it, and the paused picture is replayed again until it settles:
+     * the glide a playing clip gets from its frames, a paused one gets from
+     * its replays (view_awb_follow()). */
     bool pending;
     /* What the smoother is given as time: one frame period per estimate,
      * not the clip's pts. The filter smooths over what the eye sees, and a
@@ -796,15 +797,10 @@ struct view_awb {
 
 /* Takes the estimate just made (st->awb.last) into the track and the
  * picture, for both the raw path (main.c) and the developed one
- * (videowb.c). Playing, exporting or headless, the smoother's rules: an
- * estimate starts or moves the track only with the confidence to, so a run
- * never jumps after a reading that might be wrong. Paused, the picture on
- * screen is shown its own frame's estimate whatever its confidence, at
- * once: the one looking at it is the gate, and the panel puts the
- * confidence beside the result. Without that, Auto on a frame the
- * estimator was unsure of stayed as shot however long it was on - until a
- * denoise change happened to lift the reading over the gate - and a paused
- * seek kept the balance of the picture it came from. */
+ * (videowb.c): one push of the smoother per estimate, one frame period of
+ * its time each, playing or paused. The first reading starts the track
+ * whatever its confidence, a confident one moves it at the smoother's
+ * pace, an unsure one holds it, and nothing jumps. */
 void view_awb_follow(struct view_state *st);
 
 /* The auto white balance of a developed clip (videowb.c), whose estimates

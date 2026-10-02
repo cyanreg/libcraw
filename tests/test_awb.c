@@ -618,28 +618,40 @@ static void craw_test_smoother(void)
     CHECK_NEAR(out.cct, 8000.0, 1e-2, "a scene cut adopts the estimate");
     CHECK_NEAR(out.tint, -0.03, 1e-6, "a scene cut adopts the tint");
 
-    /* After a reset an estimate below the confidence gate cannot start the
-     * track: the call reports EAGAIN and leaves the output alone, so a
-     * caller keeps what it had. A night scene's low-confidence readings
-     * swing by thousands of kelvin between frames, and whichever came
-     * first used to become the new track at every seek. */
+    /* After a reset the first usable estimate starts the track whatever
+     * its confidence - a clip the estimator is unsure of throughout is
+     * still balanced - and the unsure readings after it hold the track
+     * rather than move it about. */
+    craw_awb_smoother_reset(sm);
+    t += frame;
+    est = craw_test_est(3850.0, 0.0, 0.1);
+    ret = craw_awb_smoother_push(sm, t, &est, false, &out);
+    CHECK(ret == 0, "a low-confidence estimate must start the track: %d", ret);
+    CHECK_NEAR(out.cct, 3850.0, 1e-2, "and the track is that estimate");
+    for (int i = 0; i < 30; i++) {
+        t += frame;
+        est = craw_test_est(8000.0 - 100.0 * i, 0.3, 0.1);
+        ret = craw_awb_smoother_push(sm, t, &est, false, &out);
+        CHECK(ret == 0, "push failed: %d", ret);
+    }
+    CHECK_NEAR(out.cct, 3850.0, 1e-2, "unsure readings after the start hold it");
+
+    /* An invalid one cannot start a track: EAGAIN, output untouched. */
     craw_awb_smoother_reset(sm);
     t += frame;
     out.cct = 1234.0f;
-    est = craw_test_est(3850.0, 0.0, 0.1);
+    est = craw_test_est(3850.0, 0.0, 1.0);
+    est.valid = false;
     ret = craw_awb_smoother_push(sm, t, &est, false, &out);
-    CHECK(ret == CRAW_ERROR(EAGAIN), "a low-confidence estimate must not start a track: %d", ret);
+    CHECK(ret == CRAW_ERROR(EAGAIN), "an invalid estimate must not start a track: %d", ret);
     CHECK_NEAR(out.cct, 1234.0, 1e-6, "EAGAIN leaves the output untouched");
-    est = craw_test_est(3850.0, 0.0, 0.1);
-    ret = craw_awb_smoother_push(sm, t, &est, true, &out);
-    CHECK(ret == CRAW_ERROR(EAGAIN), "nor start one at a scene cut: %d", ret);
 
-    /* The first confident push after a reset is adopted as is. */
+    /* The first push after a reset is adopted as is. */
     t += frame;
     est = craw_test_est(2900.0, 0.0, 1.0);
     ret = craw_awb_smoother_push(sm, t, &est, false, &out);
     CHECK(ret == 0, "push failed: %d", ret);
-    CHECK_NEAR(out.cct, 2900.0, 1e-2, "the first confident push after a reset adopts");
+    CHECK_NEAR(out.cct, 2900.0, 1e-2, "the first push after a reset adopts");
 
     /* With a track, a low-confidence scene cut holds rather than jumps. */
     t += frame;
@@ -647,41 +659,6 @@ static void craw_test_smoother(void)
     ret = craw_awb_smoother_push(sm, t, &est, true, &out);
     CHECK(ret == 0, "push failed: %d", ret);
     CHECK_NEAR(out.cct, 2900.0, 1e-2, "a low-confidence scene cut holds the track");
-
-    /* A set puts the track where the caller says, confidence or not, with
-     * or without a track, and the next pushes continue from there. */
-    {
-        CRAWIlluminant at = { .cct = 6200.0f, .tint = 0.02f };
-
-        t += frame;
-        craw_awb_smoother_set(sm, t, &at);
-        t += frame;
-        est = craw_test_est(8000.0, 0.0, 0.1);
-        ret = craw_awb_smoother_push(sm, t, &est, false, &out);
-        CHECK(ret == 0, "push failed: %d", ret);
-        CHECK_NEAR(out.cct, 6200.0, 1e-2, "a set track is where it was put");
-        CHECK_NEAR(out.tint, 0.02, 1e-6, "and so is its tint");
-
-        craw_awb_smoother_reset(sm);
-        t += frame;
-        craw_awb_smoother_set(sm, t, &at);
-        t += frame;
-        ret = craw_awb_smoother_push(sm, t, &est, false, &out);
-        CHECK(ret == 0, "a set must start a track where there was none: %d", ret);
-        CHECK_NEAR(out.cct, 6200.0, 1e-2, "started where it was put");
-
-        /* And one that is not an illuminant changes nothing. */
-        at.cct = 0.0f;
-        craw_awb_smoother_set(sm, t, &at);
-        t += frame;
-        ret = craw_awb_smoother_push(sm, t, &est, false, &out);
-        CHECK(ret == 0 && fabs(out.cct - 6200.0) < 1e-2,
-              "a set with no illuminant must be ignored");
-
-        /* Back where the gap check below expects the track. */
-        at = (CRAWIlluminant) { .cct = 2900.0f, .tint = 0.0f };
-        craw_awb_smoother_set(sm, t, &at);
-    }
 
     /* A long gap must not turn into an unbounded jump: dt is clamped to a
      * second, so at most one second worth of slew happens. */
