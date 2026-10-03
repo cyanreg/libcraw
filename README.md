@@ -231,9 +231,10 @@ font: there is no option and nothing to configure, and nuklear's own
 bitmap face is only what remains when fontconfig has nothing or the file
 will not load. Under the playback readouts sits a "Clip" block with what
 the file says about the recording, one row per fact and only the rows the
-file has: camera, lens (with the first frame's focal length), format (the
+file has: lens (with the first frame's focal length), format (the
 codec with its bit depth and coded size, "ProRes RAW 16-bit 5760x3040"),
-frame rate, ISO, aperture, shutter, the white balance as recorded (with
+frame rate, the exposure on one row ("ISO 100  f/2.8  1/15"), the white
+balance as recorded (with
 the camera's mode, "auto, 3100 K", unless it was set in Kelvin), the
 exposure index when it differs from the ISO, the capture gamma and gamut
 of a developed clip, the timecode at the clip's start and the recording
@@ -291,7 +292,8 @@ seek settles to the new frame's, and readings the estimator is unsure of
 hold it. A scene it is unsure of throughout, a filament on black, stays at
 the camera's balance, which is what RawTherapee does with it too.
 
-The White balance section's "pick white" button is the spot white balance
+The White balance section's "pick white" button, a row of its Manual mode,
+is the spot white balance
 of every raw developer: press it, and the next left click on the picture
 — the pointer is a crosshair while it waits, and Escape or a second press
 calls it off — takes the 24x24 source pixels under the click as something

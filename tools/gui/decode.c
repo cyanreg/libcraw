@@ -757,14 +757,27 @@ int view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
                   ? "%.2f fps" : "%.0f fps", av_q2d(d->frame_rate));
     }
 
-    if (d->meta_as_shot_ei > 0.0f)
-        VIEW_INFO("ISO", "%.0f", (double)d->meta_as_shot_ei);
-    if (d->aperture > 0.0f)
-        VIEW_INFO("aperture", "f/%.1f", (double)d->aperture);
-    if (d->pana.exposure_s >= 1.0f)
-        VIEW_INFO("shutter", "%.1f s", (double)d->pana.exposure_s);
-    else if (d->pana.exposure_s > 0.0f)
-        VIEW_INFO("shutter", "1/%.0f", 1.0 / d->pana.exposure_s);
+    /* The exposure on one row, "ISO 100  f/2.8  1/15", with what the clip
+     * has of the three. */
+    {
+        char exposure[64] = "";
+        size_t len = 0;
+
+        if (d->meta_as_shot_ei > 0.0f)
+            len += (size_t)snprintf(exposure + len, sizeof(exposure) - len,
+                                    "ISO %.0f", (double)d->meta_as_shot_ei);
+        if (d->aperture > 0.0f)
+            len += (size_t)snprintf(exposure + len, sizeof(exposure) - len,
+                                    "%sf/%.1f", len ? "  " : "", (double)d->aperture);
+        if (d->pana.exposure_s >= 1.0f)
+            snprintf(exposure + len, sizeof(exposure) - len, "%s%.1f s",
+                     len ? "  " : "", (double)d->pana.exposure_s);
+        else if (d->pana.exposure_s > 0.0f)
+            snprintf(exposure + len, sizeof(exposure) - len, "%s1/%.0f",
+                     len ? "  " : "", 1.0 / d->pana.exposure_s);
+        if (exposure[0])
+            VIEW_INFO("exposure", "%s", exposure);
+    }
     /* The mode is said only when it is not Kelvin, which the number
      * already says. */
     if (d->wb_kelvin > 0 && view_wb_mode_name(d->pana.wb_mode))

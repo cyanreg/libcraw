@@ -536,8 +536,13 @@ static bool view_section_header(struct nk_context *ctx, struct view_state *st,
         if (disabled)
             view_disable_begin(ctx);
         /* A disabled widget takes no input at all, so the click below
-         * cannot happen while the section is greyed. */
-        if (nk_button_symbol_styled(ctx, &bs, *on ? NK_SYMBOL_CIRCLE_SOLID
+         * cannot happen while the section is greyed. A greyed switch shows
+         * off whatever the setting is: nothing is being applied, and a
+         * solid dot that cannot be clicked read as forced on (Lynne, of
+         * Lens on a still with no record). The setting itself is kept for
+         * the next clip the section can work on. */
+        if (nk_button_symbol_styled(ctx, &bs, *on && !disabled
+                                                  ? NK_SYMBOL_CIRCLE_SOLID
                                                   : NK_SYMBOL_CIRCLE_OUTLINE))
             *on = !*on;
         if (disabled)
@@ -1937,14 +1942,19 @@ static void view_panel_wb(struct nk_context *ctx, struct view_state *st)
         lk->wb = VIEW_WB_MANUAL;
     }
 
-    /* The spot white balance. The button arms it and the next click on the
-     * picture samples, so while armed it is lit - its title and border in
-     * the colour the section switches light up in - and the pointer over
-     * the picture is a crosshair; a second press or Escape disarms. What a
-     * pick finds goes into the manual rows below, which is the readout;
-     * what it could not find is the one word beside the button, and
-     * nothing else on the panel says anything about it. */
-    {
+    /* The spot white balance, a manual balance's tool and so a row of
+     * Manual alone; leaving Manual with a pick armed calls it off. The
+     * button arms it and the next click on the picture samples, so while
+     * armed it is lit - its title and border in the colour the section
+     * switches light up in - and the pointer over the picture is a
+     * crosshair; a second press or Escape disarms. What a pick finds goes
+     * into the manual rows below, which is the readout; what it could not
+     * find is the one word beside the button, and nothing else on the
+     * panel says anything about it. */
+    if (lk->wb != VIEW_WB_MANUAL) {
+        if (st->pick.armed)
+            view_pick_arm(st, false);
+    } else {
         struct nk_style_button bs = ctx->style.button;
 
         if (st->pick.armed) {
@@ -2909,13 +2919,20 @@ static void view_panel_clip(struct nk_context *ctx, struct view_state *st)
         float w = font->width(font->userdata, font->height, rows[i].label,
                               (int)strlen(rows[i].label));
 
-        label_w = CRAW_MAX(label_w, w);
+        if (strcmp(rows[i].label, "camera"))
+            label_w = CRAW_MAX(label_w, w);
     }
     label_w += 12.0f;
 
     for (int i = 0; i < n; i++) {
         struct nk_rect b;
         char value[80];
+
+        /* The camera is in the log's clip line and the lens row says
+         * which system it is; on the panel it was a row saying the same
+         * thing every time (Lynne). */
+        if (!strcmp(rows[i].label, "camera"))
+            continue;
 
         nk_layout_row_template_begin(ctx, VIEW_ROW);
         nk_layout_row_template_push_static(ctx, label_w);
@@ -2953,16 +2970,6 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         view_disable_begin(ctx);
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-    {
-        float z = view_zoom_scale(st);
-
-        if (st->view.fit)
-            nk_labelf(ctx, NK_TEXT_LEFT, "zoom: fit (%.2fx)", z);
-        else if (z == 1.0f)
-            nk_label(ctx, "zoom: 1:1", NK_TEXT_LEFT);
-        else
-            nk_labelf(ctx, NK_TEXT_LEFT, "zoom: %.2fx", z);
-    }
     /* Which of how many, whenever there is more than one: a playlist is
      * the only thing that makes the question worth the room. The rotation
      * joins the codec inside the brackets when the clip carries one, since
@@ -3070,7 +3077,7 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
 
     /* The lens switch is the one that can be refused: a clip whose frames
      * carry no correction record cannot be corrected, so the switch greys
-     * out rather than lying about what it would do. */
+     * out, showing off, rather than lying about what it would do. */
     if (st->dec.raw &&
         view_section_header(ctx, st, VIEW_SEC_LENS, "Lens", &st->lens.on,
                             !st->lens.record.valid)) {
