@@ -590,12 +590,21 @@ void view_lut_preview(struct view_state *st, int index)
 
     /* A rendering that cannot be unpacked or parsed previews as nothing,
      * and says nothing: the click on it is what reports the failure. */
-    if (view_luts_cube_text(index, &text, &len) < 0)
-        return;
-    st->preview = pl_lut_parse_cube(st->gpu.log, text, len);
-    view_luts_cube_free(text);
-    if (!st->preview)
-        return;
+    {
+        int64_t t0 = av_gettime_relative(), t1;
+
+        if (view_luts_cube_text(index, &text, &len) < 0)
+            return;
+        t1 = av_gettime_relative();
+        st->preview = pl_lut_parse_cube(st->gpu.log, text, len);
+        view_luts_cube_free(text);
+        if (!st->preview)
+            return;
+        view_log(st, "film simulation preview: %s, %zu bytes unpacked in %.1f ms, "
+                     "parsed in %.1f ms\n", view_lut_get(index)->name, len,
+                 (double)(t1 - t0) / 1000.0,
+                 (double)(av_gettime_relative() - t1) / 1000.0);
+    }
 
     view_lut_apply_space(st->preview, st->look.lut_space);
     st->preview_sim = index;
