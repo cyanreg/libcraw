@@ -4437,9 +4437,14 @@ static int view_run_window(struct view_state *st)
          * The panel's own readouts move with the picture, so they need no
          * test of their own; the idle tick is what keeps the ones that move
          * with nothing - the frame rate averages - alive while paused. */
+        /* And a menu whose own timer has run out - an entry rested on long
+         * enough to open its column - which only a rebuild acts on: a hand
+         * that has stopped sends no events, and left to the idle tick the
+         * column opened up to a fifth of a second late. */
         if (stepped || events_seen || !st->warm || st->gpu.pic_redrew ||
             st->exp.active || st->video.active || st->need_frame ||
-            st->seek_to >= 0 || now - st->last_present >= VIEW_IDLE_PRESENT)
+            st->seek_to >= 0 || now - st->last_present >= VIEW_IDLE_PRESENT ||
+            view_ui_menu_due(st, now))
             st->present_due = true;
 
         /* The transport drives the audio, never the other way round. A

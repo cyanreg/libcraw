@@ -95,6 +95,10 @@
  * and how long an already open submenu survives the pointer sweeping
  * across its siblings on the way over to it. */
 #define VIEW_MENU_OPEN_US  150000
+/* How long a film has to be under the pointer before it previews: long
+ * enough that the films a hand crosses on its way into an open column
+ * (fifty milliseconds each at a stroll) do not each flash their look. */
+#define VIEW_MENU_PEEK_US   80000
 #define VIEW_MENU_GUARD_US 300000
 #define VIEW_MENU_MIN_W 110.0f
 #define VIEW_MENU_MAX_W 330.0f
@@ -609,20 +613,27 @@ static void view_section_end(struct nk_context *ctx)
  * top of the panel built before them. */
 
 #if CINEVIEW_HAVE_LUTS
-/* The film whose renderings column 3 lists, or NULL when the path does not
- * reach that far. */
-static const ViewLutFilm *view_menu_film(const struct view_state *st)
+/* The film at entry `i` of the films column, under the category the path
+ * has open, or NULL. */
+static const ViewLutFilm *view_menu_film_at(const struct view_state *st, int i)
 {
     const struct view_lut_menu *m = &st->menu;
     const ViewLutFilmCategory *c;
 
-    if (m->sel[0] != 0 || m->sel[1] < 0 || m->sel[2] < 0)
+    if (m->sel[0] != 0 || m->sel[1] < 0 || i < 0)
         return NULL;
     c = view_lut_film_category(m->sel[1]);
-    if (!c || m->sel[2] >= c->n_films)
+    if (!c || i >= c->n_films)
         return NULL;
 
-    return view_lut_film(c->first_film + m->sel[2]);
+    return view_lut_film(c->first_film + i);
+}
+
+/* The film whose renderings column 3 lists, or NULL when the path does not
+ * reach that far. */
+static const ViewLutFilm *view_menu_film(const struct view_state *st)
+{
+    return view_menu_film_at(st, st->menu.sel[2]);
 }
 
 /* The rendering that stands for a film while the film itself is what the
@@ -1278,6 +1289,7 @@ static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
         m->hover_entry = hit_entry;
         m->hover_since = now;
     }
+    m->guarded = false;
 
     if (hit_col >= 0) {
         bool leaf = view_menu_leaf(st, hit_col);
@@ -1301,6 +1313,7 @@ static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
             bool guarded = hit_col == m->guard_col && now < m->guard_until &&
                            dx * (float)m->dir > 0.0f;
 
+            m->guarded = guarded;
             if (leaf) {
                 /* Nothing to protect and nothing to open, so a leaf's
                  * highlight simply follows the pointer. */
@@ -1317,6 +1330,33 @@ static int view_menu_pointer(struct nk_context *ctx, struct view_state *st,
     m->prev_y = p.y;
 
     return pick;
+}
+
+bool view_ui_menu_due(const struct view_state *st, int64_t now)
+{
+    const struct view_lut_menu *m = &st->menu;
+
+    if (!m->open || m->hover_col < 0 || m->hover_entry < 0 ||
+        view_menu_leaf(st, m->hover_col))
+        return false;
+
+#if CINEVIEW_HAVE_LUTS
+    /* A film's preview, due a moment after the pointer stopped on it and
+     * not yet shown. */
+    if (m->kind == VIEW_MENU_FILM && m->sel[0] == 0 && m->hover_col == 2 &&
+        !m->guarded && now - m->hover_since >= VIEW_MENU_PEEK_US) {
+        int ix = view_menu_film_base(view_menu_film_at(st, m->hover_entry));
+
+        if (ix >= 0 && ix != st->preview_sim && ix != st->look.film_sim)
+            return true;
+    }
+#endif
+
+    if (m->sel[m->hover_col] == m->hover_entry)
+        return false;
+    if (m->guarded)
+        return now >= m->guard_until;
+    return now - m->hover_since >= VIEW_MENU_OPEN_US;
 }
 
 static void view_menu_draw(struct nk_context *ctx, struct view_state *st)
@@ -1614,7 +1654,20 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
         int ix = view_menu_lut(st, m->cols - 1, m->sel[m->cols - 1]);
 
 #if CINEVIEW_HAVE_LUTS
-        if (ix < 0)
+        /* A film under the pointer previews as its base once the pointer
+         * has been on it a moment (VIEW_MENU_PEEK_US), ahead of the rest
+         * that opens its column: the preview is what the hover is for, and
+         * a rendering unpacks in a few milliseconds. Waiting for the column
+         * meant the rest, then the idle tick that noticed it, then a
+         * present - a third of a second between the pointer stopping on a
+         * film and its look, where a variant showed in a tenth. The moment
+         * is what keeps the films a hand crosses on its way into an open
+         * column from flashing by, as is the guard. */
+        if (m->sel[0] == 0 && m->hover_col == 2 && m->hover_entry >= 0 &&
+            !m->guarded &&
+            av_gettime_relative() - m->hover_since >= VIEW_MENU_PEEK_US)
+            ix = view_menu_film_base(view_menu_film_at(st, m->hover_entry));
+        else if (ix < 0)
             ix = view_menu_film_base(view_menu_film(st));
 #endif
         view_lut_preview(st, ix);

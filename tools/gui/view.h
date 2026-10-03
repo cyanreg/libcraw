@@ -239,6 +239,7 @@ struct view_lut_menu {
     int64_t hover_since;            /* when it landed there, microseconds */
     int guard_col;                  /* the column whose submenu is protected */
     int64_t guard_until;            /* until when, microseconds */
+    bool guarded;                   /* the last pointer pass was, see ui.c */
     float prev_x, prev_y;           /* the pointer last frame, for direction */
     int dir;                        /* +1 cascading right, -1 left */
 };
@@ -1649,6 +1650,10 @@ void view_ui_rotate(struct view_gpu *g);
  * closes by a click elsewhere, a choice, or Escape. */
 void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind);
 void view_ui_menu_close(struct view_state *st);
+/* Whether the open menu is waiting on a timer of its own that has run out
+ * - an entry rested on long enough to open its column, a guard that has
+ * expired - which only a rebuild of the panel acts on. */
+bool view_ui_menu_due(const struct view_state *st, int64_t now);
 /* True when the open menu covers that point, given in window points the
  * way SDL reports them. The picture must not zoom or pan underneath it. */
 bool view_ui_menu_covers(const struct view_state *st, float x, float y);

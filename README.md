@@ -409,10 +409,11 @@ Fujifilm simulations) and Looks (warm, cool, vintage, cinematic and so on),
 by a click on the row; a click elsewhere, a choice or Escape closes it.
 The rendering the highlight rests on is previewed on the picture while it
 does, with the menu open and wherever the pointer goes from there, so the
-collection can be walked rather than picked through; a film with none of
-its renderings highlighted previews as its base, so the films column can
-be walked too. A click keeps what is previewed and closing the menu any
-other way puts the chosen one back. Exports never see a preview.
+collection can be walked rather than picked through; a film previews as
+its base a moment after the pointer stops on it, before its column opens,
+so the films column can be walked too. A click keeps what is previewed and
+closing the menu any other way puts the chosen one back. Exports never see
+a preview.
 `--lut` takes a rendering's name or slug as well as a file path, and
 `--list-luts` prints both trees. The `.cube` files live in the tree; the
 compact pack that ends up in the executable is built by
