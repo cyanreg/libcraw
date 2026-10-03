@@ -2339,30 +2339,40 @@ static void view_panel_adjust(struct nk_context *ctx, struct view_state *st)
     view_grey_end(st, ctx, grey);
 }
 
-/* A status line: one row when it fits, wrapped over as many as it takes
- * when it does not. A refusal is a sentence, and a sentence cut at the
- * panel's edge is not one anybody can act on. */
-static void view_status_rows(struct nk_context *ctx, const char *text)
+/* How many lines a status takes in the panel's width, and how tall a row
+ * that holds them is. */
+static int view_status_lines(struct nk_context *ctx, const char *text,
+                             float *height)
 {
     const struct nk_user_font *f = ctx->style.font;
     float avail = nk_window_get_content_region(ctx).w
                 - 2.0f * ctx->style.window.padding.x
                 - 2.0f * ctx->style.text.padding.x;
     float tw = f->width(f->userdata, f->height, text, (int)strlen(text));
+    float line = f->height + 2.0f * ctx->style.text.padding.y;
     int lines = 1;
 
     if (avail > 1.0f && tw > avail)
         lines = CRAW_MIN((int)ceilf(tw * 1.15f / avail), 4);
+    *height = lines == 1 ? VIEW_ROW
+                         : CRAW_MAX(VIEW_ROW, (float)lines * line + 4.0f);
 
-    if (lines == 1) {
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    return lines;
+}
+
+/* A status line: one row when it fits, wrapped over as many as it takes
+ * when it does not. A refusal is a sentence, and a sentence cut at the
+ * panel's edge is not one anybody can act on. */
+static void view_status_rows(struct nk_context *ctx, const char *text)
+{
+    float height;
+    int lines = view_status_lines(ctx, text, &height);
+
+    nk_layout_row_dynamic(ctx, height, 1);
+    if (lines == 1)
         nk_label(ctx, text, NK_TEXT_LEFT);
-    } else {
-        float line = f->height + 2.0f * ctx->style.text.padding.y;
-
-        nk_layout_row_dynamic(ctx, CRAW_MAX(VIEW_ROW, (float)lines * line + 4.0f), 1);
+    else
         nk_label_wrap(ctx, text);
-    }
 }
 
 /* The sound row of the Video block: a combo of the six modes, with the
@@ -2954,7 +2964,9 @@ static void view_panel_clip(struct nk_context *ctx, struct view_state *st)
 }
 
 /* The bottom of the panel, while files are marked for deletion
- * (Shift+Alt+Delete, struct view_bin): the button that deletes them, and
+ * (Shift+Alt+Delete, struct view_bin), down at its bottom edge while the
+ * sections above leave room and after the last of them when they do not:
+ * the button that deletes them, and
  * beside it whether the file on screen is one of them - with its JPEG
  * when a still has one. Under them, what went wrong with the last press,
  * if anything did. Nothing at all while nothing is marked. */
@@ -2967,6 +2979,36 @@ static void view_panel_bin(struct nk_context *ctx, struct view_state *st)
     if (!bin->entries || (!bin->nb_marked && !bin->status[0]))
         return;
     b = &bin->entries[st->clip];
+
+    /* Pushed down by a row as tall as the room left under the sections:
+     * where the next row would start is measured on a row of one pixel,
+     * and every row costs the window's spacing after it. Short of the
+     * bottom by a few pixels, so that the panel never comes out a pixel
+     * taller than its window and scrolls for nothing. The rows are filled
+     * with nk_spacer(), not nk_spacing(): spacing that fills a row starts
+     * the next one at the same height, which doubled the push. */
+    {
+        float sp = ctx->style.window.spacing.y;
+        float need = 6.0f + sp, top, gap, status_h;
+        struct nk_rect region = nk_window_get_content_region(ctx);
+
+        if (bin->nb_marked)
+            need += VIEW_ROW + sp;
+        if (bin->status[0]) {
+            view_status_lines(ctx, bin->status, &status_h);
+            need += status_h + sp;
+        }
+
+        nk_layout_row_dynamic(ctx, 1.0f, 1);
+        top = nk_widget_bounds(ctx).y;
+        nk_spacer(ctx);
+
+        gap = region.y + region.h - 4.0f - (top + 1.0f + 2.0f * sp) - need;
+        if (gap >= 1.0f) {
+            nk_layout_row_dynamic(ctx, gap, 1);
+            nk_spacer(ctx);
+        }
+    }
 
     nk_layout_row_dynamic(ctx, 6.0f, 1);
     nk_rule_horizontal(ctx, nk_rgba(80, 80, 92, 255), nk_false);
