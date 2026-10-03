@@ -660,6 +660,41 @@ static void craw_test_smoother(void)
     CHECK(ret == 0, "push failed: %d", ret);
     CHECK_NEAR(out.cct, 2900.0, 1e-2, "a low-confidence scene cut holds the track");
 
+    /* A seed puts the track where the caller says, with or without one,
+     * and the pushes after it play by the rules: an unsure reading holds
+     * it, a confident one at a cut replaces it. */
+    {
+        CRAWIlluminant at = { .cct = 6200.0f, .tint = 0.02f };
+
+        craw_awb_smoother_reset(sm);
+        t += frame;
+        craw_awb_smoother_set(sm, t, &at);
+        t += frame;
+        est = craw_test_est(8000.0, 0.0, 0.1);
+        ret = craw_awb_smoother_push(sm, t, &est, true, &out);
+        CHECK(ret == 0, "a seeded track takes a push: %d", ret);
+        CHECK_NEAR(out.cct, 6200.0, 1e-2, "an unsure reading at a cut leaves the seed");
+        CHECK_NEAR(out.tint, 0.02, 1e-6, "and its tint");
+        t += frame;
+        est = craw_test_est(3000.0, 0.0, 1.0);
+        ret = craw_awb_smoother_push(sm, t, &est, true, &out);
+        CHECK(ret == 0, "push failed: %d", ret);
+        CHECK_NEAR(out.cct, 3000.0, 1e-2, "a confident reading at a cut replaces the seed");
+
+        /* One that is not an illuminant changes nothing. */
+        at.cct = 0.0f;
+        craw_awb_smoother_set(sm, t, &at);
+        t += frame;
+        est = craw_test_est(8000.0, 0.0, 0.1);
+        ret = craw_awb_smoother_push(sm, t, &est, false, &out);
+        CHECK(ret == 0 && fabs(out.cct - 3000.0) < 1e-2,
+              "a seed with no illuminant must be ignored");
+
+        /* Back where the gap check below expects the track. */
+        at = (CRAWIlluminant) { .cct = 2900.0f, .tint = 0.0f };
+        craw_awb_smoother_set(sm, t, &at);
+    }
+
     /* A long gap must not turn into an unbounded jump: dt is clamped to a
      * second, so at most one second worth of slew happens. */
     est = craw_test_est(7000.0, 0.0, 1.0);

@@ -28,6 +28,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/dict.h>
+#include <libavutil/display.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/time.h>
@@ -1001,6 +1002,10 @@ struct tool_buffers {
     size_t rgba_values;
     float *channel;
     size_t channel_values;
+    /* The turned picture, when the clip or the still says the camera was on
+     * its side (tool_turn()). */
+    float *turned;
+    size_t turned_values;
 };
 
 /* On failure the old buffer is released and NULL comes back, so the
@@ -1030,6 +1035,7 @@ static void tool_buffers_free(struct tool_buffers *b)
     free(b->half);
     free(b->rgba);
     free(b->channel);
+    free(b->turned);
     *b = (struct tool_buffers) { 0 };
 }
 
@@ -1306,6 +1312,9 @@ struct tool_awb {
     CRAWAwbParams params;
     CRAWIlluminant illum;
     bool have_illum;
+    /* The track has been seeded with the camera's own balance, which
+     * happens at the first frame: see tool_awb_step(). */
+    bool seeded;
 };
 
 /* Reads back the histogram the frame that was just submitted built, turns
@@ -1332,7 +1341,27 @@ static int tool_awb_step(struct tool_awb *awb, CRAWPipeline *pipe,
         return ret;
     }
 
-    ret = craw_awb_smoother_push(awb->smoother, pts_s, &est, false, &out);
+    /* The track starts where the camera was: its as-shot gains, put on the
+     * profile's locus, are the seed, and the first reading is a cut from
+     * there - taken whole when it is confident, left alone when it is not.
+     * Without the seed the first reading started the track whatever its
+     * confidence, and a night alley the estimator was 1% sure of came out
+     * blue where the camera, and RawTherapee, kept it warm; with the gate
+     * and no seed Auto did nothing at all on a frame like that. */
+    if (!awb->seeded) {
+        CRAWIlluminant seed;
+
+        if (prof->as_shot_wb[0] > 0.0f && prof->as_shot_wb[2] > 0.0f &&
+            craw_profile_neutral_to_illuminant(prof, 1.0f / prof->as_shot_wb[0],
+                                               1.0f / prof->as_shot_wb[2], &seed) >= 0) {
+            craw_awb_smoother_set(awb->smoother, pts_s, &seed);
+            awb->illum = seed;
+            awb->have_illum = true;
+        }
+        awb->seeded = true;
+    }
+
+    ret = craw_awb_smoother_push(awb->smoother, pts_s, &est, index == 0, &out);
     if (ret < 0 && ret != CRAW_ERROR(EAGAIN)) {
         fprintf(stderr, "craw_awb_smoother_push failed: %d\n", ret);
         return ret;
@@ -1902,6 +1931,98 @@ static bool tool_frame_crop(const struct tool_cfg *cfg, const AVFrame *frame,
  * to the frame. Done on the host after the download: the pipeline has no
  * notion of a region of interest and every stage's stencil should see the
  * same neighbours it would in a full frame. */
+/* The quarter turns counter-clockwise that put the picture upright, out of
+ * the display matrix a clip carries in its stream's coded side data and a
+ * still in its frame's (the RW2 decoder makes one from the file's Exif
+ * orientation), or 0. The same reading as cineview's
+ * view_apply_display_matrix(): av_display_rotation_get() is the angle the
+ * matrix turns the frame counter-clockwise to display it, which the Lumix
+ * writes as 90 on every clip shot on its side and ffmpeg's autorotate
+ * answers with `transpose=cclock`. A matrix that is not a quarter turn
+ * needs a resample and a mirror is not a rotation, so either leaves the
+ * picture as decoded and says so, once. */
+static int tool_frame_turn(const AVFrame *frame, const AVStream *st, bool *said)
+{
+    const AVFrameSideData *fsd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
+    const int32_t *m = NULL;
+    double angle;
+    int64_t det;
+    int deg;
+
+    if (fsd && fsd->size >= 9 * sizeof(int32_t)) {
+        m = (const int32_t *)fsd->data;
+    } else if (st) {
+        const AVPacketSideData *psd =
+            av_packet_side_data_get(st->codecpar->coded_side_data,
+                                    st->codecpar->nb_coded_side_data,
+                                    AV_PKT_DATA_DISPLAYMATRIX);
+
+        if (psd && psd->size >= 9 * sizeof(int32_t))
+            m = (const int32_t *)psd->data;
+    }
+    if (!m)
+        return 0;
+
+    angle = av_display_rotation_get(m);
+    deg = isnan(angle) ? 0 : ((int)lrint(angle) % 360 + 360) % 360;
+    det = (int64_t)m[0] * m[4] - (int64_t)m[1] * m[3];
+    if (isnan(angle) || fabs(angle - lrint(angle)) > 0.5 || deg % 90 || det <= 0) {
+        if (!*said)
+            fprintf(stderr, "the display matrix is not a quarter turn; the "
+                            "picture is written as it was decoded\n");
+        *said = true;
+        return 0;
+    }
+
+    return deg / 90;
+}
+
+/* Turns the picture `ccw` quarter turns counter-clockwise, in place as far
+ * as the caller can tell. The crop, when there is one, has already been
+ * cut in the source's own pixels, which is where --crop is given. */
+static int tool_turn(struct tool_buffers *b, uint32_t *w, uint32_t *h, int ccw)
+{
+    const uint32_t sw = *w, sh = *h;
+    const uint32_t dw = ccw & 1 ? sh : sw, dh = ccw & 1 ? sw : sh;
+    const float *src = b->rgba;
+    float *dst, *swap;
+
+    if (!ccw)
+        return 0;
+
+    b->turned = tool_grow(b->turned, &b->turned_values, (size_t)sw * sh * 4,
+                          sizeof(*b->turned));
+    if (!b->turned)
+        return CRAW_ERROR(ENOMEM);
+    dst = b->turned;
+
+    for (uint32_t y = 0; y < dh; y++) {
+        for (uint32_t x = 0; x < dw; x++) {
+            uint32_t sx, sy;
+
+            switch (ccw) {
+            case 1:  sx = sw - 1 - y; sy = x;          break;
+            case 2:  sx = sw - 1 - x; sy = sh - 1 - y; break;
+            default: sx = y;          sy = sh - 1 - x; break;
+            }
+            memcpy(dst + ((size_t)y * dw + x) * 4, src + ((size_t)sy * sw + sx) * 4,
+                   4 * sizeof(float));
+        }
+    }
+
+    /* The two buffers trade places, so the next frame turns into the one
+     * this frame was developed into. */
+    swap = b->rgba;
+    b->rgba = b->turned;
+    b->turned = swap;
+    b->rgba_values = (size_t)dw * dh * 4;
+    b->turned_values = (size_t)sw * sh * 4;
+    *w = dw;
+    *h = dh;
+
+    return 0;
+}
+
 static void tool_crop(const int64_t crop[4], float *rgba, uint32_t *w, uint32_t *h)
 {
     int64_t x0 = CRAW_MIN(crop[0], (int64_t)*w - 1);
@@ -2264,6 +2385,7 @@ int main(int argc, char **argv)
     struct tool_gpu gpu = { 0 };
     struct tool_buffers buf = { 0 };
     struct tool_awb awb = { 0 };
+    bool turn_said = false;
     struct tool_noise_run noise_run = { 0 };
     struct tool_prof prof_run = { 0 };
     CRAWContextOptions ctx_opts = { 0 };
@@ -2704,6 +2826,32 @@ have_device:
             ret = tool_awb_step(&awb, gpu.pipe, &prof, pts_s, processed, cfg.verbose);
             if (ret < 0)
                 goto fail;
+
+            /* The reading is applied to the next frame, which the first
+             * frame of a run never was: it went out as shot, and a still
+             * is nothing but a first frame, so --wb auto did nothing to it
+             * at all. The first frame is developed once more with its own
+             * reading - the histogram it builds is of the sensor's response
+             * with the balance divided out, so the reading does not move -
+             * as a replay, so the temporal average is not fed it twice. */
+            if (!processed && awb.have_illum) {
+                fp.wb_mode = CRAW_WB_REBALANCE;
+                fp.illuminant = awb.illum;
+                fp.denoise_temporal_replay = true;
+
+                t0 = av_gettime_relative();
+                ret = craw_testdev_run(&gpu.td, tool_record_cb, &rec);
+                develop_ms += (double)(av_gettime_relative() - t0) / 1000.0;
+                if (ret < 0) {
+                    fprintf(stderr, "the submission failed: %d\n", ret);
+                    goto fail;
+                }
+                fp.denoise_temporal_replay = false;
+                if (cfg.verbose)
+                    fprintf(stderr, "frame %5" PRId64 " developed again at its own "
+                                    "reading, cct %.0f tint %+.4f\n", processed,
+                            awb.illum.cct, awb.illum.tint);
+            }
         }
 
         /* ------------------------------------------------- download */
@@ -2719,6 +2867,24 @@ have_device:
             if (have_crop) {
                 tool_crop(crop, buf.rgba, &w, &h);
                 npix = (size_t)w * h;
+            }
+
+            /* Upright, as the camera says the picture is to be looked at:
+             * a portrait still comes out 4000x6000, a clip shot on its side
+             * the same way cineview shows it and writes it. */
+            {
+                int turn = tool_frame_turn(frame, dec.fmt->streams[dec.stream_index],
+                                           &turn_said);
+
+                if (turn) {
+                    ret = tool_turn(&buf, &w, &h, turn);
+                    if (ret < 0)
+                        goto fail;
+                    npix = (size_t)w * h;
+                    if (cfg.verbose && !processed)
+                        fprintf(stderr, "turned %d degrees counter-clockwise, "
+                                        "written %ux%u\n", 90 * turn, w, h);
+                }
             }
         }
 

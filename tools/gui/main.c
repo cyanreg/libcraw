@@ -1565,10 +1565,26 @@ static bool view_awb_paused(const struct view_state *st)
            !st->cfg.headless;
 }
 
+/* The camera's own balance as an illuminant: a raw clip's as-shot gains
+ * put on the profile's locus, a developed clip's recorded temperature on
+ * its own. */
+static bool view_wb_as_shot(const struct view_state *st, CRAWIlluminant *out)
+{
+    const float *wb = st->prof.as_shot_wb;
+
+    if (!st->dec.raw)
+        return view_vwb_as_shot(st, out);
+    return st->have_prof && st->prof.nb_wb_knots >= 2 && wb[0] > 0.0f &&
+           wb[2] > 0.0f &&
+           craw_profile_neutral_to_illuminant(&st->prof, 1.0f / wb[0],
+                                              1.0f / wb[2], out) >= 0;
+}
+
 void view_awb_follow(struct view_state *st)
 {
     const CRAWAwbEstimate *est = &st->awb.last;
     CRAWIlluminant out;
+    bool cut = st->awb.cut;
     int ret;
 
     /* One frame period per estimate rather than the clip's pts: the filter
@@ -1576,7 +1592,28 @@ void view_awb_follow(struct view_state *st)
      * time (see struct view_awb). */
     st->awb.clock += view_frame_duration(st);
 
-    ret = craw_awb_smoother_push(st->awb.smoother, st->awb.clock, est, false, &out);
+    /* The track starts where the camera was, and the clip's first reading
+     * is a cut from there: taken whole when it is confident, left alone
+     * when it is not. Started on the first reading whatever its
+     * confidence, a night alley the estimator was 1% sure of came out blue
+     * where the camera, and RawTherapee, kept it warm; gated with no seed,
+     * Auto did nothing at all on such a frame. From the seed on, a confident
+     * reading moves the track at the smoother's pace and an unsure one
+     * holds it, which on a clip the estimator is unsure of throughout is
+     * the camera's balance. */
+    if (!st->awb.seeded) {
+        CRAWIlluminant seed;
+
+        if (view_wb_as_shot(st, &seed)) {
+            craw_awb_smoother_set(st->awb.smoother, st->awb.clock, &seed);
+            st->awb.illum = seed;
+            st->awb.have_illum = true;
+        }
+        st->awb.seeded = true;
+    }
+    st->awb.cut = false;
+
+    ret = craw_awb_smoother_push(st->awb.smoother, st->awb.clock, est, cut, &out);
     /* EAGAIN means there is no track yet and this estimate cannot start
      * one, so the picture stays on whatever the last good one left. */
     if (ret >= 0) {
@@ -1588,7 +1625,7 @@ void view_awb_follow(struct view_state *st)
                  " -> track %s cct %5.0f tint %+.4f\n",
              st->index, est->valid ? "ok" : "invalid",
              est->illuminant.cct, est->illuminant.tint, est->confidence,
-             ret >= 0 ? "moved" : "held",
+             ret < 0 ? "held" : cut ? "cut" : "moved",
              st->awb.have_illum ? st->awb.illum.cct : 0.0f,
              st->awb.have_illum ? st->awb.illum.tint : 0.0f);
 }
@@ -3506,6 +3543,8 @@ static int view_open_clip(struct view_state *st, int index, bool first)
 
     craw_awb_smoother_reset(st->awb.smoother);
     st->awb.have_illum = false;
+    st->awb.seeded = false;
+    st->awb.cut = true;
     st->vwb.gen++;
     st->vwb.converging = false;
 

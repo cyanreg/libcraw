@@ -153,6 +153,16 @@ CRAW_API void craw_awb_smoother_free(CRAWAwbSmoother **sm);
 /* Forgets the track; the next push starts from its estimate. */
 CRAW_API void craw_awb_smoother_reset(CRAWAwbSmoother *sm);
 
+/* Puts the track at `illum` as of `pts_s`, starting one when there was
+ * none, whatever any estimate says: the seed. A viewer seeds a clip's
+ * track with the camera's own balance before the first estimate, so that
+ * Auto starts where the camera was and moves from there only on readings
+ * confident enough to be worth it (push, below), rather than starting on
+ * whatever the first frame happened to say. An illuminant that is not
+ * finite and positive is ignored. */
+CRAW_API void craw_awb_smoother_set(CRAWAwbSmoother *sm, double pts_s,
+                                    const CRAWIlluminant *illum);
+
 /* Feeds one frame's estimate at presentation time `pts_s` and returns the
  * smoothed illuminant to apply to that frame. The first valid estimate
  * starts the track, whatever its confidence: it is the best reading there

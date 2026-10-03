@@ -827,6 +827,12 @@ struct view_awb {
      * the glide a playing clip gets from its frames, a paused one gets from
      * its replays (view_awb_follow()). */
     bool pending;
+    /* The track is seeded with the camera's own balance at a clip's first
+     * reading (view_awb_follow()), and that first reading is a cut from
+     * the seed: taken whole when it is confident, left alone when it is
+     * not. Cleared at every clip open. */
+    bool seeded;
+    bool cut;
     /* What the smoother is given as time: one frame period per estimate,
      * not the clip's pts. The filter smooths over what the eye sees, and a
      * seek's jump in pts is not elapsed time; fed the pts, the smoother

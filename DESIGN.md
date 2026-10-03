@@ -502,11 +502,16 @@ Ambience: if `cct < knee`, `cct = cct + ambience * (knee - cct)` after the
 estimate, i.e. warm light is only partially corrected. The estimate is
 then clamped to `[cct_min, cct_max]`.
 
-Smoother: state is a mired value and a tint. On push: with no state, adopt
-the estimate if it is valid, whatever its confidence - the first reading is
-the track until a better one moves it; a track that waited for a confident
-start was never there at all on a clip the estimator is unsure of
-throughout - and fail with EAGAIN, output untouched, if it is invalid. With
+Smoother: state is a mired value and a tint. `craw_awb_smoother_set` seeds
+the state, which both tools do with the camera's own balance (the as-shot
+gains put on the profile's locus) before a clip's first reading, and the
+first reading is pushed as a `scene_cut`: adopted when confident, held
+when not. Seven S1M2 stills against RawTherapee's temperature correlation
+settled this: a night alley the estimator was 1% sure of started the track
+blue where the camera and RawTherapee kept it warm, and with the gate and
+no seed Auto did nothing on such a frame at all. On push: with no state,
+adopt the estimate if it is valid, whatever its confidence (the unseeded
+fallback), and fail with EAGAIN, output untouched, if it is invalid. With
 `scene_cut`, adopt the estimate when it is valid and its confidence reaches
 `min_confidence`. Else if `est.valid && est.confidence >= min_confidence`:
 target = estimate; ignore the change if `|target - state| <

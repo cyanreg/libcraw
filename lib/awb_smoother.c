@@ -90,6 +90,19 @@ void craw_awb_smoother_reset(CRAWAwbSmoother *sm)
     sm->last_pts = 0.0;
 }
 
+void craw_awb_smoother_set(CRAWAwbSmoother *sm, double pts_s,
+                           const CRAWIlluminant *illum)
+{
+    if (!sm || !illum || !isfinite(illum->cct) || !(illum->cct > 0.0f) ||
+        !isfinite(illum->tint))
+        return;
+
+    sm->mired = 1e6 / (double)illum->cct;
+    sm->tint = illum->tint;
+    sm->have_state = true;
+    sm->last_pts = pts_s;
+}
+
 int craw_awb_smoother_push(CRAWAwbSmoother *sm, double pts_s,
                            const CRAWAwbEstimate *est, bool scene_cut,
                            CRAWIlluminant *out)

@@ -67,7 +67,12 @@ the GPU pipeline and writes PNG (16 bit), TIFF (16 bit, uncompressed), PFM
 (linear float) or PPM (8 bit, dithered, because a denoised shadow gradient
 bands without it) sequences. A still - an RW2, or any input with one frame
 - and a run of `--frames 1` may name one file instead of a sequence
-pattern. The options that matter most:
+pattern. Every frame is written upright, turned by the display matrix a
+clip carries in its stream and a still in its Exif orientation, so a
+portrait comes out 4000x6000. `--wb auto` reads the first frame and
+develops it again at its own reading, so a still is balanced too; the
+reading is taken when the estimator is confident of it and the camera's
+own balance kept when it is not. The options that matter most:
 
     cineraw --wb auto -v --frames 30 clip.MOV        estimate the illuminant
     cineraw --wb 5600:0.02 --ei 400 -o out_%05d.png clip.MOV
@@ -276,12 +281,15 @@ paused picture is shown its own frame's estimate whatever the confidence
 its confidence and the track — and a seek while paused re-estimates for
 the frame it lands on.
 
-Auto never jumps: the balance glides to each new reading through the same
-smoothing whether the clip is playing or paused, so a paused picture
-settles to its own frame's reading and a seek settles to the new frame's.
-The first reading of a clip starts the balance whatever the estimator's
-confidence in it (the panel prints the confidence beside the result);
-after that only confident readings move it.
+Auto starts where the camera was - its as-shot balance - and the clip's
+first reading is taken whole when the estimator is confident of it and
+left alone when it is not (the panel prints the confidence beside the
+result). From there on it never jumps: the balance glides to each new
+confident reading through the same smoothing whether the clip is playing
+or paused, so a paused picture settles to its own frame's reading and a
+seek settles to the new frame's, and readings the estimator is unsure of
+hold it. A scene it is unsure of throughout, a filament on black, stays at
+the camera's balance, which is what RawTherapee does with it too.
 
 The White balance section's "pick white" button is the spot white balance
 of every raw developer: press it, and the next left click on the picture
