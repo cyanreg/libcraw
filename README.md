@@ -179,7 +179,9 @@ Up and Page Down zoom in and out, and Shift with them goes to the first and
 last frame; `,` and `.` step one frame back and forward and pause the clip;
 Control with the arrows pans; Tab or `0` fits the picture again
 and `1` is one to one; the wheel zooms about the pointer and a left drag
-pans; `r` and `t` go to the previous and the next file; Ctrl+1 and Ctrl+2
+pans; `r` and `t` go to the previous and the next file, and held, walk on
+through them, a file per key repeat once the one before is on screen;
+Ctrl+1 and Ctrl+2
 mark the start and the end of the video export at the frame on screen, the
 whole clip being the default; `m` mutes; Escape closes an open menu, calls
 off an armed "pick white", and otherwise quits, as `q` does. Zoom and pan

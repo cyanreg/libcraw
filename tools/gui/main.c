@@ -3766,8 +3766,9 @@ static void view_seek_by(struct view_state *st, int64_t frames)
  * picture is larger than its area; c turns crop mode on and off; r and t
  * walk the files the command line was given. The panel is the pointer's:
  * Up, Down and Enter do nothing at all, since there is no focus through
- * its rows for them to move. A key that toggles, seeks or changes clip
- * acts once per press, the ones that step act on every repeat. */
+ * its rows for them to move. A key that toggles or seeks acts once per
+ * press; the ones that step act on every repeat, and so do r and t, a
+ * file at a time. */
 static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *running)
 {
     bool shift = (e->key.mod & SDL_KMOD_SHIFT) != 0;
@@ -3934,12 +3935,15 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
      * through a card's worth of files, so the repeats are ignored the way
      * every other toggle's are. */
     case SDLK_R:
-        if (!repeat)
-            view_switch_clip(st, -1);
-        break;
     case SDLK_T:
-        if (!repeat)
-            view_switch_clip(st, 1);
+        /* Held, the key walks on: a file per repeat, at the rate the
+         * compositor sets, each once the one before it is on screen - so
+         * a hold goes as fast as the files load and no faster, and the
+         * repeats that queue while one loads are not a leap over the
+         * files between (the switch is synchronous and clears the frame,
+         * which the next frame decoded sets again). */
+        if (!repeat || st->have_frame)
+            view_switch_clip(st, e->key.key == SDLK_T ? 1 : -1);
         break;
 
     case SDLK_ESCAPE:
