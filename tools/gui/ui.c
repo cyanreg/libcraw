@@ -2953,6 +2953,40 @@ static void view_panel_clip(struct nk_context *ctx, struct view_state *st)
     }
 }
 
+/* The bottom of the panel, while files are marked for deletion
+ * (Shift+Alt+Delete, struct view_bin): the button that deletes them, and
+ * beside it whether the file on screen is one of them - with its JPEG
+ * when a still has one. Under them, what went wrong with the last press,
+ * if anything did. Nothing at all while nothing is marked. */
+static void view_panel_bin(struct nk_context *ctx, struct view_state *st)
+{
+    const struct view_bin *bin = &st->bin;
+    const struct view_bin_entry *b;
+    char label[48];
+
+    if (!bin->entries || (!bin->nb_marked && !bin->status[0]))
+        return;
+    b = &bin->entries[st->clip];
+
+    nk_layout_row_dynamic(ctx, 6.0f, 1);
+    nk_rule_horizontal(ctx, nk_rgba(80, 80, 92, 255), nk_false);
+
+    if (bin->nb_marked) {
+        snprintf(label, sizeof(label), "delete %d marked", bin->nb_marked);
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        if (nk_button_label(ctx, label))
+            st->bin.go = true;
+        if (b->marked)
+            nk_label_colored(ctx, b->jpg ? "this one, and its JPEG" : "this one",
+                             NK_TEXT_LEFT, nk_rgba(235, 110, 100, 255));
+        else
+            nk_label(ctx, "", NK_TEXT_LEFT);
+    }
+
+    if (bin->status[0])
+        view_status_rows(ctx, bin->status);
+}
+
 static void view_panel(struct nk_context *ctx, struct view_state *st)
 {
     struct view_look *lk = &st->look;
@@ -3227,6 +3261,8 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         view_section_end(ctx);
     }
 
+    view_panel_bin(ctx, st);
+
     /* The end of the lock. nuklear's disable rewrites the style in place
      * and only its end puts the colours back, so this has to be the real
      * end whenever the top of the panel began one - not the lock-aware
@@ -3350,6 +3386,53 @@ static void view_crop_draw(struct nk_context *ctx, struct view_state *st)
     nk_style_pop_vec2(ctx);
 }
 
+/* A red frame round the picture while the file on screen is marked for
+ * deletion (struct view_bin), so that a marked file cannot be looked at
+ * without it being plain. Drawn inside the picture's own edges, on the
+ * same whole pixels the crop shade uses: outside them it would fall in the
+ * letterbox of a fitted picture but off the screen of a zoomed one, and
+ * the frame has to be there whichever. */
+static void view_bin_draw(struct nk_context *ctx, struct view_state *st)
+{
+    const float t = 4.0f;
+    pl_rect2df src, dst;
+    int x0, y0, x1, y1;
+
+    if (!st->bin.entries || !st->bin.entries[st->clip].marked || !st->have_frame)
+        return;
+
+    view_zoom_rects(st, &src, &dst);
+    x0 = (int)lroundf(dst.x0);
+    y0 = (int)lroundf(dst.y0);
+    x1 = (int)lroundf(dst.x1);
+    y1 = (int)lroundf(dst.y1);
+    if (x1 - x0 < 4 * (int)t || y1 - y0 < 4 * (int)t)
+        return;
+
+    nk_style_push_vec2(ctx, &ctx->style.window.padding, nk_vec2(0.0f, 0.0f));
+    nk_style_push_style_item(ctx, &ctx->style.window.fixed_background,
+                             nk_style_item_color(nk_rgba(0, 0, 0, 0)));
+    if (nk_begin(ctx, "cineview-bin",
+                 nk_rect((float)x0, (float)y0, (float)(x1 - x0), (float)(y1 - y0)),
+                 NK_WINDOW_NO_SCROLLBAR | NK_WINDOW_NO_INPUT |
+                 NK_WINDOW_BACKGROUND)) {
+        struct nk_command_buffer *out = nk_window_get_canvas(ctx);
+        struct nk_color red = nk_rgba(225, 40, 30, 255);
+
+        /* Four bands rather than a stroke, for the same reason the crop
+         * shade is bands: whole pixels, and edges that meet exactly. */
+        nk_fill_rect(out, nk_rect((float)x0, (float)y0, (float)(x1 - x0), t), 0.0f, red);
+        nk_fill_rect(out, nk_rect((float)x0, (float)y1 - t, (float)(x1 - x0), t), 0.0f, red);
+        nk_fill_rect(out, nk_rect((float)x0, (float)y0 + t, t,
+                                  (float)(y1 - y0) - 2.0f * t), 0.0f, red);
+        nk_fill_rect(out, nk_rect((float)x1 - t, (float)y0 + t, t,
+                                  (float)(y1 - y0) - 2.0f * t), 0.0f, red);
+    }
+    nk_end(ctx);
+    nk_style_pop_style_item(ctx);
+    nk_style_pop_vec2(ctx);
+}
+
 void view_ui_build(struct view_state *st)
 {
     float h = (float)st->gpu.ui_h - 2 * VIEW_UI_MARGIN;
@@ -3357,8 +3440,9 @@ void view_ui_build(struct view_state *st)
     st->ui_edit_active = false;
     st->menu.anchored = false;
 
-    /* Before the panel, which is what puts the panel on top of it. */
+    /* Before the panel, which is what puts the panel on top of them. */
     view_crop_draw(view_nk, st);
+    view_bin_draw(view_nk, st);
 
     if (nk_begin(view_nk, "cineview",
                  nk_rect((float)st->gpu.ui_w - VIEW_UI_WIDTH - VIEW_UI_MARGIN,

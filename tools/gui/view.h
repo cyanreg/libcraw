@@ -762,11 +762,31 @@ void view_trace_pass(void *priv, const struct pl_render_info *info);
 
 /* --------------------------------------------------------- program state */
 
+/* The files marked for deletion. Shift+Alt+Delete marks the file on
+ * screen and the same keys unmark it; nothing is deleted until the
+ * panel's button, at the bottom, is pressed, and then every marked file
+ * is, and taken out of the playlist. A marked still takes the camera's
+ * JPEG beside it along, found when it is marked. One entry per playlist
+ * entry, in the same order. */
+struct view_bin_entry {
+    bool marked;
+    char *jpg;                  /* av_asprintf()ed, or NULL */
+};
+
+struct view_bin {
+    struct view_bin_entry *entries;
+    int nb_marked;
+    bool go;                    /* the button was pressed; main.c acts */
+    char status[192];           /* what the last press did, if worth saying */
+};
+
 struct view_cfg {
     /* The playlist: every non-option argument, in the order they were
      * given, and `input` the one clip that is open. `r` and `t` walk the
-     * list; a headless export only ever looks at the first entry. */
-    char *const *inputs;
+     * list; a headless export only ever looks at the first entry. A copy
+     * of argv's pointers, so that deleting files (struct view_bin) can
+     * take them out of it. */
+    char **inputs;
     int nb_inputs;
     const char *input;
 
@@ -1249,6 +1269,7 @@ struct view_state {
     bool ui_edit_active;        /* a text field is being typed into */
     struct view_lut_menu menu;
     struct view_sections sections;
+    struct view_bin bin;
 
     /* `q` during a video export: the run is cancelled and the program
      * quits once the file has its trailer, rather than leaving a file

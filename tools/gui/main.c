@@ -15,13 +15,18 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <strings.h>
+#include <unistd.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
+#include <libavutil/avstring.h>
+#include <libavutil/mem.h>
 #include <libavutil/time.h>
 
 #include "view.h"
@@ -2500,6 +2505,11 @@ static void view_usage(FILE *f)
 "read again. A headless export (--export, --export-video) uses the first\n"
 "file and ignores the rest.\n"
 "\n"
+"Shift+Alt+Delete marks the file on screen for deletion, a still with the\n"
+"camera's JPEG of the same name beside it, and the same keys unmark it.\n"
+"Nothing is deleted until the button at the bottom of the panel is pressed;\n"
+"then every marked file is, for good, and leaves the playlist.\n"
+"\n"
 "  --device SUBSTR     use the Vulkan device whose name contains SUBSTR\n"
 "  --debug             turn the Vulkan validation layer on\n"
 "  --bench             play as fast as the pipeline allows instead of at the\n"
@@ -3273,8 +3283,13 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         return CRAW_ERROR(EINVAL);
     }
 
-    st->cfg.inputs = argv + optind;
     st->cfg.nb_inputs = argc - optind;
+    st->cfg.inputs = calloc((size_t)st->cfg.nb_inputs, sizeof(*st->cfg.inputs));
+    st->bin.entries = calloc((size_t)st->cfg.nb_inputs, sizeof(*st->bin.entries));
+    if (!st->cfg.inputs || !st->bin.entries)
+        return CRAW_ERROR(ENOMEM);
+    memcpy(st->cfg.inputs, argv + optind,
+           (size_t)st->cfg.nb_inputs * sizeof(*st->cfg.inputs));
     st->cfg.input = st->cfg.inputs[0];
 
     return 0;
@@ -3668,6 +3683,7 @@ static void view_switch_clip(struct view_state *st, int delta)
 
     want = (st->clip + delta + st->cfg.nb_inputs) % st->cfg.nb_inputs;
     name = st->cfg.inputs[want];
+    st->bin.status[0] = '\0';
 
     if (!view_clip_probe(name, err, sizeof(err))) {
         snprintf(st->clip_status, sizeof(st->clip_status), "%s: %.80s",
@@ -3698,6 +3714,189 @@ static void view_switch_clip(struct view_state *st, int delta)
                  "%.60s could not be opened",
                  strrchr(name, '/') ? strrchr(name, '/') + 1 : name);
     }
+}
+
+/* ------------------------------------------------------------- the bin */
+
+/* The camera's JPEG of a still shot as raw and JPEG: the same name in the
+ * same directory with a .jpg or .jpeg extension in any case, as a camera
+ * writes _1000406.RW2 and _1000406.JPG. NULL when there is none, and never
+ * the file itself. */
+static char *view_bin_jpg(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    const char *file = slash ? slash + 1 : path;
+    const char *dot = strrchr(file, '.');
+    size_t stem = dot ? (size_t)(dot - file) : strlen(file);
+    char *dir, *found = NULL;
+    struct dirent *de;
+    DIR *d;
+
+    dir = slash == path ? av_strdup("/")
+        : slash ? av_strndup(path, (size_t)(slash - path)) : av_strdup(".");
+    if (!dir)
+        return NULL;
+    d = opendir(dir);
+    av_free(dir);
+    if (!d)
+        return NULL;
+
+    while ((de = readdir(d))) {
+        const char *ext = de->d_name + stem;
+
+        if (strlen(de->d_name) <= stem || strncmp(de->d_name, file, stem) ||
+            (strcasecmp(ext, ".jpg") && strcasecmp(ext, ".jpeg")) ||
+            !strcmp(de->d_name, file))
+            continue;
+        found = av_asprintf("%.*s%s", (int)(file - path), path, de->d_name);
+        break;
+    }
+    closedir(d);
+
+    return found;
+}
+
+/* Shift+Alt+Delete: the file on screen goes on the list, or comes off it.
+ * Whether it is an image is known now, with it open, so its JPEG is looked
+ * for now as well. */
+static void view_bin_toggle(struct view_state *st)
+{
+    struct view_bin_entry *b = &st->bin.entries[st->clip];
+    const char *name = strrchr(st->cfg.input, '/');
+
+    name = name ? name + 1 : st->cfg.input;
+    st->bin.status[0] = '\0';
+
+    if (b->marked) {
+        b->marked = false;
+        av_freep(&b->jpg);
+        st->bin.nb_marked--;
+        fprintf(stderr, "%s: no longer marked for deletion\n", name);
+        return;
+    }
+
+    b->marked = true;
+    st->bin.nb_marked++;
+    if (st->dec.still)
+        b->jpg = view_bin_jpg(st->cfg.input);
+    fprintf(stderr, "%s: marked for deletion%s%s\n", name,
+            b->jpg ? ", with " : "", b->jpg ? b->jpg : "");
+}
+
+/* One file gone, or why not. A file that is already gone counts as
+ * deleted: it is what was asked for. */
+static bool view_bin_unlink(struct view_state *st, const char *path)
+{
+    const char *name = strrchr(path, '/');
+
+    if (!unlink(path) || errno == ENOENT) {
+        fprintf(stderr, "deleted %s\n", path);
+        return true;
+    }
+
+    fprintf(stderr, "cannot delete %s: %s\n", path, strerror(errno));
+    if (!st->bin.status[0])
+        snprintf(st->bin.status, sizeof(st->bin.status), "%.80s: %s",
+                 name ? name + 1 : path, strerror(errno));
+    return false;
+}
+
+/* The button: every marked file and its JPEG deleted, and every file of
+ * the playlist that is no longer there taken out of it - the marked ones,
+ * and a JPEG that was in the playlist as well. The clip on screen stays if
+ * it is not one of them, and otherwise the next one left comes up, as `t`
+ * would have gone. A file that would not go stays marked, and the first
+ * reason is said under the button. False when no file is left to show. */
+static bool view_bin_empty(struct view_state *st)
+{
+    struct view_bin *bin = &st->bin;
+    int n = st->cfg.nb_inputs, kept = 0, files = 0, jpgs = 0;
+    int cur = st->clip, want = -1;
+    int *map;
+
+    bin->go = false;
+    bin->status[0] = '\0';
+
+    /* An export owns the decoder and is reading its clip. */
+    if (st->exp.active || st->video.active) {
+        snprintf(bin->status, sizeof(bin->status),
+                 "export running: nothing deleted");
+        return true;
+    }
+
+    map = malloc((size_t)n * sizeof(*map));
+    if (!map) {
+        snprintf(bin->status, sizeof(bin->status), "out of memory: nothing deleted");
+        return true;
+    }
+
+    for (int i = 0; i < n; i++) {
+        struct view_bin_entry *b = &bin->entries[i];
+
+        if (!b->marked || !view_bin_unlink(st, st->cfg.inputs[i]))
+            continue;
+        files++;
+        if (b->jpg && view_bin_unlink(st, b->jpg))
+            jpgs++;
+        av_freep(&b->jpg);
+        b->marked = false;
+    }
+
+    /* The playlist without what is no longer there. */
+    bin->nb_marked = 0;
+    for (int i = 0; i < n; i++) {
+        if (access(st->cfg.inputs[i], F_OK) < 0 && errno == ENOENT) {
+            map[i] = -1;
+            av_freep(&bin->entries[i].jpg);
+            continue;
+        }
+        map[i] = kept;
+        st->cfg.inputs[kept] = st->cfg.inputs[i];
+        bin->entries[kept] = bin->entries[i];
+        bin->nb_marked += bin->entries[kept].marked;
+        kept++;
+    }
+    st->cfg.nb_inputs = kept;
+
+    /* The fields that remember a clip by its place in the list. */
+    st->exp.field_clip = st->exp.field_clip >= 0 && st->exp.field_clip < n
+                       ? map[st->exp.field_clip] : -1;
+    st->video.field_clip = st->video.field_clip >= 0 && st->video.field_clip < n
+                         ? map[st->video.field_clip] : -1;
+
+    if (map[cur] >= 0) {
+        st->clip = map[cur];
+    } else {
+        for (int k = 1; k < n && want < 0; k++)
+            want = map[(cur + k) % n];
+    }
+    free(map);
+
+    fprintf(stderr, "deleted %d file%s and %d JPEG%s; %d file%s left\n",
+            files, files == 1 ? "" : "s", jpgs, jpgs == 1 ? "" : "s",
+            kept, kept == 1 ? "" : "s");
+
+    if (!kept) {
+        fprintf(stderr, "every file was deleted: there is nothing left to show\n");
+        view_close_clip(st);
+        return false;
+    }
+
+    if (want >= 0) {
+        char why[sizeof(bin->status)];
+
+        snprintf(why, sizeof(why), "%s", bin->status);
+        view_close_clip(st);
+        if (view_open_clip(st, want, false) < 0) {
+            fprintf(stderr, "%s: cannot be opened\n", st->cfg.inputs[want]);
+            snprintf(why, sizeof(why), "%.80s could not be opened",
+                     strrchr(st->cfg.inputs[want], '/')
+                     ? strrchr(st->cfg.inputs[want], '/') + 1 : st->cfg.inputs[want]);
+        }
+        snprintf(bin->status, sizeof(bin->status), "%s", why);
+    }
+
+    return true;
 }
 
 /* ----------------------------------------------------------------- main */
@@ -3773,6 +3972,7 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
 {
     bool shift = (e->key.mod & SDL_KMOD_SHIFT) != 0;
     bool ctrl = (e->key.mod & SDL_KMOD_CTRL) != 0;
+    bool alt = (e->key.mod & SDL_KMOD_ALT) != 0;
     bool repeat = e->key.repeat;
 
     view_log(st, "key: %s (scancode %d, sym 0x%x, mod 0x%x%s)\n",
@@ -3934,6 +4134,13 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
     /* The playlist, one clip per press: holding the key down would tear
      * through a card's worth of files, so the repeats are ignored the way
      * every other toggle's are. */
+    /* Marks the file on screen for deletion, or unmarks it. Nothing is
+     * deleted here: that is the panel's button (struct view_bin). */
+    case SDLK_DELETE:
+        if (shift && alt && !ctrl && !repeat)
+            view_bin_toggle(st);
+        break;
+
     case SDLK_R:
     case SDLK_T:
         /* Held, the key walks on: a file per repeat, at the rate the
@@ -4413,6 +4620,13 @@ static int view_run_window(struct view_state *st)
         }
         playing_seen = st->playing;
 
+        /* The panel's delete button, acted on here rather than in the
+         * panel, which is half built when it is pressed: a deletion can
+         * close the clip on screen and open another. Nothing left to show
+         * is the end of the run. */
+        if (st->bin.go && !view_bin_empty(st))
+            break;
+
         /* Keeps the audio ring topped up whatever the picture is doing.
          * An export owns the decoder while it runs, so the clock and the
          * ring are left alone until it is done. A slowed clip's track is
@@ -4725,6 +4939,11 @@ static void view_close(struct view_state *st)
         SDL_DestroyWindow(st->win);
     if (st->sdl_init)
         SDL_Quit();
+
+    for (int i = 0; st->bin.entries && i < st->cfg.nb_inputs; i++)
+        av_freep(&st->bin.entries[i].jpg);
+    free(st->bin.entries);
+    free(st->cfg.inputs);
 }
 
 /* Where a headless export's wall time goes, for -v: the device and the

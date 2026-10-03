@@ -181,6 +181,7 @@ Control with the arrows pans; Tab or `0` fits the picture again
 and `1` is one to one; the wheel zooms about the pointer and a left drag
 pans; `r` and `t` go to the previous and the next file, and held, walk on
 through them, a file per key repeat once the one before is on screen;
+Shift+Alt+Delete marks the file on screen for deletion and unmarks it again;
 Ctrl+1 and Ctrl+2
 mark the start and the end of the video export at the frame on screen, the
 whole clip being the default; `m` mutes; Escape closes an open menu, calls
@@ -402,6 +403,20 @@ clip is read again: its tables and as-shot values, its crop, its lens
 records, its metadata. A file that cannot be opened is reported and leaves
 the viewer on the clip it is showing, and `--export` and `--export-video`
 take the first file only.
+
+Going through a card's worth of files is also where the bad ones get
+thrown out. Shift+Alt+Delete marks the file on screen for deletion, and
+the same keys unmark it; a still is marked with the camera's JPEG of the
+same name beside it, `_1000406.JPG` with `_1000406.RW2`, when there is
+one. Nothing is deleted on a mark. A marked file is shown with a red frame
+round the picture. While anything is marked the bottom of
+the panel has a "delete N marked" button, and beside it whether the file
+on screen is one of them ("this one", or "this one, and its JPEG"). The
+button deletes every marked file, permanently rather than to a trash, and
+takes them out of the playlist; the clip on screen stays if it was not
+marked, and otherwise the next file left comes up. A file that will not go
+stays marked and the reason is said under the button. Deleting every file
+of the playlist ends the run, there being nothing left to show.
 
 It also carries 296 film simulation LUTs from
 [filmgrid.org](https://filmgrid.org/), which derive from the open-source
