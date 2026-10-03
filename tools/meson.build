@@ -81,6 +81,24 @@ if craw_tools_ffmpeg
         tools_args += '-DCRAW_TOOL_HAVE_EXPOSURE_INDEX=0'
     endif
 
+    # Panasonic RW2 stills need the RW2 member of the colour record
+    # (libavutil) and the codec (libavcodec), neither of which upstream
+    # FFmpeg has yet. Without them the tools develop ProRes RAW only, and an
+    # RW2 is refused like any other file that is not a raw camera clip.
+    if cc.has_header_symbol('libavutil/raw_color_params.h', 'AV_RAW_COLOR_PARAMS_RW2',
+                            dependencies: libavutil_dep) and \
+       cc.has_header_symbol('libavcodec/codec_id.h', 'AV_CODEC_ID_RW2',
+                            dependencies: libavcodec_dep)
+        tools_args += '-DCRAW_TOOL_HAVE_RW2=1'
+    else
+        tools_args += '-DCRAW_TOOL_HAVE_RW2=0'
+    endif
+
+    # tools/profiles.c builds a profile from a decoded frame, which the
+    # tools always can; tests/test_profile builds the same file without
+    # libavutil when there is none.
+    tools_args += '-DCRAW_TOOL_HAVE_LAVU=1'
+
     gui_args = tools_args
     gui_deps = []
     if swresample.found()
@@ -185,4 +203,5 @@ summary({
     'cineview': craw_tools_gui,
     'cineview audio': craw_tools_gui and swresample.found(),
     'cineview Wayland colour': craw_tools_gui and have_wl_colour,
+    'RW2 stills': craw_tools_ffmpeg and tools_args.contains('-DCRAW_TOOL_HAVE_RW2=1'),
 }, section: 'tools', bool_yn: true)

@@ -40,13 +40,44 @@ foreach t : [ 'test_ref_debayer', 'test_awb' ]
     test(t, exe, timeout: 120)
 endforeach
 
-# test_profile also checks the tools' built-in S1M2 noise table, so it
-# builds tools/profiles.c in, which needs nothing but libcraw.
+# test_profile also checks the tools' built-in S1M2 noise table and the
+# profile the tools build from a decoded frame, so it builds
+# tools/profiles.c in. The frame half needs libavutil, which is asked for
+# again here rather than taken from tools/ because meson walks tests/
+# first, and so are the two checks tools/meson.build makes on it; without
+# libavutil that half is left out of both files and the rest still runs.
+prof_lavu = dependency('libavutil', required: false)
+prof_deps = [ craw_static_dep ]
+prof_args = []
+if prof_lavu.found()
+    prof_deps += prof_lavu
+    prof_args += '-DCRAW_TOOL_HAVE_LAVU=1'
+    if cc.has_member('AVRawColorParams', 'as_shot_ei',
+                     prefix: '#include <libavutil/raw_color_params.h>',
+                     dependencies: prof_lavu)
+        prof_args += '-DCRAW_TOOL_HAVE_EXPOSURE_INDEX=1'
+    else
+        prof_args += '-DCRAW_TOOL_HAVE_EXPOSURE_INDEX=0'
+    endif
+    # Only the colour record: the test hands the builder a frame of its
+    # own, and no decoder is involved.
+    if cc.has_header_symbol('libavutil/raw_color_params.h', 'AV_RAW_COLOR_PARAMS_RW2',
+                            dependencies: prof_lavu)
+        prof_args += '-DCRAW_TOOL_HAVE_RW2=1'
+    else
+        prof_args += '-DCRAW_TOOL_HAVE_RW2=0'
+    endif
+else
+    prof_args += [ '-DCRAW_TOOL_HAVE_LAVU=0', '-DCRAW_TOOL_HAVE_EXPOSURE_INDEX=0',
+                   '-DCRAW_TOOL_HAVE_RW2=0' ]
+endif
+
 exe = executable('test_profile',
     'test_profile.c',
     '../tools/profiles.c',
     include_directories: include_directories('../tools'),
-    dependencies: [ craw_static_dep ],
+    dependencies: prof_deps,
+    c_args: prof_args,
     link_language: 'cpp')
 test('test_profile', exe, timeout: 120)
 

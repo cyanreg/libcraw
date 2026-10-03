@@ -3,7 +3,11 @@
 #ifndef CRAW_TOOL_PROFILES_H
 #define CRAW_TOOL_PROFILES_H
 
+#include <stdbool.h>
+
 #include <craw/profile.h>
+
+struct AVFrame;
 
 /* Per-CCT white balance and matrix tables for the CLI tools.
  *
@@ -30,5 +34,25 @@ const char *craw_tool_profile_detect(const char *text);
  * comment; the two kinds may be interleaved and are sorted by CCT on load.
  * Returns a negative error and prints the offending line to stderr. */
 int craw_tool_profile_load_tables(CRAWProfile *p, const char *path);
+
+/* Fills the per-frame half of `p` from a decoded raw frame, on top of the
+ * camera's tables the caller has already put there: the CFA phase from the
+ * frame's pixel format (the software format behind a Vulkan frame), and
+ * the levels, the as-shot white balance, matrix and colour temperature and
+ * the gain from its AV_FRAME_DATA_RAW_COLOR_PARAMS side data.
+ *
+ * ProRes RAW carries all of it in the frame header. A Panasonic RW2 still
+ * carries the levels and the white balance only: its matrix and colour
+ * temperature are where the as-shot gains lie on the camera's own tables,
+ * and its gain is the camera's video GainFactor for the gain mode its ISO
+ * is in, so it needs tables and fails with CRAW_ERROR(ENOENT) without them.
+ * Both are rebuilt from the frame every time, so it is called per frame.
+ * The exposure indices are set where the frame carries them (an RW2's ISO
+ * comes from its Exif) and left alone otherwise.
+ *
+ * `verbose` prints how an RW2's numbers were derived. Returns 0 or a
+ * negative error, having said why on stderr. */
+int craw_tool_profile_from_frame(CRAWProfile *p, const struct AVFrame *frame,
+                                 bool verbose);
 
 #endif /* CRAW_TOOL_PROFILES_H */

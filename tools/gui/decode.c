@@ -18,11 +18,11 @@
 #include <libavcodec/defs.h>
 #include <libavutil/dict.h>
 #include <libavutil/display.h>
+#include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/parseutils.h>
 #include <libavutil/pixdesc.h>
-#include <libavutil/raw_color_params.h>
 #include <libavutil/time.h>
 
 #include <libxml/parser.h>
@@ -34,6 +34,46 @@
 
 static enum AVPixelFormat view_get_format(AVCodecContext *avc,
                                           const enum AVPixelFormat *fmts);
+
+/* Whether the decoder can hand its pictures over on the GPU through a
+ * Vulkan hwaccel - ProRes RAW's can - rather than only in system memory,
+ * which is all the RW2 decoder has. */
+static bool view_codec_has_vulkan(const AVCodec *codec)
+{
+    const AVCodecHWConfig *cfg;
+
+    for (int i = 0; (cfg = avcodec_get_hw_config(codec, i)); i++)
+        if (cfg->device_type == AV_HWDEVICE_TYPE_VULKAN &&
+            (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+            return true;
+
+    return false;
+}
+
+/* Whether a decoder in the pool can take this stream through a flush and
+ * the stream's extradata on its first packet, which is how every codec
+ * this viewer has met so far takes the next clip. The RW2 decoder cannot:
+ * it reads the file's whole header - the stripes, the levels, the white
+ * balance - from the context's extradata at every picture and looks at
+ * nothing on the packet, so a decoder opened on one still would decode the
+ * next still's stripes with the first one's header. It is kept only for a
+ * stream with the same header, which is the same file again as a playlist
+ * comes back round to it; anything else gets a decoder of its own, which
+ * for a software decoder with nothing to set up costs nothing. */
+static bool view_decoder_takes(const AVCodecContext *avc, const AVCodecParameters *par)
+{
+#if CRAW_TOOL_HAVE_RW2
+    if (par->codec_id == AV_CODEC_ID_RW2)
+        return avc->extradata_size == par->extradata_size &&
+               (!par->extradata_size ||
+                !memcmp(avc->extradata, par->extradata, (size_t)par->extradata_size));
+#else
+    (void)avc;
+    (void)par;
+#endif
+
+    return true;
+}
 
 /* Opens the decoder for the clip's stream, or takes the one the pool holds
  * for its codec. libavcodec takes one stream after another through a
@@ -59,6 +99,16 @@ static int view_decoder_codec_open(struct view_decoder *d)
     for (int i = 0; i < d->codec.nb_pool; i++) {
         if (d->codec.pool[i]->codec_id != st->codecpar->codec_id)
             continue;
+        /* One that cannot take this stream goes, and a new one opens in its
+         * place below; the pool keeps one decoder per codec either way. */
+        if (!view_decoder_takes(d->codec.pool[i], st->codecpar)) {
+            avcodec_free_context(&d->codec.pool[i]);
+            d->codec.pool[i] = d->codec.pool[--d->codec.nb_pool];
+            if (d->verbose)
+                fprintf(stderr, "decoder: %s from the pool cannot take another "
+                                "file's header; a new one opens\n", codec->name);
+            break;
+        }
         /* Clean since its last clip closed (view_decoder_close()). */
         d->codec.avc = d->codec.pool[i];
         d->new_extradata = st->codecpar->extradata_size > 0;
@@ -88,9 +138,24 @@ static int view_decoder_codec_open(struct view_decoder *d)
     avc->get_format = view_get_format;
     /* On the raw path the hwaccel does the work on the GPU and extra CPU
      * threads would only race the frame properties read under the frames
-     * context lock. A non-raw clip may end up decoding in software, where
-     * threads are the difference between real time and not. */
-    avc->thread_count = d->raw ? 1 : 0;
+     * context lock: the AVVkFrame's layout, access and semaphore value,
+     * which the decode threads' submissions move while view_gpu_develop()
+     * reads them. A raw decoder without a Vulkan hwaccel - RW2's - decodes
+     * into system memory, where no frames context and no lock are involved
+     * until the picture is uploaded on this thread, and its threads are the
+     * decode time. Slice threads, because a still is one packet: they split
+     * that one picture's stripes across the cores, where frame threads
+     * would give it one core and hold it back until the stream ends. A
+     * non-raw clip may end up decoding in software, where threads are the
+     * difference between real time and not. */
+    if (d->raw && view_codec_has_vulkan(codec)) {
+        avc->thread_count = 1;
+    } else if (d->raw) {
+        avc->thread_type = FF_THREAD_SLICE;
+        avc->thread_count = 0;
+    } else {
+        avc->thread_count = 0;
+    }
 
     /* A ProRes RAW frame header can carry a crop (the Sony FX6 clips mark
      * 3840x2160 inside a 3872x2192 readout), and for this camera the
@@ -244,20 +309,15 @@ fail:
  * produced otherwise. libavcodec calls this again without the hardware
  * entry when the hwaccel fails to initialize, which is exactly the fallback
  * a non-raw clip wants: a software HEVC decode with threads still plays,
- * and the pacing drops frames if it cannot keep up. */
+ * and the pacing drops frames if it cannot keep up. A raw clip takes the
+ * same fallback, and so does every RW2, whose decoder has no hwaccel: the
+ * mosaic comes in system memory and view_decoder_next() uploads it. */
 static enum AVPixelFormat view_get_format(AVCodecContext *avc,
                                           const enum AVPixelFormat *fmts)
 {
-    const struct view_decoder *d = avc->opaque;
-
     for (const enum AVPixelFormat *f = fmts; *f != AV_PIX_FMT_NONE; f++)
         if (*f == AV_PIX_FMT_VULKAN)
             return *f;
-
-    if (d && d->raw) {
-        fprintf(stderr, "the decoder does not offer Vulkan frames\n");
-        return AV_PIX_FMT_NONE;
-    }
 
     /* Skip the other hardware formats: this tool has one device context and
      * it is a Vulkan one, so offering VAAPI here only produces a complaint
@@ -607,6 +667,11 @@ static void view_format_name(const AVCodecParameters *par, const AVCodec *codec,
     case AV_CODEC_ID_PRORES_RAW:
         snprintf(out, n, "ProRes RAW");
         return;
+#if CRAW_TOOL_HAVE_RW2
+    case AV_CODEC_ID_RW2:
+        snprintf(out, n, "RW2");
+        return;
+#endif
     case AV_CODEC_ID_PRORES:
         switch (par->profile) {
         case AV_PROFILE_PRORES_PROXY:    profile = "422 Proxy"; break;
@@ -682,11 +747,15 @@ int view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
                   d->coded_w, d->coded_h);
     }
 
-    if (d->frame_rate_str[0])
+    if (d->still) {
+        /* A still's rate is the demuxer's placeholder for one picture, and
+         * says nothing about it. */
+    } else if (d->frame_rate_str[0]) {
         VIEW_INFO("frame rate", "%s", d->frame_rate_str);
-    else if (d->frame_rate.num > 0 && d->frame_rate.den > 0)
+    } else if (d->frame_rate.num > 0 && d->frame_rate.den > 0) {
         VIEW_INFO("frame rate", d->frame_rate.num % d->frame_rate.den
                   ? "%.2f fps" : "%.0f fps", av_q2d(d->frame_rate));
+    }
 
     if (d->meta_as_shot_ei > 0.0f)
         VIEW_INFO("ISO", "%.0f", (double)d->meta_as_shot_ei);
@@ -727,13 +796,15 @@ int view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
 }
 
 /* The track header's display matrix, which is how a camera says the body
- * was on its side.
+ * was on its side - or, for a still, the frame's, which the RW2 decoder
+ * makes from the file's Exif orientation (view_read_frame_info()).
  *
- * FFmpeg carries it as AV_PKT_DATA_DISPLAYMATRIX in the stream's coded side
- * data, and av_display_rotation_get() reduces it to the angle the matrix
- * turns the frame counter-clockwise - the turn that displays it upright,
- * not the one that was applied when shooting. pl_rotation counts quarter
- * turns clockwise, so the two are each other's negation and nothing else.
+ * FFmpeg carries a clip's as AV_PKT_DATA_DISPLAYMATRIX in the stream's
+ * coded side data, and av_display_rotation_get() reduces it to the angle
+ * the matrix turns the frame counter-clockwise - the turn that displays it
+ * upright, not the one that was applied when shooting. pl_rotation counts
+ * quarter turns clockwise, so the two are each other's negation and
+ * nothing else.
  * The Lumix writes 90 on every clip shot on its side, and ffmpeg's
  * autorotate answers it with `transpose=cclock`.
  *
@@ -744,21 +815,12 @@ int view_decoder_info(const struct view_decoder *d, struct view_info_row *rows,
  * reflection reverses orientation and so makes it negative - and it is
  * taken in 64 bits because the entries are 16.16 fixed point and their
  * products do not fit in 32. */
-static void view_read_display_matrix(struct view_decoder *d, const AVStream *st)
+static void view_apply_display_matrix(struct view_decoder *d, const int32_t *m)
 {
-    const AVPacketSideData *sd;
-    const int32_t *m;
     double angle;
     int64_t det;
     int deg;
 
-    sd = av_packet_side_data_get(st->codecpar->coded_side_data,
-                                 st->codecpar->nb_coded_side_data,
-                                 AV_PKT_DATA_DISPLAYMATRIX);
-    if (!sd || sd->size < 9 * sizeof(int32_t))
-        return;
-
-    m = (const int32_t *)sd->data;
     angle = av_display_rotation_get(m);
     if (isnan(angle)) {
         fprintf(stderr, "the display matrix is singular; the picture is left "
@@ -780,6 +842,252 @@ static void view_read_display_matrix(struct view_decoder *d, const AVStream *st)
     d->rotation_deg = deg;
     /* Counter-clockwise degrees to clockwise quarter turns. */
     d->rotation = pl_rotation_normalize(-(deg / 90));
+}
+
+static void view_read_display_matrix(struct view_decoder *d, const AVStream *st)
+{
+    const AVPacketSideData *sd;
+
+    sd = av_packet_side_data_get(st->codecpar->coded_side_data,
+                                 st->codecpar->nb_coded_side_data,
+                                 AV_PKT_DATA_DISPLAYMATRIX);
+    if (!sd || sd->size < 9 * sizeof(int32_t))
+        return;
+
+    d->stream_matrix = true;
+    view_apply_display_matrix(d, (const int32_t *)sd->data);
+}
+
+/* An Exif value as the decoder prints it, without the spaces it is padded
+ * with ("LUMIX S 24-60/F2.8" and fifty spaces). Anything that does not fit
+ * leaves `out` alone, as view_xpath_text() does. */
+static bool view_meta_text(const AVDictionary *m, const char *key, char *out,
+                           size_t size)
+{
+    const AVDictionaryEntry *e = av_dict_get(m, key, NULL, 0);
+    const char *b, *end;
+    size_t n;
+
+    if (!e)
+        return false;
+
+    b = e->value;
+    end = b + strlen(b);
+    while (b < end && (unsigned char)*b <= ' ')
+        b++;
+    while (end > b && (unsigned char)end[-1] <= ' ')
+        end--;
+
+    n = (size_t)(end - b);
+    if (!n || n >= size)
+        return false;
+
+    memcpy(out, b, n);
+    out[n] = '\0';
+
+    return true;
+}
+
+/* A number the way av_exif prints one: "    100", or a rational as
+ * "    28:10". 0 when there is none. */
+static float view_meta_number(const AVDictionary *m, const char *key)
+{
+    const AVDictionaryEntry *e = av_dict_get(m, key, NULL, 0);
+    double num, den;
+    char *end;
+
+    if (!e)
+        return 0.0f;
+
+    num = strtod(e->value, &end);
+    if (end == e->value)
+        return 0.0f;
+    while (*end == ' ')
+        end++;
+    if (*end == ':' || *end == '/') {
+        den = strtod(end + 1, NULL);
+        return den > 0.0 ? (float)(num / den) : 0.0f;
+    }
+
+    return (float)num;
+}
+
+static void view_decoder_log_info(const struct view_decoder *d)
+{
+    struct view_info_row rows[VIEW_INFO_MAX];
+    int n = view_decoder_info(d, rows, VIEW_INFO_MAX);
+
+    fprintf(stderr, "clip:");
+    for (int i = 0; i < n; i++)
+        fprintf(stderr, "%s %s %s", i ? "," : "", rows[i].label, rows[i].value);
+    fprintf(stderr, "%s\n", n ? "" : " nothing the demuxer exposes");
+}
+
+/* What a still says about itself. An RW2 is its own container and its
+ * demuxer exports no tags; the decoder attaches the file's Exif IFD to the
+ * picture instead, keyed "Make", "Model", "ExifIFD/FNumber" and so on, with
+ * the values padded and the rationals written "28:10". Read once, from the
+ * first picture, into what the container left empty, which for a clip that
+ * has its tags is nothing: the frame only fills in. The display matrix
+ * likewise, when the track header had none. */
+static void view_read_frame_info(struct view_decoder *d, const AVFrame *frame)
+{
+    const AVDictionary *m = frame->metadata;
+    const AVFrameSideData *sd;
+    char date[40], zone[16];
+    float v;
+
+    if (!d->cam_make[0])
+        view_meta_text(m, "Make", d->cam_make, sizeof(d->cam_make));
+    if (!d->cam_model[0])
+        view_meta_text(m, "Model", d->cam_model, sizeof(d->cam_model));
+    /* The camera's own words are what view_profile_setup() matches the
+     * built-in tables against, as it does an Apple model name. */
+    if (!d->model[0] && d->cam_model[0] && m && av_dict_get(m, "Model", NULL, 0))
+        snprintf(d->model, sizeof(d->model), "%s", d->cam_model);
+
+    if (!(d->meta_as_shot_ei > 0.0f) &&
+        (v = view_meta_number(m, "ExifIFD/ISOSpeedRatings")) > 0.0f)
+        d->meta_as_shot_ei = v;
+    if (!(d->aperture > 0.0f) && (v = view_meta_number(m, "ExifIFD/FNumber")) > 0.0f)
+        d->aperture = v;
+
+    /* The shutter, the focal length and the lens go where a clip's maker
+     * note puts them, which the Clip block reads them from. */
+    if (!(d->pana.exposure_s > 0.0f) &&
+        (v = view_meta_number(m, "ExifIFD/ExposureTime")) > 0.0f)
+        d->pana.exposure_s = v;
+    if (!(d->pana.focal_mm > 0.0f) &&
+        (v = view_meta_number(m, "ExifIFD/FocalLength")) > 0.0f)
+        d->pana.focal_mm = v;
+    /* LensModel, which this libavcodec's table does not name and prints
+     * by its tag number. */
+    if (!d->pana.lens[0] &&
+        !view_meta_text(m, "ExifIFD/LensModel", d->pana.lens, sizeof(d->pana.lens)))
+        view_meta_text(m, "ExifIFD/0xA434", d->pana.lens, sizeof(d->pana.lens));
+
+    /* "2025:07:06 19:56:43" and the zone the camera was set to, "+09:00"
+     * (OffsetTimeOriginal, by number too), as the XML's date reads. */
+    if (!d->recorded[0] &&
+        view_meta_text(m, "ExifIFD/DateTimeOriginal", date, sizeof(date)) &&
+        strlen(date) == 19) {
+        date[4] = date[7] = '-';
+        if (view_meta_text(m, "ExifIFD/OffsetTimeOriginal", zone, sizeof(zone)) ||
+            view_meta_text(m, "ExifIFD/0x9011", zone, sizeof(zone)))
+            snprintf(d->recorded, sizeof(d->recorded), "%s %s", date, zone);
+        else
+            snprintf(d->recorded, sizeof(d->recorded), "%s", date);
+    }
+
+    if (!d->stream_matrix &&
+        (sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX)) &&
+        sd->size >= 9 * sizeof(int32_t))
+        view_apply_display_matrix(d, (const int32_t *)sd->data);
+
+    /* Said again once the picture has filled it in, which for a clip with
+     * its tags changes nothing and is not worth a line. */
+    if (d->verbose && (m || d->rotation)) {
+        char rot[48] = "";
+
+        if (d->rotation)
+            snprintf(rot, sizeof(rot), ", rotated %d deg -> %dx%d", d->rotation_deg,
+                     d->rotation % PL_ROTATION_180 ? d->coded_h : d->coded_w,
+                     d->rotation % PL_ROTATION_180 ? d->coded_w : d->coded_h);
+        fprintf(stderr, "first picture: model `%s`, as-shot ISO %.0f%s\n",
+                d->model[0] ? d->model : "(unknown)", d->meta_as_shot_ei, rot);
+        view_decoder_log_info(d);
+    }
+}
+
+/* A raw picture that came in system memory - every RW2, and ProRes RAW
+ * whenever its hwaccel would not start - goes to the device here, so that
+ * everything after the decoder sees what the hwaccel would have handed
+ * over: an AVVkFrame of one R16_UNORM plane. av_hwframe_transfer_data()
+ * keeps the hwcontext's contract on it - the copy waits for the frame's
+ * semaphore at its value and signals the next one, and the layout, access
+ * and queue family it leaves are written back into the AVVkFrame, or the
+ * copy is done on the host when the device can - which is exactly what
+ * view_gpu_develop() waits for and transitions from, under the same frames
+ * lock, as it does for a decoded picture. The side data, the metadata, the
+ * crop and the timestamps come across with av_frame_copy_props().
+ *
+ * The frames context is made on the clip's first such picture, on the
+ * device the decoders share, and goes with the clip
+ * (view_decoder_close()); a picture of another size or format makes
+ * another, which view_decoder_next() sees as a new frame pool and the view
+ * cache follows. Only RGGB has a Vulkan format in libavutil, which is all
+ * the pipeline develops anyway. */
+static int view_decoder_upload(struct view_decoder *d, AVFrame *frame)
+{
+    AVHWFramesContext *fc = d->upload ? (AVHWFramesContext *)d->upload->data : NULL;
+    int64_t t0 = av_gettime_relative();
+    AVFrame *hw = NULL;
+    int ret;
+
+    if (fc && (fc->sw_format != frame->format || fc->width != frame->width ||
+               fc->height != frame->height))
+        av_buffer_unref(&d->upload);
+
+    if (!d->upload) {
+        AVVulkanFramesContext *vk;
+
+        d->upload = av_hwframe_ctx_alloc(d->codec.hw_device);
+        if (!d->upload)
+            return CRAW_ERROR(ENOMEM);
+
+        fc = (AVHWFramesContext *)d->upload->data;
+        vk = fc->hwctx;
+
+        fc->format            = AV_PIX_FMT_VULKAN;
+        fc->sw_format         = (enum AVPixelFormat)frame->format;
+        fc->width             = frame->width;
+        fc->height            = frame->height;
+        fc->initial_pool_size = 0;
+
+        /* libcraw reads the mosaic as a storage image and the upload
+         * writes it; libavutil adds whatever else the format supports. */
+        vk->usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+        ret = av_hwframe_ctx_init(d->upload);
+        if (ret < 0) {
+            fprintf(stderr, "cannot put the decoder's %dx%d %s mosaic on the device: "
+                            "%s%s\n", frame->width, frame->height,
+                    av_get_pix_fmt_name((enum AVPixelFormat)frame->format),
+                    av_err2str(ret),
+                    frame->format != AV_PIX_FMT_BAYER_RGGB16
+                        ? " (libavutil has a Vulkan format for RGGB only)" : "");
+            av_buffer_unref(&d->upload);
+            return CRAW_ERROR(ENOTSUP);
+        }
+    }
+
+    hw = av_frame_alloc();
+    if (!hw)
+        return CRAW_ERROR(ENOMEM);
+
+    ret = av_hwframe_get_buffer(d->upload, hw, 0);
+    if (ret >= 0)
+        ret = av_hwframe_transfer_data(hw, frame, 0);
+    if (ret >= 0)
+        ret = av_frame_copy_props(hw, frame);
+    if (ret < 0) {
+        fprintf(stderr, "uploading the %dx%d mosaic failed: %s\n", frame->width,
+                frame->height, av_err2str(ret));
+        av_frame_free(&hw);
+        return CRAW_ERROR(EIO);
+    }
+
+    av_frame_unref(frame);
+    av_frame_move_ref(frame, hw);
+    av_frame_free(&hw);
+
+    if (d->verbose && !d->uploads)
+        fprintf(stderr, "upload: %dx%d %s to the device in %.1f ms\n",
+                frame->width, frame->height, av_get_pix_fmt_name(fc->sw_format),
+                (double)(av_gettime_relative() - t0) / 1000.0);
+    d->uploads++;
+
+    return 0;
 }
 
 int view_decoder_open(struct view_decoder *d, const char *path,
@@ -817,8 +1125,12 @@ int view_decoder_open(struct view_decoder *d, const char *path,
     /* A Bayer source is one the pipeline has to debayer, and the only thing
      * that says so reliably is the codec: the Panasonic XML in a ProRes RAW
      * clip advertises the same capture gamma and gamut a log recording
-     * would, so it cannot be used to tell them apart. */
+     * would, so it cannot be used to tell them apart. An RW2 still is the
+     * same camera's mosaic, one picture of it. */
     d->raw = st->codecpar->codec_id == AV_CODEC_ID_PRORES_RAW;
+#if CRAW_TOOL_HAVE_RW2
+    d->raw = d->raw || st->codecpar->codec_id == AV_CODEC_ID_RW2;
+#endif
     d->codec_name = codec->name;
     d->verbose = verbose;
 
@@ -829,6 +1141,15 @@ int view_decoder_open(struct view_decoder *d, const char *path,
     if (!d->nb_frames && st->duration > 0 && d->frame_rate.num)
         d->nb_frames = av_rescale_q(st->duration, d->time_base,
                                     av_inv_q(d->frame_rate));
+
+    /* One picture, whatever the container says its rate is: an RW2's is a
+     * placeholder of 1 fps, and a one-frame clip's is that of a clip it
+     * was cut from. main.c shows it and does not loop it. */
+    d->still = d->nb_frames == 1;
+
+    d->recv = av_frame_alloc();
+    if (!d->recv)
+        return CRAW_ERROR(ENOMEM);
 
     view_read_display_matrix(d, st);
 
@@ -919,15 +1240,8 @@ int view_decoder_open(struct view_decoder *d, const char *path,
                 d->pana.wb_levels[1], d->pana.wb_levels[2]);
 
     /* The Clip block's rows, exactly as the panel shows them. */
-    if (verbose) {
-        struct view_info_row rows[VIEW_INFO_MAX];
-        int n = view_decoder_info(d, rows, VIEW_INFO_MAX);
-
-        fprintf(stderr, "clip:");
-        for (int i = 0; i < n; i++)
-            fprintf(stderr, "%s %s %s", i ? "," : "", rows[i].label, rows[i].value);
-        fprintf(stderr, "%s\n", n ? "" : " nothing the demuxer exposes");
-    }
+    if (verbose)
+        view_decoder_log_info(d);
 
     return 0;
 }
@@ -938,7 +1252,12 @@ void view_decoder_close(struct view_decoder *d)
 
     view_reader_stop(d);
     av_packet_free(&d->pkt);
+    av_frame_free(&d->recv);
     av_buffer_unref(&d->frames);
+    /* The uploads' pool is the clip's. A picture still referencing it - the
+     * one on screen, which view_close_clip() lets go of first anyway -
+     * keeps it alive until it goes. */
+    av_buffer_unref(&d->upload);
     avformat_close_input(&d->fmt);
 
     /* The decoder lets go of the pictures it still held now, at the
@@ -1219,8 +1538,18 @@ static int view_decoder_feed(struct view_decoder *d, int budget)
                  * and draining one is a state a flush does not always undo:
                  * after a loop point the prores_raw hwaccel keeps reporting
                  * end of stream. A codec without delay has nothing held
-                 * back, so it is simply left alone. */
-                if (d->codec.avc->codec->capabilities & AV_CODEC_CAP_DELAY)
+                 * back, so it is simply left alone - unless it runs frame
+                 * threads, which hold every picture back until each thread
+                 * has a packet or the stream is drained, whatever the
+                 * codec's own delay. Not draining one is what made a clip
+                 * of one frame never show it: the picture stayed in the
+                 * thread, the end of the stream came, the loop sought back
+                 * to the start and the flush threw it away, over and over
+                 * (a one-frame ProRes 422 clip: 1041 passes and no picture
+                 * in 35 s). A clip of more frames lost its last few to it
+                 * at every loop point. */
+                if ((d->codec.avc->codec->capabilities & AV_CODEC_CAP_DELAY) ||
+                    (d->codec.avc->active_thread_type & FF_THREAD_FRAME))
                     avcodec_send_packet(d->codec.avc, NULL);
                 d->draining = true;
                 return moved + 1;
@@ -1285,15 +1614,36 @@ int view_decoder_next(struct view_decoder *d, AVFrame *frame)
     int ret;
 
     while (1) {
-        ret = avcodec_receive_frame(d->codec.avc, frame);
+        /* Into a frame of the decoder's own, and handed over only when a
+         * picture came: avcodec_receive_frame() unreferences what it is
+         * given before it looks, and at the end of the stream the caller's
+         * frame is the picture on screen, which a grade change still has
+         * to be able to develop again - a still's only picture, a clip's
+         * last one with --no-loop. */
+        ret = avcodec_receive_frame(d->codec.avc, d->recv);
         if (ret >= 0) {
+            av_frame_unref(frame);
+            av_frame_move_ref(frame, d->recv);
+
             if (!d->know_hwaccel) {
                 d->hwaccel = frame->format == AV_PIX_FMT_VULKAN;
                 d->know_hwaccel = true;
                 if (d->verbose)
-                    fprintf(stderr, "decoding %s: %s\n", d->codec_name,
+                    fprintf(stderr, "decoding %s: %s, %d threads\n", d->codec_name,
                             d->hwaccel ? "Vulkan hwaccel, frames stay on the GPU"
-                                       : "software, frames uploaded per picture");
+                                       : "software, frames uploaded per picture",
+                            d->codec.avc->thread_count);
+            }
+
+            if (!d->frame_info) {
+                d->frame_info = true;
+                view_read_frame_info(d, frame);
+            }
+
+            if (d->raw && frame->format != AV_PIX_FMT_VULKAN) {
+                ret = view_decoder_upload(d, frame);
+                if (ret < 0)
+                    return ret;
             }
 
             /* A picture out of another frame pool than the last one's; see
@@ -1433,63 +1783,4 @@ int view_decoder_seek(struct view_decoder *d, int64_t frame_index)
     d->eof = false;
 
     return 0;
-}
-
-/* --------------------------------------------------------- the profile */
-
-static float view_q2f(AVRational r)
-{
-    return r.den ? (float)av_q2d(r) : 0.0f;
-}
-
-int view_profile_from_frame(CRAWProfile *p, const AVFrame *frame)
-{
-    const AVFrameSideData *sd;
-    const AVRawColorParams *rc;
-    const AVProResRawColorParams *pr;
-    int ret;
-
-    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_RAW_COLOR_PARAMS);
-    if (!sd) {
-        fprintf(stderr, "the decoder produced no AV_FRAME_DATA_RAW_COLOR_PARAMS "
-                        "side data; cineview only handles raw camera clips\n");
-        return CRAW_ERROR(EINVAL);
-    }
-
-    rc = (const AVRawColorParams *)sd->data;
-    if (rc->type != AV_RAW_COLOR_PARAMS_PRORES_RAW) {
-        fprintf(stderr, "raw colour parameters of type %d are not supported\n",
-                (int)rc->type);
-        return CRAW_ERROR(ENOTSUP);
-    }
-    pr = &rc->codec.prores_raw;
-
-    for (int i = 0; i < 4; i++) {
-        p->black_level[i] = view_q2f(rc->black_level);
-        p->white_level[i] = view_q2f(rc->white_level);
-    }
-
-    p->cfa = CRAW_CFA_RGGB;
-    p->as_shot_wb[0] = view_q2f(pr->wb_red);
-    p->as_shot_wb[1] = 1.0f;
-    p->as_shot_wb[2] = view_q2f(pr->wb_blue);
-
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-            p->as_shot_matrix[i][j] = view_q2f(pr->color_matrix[i][j]);
-
-    p->gain = view_q2f(pr->gain);
-    p->as_shot_cct = (float)rc->wb_cct;
-
-#if CRAW_TOOL_HAVE_EXPOSURE_INDEX
-    p->as_shot_ei = view_q2f(rc->as_shot_ei);
-    p->exposure_index = view_q2f(rc->exposure_index);
-#endif
-
-    ret = craw_profile_validate(p);
-    if (ret < 0)
-        fprintf(stderr, "the frame's colour parameters do not make a valid profile: %d\n",
-                ret);
-
-    return ret;
 }

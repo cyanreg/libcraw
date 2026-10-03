@@ -1,7 +1,7 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-/* cineraw: decode a camera raw clip with FFmpeg, run every frame
- * through libcraw on the GPU, write an image sequence.
+/* cineraw: decode a camera raw clip or still with FFmpeg, run every frame
+ * through libcraw on the GPU, write an image sequence or one image.
  *
  * This is the development driver for the library: it is the only place
  * where a real clip, a real decoder and the whole pipeline meet, so it
@@ -12,7 +12,9 @@
  * the per-frame AV_FRAME_DATA_RAW_COLOR_PARAMS side data (levels, as-shot
  * white balance, matrix, gain), and the per-CCT tables, which the decoder
  * does not expose yet and which therefore come from tools/profiles.c or a
- * text file. */
+ * text file. A Panasonic RW2 still carries only the levels and the white
+ * balance, and the rest of its profile comes from those tables
+ * (craw_tool_profile_from_frame()). */
 
 #include <getopt.h>
 #include <inttypes.h>
@@ -28,7 +30,6 @@
 #include <libavutil/dict.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
-#include <libavutil/raw_color_params.h>
 #include <libavutil/time.h>
 
 #include <craw/craw.h>
@@ -58,6 +59,7 @@ enum tool_writer {
     TOOL_WRITER_PNG,
     TOOL_WRITER_PPM,
     TOOL_WRITER_PFM,
+    TOOL_WRITER_TIFF,
 };
 
 enum tool_wb {
@@ -80,6 +82,9 @@ enum tool_lens {
 struct tool_cfg {
     const char *input;
     const char *pattern;
+    /* The pattern has a frame index in it. Without one it names a single
+     * file, which only a run that writes one frame may use. */
+    bool pattern_indexed;
     enum tool_writer writer;
 
     int64_t frames;             /* -1: to the end of the clip */
@@ -211,13 +216,16 @@ static void tool_usage(FILE *f)
     fprintf(f,
 "usage: cineraw [options] INPUT\n"
 "\n"
-"Decodes a camera raw clip with FFmpeg, runs every frame through libcraw on\n"
-"the GPU and writes an image sequence.\n"
+"Decodes a camera raw clip (ProRes RAW) or still (Panasonic RW2) with\n"
+"FFmpeg, runs every frame through libcraw on the GPU and writes an image\n"
+"sequence, or one image.\n"
 "\n"
 "  -o PATTERN          output path with a printf frame index, e.g.\n"
 "                      out_%%05d.png. The extension picks the writer: .png\n"
-"                      (16 bit), .ppm (8 bit preview, dithered), .pfm\n"
-"                      (linear float).\n"
+"                      (16 bit), .tif (16 bit, uncompressed), .ppm (8 bit\n"
+"                      preview, dithered), .pfm (linear float). A still, or\n"
+"                      a run of --frames 1, may name one file instead,\n"
+"                      e.g. out.tif.\n"
 "                      Without -o nothing is written, which is what --bench\n"
 "                      and `--wb auto -v` want.\n"
 "  --frames N          stop after N frames (default: the whole clip)\n"
@@ -226,8 +234,9 @@ static void tool_usage(FILE *f)
 "                      the CRAW_TEST_DEVICE environment variable does the\n"
 "                      same and wins over this option, and\n"
 "                      CRAW_TEST_VALIDATION=1 turns the validation layer on\n"
-"  -v                  verbose: per frame diagnostics, container metadata\n"
-"                      and libcraw's own log at CRAW_LOG_VERBOSE\n"
+"  -v                  verbose: per frame diagnostics with the decode and\n"
+"                      develop times, container and still metadata, and\n"
+"                      libcraw's own log at CRAW_LOG_VERBOSE\n"
 "  -h                  this text\n"
 "\n"
 "  --debayer METHOD    bilinear, mhc or rcd (default: rcd)\n"
@@ -377,8 +386,13 @@ static void tool_usage(FILE *f)
 "                      `wb CCT R B` and `matrix CCT m00 .. m22` lines,\n"
 "                      `#` comments, any order\n"
 "  --profile NAME      use a built-in table set (%s). The default is to\n"
-"                      match the camera model in the container metadata\n"
-"                      and to carry on without tables if that fails.\n"
+"                      match the camera model in the container metadata,\n"
+"                      or in the first frame's Exif for a still, and to\n"
+"                      carry on without tables if that fails. An RW2\n"
+"                      still carries no colour matrix and is refused\n"
+"                      without tables: its matrix and colour temperature\n"
+"                      are where its as-shot white balance lies on them\n"
+"                      (DESIGN.md 9c).\n"
 "\n"
 "`--wb auto` estimates the illuminant from the histogram of the frame it\n"
 "has just processed and applies the smoothed result to the *next* frame, so\n"
@@ -452,13 +466,17 @@ static enum tool_writer tool_writer_from_path(const char *path)
         return TOOL_WRITER_PPM;
     if (!strcmp(dot, ".pfm"))
         return TOOL_WRITER_PFM;
+    if (!strcmp(dot, ".tif") || !strcmp(dot, ".tiff"))
+        return TOOL_WRITER_TIFF;
 
     return TOOL_WRITER_NONE;
 }
 
-/* The pattern is handed to snprintf(), so exactly one integer conversion
- * has to be there: none silently overwrites the same file every frame, two
- * reads past the end of the argument list. */
+/* The pattern is handed to snprintf(), so at most one integer conversion
+ * may be there: two read past the end of the argument list. Returns how
+ * many there are. None is a single file, which would be overwritten by
+ * every frame of a clip, so main() lets only a run of one frame have it
+ * (tool_check_single()). */
 static int tool_check_pattern(const char *pattern)
 {
     int nb = 0;
@@ -485,13 +503,13 @@ static int tool_check_pattern(const char *pattern)
         }
     }
 
-    if (nb != 1) {
+    if (nb > 1) {
         fprintf(stderr, "-o: `%s` needs exactly one printf frame index "
                         "(e.g. out_%%05d.png), found %d\n", pattern, nb);
         return CRAW_ERROR(EINVAL);
     }
 
-    return 0;
+    return nb;
 }
 
 /* PFM as the convention has it: rows bottom-up, interleaved RGB, and a
@@ -580,15 +598,20 @@ static float tool_dither(uint32_t x, uint32_t y, int c)
          + (float)(h >> 16)     * (1.0f / 65536.0f) - 1.0f;
 }
 
-/* PNG and PPM both go through libavcodec, so no image writer of our own and
- * no libswscale: the pixel conversion is a clip and a scale. 16 bit PNG is
- * big endian by definition and the encoder takes nothing else. */
+/* PNG, TIFF and PPM all go through libavcodec, so no image writer of our
+ * own and no libswscale: the pixel conversion is a clip and a scale. 16 bit
+ * PNG is big endian by definition and the encoder takes nothing else; the
+ * TIFF encoder takes only little endian, and is told not to compress,
+ * which is the point of asking for a TIFF: a 5.8K frame is 0.4 s of
+ * writing where PNG's deflate is ten. */
 static int tool_write_avcodec(const char *path, enum AVCodecID codec_id,
                               enum AVPixelFormat pix_fmt, const float *rgba,
                               uint32_t w, uint32_t h, enum tool_encode enc)
 {
-    const int depth = pix_fmt == AV_PIX_FMT_RGB48BE ? 16 : 8;
+    const bool be = pix_fmt == AV_PIX_FMT_RGB48BE;
+    const int depth = be || pix_fmt == AV_PIX_FMT_RGB48LE ? 16 : 8;
     const float scale = depth == 16 ? 65535.0f : 255.0f;
+    AVDictionary *opts = NULL;
     const AVCodec *codec;
     AVCodecContext *avc = NULL;
     AVFrame *frame = NULL;
@@ -614,7 +637,11 @@ static int tool_write_avcodec(const char *path, enum AVCodecID codec_id,
     avc->pix_fmt = pix_fmt;
     avc->time_base = (AVRational) { 1, 1 };
 
-    ret = avcodec_open2(avc, codec, NULL);
+    if (codec_id == AV_CODEC_ID_TIFF)
+        av_dict_set(&opts, "compression_algo", "raw", 0);
+
+    ret = avcodec_open2(avc, codec, &opts);
+    av_dict_free(&opts);
     if (ret < 0) {
         fprintf(stderr, "avcodec_open2(%s): %s\n", codec->name, av_err2str(ret));
         ret = CRAW_ERROR(EINVAL);
@@ -652,11 +679,11 @@ static int tool_write_avcodec(const char *path, enum AVCodecID codec_id,
                 iq = lrintf(v * scale + (depth == 8 ? tool_dither(x, y, c) : 0.0f));
                 q = (unsigned)CRAW_CLAMP(iq, 0, (long)scale);
 
-                /* Written byte by byte so the BE in RGB48BE is honoured
-                 * whatever the host is. */
+                /* Written byte by byte so the byte order the format names
+                 * is honoured whatever the host is. */
                 if (depth == 16) {
-                    dst[(x * 3 + c) * 2 + 0] = (uint8_t)(q >> 8);
-                    dst[(x * 3 + c) * 2 + 1] = (uint8_t)(q & 0xFF);
+                    dst[(x * 3 + c) * 2 + !be] = (uint8_t)(q >> 8);
+                    dst[(x * 3 + c) * 2 +  be] = (uint8_t)(q & 0xFF);
                 } else {
                     dst[x * 3 + c] = (uint8_t)q;
                 }
@@ -741,6 +768,9 @@ static int tool_write_frame(const struct tool_cfg *cfg, const char *path,
         return tool_write_pfm(path, rgba, w, h, enc);
     case TOOL_WRITER_PNG:
         return tool_write_avcodec(path, AV_CODEC_ID_PNG, AV_PIX_FMT_RGB48BE,
+                                  rgba, w, h, enc);
+    case TOOL_WRITER_TIFF:
+        return tool_write_avcodec(path, AV_CODEC_ID_TIFF, AV_PIX_FMT_RGB48LE,
                                   rgba, w, h, enc);
     case TOOL_WRITER_PPM:
         return tool_write_avcodec(path, AV_CODEC_ID_PPM, AV_PIX_FMT_RGB24,
@@ -830,6 +860,7 @@ struct tool_gpu {
     CRAWTestImage src, dst;
     bool have_src, have_dst;
     uint32_t width, height;
+    enum CRAWCfa cfa;
     bool lens;              /* the pipeline was built with the warp */
 };
 
@@ -862,14 +893,14 @@ static void tool_gpu_drop_size(struct tool_gpu *g)
 /* Sized to the frame that actually came out of the decoder, cropping and
  * all, and rebuilt whenever that changes mid-clip. */
 static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
-                           uint32_t w, uint32_t h, bool lens)
+                           uint32_t w, uint32_t h, enum CRAWCfa cfa, bool lens)
 {
     VkFormat out_format = cfg->float32 ? VK_FORMAT_R32G32B32A32_SFLOAT
                                        : VK_FORMAT_R16G16B16A16_SFLOAT;
     CRAWPipelineParams pp;
     int ret;
 
-    if (g->pipe && g->width == w && g->height == h && g->lens == lens)
+    if (g->pipe && g->width == w && g->height == h && g->cfa == cfa && g->lens == lens)
         return 0;
 
     if (g->width)
@@ -895,7 +926,9 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
     craw_pipeline_params_init(&pp);
     pp.width = w;
     pp.height = h;
-    pp.cfa = CRAW_CFA_RGGB;
+    /* The frame's own phase; the pipeline says so if it cannot develop
+     * it. */
+    pp.cfa = cfa;
     pp.debayer = cfg->debayer;
     pp.out_space = cfg->space;
     pp.out_format = out_format;
@@ -929,6 +962,7 @@ static int tool_gpu_resize(struct tool_gpu *g, const struct tool_cfg *cfg,
 
     g->width = w;
     g->height = h;
+    g->cfa = cfa;
     g->lens = lens;
 
     return 0;
@@ -1343,70 +1377,6 @@ static int tool_awb_step(struct tool_awb *awb, CRAWPipeline *pipe,
 
 /* ------------------------------------------------------------- profile */
 
-static float tool_q2f(AVRational r)
-{
-    return r.den ? (float)av_q2d(r) : 0.0f;
-}
-
-/* Rebuilt from the side data every frame: a clip may change its white
- * balance in the middle, and in as-shot mode that has to be honoured. */
-static int tool_profile_from_frame(CRAWProfile *p, const AVFrame *frame)
-{
-    const AVFrameSideData *sd;
-    const AVRawColorParams *rc;
-    const AVProResRawColorParams *pr;
-    int ret;
-
-    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_RAW_COLOR_PARAMS);
-    if (!sd) {
-        fprintf(stderr, "the decoder produced no AV_FRAME_DATA_RAW_COLOR_PARAMS "
-                        "side data; cineraw only handles raw camera clips\n");
-        return CRAW_ERROR(EINVAL);
-    }
-
-    rc = (const AVRawColorParams *)sd->data;
-    if (rc->type != AV_RAW_COLOR_PARAMS_PRORES_RAW) {
-        fprintf(stderr, "raw colour parameters of type %d are not supported\n",
-                (int)rc->type);
-        return CRAW_ERROR(ENOTSUP);
-    }
-    pr = &rc->codec.prores_raw;
-
-    /* The levels arrive normalized to the 16 bit sample range, which is
-     * exactly the UNORM domain the pipeline reads, and ProRes RAW has no
-     * per-site variation. */
-    for (int i = 0; i < 4; i++) {
-        p->black_level[i] = tool_q2f(rc->black_level);
-        p->white_level[i] = tool_q2f(rc->white_level);
-    }
-
-    p->cfa = CRAW_CFA_RGGB;
-    p->as_shot_wb[0] = tool_q2f(pr->wb_red);
-    p->as_shot_wb[1] = 1.0f;
-    p->as_shot_wb[2] = tool_q2f(pr->wb_blue);
-
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-            p->as_shot_matrix[i][j] = tool_q2f(pr->color_matrix[i][j]);
-
-    p->gain = tool_q2f(pr->gain);
-    p->as_shot_cct = (float)rc->wb_cct;
-
-#if CRAW_TOOL_HAVE_EXPOSURE_INDEX
-    p->as_shot_ei = tool_q2f(rc->as_shot_ei);
-    p->exposure_index = tool_q2f(rc->exposure_index);
-#endif
-
-    ret = craw_profile_validate(p);
-    if (ret < 0)
-        fprintf(stderr, "the frame's colour parameters do not make a valid profile "
-                        "(black %.6f, white %.6f, wb %.5f/%.5f, gain %.4f): %d\n",
-                p->black_level[0], p->white_level[0], p->as_shot_wb[0],
-                p->as_shot_wb[2], p->gain, ret);
-
-    return ret;
-}
-
 /* Exposure indices from the container, the way Apple's decoder reads them:
  * the as-shot ISO from the SMPTE RDD 18 camera metadata, the working index
  * from Apple's own EXIF-style key. Either may be missing. */
@@ -1463,7 +1433,97 @@ static const char *tool_detect_profile(AVFormatContext *fmt, int stream_index,
     return found;
 }
 
+/* A still's container says nothing - an RW2 is its own container, and the
+ * file's tags are the frame's - so the camera is looked for in the Exif IFD
+ * the decoder attaches to the first frame, the same way: every value. */
+static const char *tool_detect_frame_profile(const AVFrame *frame, bool verbose,
+                                             const char **match_key)
+{
+    const AVDictionaryEntry *e = NULL;
+    const char *found = NULL;
+
+    while ((e = av_dict_iterate(frame->metadata, e))) {
+        const char *name;
+
+        if (verbose) {
+            int len = (int)strlen(e->value);
+            fprintf(stderr, "  frame metadata: %s = %.*s%s\n", e->key,
+                    CRAW_MIN(len, 120), e->value, len > 120 ? " [...]" : "");
+        }
+
+        name = craw_tool_profile_detect(e->value);
+        if (name && !found) {
+            found = name;
+            *match_key = e->key;
+        }
+    }
+
+    return found;
+}
+
+/* The rest of the camera's profile once its built-in tables, if any, are
+ * in: a --tables file on top, and the check that a white balance other
+ * than as shot has a table to work from. Run before the first frame when
+ * the container named the camera, and at the first frame when only the
+ * frame could. */
+static int tool_base_finish(const struct tool_cfg *cfg, CRAWProfile *base)
+{
+    int ret;
+
+    /* The file wins over anything built in: it is how a new camera gets
+     * tried without a rebuild. */
+    if (cfg->tables) {
+        ret = craw_tool_profile_load_tables(base, cfg->tables);
+        if (ret < 0)
+            return ret;
+        if (cfg->verbose)
+            fprintf(stderr, "loaded %u wb and %u matrix knots from %s\n",
+                    base->nb_wb_knots, base->nb_matrix_knots, cfg->tables);
+    }
+
+    if (cfg->wb != TOOL_WB_AS_SHOT && !base->nb_wb_knots) {
+        fprintf(stderr, "--wb %s needs the camera's per-CCT white balance table, and "
+                        "none was found.\nPass --profile NAME (have: %s) or --tables FILE.\n",
+                cfg->wb == TOOL_WB_AUTO ? "auto" : "CCT", craw_tool_profile_builtin_list());
+        return CRAW_ERROR(ENOENT);
+    }
+
+    return 0;
+}
+
 /* -------------------------------------------------------------- decode */
+
+/* How many frames the stream holds, from its own count or else from its
+ * duration and rate; 0 when neither says. An RW2 says 1 the second way. */
+static int64_t tool_stream_frames(const AVStream *st)
+{
+    AVRational rate = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
+
+    if (st->nb_frames > 0)
+        return st->nb_frames;
+    if (st->duration > 0 && rate.num > 0 && rate.den > 0)
+        return av_rescale_q(st->duration, st->time_base, av_inv_q(rate));
+
+    return 0;
+}
+
+/* -o without a frame index names one file, which every frame after the
+ * first would overwrite: only a run that writes one frame - a still, or
+ * --frames 1 - may use it. */
+static int tool_check_single(const struct tool_cfg *cfg, const AVStream *st)
+{
+    int64_t n = tool_stream_frames(st);
+
+    if (!cfg->pattern || cfg->pattern_indexed || cfg->frames == 1 || n == 1)
+        return 0;
+
+    fprintf(stderr, "-o: `%s` has no printf frame index, and this clip has %s%" PRId64
+                    " frames; name one (e.g. out_%%05d%s) or pass --frames 1\n",
+            cfg->pattern, n ? "" : "an unknown number of ", n,
+            strrchr(cfg->pattern, '.') ? strrchr(cfg->pattern, '.') : "");
+
+    return CRAW_ERROR(EINVAL);
+}
 
 /* The lens record travels with the packet, not with the frame: it lives in
  * the frame's vendor metadata, which the decoder does not expose, so it is
@@ -1585,14 +1645,25 @@ static int tool_decoder_open(struct tool_decoder *d, const char *path, bool verb
 
     /* Software decode only in this version; a Vulkan hwaccel would hand the
      * pipeline its input image directly and skip the round trip entirely. */
-    /* One thread: ProRes RAW frame threading keeps a 35 MB Bayer frame in
-     * flight per thread, which on a many-core machine is gigabytes for a
-     * tool that hands every frame to the GPU anyway. */
-    d->dec->thread_count = 1;
+    if (codec->id == AV_CODEC_ID_PRORES_RAW) {
+        /* One thread: ProRes RAW frame threading keeps a 35 MB Bayer frame
+         * in flight per thread, which on a many-core machine is gigabytes
+         * for a tool that hands every frame to the GPU anyway. */
+        d->dec->thread_count = 1;
+    } else {
+        /* A still is one packet. Frame threads would get nothing out of it
+         * but a picture held back until the stream ends; slice threads
+         * split that one picture - an RW2's stripes - across the cores and
+         * keep nothing extra in flight. 0.11 s for the 24 MP _1000406.RW2
+         * against 0.15 s on one thread, 0.32 against 0.55 s at 96 MP. */
+        d->dec->thread_type = FF_THREAD_SLICE;
+        d->dec->thread_count = 0;
+    }
 
     /* ProRes RAW carries a crop in the frame header (the Sony FX6 clips
-     * mark 3840x2160 inside a 3872x2192 readout), and two things are wrong
-     * with letting libavutil apply it. It refuses to, for one:
+     * mark 3840x2160 inside a 3872x2192 readout), and so does an RW2 (the
+     * DC-S1M2's 6004x4000 picture in a 6008x4008 readout), and two things
+     * are wrong with letting libavutil apply it. It refuses to, for one:
      * av_frame_apply_cropping() compares the number of low zero bits of
      * crop_left with that of the resulting byte offset and returns
      * AVERROR_BUG when the crop looks less aligned than the offset, which
@@ -2159,10 +2230,12 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
     if (cfg->pattern) {
         if ((ret = tool_check_pattern(cfg->pattern)) < 0)
             return ret;
+        cfg->pattern_indexed = ret == 1;
 
         cfg->writer = tool_writer_from_path(cfg->pattern);
         if (cfg->writer == TOOL_WRITER_NONE) {
-            fprintf(stderr, "-o: `%s` has no .png, .ppm or .pfm extension\n", cfg->pattern);
+            fprintf(stderr, "-o: `%s` has no .png, .tif, .ppm or .pfm extension\n",
+                    cfg->pattern);
             return CRAW_ERROR(EINVAL);
         }
 
@@ -2200,6 +2273,9 @@ int main(int argc, char **argv)
     double gpu_ms_total = 0.0, decode_ms_total = 0.0, decode_ms_warm = 0.0;
     float last_lens_dist = 0.0f;
     bool have_lens_report = false, warned_no_lens = false;
+    /* The camera is to be found in the first frame's metadata rather than
+     * the container's: a still. */
+    bool detect_late = false;
     int64_t processed = 0;
     int ret;
 
@@ -2235,6 +2311,10 @@ int main(int argc, char **argv)
                     dec.fmt->streams[dec.stream_index]->codecpar->codec_id ==
                         AV_CODEC_ID_PRORES_RAW;
 
+    ret = tool_check_single(&cfg, dec.fmt->streams[dec.stream_index]);
+    if (ret < 0)
+        goto fail;
+
     if (!cfg.profile) {
         const char *key = NULL;
         tool_read_exposure_metadata(dec.fmt, dec.stream_index, &cfg.meta_as_shot_ei, &cfg.meta_apple_ei);
@@ -2249,29 +2329,18 @@ int main(int argc, char **argv)
                 goto fail;
             if (cfg.verbose)
                 fprintf(stderr, "detected `%s` from the metadata key %s\n", name, key);
-        } else if (!cfg.tables) {
-            fprintf(stderr, "warning: no camera recognized in the container metadata, "
-                            "carrying on without per-CCT tables\n");
+        } else {
+            /* Nothing in the container, which for a still is where nothing
+             * ever is: the first frame's own metadata may yet name the
+             * camera, and the rest of the profile waits for it. */
+            detect_late = true;
         }
     }
 
-    /* The file wins over anything built in: it is how a new camera gets
-     * tried without a rebuild. */
-    if (cfg.tables) {
-        ret = craw_tool_profile_load_tables(&base, cfg.tables);
+    if (!detect_late) {
+        ret = tool_base_finish(&cfg, &base);
         if (ret < 0)
             goto fail;
-        if (cfg.verbose)
-            fprintf(stderr, "loaded %u wb and %u matrix knots from %s\n",
-                    base.nb_wb_knots, base.nb_matrix_knots, cfg.tables);
-    }
-
-    if (cfg.wb != TOOL_WB_AS_SHOT && !base.nb_wb_knots) {
-        fprintf(stderr, "--wb %s needs the camera's per-CCT white balance table, and "
-                        "none was found.\nPass --profile NAME (have: %s) or --tables FILE.\n",
-                cfg.wb == TOOL_WB_AUTO ? "auto" : "CCT", craw_tool_profile_builtin_list());
-        ret = CRAW_ERROR(ENOENT);
-        goto fail;
     }
 
     /* --------------------------------------------------------- seek */
@@ -2347,6 +2416,7 @@ have_device:
         CRAWLensCorrection lens;
         struct tool_record rec;
         double pts_s, decode_ms, gpu_ms = 0.0;
+        double upload_ms, develop_ms, download_ms = 0.0, write_ms = 0.0;
         int64_t t0;
         int64_t crop[4];
         bool have_crop;
@@ -2369,14 +2439,42 @@ have_device:
             continue;
         }
 
-        if (frame->format != AV_PIX_FMT_BAYER_RGGB16LE) {
+        /* The upload copies the samples as they are, so they have to be in
+         * the host's order; which of the four phases it is the profile
+         * reads off the format, and the pipeline says whether it can
+         * develop it. */
+        if (frame->format != AV_PIX_FMT_BAYER_RGGB16LE &&
+            frame->format != AV_PIX_FMT_BAYER_BGGR16LE &&
+            frame->format != AV_PIX_FMT_BAYER_GRBG16LE &&
+            frame->format != AV_PIX_FMT_BAYER_GBRG16LE) {
             const char *name = av_get_pix_fmt_name(frame->format);
-            fprintf(stderr, "the decoder produced %s frames; cineraw needs "
-                            "%s (an RGGB Bayer mosaic)\n",
-                    name ? name : "frames of an unknown format",
-                    av_get_pix_fmt_name(AV_PIX_FMT_BAYER_RGGB16LE));
+            fprintf(stderr, "the decoder produced %s frames; cineraw needs a "
+                            "16-bit little endian Bayer mosaic\n",
+                    name ? name : "frames of an unknown format");
             ret = CRAW_ERROR(ENOTSUP);
             goto fail;
+        }
+
+        if (detect_late) {
+            const char *key = NULL;
+            const char *name = tool_detect_frame_profile(frame, cfg.verbose, &key);
+
+            detect_late = false;
+            if (name) {
+                ret = craw_tool_profile_apply_builtin(&base, name);
+                if (ret < 0)
+                    goto fail;
+                if (cfg.verbose)
+                    fprintf(stderr, "detected `%s` from the frame's metadata key %s\n",
+                            name, key);
+            } else if (!cfg.tables) {
+                fprintf(stderr, "warning: no camera recognized in the container or the "
+                                "frame metadata, carrying on without per-CCT tables\n");
+            }
+
+            ret = tool_base_finish(&cfg, &base);
+            if (ret < 0)
+                goto fail;
         }
 
         /* The whole coded frame: nothing was cropped away, so the pipeline
@@ -2389,7 +2487,7 @@ have_device:
         have_crop = tool_frame_crop(&cfg, frame, crop);
 
         prof = base;
-        ret = tool_profile_from_frame(&prof, frame);
+        ret = craw_tool_profile_from_frame(&prof, frame, cfg.verbose && !processed);
         if (ret < 0)
             goto fail;
 
@@ -2527,11 +2625,13 @@ have_device:
 
         /* The pass is only built once a frame has been seen to carry a
          * record, so a clip without one never allocates the extra image. */
-        ret = tool_gpu_resize(&gpu, &cfg, w, h, dec.lens_any);
+        ret = tool_gpu_resize(&gpu, &cfg, w, h, prof.cfa, dec.lens_any);
         if (ret < 0)
             goto fail;
 
+        t0 = av_gettime_relative();
         ret = tool_upload_frame(&gpu, &buf, frame);
+        upload_ms = (double)(av_gettime_relative() - t0) / 1000.0;
         if (ret < 0)
             goto fail;
 
@@ -2572,10 +2672,12 @@ have_device:
             .pipe = gpu.pipe, .src = &gpu.src.img, .dst = &gpu.dst.img, .fp = &fp,
         };
 
+        t0 = av_gettime_relative();
         if (cfg.bench)
             ret = craw_testdev_run_timed(&gpu.td, tool_record_cb, &rec, &gpu_ms);
         else
             ret = craw_testdev_run(&gpu.td, tool_record_cb, &rec);
+        develop_ms = (double)(av_gettime_relative() - t0) / 1000.0;
         if (ret < 0) {
             fprintf(stderr, "the submission failed: %d\n", ret);
             goto fail;
@@ -2608,7 +2710,9 @@ have_device:
 
         /* 280 MB a frame, so only when something is going to read it. */
         if (cfg.writer != TOOL_WRITER_NONE || cfg.stats) {
+            t0 = av_gettime_relative();
             ret = tool_download_frame(&gpu, &buf, cfg.float32);
+            download_ms = (double)(av_gettime_relative() - t0) / 1000.0;
             if (ret < 0)
                 goto fail;
 
@@ -2641,14 +2745,27 @@ have_device:
         if (cfg.writer != TOOL_WRITER_NONE) {
             char path[4096];
 
+            /* A pattern without an index is formatted all the same, so
+             * that a %% in it still means one percent sign. */
             snprintf(path, sizeof(path), cfg.pattern, (int)processed);
 
+            t0 = av_gettime_relative();
             ret = tool_write_frame(&cfg, path, buf.rgba, w, h);
+            write_ms = (double)(av_gettime_relative() - t0) / 1000.0;
             if (ret < 0)
                 goto fail;
             if (cfg.verbose)
                 fprintf(stderr, "frame %5" PRId64 " -> %s\n", processed, path);
         }
+
+        /* Wall times of the frame's steps. The decode includes the read,
+         * and on the first frame the decoder's own start-up; the develop
+         * is the submission waited for, so on the first frame it pays for
+         * the pipeline's first dispatches too. */
+        if (cfg.verbose)
+            fprintf(stderr, "frame %5" PRId64 ": decode %.1f ms, upload %.1f ms, develop "
+                            "%.1f ms, download %.1f ms, write %.1f ms\n", processed,
+                    decode_ms, upload_ms, develop_ms, download_ms, write_ms);
 
         if (cfg.bench)
             printf("frame %5" PRId64 " pts %8.3f s: gpu %7.3f ms, decode %7.1f ms\n",

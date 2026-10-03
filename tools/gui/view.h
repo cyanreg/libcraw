@@ -304,7 +304,8 @@ struct view_reader {
 };
 
 /* What a Panasonic clip's PANA box says about the take, out of the Exif
- * block the camera writes there (see pana.c). Zero or empty wherever the
+ * block the camera writes there (see pana.c), or a still's own Exif, which
+ * the decoder attaches to its picture (decode.c). Zero or empty wherever the
  * clip carries nothing, which is every clip from another camera. */
 struct view_pana {
     /* The maker note's white balance: the mode (1 auto, 2 daylight,
@@ -397,10 +398,28 @@ struct view_decoder {
      * the VkImageViews cached for them have to go the moment a picture
      * arrives from another pool: `frames_reset` says one has
      * (view_frames_follow() in main.c acts on it). The reference held here
-     * keeps the old pool's address from being reused under the comparison. */
+     * keeps the old pool's address from being reused under the comparison.
+     * An uploaded picture's pool is `upload` below, and counts the same. */
     AVBufferRef *frames;
     bool frames_reset;
     int frames_pools;           /* seen this clip, for -v */
+
+    /* The frames context a raw picture decoded in system memory - an RW2's
+     * - is uploaded into, so that it reaches the pipeline as the hwaccel's
+     * pictures do (view_decoder_upload()). Made on the clip's first such
+     * picture and released with the clip; NULL while the hwaccel decodes. */
+    AVBufferRef *upload;
+    int uploads;
+    /* What view_decoder_next() receives into, so that the caller's picture
+     * is replaced by the next one rather than unreferenced by the decoder
+     * at the end of the stream. */
+    AVFrame *recv;
+    /* The clip is one picture, a still: shown, never looped, and given no
+     * rate row. */
+    bool still;
+    /* The first picture's own metadata has been read
+     * (view_read_frame_info()). */
+    bool frame_info;
 
     /* Bayer source that goes through libcraw, as opposed to a camera clip
      * that is already demosaiced and encoded. Decided by codec id: nothing
@@ -480,11 +499,15 @@ struct view_decoder {
      * written: what mpv and ffmpeg's autorotate do with it. Zero for a clip
      * that carries no matrix, and for one whose matrix is not a multiple of
      * ninety degrees or carries a flip - a mirror is not a rotation, and
-     * view_decoder_open() logs one rather than guessing at it. */
+     * view_decoder_open() logs one rather than guessing at it. A still's
+     * is its first picture's, the Exif orientation the decoder turned into
+     * a matrix, and is known from that picture on. */
     pl_rotation rotation;
     /* The matrix's own angle, in the counter-clockwise degrees
      * av_display_rotation_get() reports, for the clip line and the log. */
     int rotation_deg;
+    /* The track header had one, which a picture's does not override. */
+    bool stream_matrix;
 };
 
 /* --------------------------------------------------------------- the gpu */
@@ -1224,6 +1247,11 @@ struct view_state {
     CRAWProfile base;           /* tables, no per-frame data */
     CRAWProfile prof;           /* base plus the current frame's side data */
     bool have_prof;
+    /* The container did not name the camera, so `base` gets its tables
+     * from the first picture's metadata, when that is developed
+     * (view_frame_profile()); `first` as view_profile_setup() had it. */
+    bool profile_late;
+    bool profile_late_first;
 
     /* Which of cfg.inputs is open. `r` and `t` step it, wrapping. */
     int clip;
@@ -1247,6 +1275,9 @@ struct view_state {
     int64_t index;              /* frame number of the picture on screen */
     double pts;
     bool have_frame;
+    /* A still paused the transport at its end instead of looping, and the
+     * next clip plays again (view_open_clip()). */
+    bool still_paused;
     struct view_pipeline_look processed;    /* what it was processed with */
     bool playing;
     /* The output frame rate the clip is shown and written at, 0/0 for the
@@ -1531,9 +1562,6 @@ bool view_decoder_wait(struct view_decoder *d, int ms);
 
 /* Mean queue depth since the last call, as the reader itself saw it. */
 double view_decoder_queued(struct view_decoder *d);
-
-/* Fills `p` from the frame's AV_FRAME_DATA_RAW_COLOR_PARAMS side data. */
-int  view_profile_from_frame(CRAWProfile *p, const AVFrame *frame);
 
 /* The lens record of the picture with this presentation timestamp, read off
  * the packet it was decoded from. `out` is left invalid when that frame

@@ -1645,16 +1645,34 @@ static int view_awb_step(struct view_state *st)
     return 0;
 }
 
+static int view_profile_tables(struct view_state *st, bool first);
+
 /* The profile a frame is developed with: the camera's tables and the
- * frame's own side data. */
+ * frame's own side data. A clip whose container did not name the camera -
+ * a still, whose container is the file itself - has its tables found here,
+ * on its first picture, whose metadata may (view_read_frame_info()). */
 static int view_frame_profile(struct view_state *st, const AVFrame *f)
 {
     int ret;
 
+    if (st->profile_late) {
+        st->profile_late = false;
+        ret = view_profile_tables(st, st->profile_late_first);
+        if (ret < 0)
+            return ret;
+    }
+
     st->prof = st->base;
-    ret = view_profile_from_frame(&st->prof, f);
+    /* The derivation is printed once a clip; a replay builds the same. */
+    ret = craw_tool_profile_from_frame(&st->prof, f, st->cfg.verbose && !st->have_prof);
     if (ret < 0)
         return ret;
+
+    /* The as-shot balance for the Clip block when the container gave none:
+     * the frame's own colour temperature, which for a still is where its
+     * gains lie on the camera's locus. */
+    if (!st->dec.wb_kelvin && st->prof.as_shot_cct > 0.0f)
+        st->dec.wb_kelvin = (int)lrintf(st->prof.as_shot_cct);
 
     /* The same exposure model cineraw uses: the frame gain times the
      * working index over the as-shot ISO, times the bias in stops. */
@@ -2008,6 +2026,19 @@ int view_step_frame(struct view_state *st)
         return CRAW_ERROR(EIO);
     vs = st->dec.fmt->streams[st->dec.stream_index];
 
+    /* A still has one picture, and a seek to it while it is on screen -
+     * Home, an arrow key, a step back - would read and decode all of it
+     * again to show the same thing: the step is the end of the clip
+     * instead, which is what any step from that picture comes to. A seek
+     * that has to start cold, an export's, still decodes. The raw picture
+     * must still be held for that, since a grade change develops it again;
+     * a developed one stays mapped whatever happens to the frame. */
+    if (st->seek_to >= 0 && st->dec.still && st->have_frame && !st->seek_cold &&
+        st->seek_to == st->index && (st->frame->buf[0] || !st->dec.raw)) {
+        st->seek_to = -1;
+        return 1;
+    }
+
     if (st->seek_to >= 0) {
         /* Replaying the picture already on screen, which is how a grade
          * change repaints while paused, is not a move in time and must not
@@ -2093,7 +2124,10 @@ int view_step_frame(struct view_state *st)
      * never blocks on a read while playing. */
     if (ret == 2 && st->scrubbing && view_decoder_wait(&st->dec, 40))
         ret = view_decoder_next(&st->dec, st->frame);
-    st->decode_ms = (double)(av_gettime_relative() - t0) / 1000.0;
+    /* The end of the stream decodes nothing, and the readout keeps the
+     * last picture's time: a still's own, for as long as it is up. */
+    if (ret != 1)
+        st->decode_ms = (double)(av_gettime_relative() - t0) / 1000.0;
     st->timing.read += st->dec.read_ms;
     st->timing.decode += st->decode_ms - st->dec.read_ms;
     if (ret == 2) {
@@ -2173,9 +2207,10 @@ int view_step_frame(struct view_state *st)
         st->seek_target = -1;
     }
 
+    /* view_decoder_next() uploads whatever did not come on the GPU, so
+     * this is only ever a picture that went missing on the way. */
     if (st->frame->format != AV_PIX_FMT_VULKAN) {
-        fprintf(stderr, "the decoder produced software frames; cineview needs the "
-                        "Vulkan hwaccel for a raw clip\n");
+        fprintf(stderr, "a raw picture did not reach the device\n");
         return CRAW_ERROR(ENOTSUP);
     }
 
@@ -2379,7 +2414,11 @@ static void view_usage(FILE *f)
 "\n"
 "Opens a camera raw clip, decodes it with FFmpeg's Vulkan hwaccel, runs\n"
 "every frame through libcraw on the same device and displays the result\n"
-"through libplacebo, with a nuklear panel for the grade.\n"
+"through libplacebo, with a nuklear panel for the grade. A Panasonic RW2\n"
+"still is decoded on the CPU and uploaded, and developed the same way. A\n"
+"still, or any file of one frame, is shown and not looped: it pauses at\n"
+"the end of its stream, and a playlist that was playing plays on at the\n"
+"next file.\n"
 "\n"
 "More than one file makes a playlist: `r` and `t` step to the previous and\n"
 "the next clip, wrapping at both ends, and the panel's clip line says which\n"
@@ -3171,23 +3210,18 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
 
 /* ------------------------------------------------------------ the profile */
 
-/* `first` says this is the clip the command line opened, which is the only
+/* The camera's tables, into st->base: --profile's, or the built-in set
+ * the clip's model names, then --tables on top.
+ *
+ * `first` says this is the clip the command line opened, which is the only
  * one whose choices are worth arguing with: a later clip that brings no
  * per-CCT tables is no reason to throw away a white balance the user set
  * three clips ago, and view_frame_params() falls back to as shot by itself
  * on a profile that has none. */
-static int view_profile_setup(struct view_state *st, bool first)
+static int view_profile_tables(struct view_state *st, bool first)
 {
     const char *profile = st->cfg.profile, *tables = st->cfg.tables;
     int ret;
-
-    craw_profile_init(&st->base);
-    st->have_prof = false;
-
-    /* An already developed clip has no raw to balance, so none of this
-     * applies and its absence must not be reported as a problem. */
-    if (!st->dec.raw)
-        return 0;
 
     if (profile) {
         ret = craw_tool_profile_apply_builtin(&st->base, profile);
@@ -3203,10 +3237,11 @@ static int view_profile_setup(struct view_state *st, bool first)
             ret = craw_tool_profile_apply_builtin(&st->base, name);
             if (ret < 0)
                 return ret;
-            view_log(st, "recognized `%s` from the container metadata\n", name);
+            view_log(st, "recognized `%s` from the %s metadata\n", name,
+                     st->dec.frame_info ? "first picture's" : "container");
         } else if (!tables) {
-            fprintf(stderr, "warning: no camera recognized in the container metadata, "
-                            "carrying on without per-CCT tables\n");
+            fprintf(stderr, "warning: no camera recognized in the container or the first "
+                            "picture's metadata, carrying on without per-CCT tables\n");
         }
     }
 
@@ -3230,6 +3265,32 @@ static int view_profile_setup(struct view_state *st, bool first)
     }
 
     return 0;
+}
+
+/* What a clip that opens starts with: no tables, until its camera is
+ * known. */
+static int view_profile_setup(struct view_state *st, bool first)
+{
+    craw_profile_init(&st->base);
+    st->have_prof = false;
+    st->profile_late = false;
+
+    /* An already developed clip has no raw to balance, so none of this
+     * applies and its absence must not be reported as a problem. */
+    if (!st->dec.raw)
+        return 0;
+
+    /* A container that names no camera - every still's, since an RW2 is
+     * its own container and keeps its tags on the picture - leaves the
+     * question to the first picture, whose metadata
+     * view_read_frame_info() reads before anything is developed. */
+    if (!st->cfg.profile && !st->dec.model[0]) {
+        st->profile_late = true;
+        st->profile_late_first = first;
+        return 0;
+    }
+
+    return view_profile_tables(st, first);
 }
 
 /* ---------------------------------------------------------------- clips */
@@ -3365,10 +3426,18 @@ static void view_log_look(const struct view_state *st)
  * view_profile_setup().
  *
  * The transport is not touched: a switch while paused stays paused, and one
- * while playing plays. */
+ * while playing plays - which includes one from a still that paused itself
+ * at its end in a playlist that was playing. */
 static int view_open_clip(struct view_state *st, int index, bool first)
 {
     int ret;
+
+    /* A still paused itself where a clip would have looped; the clip after
+     * it plays, as the playlist was doing before the still came up. */
+    if (st->still_paused) {
+        st->still_paused = false;
+        st->playing = true;
+    }
 
     st->clip = index;
     st->cfg.input = st->cfg.inputs[index];
@@ -3654,8 +3723,11 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
 
     switch (e->key.key) {
     case SDLK_SPACE:
-        if (!repeat)
+        if (!repeat) {
             st->playing = !st->playing;
+            /* Whatever it is now is the user's. */
+            st->still_paused = false;
+        }
         break;
 
     case SDLK_UP:
@@ -3899,7 +3971,29 @@ static int view_loop_step(struct view_state *st, bool *stepped, int *proc_frames
          * never drain - and ends once its last picture is shown. */
         if (!view_audio_live(st) || view_audio_drained(&st->audio)) {
             st->loops_done++;
-            if (st->cfg.loops && st->loops_done >= st->cfg.loops) {
+            if (st->dec.still) {
+                /* A still is not looped: going round would decode the same
+                 * picture again and again to show what is on screen
+                 * already (a one-frame ProRes RAW clip re-developed itself
+                 * twenty times a second). It stays up, paused, which is
+                 * what makes everything a paused picture does work on it:
+                 * a grade change develops it again, the auto white
+                 * balance settles on it. The pause is the still's and not
+                 * the user's, so a playlist that was playing plays on at
+                 * the next clip (view_open_clip()). --loops counts it as
+                 * every pass at once, since more passes of one picture
+                 * show nothing more, and --no-loop stops at it as it stops
+                 * at the end of any clip. */
+                if (st->cfg.loops) {
+                    st->playing = false;
+                    stop = true;
+                } else if (!st->cfg.loop) {
+                    st->playing = false;
+                } else if (st->playing) {
+                    st->playing = false;
+                    st->still_paused = true;
+                }
+            } else if (st->cfg.loops && st->loops_done >= st->cfg.loops) {
                 st->playing = false;
                 stop = true;
             } else if (st->cfg.loop) {

@@ -100,7 +100,16 @@ row, "Gr"), 2 = G (in the B row, "Gb"), 3 = B.
 
 Input image: `VK_FORMAT_R16_UNORM`, the mosaic, sample `raw(x, y)` in
 [0, 1]. This is what FFmpeg's Vulkan hwcontext maps `AV_PIX_FMT_BAYER_RGGB16`
-to.
+to. The samples need not fill the 16 bits: a ProRes RAW frame's do (black
+256, white 63743 of 65535), a Panasonic RW2 still's are the camera's 14-bit
+codes in the 16-bit container (black 512, white 16383), and each is
+normalised by its own levels, `(raw - black) / (white - black)`, which the
+profile carries in the same units. The tools take the CFA phase from the
+frame's pixel format, the software format behind a Vulkan frame
+(`craw_tool_profile_from_frame()`), so a GRBG, GBRG or BGGR mosaic is
+named as what it is and then refused by `craw_pipeline_create()` (section
+1); every frame either tool has seen so far is RGGB. libavutil has a Vulkan
+format for the RGGB phase only, so cineview could not even upload another.
 
 Denoised mosaic (internal, only with `CRAW_PIPELINE_FLAG_DENOISE` or
 `CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE`): `VK_FORMAT_R16_UNORM`, the same raw
@@ -743,6 +752,81 @@ coefficients, radius limits), and ignores Panasonic's
 `optical_correction` record entirely. The plug-in also carries built-in
 per-CCT tables for the Panasonic 35LT1 and S1H and the Nikon Z 6 and Z 7,
 for containers without them.
+
+## 9c. Panasonic RW2 stills
+
+An RW2 from the same camera is the same sensor's mosaic, one picture of it,
+and FFmpeg's rw2 decoder (in Lynne's tree; upstream has neither the decoder
+nor the record, so the tools build without RW2 there, `CRAW_TOOL_HAVE_RW2`)
+exports less about it than a ProRes RAW frame header says. What it gives,
+in `AV_FRAME_DATA_RAW_COLOR_PARAMS` of type `AV_RAW_COLOR_PARAMS_RW2`: the
+levels (the green sites' black for all four, `black[1]/65535`, and the
+largest linearity limit as the white), and the as-shot white balance, R/G
+and B/G, from the file's WB tags. No matrix, no colour temperature
+(`wb_cct` is 0), no gain. The camera model and the ISO are in the Exif IFD
+the decoder attaches to the frame, `Model` and `ExifIFD/ISOSpeedRatings`;
+the demuxer has no tags at all. The picture is cropped by the file's
+border, even aligned: 6000x4000 inside a 6008x4008 readout on the DC-S1M2,
+which is also the size of the camera's own JPEG (ffprobe reports 6004x4000
+because `av_frame_apply_cropping()` gives up four columns of the left crop
+to keep the plane pointer aligned; the tools never let it crop).
+
+`craw_tool_profile_from_frame()` (tools/profiles.c) makes the rest out of
+the camera's own tables, which are the same sensor's:
+
+- as_shot_wb = { R/G, 1, B/G } as the file has them;
+- as_shot_cct = the temperature the as-shot gains lie at on the table's
+  locus, `craw_profile_neutral_to_illuminant(1/R, 1/B)`, the tint left
+  across it being already in the gains;
+- as_shot_matrix = the table's matrix at that temperature,
+  `craw_profile_eval(CRAW_WB_REBALANCE)`'s `cam_to_xyz`, which is how the
+  camera itself picks a ProRes RAW frame's matrix (section 9: REBALANCE at
+  a frame's CCT reproduces its header matrix to 5e-4);
+- gain = the camera's own GainFactor for the gain mode the ISO is in,
+  23.04 at ISO 1000 and above and 14.51 below, divided by eight: a still
+  is rated three stops closer to the sensor clip than a V-Log recording
+  (the measurement below), so the video factor itself made every still
+  three stops brighter than the camera's own JPEG. Both factors are this
+  camera's video ones (14.2's clips: 23.04 in every clip from 1000 up,
+  14.51 in every 640 clip). ISO 100 to 500 exist only for stills, so no
+  clip says which mode they are, and the low mode is an assumption; where
+  between 640 and 1000 the camera changes mode is not known either;
+- as_shot_ei = the ISO, so that a working index re-rates a still exactly as
+  it re-rates a clip, `gain * (ei / iso)`.
+
+The camera's tables come from the model in the Exif when the container
+names none, which for a still it never does; without tables there is no
+matrix, and the frame is refused with a message that names `--profile` and
+`--tables`, never developed through an identity.
+
+What the gain rule does, measured against the camera's own JPEGs on flat
+mid-tone patches (64x64, the JPEG's green between 0.25 and 0.75 of full
+scale, flat in both; the JPEG taken to linear through the sRGB curve, which
+ignores its picture style's S curve):
+
+    still      ISO  exposure         patches  ours / JPEG, linear G
+    _1000406   100  1/15 f/2.8 (M)       152  9.66  (+3.27 stops)
+    _1000036   100  1/640 f/6.3 (P)        3  6.52  (+2.71 stops)
+    _1000042   100  1/200 f/4 (scene)     40  7.97  (+3.00 stops)
+    _1093946   640  1/8000 f/1.4         152  7.76  (+2.96 stops)
+
+So a still developed with its camera's video GainFactor itself sits about
+three stops above the camera's JPEG of it in the mid-tones, at ISO 100 and
+at 640 alike: the ISO 640 still, whose factor is measured, is as far off
+as the ISO 100 ones, whose factor is assumed. The gap is the rating, not
+the assumption: the video factor places the sensor clip 6.3 stops above
+18% grey (14.51 / 0.18), the log-style headroom the camera gives a V-Log
+recording at the same ISO number, where its stills rating leaves about
+three. The tools therefore take the video factor over eight for a still
+(measured as 2.7 to 3.3 stops over the four stills; three is the rating
+convention and the number used). With it cineraw's SDR file shows the
+same mid-tone patches at 0.34 of full scale against the JPEG's 0.31 on
+_1000406, and at 0.62 against 0.63 on _1093946; with the video factor
+itself they came out at 0.87. The price is that a still and a clip from
+the same body at the same ISO number and exposure no longer have the same
+brightness: the clip is three stops brighter, because the camera's two
+ratings are three stops apart, and `--exposure 3` on the still (or the
+panel's Exposure section) puts the two side by side.
 
 ## 10. Vulkan runtime
 
@@ -2134,10 +2218,12 @@ The pre-roll took 70 to 170 ms a jump in the window at 5.8K on the 6900 XT,
 82 ms the median of 63 and the slowest with other work on the GPU, the
 target's own decode included: six decodes and five passes that the device
 runs one after another, the wait for the medium no more than 10 ms of it.
-The raw path has no software decode to cap it for: a raw clip without the
-Vulkan hwaccel does not open at all (decode.c), so every frame of a
-pre-roll is a decode on the device and none of them can cost what a
-decode on the CPU would.
+The raw path has no software decode of a clip to cap it for: ProRes RAW is
+decoded by the Vulkan hwaccel, so every frame of a pre-roll is a decode on
+the device and none of them can cost what a decode on the CPU would. The
+one raw source decoded on the CPU and uploaded is a still (section 24),
+which has nothing before it to pre-roll; a ProRes RAW clip whose hwaccel
+would not start takes the same upload, frame by frame, and pays for it.
 
 A frame the player drops to keep up is not a break: the next one is still
 the next frame of the same scene, further on, and the pass takes what
@@ -5023,3 +5109,127 @@ Not verified: an export started from the panel while slowed (the engine is
 the same as the headless one, which was run), and a playlist switch
 between clips of different rates, for want of a way to send keys to the
 nested compositor.
+
+## 24. Stills in cineview
+
+### 24.1 What a still is
+
+A clip of one picture: `nb_frames` 1, from the container's count or from
+its duration at its rate. An RW2 is one by construction (its demuxer gives
+it a duration of one second at 1 fps), and so is a one-frame cut of any
+clip. `struct view_decoder`'s `still` says so, and four things follow.
+
+- It is not looped. At the end of its stream - the step after its picture
+  - it pauses instead, and the pause is the still's rather than the
+  user's (`still_paused`): the next clip a playlist opens plays if the
+  playlist was playing. Paused, everything a paused picture does works on
+  it: a grade change develops it again, the auto white balance settles on
+  it through replays. `--loops N` counts it as every pass at once and
+  quits after it, `--no-loop` stops at it as at the end of any clip.
+- A seek to it while it is on screen (Home, an arrow key, `,`) is the end
+  of the stream at once rather than a read and a decode of the same
+  picture; a cold seek, an export's, still decodes it.
+- Its rate is a placeholder, so the Clip block leaves the frame rate out
+  and the panel has no rate row for it; the scrub bar already needed more
+  than one frame.
+- The end of its stream does not take the picture away. The decoder
+  receives into a frame of its own (`recv`) and hands it over only when a
+  picture came: `avcodec_receive_frame()` unreferences what it is given
+  before it looks, which at the end of a stream used to be the picture on
+  screen, so a still, or a clip's last frame with `--no-loop`, could no
+  longer be developed again for a grade change.
+
+Why a one-frame clip never came up before: `view_decoder_feed()` drained
+the decoder at the end of the stream only when the codec has
+`AV_CODEC_CAP_DELAY`, and a decoder running frame threads holds every
+picture back until each thread has had a packet or it is drained,
+whatever its own delay. With one packet - or with fewer packets than
+threads, a ten-frame ProRes 422 clip on 13 threads - nothing ever came
+out: the end of the stream arrived, the loop sought back to the start, the
+flush threw away the picture in flight, and round again (a one-frame
+ProRes 422 clip: 1041 passes and no picture in 35 s; the ten-frame one:
+three passes, no picture). A frame-threaded decoder is now drained too,
+and a clip of more frames no longer loses its last ones at every loop
+point either. A one-frame ProRes RAW clip did show its picture (one
+thread, nothing held back), and then re-decoded and re-developed it about
+twenty times a second at the loop point.
+
+### 24.2 The RW2 path
+
+The rw2 decoder has no hwaccel, so every RW2 decodes into system memory.
+`view_get_format()` takes the software format for a raw clip when no
+Vulkan one is offered (it used to refuse), and `view_decoder_next()`
+uploads the picture into a Vulkan frames context of the clip's own on the
+decoders' device (`view_decoder_upload()`): sw_format the frame's Bayer
+format, the frame's coded size, storage and transfer usage, made on the
+first such picture and released with the clip. `av_hwframe_transfer_data()`
+keeps the hwcontext's contract on the AVVkFrame it fills - the copy waits
+for the frame's timeline semaphore at its value and signals the next, and
+writes the layout, access and queue family it leaves back into the frame,
+or copies on the host when the device can - which is exactly what
+`view_gpu_develop()` waits for and transitions from under the frames lock,
+as it does for a decoded picture. `av_frame_copy_props()` carries the side
+data, the metadata, the crop and the timestamps across. Everything after
+the decoder therefore sees what the hwaccel would have handed over, the
+frame pool change detection (`frames`) included. A 24 MP mosaic uploads in
+4.5 to 8 ms, a 96 MP one in 19 to 20 ms.
+
+The decoder runs slice threads, as many as FFmpeg picks: a still is one
+packet, its stripes are the slices, and frame threads would give it one
+core. One thread is kept for a decoder with a Vulkan hwaccel, whose
+reason (the decode threads' submissions moving the AVVkFrame's state
+while the develop reads it under the frames lock) does not apply to a
+software decoder, which never touches a frames context. The panel's decode
+time for a 24 MP still, the upload in it, was 56 to 119 ms, and 246 to 251
+ms for the 96 MP one.
+
+A decoder in the pool (view.h, `view_codec`) takes the next clip of its
+codec through a flush and the stream's extradata on its first packet. The
+rw2 decoder cannot: it reads the file's whole header - the stripes, the
+levels, the white balance - from the context's extradata on every picture
+and looks at nothing on the packet, so a pooled decoder handed a second
+still decoded its stripes with the first one's header ("Error decoding
+stripe 1", and the viewer gave up on the playlist). It is kept only for a
+stream with the same extradata, the same file coming round again, and
+replaced by a new one otherwise, which for a software decoder costs
+nothing (`view_decoder_takes()`).
+
+The model, and with it the camera's tables, is read from the first
+picture's metadata when the container names no camera (`profile_late`),
+before that picture is developed, along with the Clip block's camera,
+lens, ISO, aperture, shutter and date out of the Exif; the white balance
+row is the as-shot temperature of 9c. A display matrix on the picture -
+the decoder's translation of the Exif orientation - turns it the way a
+track header's turns a clip, when the track had none.
+
+### 24.3 Verified
+
+On the nested compositor, with `-v`:
+
+- `_1000406.RW2` alone: one picture presented, then nothing decoded or
+  developed while it stayed up (the panel's pipeline rate 0.0 fps); `q`
+  quits.
+- A playlist P1000319.MOV, _1083412.RW2 (96 MP), P1000319.MOV with `t`,
+  three runs: the clip plays, the still comes up, and the next clip plays
+  again from the pool, every frame of it shown in order. Two runs dropped
+  nothing; the first dropped 25 frames in the first second of the first
+  clip, before the still had been opened, and that did not happen again.
+- Four stills in a row, two of them portraits with Exif orientations 6 and
+  8: each opens a decoder of its own and comes up upright, matching the
+  camera's JPEGs.
+- `--wb auto` on _1000406: the first replay reads the histogram and the
+  balance goes from the as-shot 3371 K to the estimate, 2741 K (confidence
+  0.01: the first reading starts the track whatever its confidence, as on a
+  clip), the second replay finds it there and the replays stop.
+- `--loops 1` quits after the picture, `--no-loop` keeps it, play and Home
+  on a still decode nothing.
+- The one-frame ProRes RAW and ProRes 422 clips and the ten-frame ProRes
+  422 one above, before and after.
+- Headless: `--export 0 out.tif` of an RW2 writes the 6000x4000 picture;
+  `--export-video 0 0` writes one frame; the scene-referred XYZ of that one
+  frame (`--colour xyz`, FFv1 (Vulkan) L4, gbrpf32le) is bit for bit
+  cineraw's `--space xyz --encode linear --float32` PFM of the same still,
+  same md5 of the float samples. The display-referred still export is not
+  cineraw's SDR file and never was: libplacebo's tone mapping against
+  cineraw's per-channel roll-off, a mean difference of 0.105 of full scale
+  on _1000406 and 0.150 on P1000387 frame 13.

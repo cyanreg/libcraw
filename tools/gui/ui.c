@@ -1809,7 +1809,8 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
         view_scrub_bar(ctx, st, total);
     }
 
-    if (st->dec.fmt)
+    /* A still is not played, so there is nothing for it to be slowed to. */
+    if (st->dec.fmt && !st->dec.still)
         view_panel_rate(ctx, st);
 }
 

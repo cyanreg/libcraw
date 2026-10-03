@@ -12,6 +12,14 @@
 #include <craw/noise.h>
 #include <craw/profile.h>
 
+#if CRAW_TOOL_HAVE_LAVU
+#include <libavutil/dict.h>
+#include <libavutil/frame.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/pixfmt.h>
+#include <libavutil/raw_color_params.h>
+#endif
+
 #include "profiles.h"
 
 static int failures;
@@ -744,6 +752,249 @@ static void craw_test_noise_s1m2(void)
     }
 }
 
+#if CRAW_TOOL_HAVE_LAVU
+
+/* A decoded frame as far as craw_tool_profile_from_frame() looks at one: a
+ * pixel format, the colour record and the Exif keys. No pixels. */
+static AVFrame *craw_test_raw_frame(enum AVPixelFormat fmt,
+                                    enum AVRawColorParamsType type,
+                                    AVRawColorParams **rc)
+{
+    AVFrame *f = av_frame_alloc();
+
+    if (!f)
+        return NULL;
+
+    f->format = fmt;
+    f->width = 6008;
+    f->height = 4008;
+
+    *rc = av_raw_color_params_create_side_data(f);
+    if (!*rc) {
+        av_frame_free(&f);
+        return NULL;
+    }
+    (*rc)->type = type;
+
+    return f;
+}
+
+/* The ProRes RAW branch is the frame header's record copied over, as both
+ * tools did on their own before they shared the builder. */
+static void craw_test_frame_prores_raw(void)
+{
+    AVRawColorParams *rc = NULL;
+    AVFrame *f;
+    CRAWProfile p;
+    int ret;
+
+    f = craw_test_raw_frame(AV_PIX_FMT_BAYER_RGGB16LE, AV_RAW_COLOR_PARAMS_PRORES_RAW, &rc);
+    CHECK(f, "cannot allocate a frame");
+    if (!f)
+        return;
+
+    rc->black_level = av_make_q(256, 65535);
+    rc->white_level = av_make_q(63743, 65535);
+    rc->wb_cct = 5500;
+    rc->codec.prores_raw.wb_red = av_d2q(2.02539, 100000);
+    rc->codec.prores_raw.wb_blue = av_d2q(1.66797, 100000);
+    rc->codec.prores_raw.gain = av_d2q(23.04, 100000);
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            rc->codec.prores_raw.color_matrix[i][j] =
+                av_d2q(craw_test_frame_matrix[i][j], 1000000);
+
+    craw_profile_init(&p);
+    craw_tool_profile_apply_builtin(&p, "s1m2");
+    ret = craw_tool_profile_from_frame(&p, f, false);
+    CHECK(ret == 0, "a ProRes RAW frame failed: %d", ret);
+    CHECK(p.cfa == CRAW_CFA_RGGB, "ProRes RAW cfa %d", (int)p.cfa);
+    CHECK_NEAR(p.black_level[3], 256.0 / 65535.0, 1e-9, "ProRes RAW black");
+    CHECK_NEAR(p.white_level[0], 63743.0 / 65535.0, 1e-9, "ProRes RAW white");
+    CHECK_NEAR(p.as_shot_wb[0], 2.02539, 1e-6, "ProRes RAW R gain");
+    CHECK_NEAR(p.as_shot_wb[2], 1.66797, 1e-6, "ProRes RAW B gain");
+    CHECK_NEAR(p.gain, 23.04, 1e-6, "ProRes RAW gain");
+    CHECK_NEAR(p.as_shot_cct, 5500.0, 0.0, "ProRes RAW cct");
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            CHECK_NEAR(p.as_shot_matrix[i][j], craw_test_frame_matrix[i][j], 1e-6,
+                       "ProRes RAW matrix [%d][%d]", i, j);
+
+    av_frame_free(&f);
+}
+
+#if CRAW_TOOL_HAVE_RW2
+
+/* An RW2 still the way the rw2 decoder exports one: 14-bit levels in the
+ * 16-bit sample range, the as-shot gains and nothing else, and the ISO in
+ * the Exif, space padded as the decoder prints it. */
+static AVFrame *craw_test_rw2_frame(enum AVPixelFormat fmt, double wb_r, double wb_b,
+                                    const char *iso)
+{
+    AVRawColorParams *rc = NULL;
+    AVFrame *f = craw_test_raw_frame(fmt, AV_RAW_COLOR_PARAMS_RW2, &rc);
+
+    if (!f)
+        return NULL;
+
+    rc->black_level = av_make_q(512, 65535);
+    rc->white_level = av_make_q(16383, 65535);
+    rc->codec.rw2.wb_red = av_d2q(wb_r, 100000);
+    rc->codec.rw2.wb_blue = av_d2q(wb_b, 100000);
+
+    av_dict_set(&f->metadata, "Make", "Panasonic", 0);
+    av_dict_set(&f->metadata, "Model", "DC-S1M2", 0);
+    if (iso)
+        av_dict_set(&f->metadata, "ExifIFD/ISOSpeedRatings", iso, 0);
+
+    return f;
+}
+
+static void craw_test_frame_rw2(void)
+{
+    static const struct {
+        enum AVPixelFormat fmt;
+        enum CRAWCfa cfa;
+    } phases[] = {
+        { AV_PIX_FMT_BAYER_RGGB16LE, CRAW_CFA_RGGB },
+        { AV_PIX_FMT_BAYER_GRBG16LE, CRAW_CFA_GRBG },
+        { AV_PIX_FMT_BAYER_GBRG16LE, CRAW_CFA_GBRG },
+        { AV_PIX_FMT_BAYER_BGGR16LE, CRAW_CFA_BGGR },
+    };
+    /* The 5500 K knot's pair, which must land on 5500 K exactly, and a
+     * balance between knots with a tint on it, 4200 K and +0.02. */
+    const double knot_r = 2.0253, knot_b = 1.6676;
+    double r42, b42;
+    CRAWProfile p, tab;
+    CRAWIlluminant il, want;
+    CRAWColorParams cp;
+    AVFrame *f;
+    float rg, bg;
+    int ret;
+
+    craw_profile_init(&tab);
+    ret = craw_tool_profile_apply_builtin(&tab, "s1m2");
+    CHECK(ret == 0, "the s1m2 built-in failed: %d", ret);
+
+    il = (CRAWIlluminant) { .cct = 4200.0f, .tint = 0.02f };
+    ret = craw_profile_illuminant_to_neutral(&tab, &il, &rg, &bg);
+    CHECK(ret == 0, "illuminant_to_neutral failed: %d", ret);
+    r42 = 1.0 / rg;
+    b42 = 1.0 / bg;
+
+    /* The phase is the pixel format's, whichever of the four it is. */
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(phases); i++) {
+        f = craw_test_rw2_frame(phases[i].fmt, knot_r, knot_b, "    640");
+        CHECK(f, "cannot allocate a frame");
+        if (!f)
+            return;
+        p = tab;
+        ret = craw_tool_profile_from_frame(&p, f, false);
+        CHECK(ret == 0, "an RW2 frame failed: %d", ret);
+        CHECK(p.cfa == phases[i].cfa, "%s: cfa %d, want %d",
+              av_get_pix_fmt_name(phases[i].fmt), (int)p.cfa, (int)phases[i].cfa);
+        av_frame_free(&f);
+    }
+
+    /* Levels, gains, the colour temperature and the matrix at the knot. */
+    f = craw_test_rw2_frame(AV_PIX_FMT_BAYER_RGGB16LE, knot_r, knot_b, "    640");
+    p = tab;
+    ret = craw_tool_profile_from_frame(&p, f, false);
+    CHECK(ret == 0, "an RW2 frame failed: %d", ret);
+    for (int i = 0; i < 4; i++) {
+        CHECK_NEAR(p.black_level[i], 512.0 / 65535.0, 1e-9, "RW2 black, site %d", i);
+        CHECK_NEAR(p.white_level[i], 16383.0 / 65535.0, 1e-9, "RW2 white, site %d", i);
+    }
+    CHECK_NEAR(p.as_shot_wb[0], knot_r, 1e-6, "RW2 R gain");
+    CHECK_NEAR(p.as_shot_wb[1], 1.0, 0.0, "RW2 G gain");
+    CHECK_NEAR(p.as_shot_wb[2], knot_b, 1e-6, "RW2 B gain");
+    CHECK_NEAR(p.as_shot_cct, 5500.0, 1e-2, "RW2 cct at the 5500 K knot's gains");
+    CHECK(p.nb_wb_knots == tab.nb_wb_knots && p.nb_matrix_knots == tab.nb_matrix_knots &&
+          p.nb_noise_knots == tab.nb_noise_knots && !strcmp(p.name, tab.name),
+          "the camera's tables must be left as they were");
+    av_frame_free(&f);
+
+    /* Between knots and off the locus: the temperature is the one the
+     * locus mapping gives for the reciprocal gains, and the matrix the
+     * table's at that point. */
+    f = craw_test_rw2_frame(AV_PIX_FMT_BAYER_RGGB16LE, r42, b42, "    100");
+    p = tab;
+    ret = craw_tool_profile_from_frame(&p, f, false);
+    CHECK(ret == 0, "an RW2 frame failed: %d", ret);
+    ret = craw_profile_neutral_to_illuminant(&tab, 1.0f / p.as_shot_wb[0],
+                                             1.0f / p.as_shot_wb[2], &want);
+    CHECK(ret == 0, "neutral_to_illuminant failed: %d", ret);
+    CHECK_NEAR(p.as_shot_cct, want.cct, 0.0, "RW2 cct between knots");
+    CHECK_NEAR(want.cct, 4200.0, 0.05, "the 4200 K balance's temperature");
+    CHECK_NEAR(want.tint, 0.02, 1e-4, "the 4200 K balance's tint");
+    ret = craw_profile_eval(&tab, CRAW_WB_REBALANCE, &want, &cp);
+    CHECK(ret == 0, "eval failed: %d", ret);
+    CHECK(!memcmp(p.as_shot_matrix, cp.cam_to_xyz, sizeof(cp.cam_to_xyz)),
+          "the RW2 matrix must be the table's at its temperature");
+    av_frame_free(&f);
+
+    /* The gain mode by ISO: the low mode's factor at 640 and below, the
+     * high one's from 1000, each over eight because a still is rated three
+     * stops closer to the clip than a V-Log recording (DESIGN.md 9c), and
+     * the ISO the as-shot index, so that a working index re-rates a still
+     * as it does a clip. */
+    {
+        static const struct {
+            const char *iso;
+            float want_iso, want_gain;
+        } modes[] = {
+            { "    100",   100.0f, 14.51f / 8.0f },
+            { "    640",   640.0f, 14.51f / 8.0f },
+            { "    800",   800.0f, 14.51f / 8.0f },
+            { "   1000",  1000.0f, 23.04f / 8.0f },
+            { "  12800", 12800.0f, 23.04f / 8.0f },
+            { NULL,          0.0f, 14.51f / 8.0f },
+        };
+
+        for (size_t i = 0; i < CRAW_ARRAY_ELEMS(modes); i++) {
+            f = craw_test_rw2_frame(AV_PIX_FMT_BAYER_RGGB16LE, knot_r, knot_b,
+                                    modes[i].iso);
+            p = tab;
+            ret = craw_tool_profile_from_frame(&p, f, false);
+            CHECK(ret == 0, "an RW2 frame failed: %d", ret);
+            CHECK_NEAR(p.as_shot_ei, modes[i].want_iso, 0.0, "as-shot ISO of `%s`",
+                       modes[i].iso ? modes[i].iso : "(none)");
+            CHECK_NEAR(p.gain, modes[i].want_gain, 1e-6, "gain at ISO `%s`",
+                       modes[i].iso ? modes[i].iso : "(none)");
+            av_frame_free(&f);
+        }
+
+        f = craw_test_rw2_frame(AV_PIX_FMT_BAYER_RGGB16LE, knot_r, knot_b, "    640");
+        p = tab;
+        craw_tool_profile_from_frame(&p, f, false);
+        p.exposure_index = 1000.0f;
+        ret = craw_profile_eval(&p, CRAW_WB_AS_SHOT, NULL, &cp);
+        CHECK(ret == 0, "eval failed: %d", ret);
+        CHECK_NEAR(cp.gain, 14.51 / 8.0 * 1000.0 / 640.0, 1e-4, "an ISO 640 still rated at 1000");
+        av_frame_free(&f);
+    }
+
+    /* No tables, no matrix: refused, never an identity. */
+    f = craw_test_rw2_frame(AV_PIX_FMT_BAYER_RGGB16LE, knot_r, knot_b, "    640");
+    craw_profile_init(&p);
+    printf("(an error message about missing tables is expected here)\n");
+    fflush(stdout);
+    ret = craw_tool_profile_from_frame(&p, f, false);
+    CHECK(ret == CRAW_ERROR(ENOENT), "an RW2 without tables must be refused: %d", ret);
+    av_frame_free(&f);
+
+    /* Not a mosaic at all. */
+    f = craw_test_rw2_frame(AV_PIX_FMT_RGB48LE, knot_r, knot_b, "    640");
+    p = tab;
+    ret = craw_tool_profile_from_frame(&p, f, false);
+    CHECK(ret == CRAW_ERROR(ENOTSUP), "an RGB frame must be refused: %d", ret);
+    av_frame_free(&f);
+}
+
+#endif /* CRAW_TOOL_HAVE_RW2 */
+
+#endif /* CRAW_TOOL_HAVE_LAVU */
+
 int main(void)
 {
     craw_test_validate();
@@ -754,6 +1005,12 @@ int main(void)
     craw_test_bradford();
     craw_test_noise_eval();
     craw_test_noise_s1m2();
+#if CRAW_TOOL_HAVE_LAVU
+    craw_test_frame_prores_raw();
+#if CRAW_TOOL_HAVE_RW2
+    craw_test_frame_rw2();
+#endif
+#endif
 
     if (failures) {
         printf("test_profile: %d failure(s)\n", failures);

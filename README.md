@@ -5,8 +5,9 @@ scene-linear colour on the GPU with Vulkan compute, and nothing else: no
 container parsing, no decoding, no display. Decoding is FFmpeg's job,
 rendering is libplacebo's; libcraw sits between them.
 
-First target: Panasonic ProRes RAW as decoded by FFmpeg (Lumix S1II).
-ARRIRAW and BRAW are planned.
+First target: Panasonic ProRes RAW as decoded by FFmpeg (Lumix S1II), and
+the same camera's RW2 stills where the installed FFmpeg has an RW2 decoder
+(upstream does not yet). ARRIRAW and BRAW are planned.
 
 ## What it does
 
@@ -61,16 +62,34 @@ device; llvmpipe is enough.
 
 ## Tools
 
-`cineraw` decodes a clip with FFmpeg, runs every frame through the
-GPU pipeline and writes PNG (16 bit), PFM (linear float) or PPM (8 bit,
-dithered, because a denoised shadow gradient bands without it) sequences.
-The options that matter most:
+`cineraw` decodes a clip or a still with FFmpeg, runs every frame through
+the GPU pipeline and writes PNG (16 bit), TIFF (16 bit, uncompressed), PFM
+(linear float) or PPM (8 bit, dithered, because a denoised shadow gradient
+bands without it) sequences. A still - an RW2, or any input with one frame
+- and a run of `--frames 1` may name one file instead of a sequence
+pattern. The options that matter most:
 
     cineraw --wb auto -v --frames 30 clip.MOV        estimate the illuminant
     cineraw --wb 5600:0.02 --ei 400 -o out_%05d.png clip.MOV
+    cineraw -v -o still.tif _1000406.RW2             a still, with its timings
     cineraw --bench --frames 60 clip.MOV             GPU time per pass, decode timing
     cineraw --denoise 1.0 --crop 2750,1450,1000,1000 -o c_%d.png clip.MOV
     cineraw --noise-estimate --frames 10 flatfield.MOV   fit the noise model
+
+A Panasonic RW2 carries its levels and its as-shot white balance and
+nothing else of a profile, so the rest comes from the camera's per-CCT
+tables, picked by the model in the still's Exif: its colour temperature is
+where the as-shot gains lie on the table's locus, its matrix the table's at
+that temperature, and its gain the camera's video GainFactor for the ISO's
+gain mode (23.04 from ISO 1000 up and 14.51 below, measured at 640 and
+assumed below it) over eight, because the camera rates a still three stops
+closer to the sensor clip than a V-Log recording. A still therefore comes
+out as the camera's own JPEG does; a clip shot at the same ISO number and
+exposure is three stops brighter than it, and `--exposure 3` on the still
+puts them side by side. Without tables an RW2 has no matrix and is refused
+(DESIGN.md 9c). The
+decode runs slice threads; `-v` prints the profile it built and every
+frame's decode, upload, develop, download and write time.
 
 `--denoise STRENGTH[,CHROMA[,TEMPORAL]]` takes a strength in units of the
 camera's modelled noise level, 1.0 meaning "remove exactly that much", an
@@ -124,16 +143,29 @@ at a working exposure index, `--exposure` adds a bias in stops; `--encode`
 picks the transfer function for image output, `sdr` by default for PNG,
 which rolls highlights off per channel before the sRGB curve. The
 Panasonic DC-S1M2 per-CCT tables are built in and selected from the
-container's model name; `--tables` loads others from a text file.
+container's model name, or for a still from its Exif; `--tables` loads
+others from a text file.
 
 `cineview` is the interactive viewer and exporter built on SDL3, nuklear
 and libplacebo, when those are found. It decodes with FFmpeg's Vulkan
 hwaccel on libplacebo's device, runs libcraw on the same device, reads the
-file on its own thread and loops by default (`--no-loop`). Every decoder
+file on its own thread and loops by default (`--no-loop`). An RW2 still,
+whose decoder has no hwaccel, is decoded on the CPU with slice threads and
+uploaded to the device once, and from there it is developed like a ProRes
+RAW frame. A still - an RW2, or any file of one frame - is not looped: it
+comes up, stays up and is paused at the end of its stream, so a grade
+change or the auto white balance develops it again, and a playlist that
+was playing plays on at the next file. It has no rate row, and the Clip
+block shows what its Exif says, its white balance being the as-shot
+temperature on the camera's locus; a portrait still is turned upright by
+its Exif orientation. Every decoder
 it opens stays open until it quits, one per codec: a decoder is flushed
 when its clip closes, a clip of a codec seen before takes it back from the
 pool, only a codec not seen yet opens a new one, and a loop point is a
-flush too, the way libavcodec takes one stream after another. The panel is
+flush too, the way libavcodec takes one stream after another. The RW2
+decoder is the exception: it reads a file's whole header from its own
+setup, so it is taken back only for the same file, and another still
+replaces it with a new one, which for a software decoder costs nothing. The panel is
 worked with the pointer: its switches, expanders, sliders, fields and
 cascading menus are clicked, and no key reaches a panel row. The keys are
 the transport's and the view's. Space plays and pauses; Left and Right
