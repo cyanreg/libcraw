@@ -1157,17 +1157,34 @@ void view_rot_to_disp(const struct view_state *st, const pl_rect2df *in,
     pl_rect2df_normalize(out);
 }
 
+/* The part of the rotated picture that is on screen: the picture the clip
+ * marks inside its readout while that is the crop (an RW2's 6000x4000 in
+ * a 6008x4008 readout, a Sony FX6 clip's 3840x2160 in 3872x2192),
+ * otherwise all of it. The sensels around a marked picture are developed
+ * like the rest and crop mode shows them, since turning it on clears the
+ * rectangle; but they are not the picture, and shown with the rectangle
+ * shaded over them they put a thin light line, the rectangle's border,
+ * just inside every edge of what looks like the picture. */
+void view_disp_rect(const struct view_state *st, int *x, int *y, int *w, int *h)
+{
+    if (st->crop.from_clip && view_crop_disp_rect(st, x, y, w, h))
+        return;
+    *x = 0;
+    *y = 0;
+    view_disp_size(st, w, h);
+}
+
 /* The scale at which the whole picture just fits the area. */
 static float view_fit_scale(const struct view_state *st)
 {
     pl_rect2df area;
-    int dw, dh;
+    int dx, dy, dw, dh;
 
     if (!st->gpu.width || !st->gpu.height)
         return 1.0f;
 
     view_picture_area(st, &area);
-    view_disp_size(st, &dw, &dh);
+    view_disp_rect(st, &dx, &dy, &dw, &dh);
 
     return CRAW_MIN(pl_rect_w(area) / (float)dw,
                     pl_rect_h(area) / (float)dh);
@@ -1182,13 +1199,18 @@ void view_zoom_rects(const struct view_state *st, pl_rect2df *src, pl_rect2df *d
 {
     float z = view_zoom_scale(st);
     pl_rect2df area;
-    float sw, sh, dw, dh, vw, vh, cx, cy;
-    int pw, ph;
+    float ox, oy, sw, sh, dw, dh, vw, vh, cx, cy;
+    int px, py, pw, ph;
 
     view_picture_area(st, &area);
-    /* The rotated picture's own pixels: the centre and the zoom are about
-     * what is on screen, not about the readout behind it. */
-    view_disp_size(st, &pw, &ph);
+    /* The rotated picture's own pixels, and of those the ones the clip
+     * marks as the picture: the centre and the zoom are about what is on
+     * screen, not about the readout behind it. The rectangles stay in the
+     * whole rotated picture's coordinates, which is what the renderer and
+     * view_picture_pos() work in. */
+    view_disp_rect(st, &px, &py, &pw, &ph);
+    ox = (float)px;
+    oy = (float)py;
     sw = (float)pw;
     sh = (float)ph;
 
@@ -1200,8 +1222,10 @@ void view_zoom_rects(const struct view_state *st, pl_rect2df *src, pl_rect2df *d
 
     /* The centre is clamped so that no edge of the area is ever left empty
      * while the picture is big enough to fill it. */
-    cx = vw >= sw ? sw * 0.5f : CRAW_CLAMP(st->view.cx, vw * 0.5f, sw - vw * 0.5f);
-    cy = vh >= sh ? sh * 0.5f : CRAW_CLAMP(st->view.cy, vh * 0.5f, sh - vh * 0.5f);
+    cx = vw >= sw ? ox + sw * 0.5f
+                  : CRAW_CLAMP(st->view.cx, ox + vw * 0.5f, ox + sw - vw * 0.5f);
+    cy = vh >= sh ? oy + sh * 0.5f
+                  : CRAW_CLAMP(st->view.cy, oy + vh * 0.5f, oy + sh - vh * 0.5f);
 
     *src = (pl_rect2df) { cx - vw * 0.5f, cy - vh * 0.5f,
                           cx + vw * 0.5f, cy + vh * 0.5f };
@@ -1224,12 +1248,12 @@ void view_zoom_by(struct view_state *st, float notches, int sx, int sy,
     float want = z * powf(VIEW_ZOOM_STEP, notches);
     pl_rect2df src, dst;
     float px, py;
-    int dw, dh;
+    int dx, dy, dw, dh;
 
     if (!st->gpu.width)
         return;
 
-    view_disp_size(st, &dw, &dh);
+    view_disp_rect(st, &dx, &dy, &dw, &dh);
 
     /* One-to-one is the stop a raw tool is judged on, so a step that would
      * pass it lands on it exactly. */
@@ -1252,8 +1276,8 @@ void view_zoom_by(struct view_state *st, float notches, int sx, int sy,
     if (want <= fit * 1.0001f) {
         st->view.fit = true;
         st->view.zoom = fit;
-        st->view.cx = (float)dw * 0.5f;
-        st->view.cy = (float)dh * 0.5f;
+        st->view.cx = (float)dx + (float)dw * 0.5f;
+        st->view.cy = (float)dy + (float)dh * 0.5f;
         return;
     }
 
@@ -1269,17 +1293,17 @@ void view_zoom_by(struct view_state *st, float notches, int sx, int sy,
 
 void view_zoom_reset(struct view_state *st, bool one_to_one)
 {
-    int dw, dh;
+    int dx, dy, dw, dh;
 
-    view_disp_size(st, &dw, &dh);
+    view_disp_rect(st, &dx, &dy, &dw, &dh);
 
     st->view.fit = !one_to_one;
     st->view.zoom = one_to_one ? 1.0f : view_fit_scale(st);
     /* Fitting forgets the pan as well; one to one keeps looking where the
      * picture was, unless nowhere has been looked at yet. */
     if (!one_to_one || (!st->view.cx && !st->view.cy)) {
-        st->view.cx = (float)dw * 0.5f;
-        st->view.cy = (float)dh * 0.5f;
+        st->view.cx = (float)dx + (float)dw * 0.5f;
+        st->view.cy = (float)dy + (float)dh * 0.5f;
     }
 }
 
@@ -1407,11 +1431,13 @@ void view_crop_clear(struct view_state *st)
 
 /* The clip's own crop as the default rectangle, read once per clip.
  *
- * A ProRes RAW frame header can mark a picture inside the readout, and for
- * the cameras that do it the sensels around that picture are real, so the
- * viewer's decoder is told not to crop (decode.c): the frame stays the
- * whole readout, libcraw develops all of it, and this rectangle only
- * decides what is looked at. Clearing it brings the rest back.
+ * A ProRes RAW frame header can mark a picture inside the readout, as an
+ * RW2 does, and for the cameras that do it the sensels around that picture
+ * are real, so the viewer's decoder is told not to crop (decode.c): the
+ * frame stays the whole readout, libcraw develops all of it, and this
+ * rectangle only decides what is looked at - it is the picture on screen
+ * (view_disp_rect()) and the region the export writes. Clearing it, which
+ * is what turning crop mode on does, brings the rest back.
  *
  * The CFA phase does not come into it, which is the point of doing it here
  * rather than in the pipeline: the frame still starts at its own (0, 0),
@@ -4598,13 +4624,14 @@ static int view_run_window(struct view_state *st)
         }
 
         if (!st->view.cx && !st->view.cy && st->gpu.width) {
-            int dw, dh;
+            int dx, dy, dw, dh;
 
             /* The centre of the picture as it is shown, which for a rotated
-             * clip is not the centre of the readout. */
-            view_disp_size(st, &dw, &dh);
-            st->view.cx = (float)dw * 0.5f;
-            st->view.cy = (float)dh * 0.5f;
+             * clip is not the centre of the readout, nor for one that marks
+             * its picture inside the readout. */
+            view_disp_rect(st, &dx, &dy, &dw, &dh);
+            st->view.cx = (float)dx + (float)dw * 0.5f;
+            st->view.cy = (float)dy + (float)dh * 0.5f;
         }
 
         if (!st->warm && st->have_frame) {

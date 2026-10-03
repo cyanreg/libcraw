@@ -922,8 +922,9 @@ struct view_zoom {
  * edges are even, which is what a subsampled encoder and a Bayer quad both
  * want. `on` is the mode a left drag draws in - outside it a drag pans as
  * it always has - and the rectangle outlives the mode being turned off.
- * Only the export reads it; the picture on screen is untouched, and the
- * shading over it is drawn on the nuklear overlay. */
+ * The export reads it. A rectangle drawn or given on the command line
+ * leaves the picture on screen untouched, with the shading over it drawn
+ * on the nuklear overlay; a clip's own is the picture on screen. */
 struct view_crop {
     bool on;
     bool have;
@@ -932,10 +933,11 @@ struct view_crop {
     float ax, ay;               /* the drag's anchor, in source pixels */
 
     /* A clip whose frames carry a crop starts with that rectangle, so that
-     * what is on screen and what an export writes is the picture the camera
-     * marked, while the sensels around it stay one `clear` away. It is a
-     * default and nothing more: drawing a rectangle or clearing it drops
-     * the flag, and the panel says "(clip)" only while it holds. */
+     * what is on screen (view_disp_rect()) and what an export writes is the
+     * picture the camera marked, while the sensels around it stay one `c`
+     * away. It is a default and nothing more: drawing a rectangle or
+     * clearing it drops the flag, and the panel says "(clip)" only while it
+     * holds. */
     bool from_clip;
     bool clip_read;             /* the clip's own crop has been looked at */
 
@@ -1868,6 +1870,10 @@ void view_picture_area(const struct view_state *st, pl_rect2df *out);
  * Everything in source space stays in source space: libcraw's pipeline, the
  * lens correction, the histogram and the denoise never see the rotation. */
 void view_disp_size(const struct view_state *st, int *w, int *h);
+/* The part of that which is on screen: the picture a clip marks inside its
+ * readout while that is the crop rectangle, otherwise all of it. Fit, zoom
+ * and pan are about this rectangle, in the rotated picture's pixels. */
+void view_disp_rect(const struct view_state *st, int *x, int *y, int *w, int *h);
 
 /* A rectangle of the picture as it is shown, in the source pixels it came
  * from, and back again. Both are exact: a quarter turn maps an even

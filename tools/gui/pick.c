@@ -271,7 +271,7 @@ void view_pick_click(struct view_state *st, int px, int py)
 {
     pl_rect2df disp, src;
     float sx, sy;
-    int dw, dh;
+    int dx, dy, dw, dh;
 
     if (!st->gpu.width || !st->gpu.height)
         return;
@@ -282,8 +282,9 @@ void view_pick_click(struct view_state *st, int px, int py)
      * picture is not on the picture, and the pick stays armed for one that
      * is. */
     view_picture_pos(st, px, py, &sx, &sy);
-    view_disp_size(st, &dw, &dh);
-    if (sx < 0.0f || sy < 0.0f || sx >= (float)dw || sy >= (float)dh)
+    view_disp_rect(st, &dx, &dy, &dw, &dh);
+    if (sx < (float)dx || sy < (float)dy ||
+        sx >= (float)(dx + dw) || sy >= (float)(dy + dh))
         return;
 
     disp = (pl_rect2df) { sx, sy, sx, sy };

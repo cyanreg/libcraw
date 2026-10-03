@@ -477,7 +477,13 @@ resolution. On a rotated clip it is drawn on the picture as it is shown and
 mapped through the turn both ways, so the shade and the readout follow what
 was drawn and the file holds exactly that region, upright. `--crop WxH+X+Y`
 sets the same rectangle from the command line, in source pixels — which on a
-rotated clip is the readout's rectangle turned back.
+rotated clip is the readout's rectangle turned back. A clip that marks its
+picture inside the readout (a ProRes RAW frame header can, an RW2 does:
+6000x4000 inside 6008x4008) starts with that as the rectangle, and that
+rectangle is the picture on screen rather than a shaded one over the
+readout, so there is no border round it; the Crop section reports it as
+the clip's. `c` clears it like any other, which is how the sensels around
+the picture are looked at.
 
 Two sections hold two exports, **Export image** and **Export video**,
 independent of each other: the image is the frame on screen, one file, and

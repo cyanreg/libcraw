@@ -2815,7 +2815,9 @@ static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
 
     /* "(clip)" while the rectangle is the one the clip's own frame header
      * marked rather than one that was drawn or asked for: it says why a
-     * picture that was never cropped by hand is shaded all the same. */
+     * picture that was never cropped by hand exports smaller than its
+     * readout, and that the rectangle is the picture on screen rather than
+     * a shade over it. */
     if (view_crop_disp_rect(st, &x, &y, &w, &h))
         nk_labelf(ctx, NK_TEXT_LEFT, "crop: %dx%d at %d,%d%s", w, h, x, y,
                   st->crop.from_clip ? " (clip)" : "");
@@ -3214,7 +3216,10 @@ static void view_crop_draw(struct nk_context *ctx, struct view_state *st)
     pl_rect2df src, dst, crop;
     int dx0, dy0, dx1, dy1, cx0, cy0, cx1, cy1, rx0, ry0, rx1, ry1;
 
-    if (!st->crop.have || !view_crop_screen(st, &crop))
+    /* A clip's own rectangle is the picture on screen (view_disp_rect()),
+     * so there is nothing outside it to shade and its border would be a
+     * light line round the edge of the picture. */
+    if (!st->crop.have || st->crop.from_clip || !view_crop_screen(st, &crop))
         return;
 
     view_zoom_rects(st, &src, &dst);
