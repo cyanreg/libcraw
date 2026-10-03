@@ -2430,6 +2430,64 @@ static void view_panel_export_audio(struct nk_context *ctx, struct view_state *s
         view_disable_end(st, ctx);
 }
 
+/* ------------------------------------------------- the export file fields */
+
+/* A path's extension - the last dot after the last slash, dot included -
+ * and where it starts; "" and the whole path when there is none. */
+static const char *view_field_ext(const char *path, size_t *stem)
+{
+    const char *slash = strrchr(path, '/');
+    const char *dot = strrchr(slash ? slash + 1 : path, '.');
+
+    *stem = dot ? (size_t)(dot - path) : strlen(path);
+    return dot ? dot : "";
+}
+
+/* The file field of an export section follows its default, `want` - the
+ * clip's name and the frame or the range on screen, in ~/Processed, under
+ * the section's own extension - except for what was typed into it, which
+ * is told from what was put there by `def`, the default the field was
+ * last given. The two parts of a name are kept differently. The
+ * extension, once typed, is the user's format and stays: on this clip,
+ * the next and every one after, until it is typed back. The name before
+ * it, once typed, is kept on the clip it was typed on and on no other:
+ * the next clip gets its own name again, under the user's extension. The
+ * name used to be kept across clips as well, so a name typed for one
+ * clip was the next one's too, and exporting the next wrote over the
+ * first (Lynne). A name typed without an extension gets the default's
+ * when the button is pressed and is not a choice of extension.
+ *
+ * `clip` is the clip the field was last given a default on, which is how
+ * the next one is told. Called while the field is not being typed into. */
+static void view_field_follow(const struct view_state *st, char *field,
+                              size_t size, char *def, size_t def_size,
+                              int *clip, const char *want)
+{
+    char out[VIEW_MAX_PATH];
+    const char *fext = "", *dext, *wext;
+    size_t fstem = 0, dstem, wstem;
+    bool stem_typed = false, ext_typed = false;
+
+    if (field[0]) {
+        fext = view_field_ext(field, &fstem);
+        dext = view_field_ext(def, &dstem);
+        stem_typed = fstem != dstem || strncmp(field, def, fstem) != 0;
+        ext_typed = fext[0] && strcmp(fext, dext) != 0;
+    }
+    wext = view_field_ext(want, &wstem);
+
+    if (stem_typed && *clip == st->clip)
+        /* The user's name on the user's clip: left alone. */
+        snprintf(out, sizeof(out), "%s", field);
+    else
+        snprintf(out, sizeof(out), "%.*s%s", (int)wstem, want,
+                 ext_typed ? fext : wext);
+
+    snprintf(field, size, "%s", out);
+    snprintf(def, def_size, "%s", want);
+    *clip = st->clip;
+}
+
 /* The Export video section: the codec preset and the colour
  * space cascades, the pixel format, the size, whatever knobs the chosen
  * family declares, the sound, the threads, a frame range, the file, one
@@ -2480,19 +2538,16 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         codec = fam->encoder;
 
     /* The file field follows its default - the clip's name, the range and
-     * the family's container, in ~/Processed - until it differs from the
-     * default it was last given: once it does, it is the user's and is
-     * left alone, on this clip and the next. Not while a run is on: the
-     * name the run is writing is the one to show. And not while the field
-     * is being typed into: a field cleared to type a fresh name into would
-     * otherwise be refilled under the cursor. */
+     * the family's container, in ~/Processed - the way view_field_follow()
+     * says: a typed extension stays, a typed name stays on its clip. Not
+     * while a run is on: the name the run is writing is the one to show.
+     * And not while the field is being typed into: a field cleared to type
+     * a fresh name into would otherwise be refilled under the cursor. */
     if (!busy && !v->field_active) {
         view_encode_default_path(st, v->start_ui, v->end_ui, sel, codec,
                                  want, sizeof(want));
-        if (!v->field[0] || !strcmp(v->field, v->field_def)) {
-            snprintf(v->field, sizeof(v->field), "%s", want);
-            snprintf(v->field_def, sizeof(v->field_def), "%s", want);
-        }
+        view_field_follow(st, v->field, sizeof(v->field), v->field_def,
+                          sizeof(v->field_def), &v->field_clip, want);
     }
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
@@ -2732,10 +2787,9 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
 }
 
 /* The Export image section: the frame on screen, one image, the format
- * picked by the file field's extension. The field
- * follows the frame on screen until it is typed into: once it differs from
- * the default that was last put there, it is the user's and is left alone,
- * on this clip and the next. */
+ * picked by the file field's extension. The field follows the frame on
+ * screen, a .jpg under the clip's name, the way view_field_follow() says:
+ * a typed extension stays, a typed name stays on its clip. */
 static void view_panel_export_still(struct nk_context *ctx, struct view_state *st)
 {
     struct view_export *e = &st->exp;
@@ -2746,10 +2800,8 @@ static void view_panel_export_still(struct nk_context *ctx, struct view_state *s
      * fresh name into would otherwise be refilled under the cursor. */
     if (!e->field_active) {
         view_export_default_path(st, st->index, want, sizeof(want));
-        if (!e->field[0] || !strcmp(e->field, e->field_def)) {
-            snprintf(e->field, sizeof(e->field), "%s", want);
-            snprintf(e->field_def, sizeof(e->field_def), "%s", want);
-        }
+        view_field_follow(st, e->field, sizeof(e->field), e->field_def,
+                          sizeof(e->field_def), &e->field_clip, want);
     }
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
@@ -2769,7 +2821,7 @@ static void view_panel_export_still(struct nk_context *ctx, struct view_state *s
          * name implies; there is no codec box, the extension is the
          * choice. */
         st->playing = false;
-        /* A name without an extension gets the .png the default has, in
+        /* A name without an extension gets the .jpg the default has, in
          * the field itself, so that what the panel shows is what is
          * written. */
         view_export_complete_path(e->field, sizeof(e->field));

@@ -71,12 +71,14 @@ struct view_video {
     char enc[256];
     int out_w, out_h;
 
-    /* The panel's file field and the default it was last given. The field
-     * follows the default - the clip's name, the range and the family's
-     * container - until it differs from it, after which it is the user's
-     * and is left alone, across clips too. */
+    /* The panel's file field, the default it was last given and the clip
+     * that was on. The field follows the default - the clip's name, the
+     * range and the family's container - except for what was typed into
+     * it: a typed extension for good, a typed name on its own clip (ui.c,
+     * view_field_follow()). */
     char field[1024];
     char field_def[1024];
+    int field_clip;             /* the clip the default was last given on */
     bool field_active;          /* being typed into, as of the last frame */
 
     /* The frame that was on screen when the run started, and whether there

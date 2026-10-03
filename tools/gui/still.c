@@ -280,6 +280,16 @@ int view_still_write(const char *path, const char *codec_name,
          * wants the samples without a decoder. */
         av_dict_set(&copts, "compression_algo", "raw", 0);
         break;
+    case AV_CODEC_ID_MJPEG:
+        /* A fixed quantiser of 2, near the top of the encoder's scale,
+         * rather than the rate control it falls back on, which aims at a
+         * bit rate meant for video and hands a 24 megapixel still less
+         * than a megabyte at 40 dB against the PNG of the same frame;
+         * q=2 is 43.6 dB. The encoder reads the quantiser off the frame
+         * (below), the flag only tells it not to choose its own. */
+        avc->flags |= AV_CODEC_FLAG_QSCALE;
+        avc->global_quality = 2 * FF_QP2LAMBDA;
+        break;
     default:
         break;
     }
@@ -320,6 +330,7 @@ int view_still_write(const char *path, const char *codec_name,
     frame->color_trc       = avc->color_trc;
     frame->colorspace      = avc->colorspace;
     frame->pts    = 0;
+    frame->quality = avc->global_quality;
 
     ret = av_frame_get_buffer(frame, 0);
     if (ret < 0) {

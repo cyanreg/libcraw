@@ -39,9 +39,10 @@ void view_export_default_path(const struct view_state *st, int64_t frame,
 
     /* In ~/Processed (view_export_dir()), named after the clip and the
      * frame, so that two frames of one clip never land on the same file.
-     * PNG, because it is the one format that holds what was rendered
-     * without a decision. */
-    snprintf(out, size, "%s/%s-%05d.png", view_export_dir(st), base, (int)frame);
+     * JPEG, the format a still is looked at and sent in (Lynne's choice;
+     * it was PNG, which holds what was rendered without a decision and is
+     * a hundred megabytes of it). The field's extension picks another. */
+    snprintf(out, size, "%s/%s-%05d.jpg", view_export_dir(st), base, (int)frame);
 }
 
 void view_export_complete_path(char *path, size_t size)
@@ -49,13 +50,13 @@ void view_export_complete_path(char *path, size_t size)
     size_t len = strlen(path);
 
     /* A name that picks no muxer has no extension libavformat knows, and
-     * the default's PNG is what such a name means. A name that ends in a
+     * the default's JPEG is what such a name means. A name that ends in a
      * slash is a directory, which no extension makes a file. */
     if (!len || av_guess_format(NULL, path, NULL) || path[len - 1] == '/')
         return;
     if (path[len - 1] == '.')
         len--;
-    snprintf(path + len, size - len, ".png");
+    snprintf(path + len, size - len, ".jpg");
 }
 
 void view_export_begin(struct view_state *st, int64_t frame, const char *path,

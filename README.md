@@ -492,16 +492,21 @@ last frame — Ctrl+1, Ctrl+2 and `--export-video` hold to it the same way,
 so a range cannot reach past the clip. Each section has its own file
 field, its own button and its own status line, neither field names the
 other's file, and a field keeps what was typed into it while its section
-is folded. Each field follows its own default name until it is typed into
-— the image's the clip and the frame, the video's the clip and the range,
-both in `~/Processed`, which is made on first use (the clip's own directory
-when there is no home to put it under) — and once a path is typed it is the
-user's and is kept, across clips too. A typed path always wins. Nothing judges a name
-while it is being typed: the extension picks the container when the button
-is pressed, a name with no extension libavformat knows gets the family's
-container appended (`.png` for the image) in the field itself, and a
-container that will not carry the encoder or the sound is refused on the
-status line under the button, in a sentence.
+is folded. Each field follows its own default name — the image's the clip
+and the frame as a `.jpg`, the video's the clip and the range in the
+family's container, both in `~/Processed`, which is made on first use (the
+clip's own directory when there is no home to put it under) — except for
+what is typed into it, and the two parts of a name are kept differently.
+An extension typed is the format from then on, on this clip and every one
+after. A name typed before it is kept on the clip it was typed on and on
+no other: the next clip gets its own name again, under that extension, so
+a name typed for one clip is never the next one's and exporting the next
+never writes over the first. A typed path always wins while it stands.
+Nothing judges a name while it is being typed: the extension picks the
+container when the button is pressed, a name with no extension libavformat
+knows gets the family's container appended (`.jpg` for the image) in the
+field itself, and a container that will not carry the encoder or the sound
+is refused on the status line under the button, in a sentence.
 
 `--export FRAME OUT` is the image export from the command line: it writes one frame
 to one file and exits without opening a window, upright and at the crop
@@ -512,7 +517,9 @@ and `.avif` whatever their encoder supports, deepest first, through
 libswscale where that is not RGB; `--codec` overrides the encoder and `--enc
 KEY=VALUE,...` passes it options (`cpu-used=8,threads=2` for an AVIF). PNG is
 written at zlib level 1 (a fifth of the time of the default level for a per
-cent of the size) and TIFF uncompressed. The stream is tagged as what the
+cent of the size), TIFF uncompressed, and JPEG at 4:4:4 with the encoder's
+quantiser fixed at 2 (`--enc global_quality=N` sets another, in the
+encoder's lambda units, 118 a step). The stream is tagged as what the
 export really is: full range, BT.709 primaries, sRGB transfer, display
 referred. A sequence of stills is deliberately not offered — that is a video
 encode. `--export-video START END OUT` is the video export headless, and

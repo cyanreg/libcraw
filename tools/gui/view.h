@@ -876,11 +876,13 @@ struct view_export {
     char enc[256];              /* encoder options, from --enc */
     char status[128];
 
-    /* The panel's file field and the default it was last given: the field
-     * follows the frame on screen until it differs from that default, after
-     * which it is the user's and is kept, across clips too. */
+    /* The panel's file field, the default it was last given and the clip
+     * that was on: the field follows the frame on screen except for what
+     * was typed into it, a typed extension for good and a typed name on
+     * its own clip (ui.c, view_field_follow()). */
     char field[VIEW_MAX_PATH];
     char field_def[VIEW_MAX_PATH];
+    int field_clip;
     bool field_active;          /* being typed into, as of the last frame */
 
     /* One RGBA16 frame, grown once and kept. */
