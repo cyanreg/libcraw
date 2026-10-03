@@ -523,15 +523,20 @@ static bool view_section_header(struct nk_context *ctx, struct view_state *st,
         bs.border = 1.0f;
         bs.border_color = style->tab.border_color;
         bs.padding = style->tab.padding;
+        /* The colour as well as the dot follows what is shown: a greyed
+         * switch is off, in the off colour, not a dimmed blue outline. */
         bs.text_normal = bs.text_hover = bs.text_active =
-            *on ? VIEW_SWITCH_ON : VIEW_SWITCH_OFF;
+            *on && !disabled ? VIEW_SWITCH_ON : VIEW_SWITCH_OFF;
         /* This style is a copy, so the dimming nk_widget_disable_begin()
          * does to ctx->style never reaches it: a greyed switch has to be
          * given the factor here to look greyed as well as refuse the
-         * click. */
+         * click. The symbol's colour only: nuklear draws the outline as a
+         * disc of the button's background colour inside a disc of the
+         * symbol's, and takes that background undimmed, so dimming the
+         * button's own background left a lighter disc inside a dark rim,
+         * which read as a filled dot. */
         if (disabled)
-            bs.color_factor_text = bs.color_factor_background =
-                bs.disabled_factor;
+            bs.color_factor_text = bs.disabled_factor;
 
         if (disabled)
             view_disable_begin(ctx);
