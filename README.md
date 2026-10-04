@@ -211,29 +211,27 @@ seconds. A 23.976 clip has nothing slower to go to and its row is greyed.
 refused when that clip opens: a headless run stops there, a window plays
 the clip at its own rate (DESIGN.md 23).
 
-Under the rate row, "every other frame" plays and exports every second
-frame and none of those between: half the clip's rate at its own speed,
-with its sound. The frames kept are counted from the one on screen when the
-switch goes on, which is kept, and not from the top of the file: turned on
-over a frame where the lamps are lit, the lit half is the one shown. A clip
-that opens counts from its first frame, and a headless run from the first
-frame it writes. It is for light that pulses in step with half the frame
-rate, LED street lamps on a mains-rate driver under a high-speed clip, which
-leave every second frame darker than the ones either side; the shown half is
-a clip without that flicker. The rate row's readout says it, "59.94 fps,
-every other frame" on a 119.88 clip, and its slower stops are measured
-against that half rate, so the two combine. The frames between are still
-decoded, since a decoder needs them, and dropped before they are developed.
-A seek lands on the shown frame at or before where it was sent, so `,` and
-`.` step from one shown frame to the next, and the temporal denoise averages
-only shown frames, after a seek as well. The video export writes the shown
-frames of its range, the same half as on screen, numbered in the file at
-the half rate: frames 0 to 59 of a 60 fps clip are 30 frames lasting one
-second, sound and all, and file frame k is the clip's frame 2k, or 2k + 1
-when the odd half is shown. A range that starts on a frame between starts
-at the next shown one. `--every-other-frame` sets it from the command
-line for every clip of a playlist, and the switch carries from clip to clip
-like the rate.
+Under the rate row, the "frames" row plays and exports all of a clip's
+frames, or every other one: its odd-numbered frames or its even-numbered
+ones, counted from frame 0 as the frame readout counts. That is half the
+clip's rate at its own speed, with its sound. It is for light that pulses
+in step with half the frame rate, LED street lamps on a mains-rate driver
+under a high-speed clip, which leave every second frame darker than the
+ones either side; one half is a clip without that flicker, and the row picks
+which. The rate row's readout says it, "59.94 fps, odd frames" on a 119.88
+clip, and its slower stops are measured against that half rate, so the two
+combine. The frames left out are still decoded, since a decoder needs them,
+and dropped before they are developed. A seek lands on the shown frame at
+or before where it was sent, picking the other half while a frame of it is
+on screen goes back one frame, `,` and `.` step from one shown frame to the
+next, and the temporal denoise averages only shown frames, after a seek as
+well. The video export writes the shown frames of its range, numbered in
+the file at the half rate: frames 0 to 59 of a 60 fps clip are 30 frames
+lasting one second, sound and all, and file frame k is the clip's frame 2k
+for the even half and 2k + 1 for the odd. A range that starts on a frame
+left out starts at the next shown one. `--every-other-frame odd` or `even`
+sets it from the command line for every clip of a playlist, and the row
+carries from clip to clip like the rate.
 
 On Wayland the window follows the compositor's colour management
 (`wp_color_manager_v1`): it asks for the image description the compositor

@@ -822,14 +822,29 @@ AVRational view_rate_native(const struct view_state *st)
 
 int view_frame_step(const struct view_state *st)
 {
-    return st->alternate ? 2 : 1;
+    return st->half != VIEW_HALF_OFF ? 2 : 1;
+}
+
+const char *view_half_name(enum view_half half)
+{
+    switch (half) {
+    case VIEW_HALF_ODD:  return "odd frames";
+    case VIEW_HALF_EVEN: return "even frames";
+    default:             return NULL;
+    }
+}
+
+/* The frame number every shown one is, modulo N: 1 for the odd ones. */
+static int64_t view_half_phase(const struct view_state *st)
+{
+    return st->half == VIEW_HALF_ODD ? 1 : 0;
 }
 
 bool view_frame_shown(const struct view_state *st, int64_t index)
 {
     int64_t n = view_frame_step(st);
 
-    return n == 1 || ((index - st->alt_phase) % n + n) % n == 0;
+    return n == 1 || ((index - view_half_phase(st)) % n + n) % n == 0;
 }
 
 int64_t view_frame_snap(const struct view_state *st, int64_t index)
@@ -838,7 +853,7 @@ int64_t view_frame_snap(const struct view_state *st, int64_t index)
 
     if (n == 1)
         return index;
-    index -= ((index - st->alt_phase) % n + n) % n;
+    index -= ((index - view_half_phase(st)) % n + n) % n;
     if (index < 0)
         index += n;
 
@@ -920,7 +935,7 @@ void view_rate_label(const struct view_state *st, AVRational r, char *buf,
     view_rate_name(r, name, sizeof(name));
     if (view_rate_cmp(r, own) >= 0) {
         snprintf(buf, n, "%s fps, %s", name,
-                 st->alternate ? "every other frame" : "the clip's own");
+                 st->half ? view_half_name(st->half) : "the clip's own");
         return;
     }
 
@@ -972,8 +987,9 @@ static int view_rate_open(struct view_state *st)
 
     if (view_rate_cmp(want, own) > 0 && view_rate_same(want, st->cfg.rate)) {
         view_rate_name(own, name, sizeof(name));
-        fprintf(stderr, "`%s` runs at %s fps%s; --rate can only slow a clip down\n",
-                st->cfg.input, name, st->alternate ? " every other frame" : "");
+        fprintf(stderr, "`%s` runs at %s fps%s%s; --rate can only slow a clip down\n",
+                st->cfg.input, name, st->half ? " in its " : "",
+                st->half ? view_half_name(st->half) : "");
         if (st->cfg.headless)
             return CRAW_ERROR(EINVAL);
     }
@@ -2580,11 +2596,13 @@ static void view_usage(FILE *f)
 "  --rate FPS          play and export every frame at FPS, slower than the\n"
 "                      clip and without its sound: 23.976, 24, 25, 29.97, 30,\n"
 "                      48, 50, 59.94, 60, or clip (the default)\n"
-"  --every-other-frame play and export frames 0, 2, 4 and so on only, at half\n"
-"                      the clip's rate and its own speed, with its sound: the\n"
-"                      cure for lights that pulse at half the frame rate, which\n"
-"                      leave every second frame darker. --rate slows that\n"
-"                      further, as it slows a clip\n"
+"  --every-other-frame odd|even\n"
+"                      play and export only the clip's odd-numbered or its\n"
+"                      even-numbered frames, counted from frame 0, at half its\n"
+"                      rate and its own speed, with its sound: the cure for\n"
+"                      lights that pulse at half the frame rate, which leave\n"
+"                      every second frame darker. --rate slows that further,\n"
+"                      as it slows a clip\n"
 "  --audio-dump FILE   write exactly the float samples handed to the audio\n"
 "                      device, raw interleaved float32 48 kHz stereo. The\n"
 "                      file is the clip\'s: switching clips starts it again\n"
@@ -2935,7 +2953,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "loops",    required_argument, NULL, VIEW_OPT_LOOPS     },
         { "no-loop",  no_argument,       NULL, VIEW_OPT_NO_LOOP   },
         { "rate",     required_argument, NULL, VIEW_OPT_RATE      },
-        { "every-other-frame", no_argument, NULL, VIEW_OPT_ALTERNATE },
+        { "every-other-frame", required_argument, NULL, VIEW_OPT_ALTERNATE },
         { "audio-dump", required_argument, NULL, VIEW_OPT_AUDIO_DUMP },
         { "audio-map", required_argument,  NULL, VIEW_OPT_AUDIO_MAP },
         { "zoom",     required_argument, NULL, VIEW_OPT_ZOOM      },
@@ -2999,10 +3017,15 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
             if ((ret = view_parse_rate(st, optarg)) < 0)
                 return ret;
             break;
-        case VIEW_OPT_ALTERNATE:
-            st->cfg.alternate = true;
-            st->alternate = true;
+        case VIEW_OPT_ALTERNATE: {
+            static const char *const halves[] = { "odd", "even" };
+            int h;
+
+            if ((ret = view_lookup(halves, 2, "--every-other-frame", optarg, &h)) < 0)
+                return ret;
+            st->half = h ? VIEW_HALF_EVEN : VIEW_HALF_ODD;
             break;
+        }
         case VIEW_OPT_AUDIO_DUMP:
             st->cfg.audio_dump = optarg;
             break;
@@ -3571,8 +3594,8 @@ static void view_log_look(const struct view_state *st)
     } else {
         fprintf(stderr, ", rate the clip's own");
     }
-    if (st->alternate)
-        fprintf(stderr, ", every other frame");
+    if (st->half)
+        fprintf(stderr, ", %s", view_half_name(st->half));
     fprintf(stderr, ", volume %.0f%%%s\n", st->volume * 100.0f,
             st->mute ? ", muted" : "");
 }
@@ -3597,8 +3620,6 @@ static int view_open_clip(struct view_state *st, int index, bool first)
     }
 
     st->clip = index;
-    /* A clip starts from its first frame, which is the one on screen. */
-    st->alt_phase = 0;
     st->cfg.input = st->cfg.inputs[index];
 
     view_log(st, "clip %d/%d: %s\n", index + 1, st->cfg.nb_inputs, st->cfg.input);
@@ -4268,9 +4289,9 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
  * read the paused track as the clock on the way back, fourteen seconds
  * behind. */
 static void view_rate_follow(struct view_state *st, AVRational *choice_seen,
-                             AVRational *rate_seen, bool *alt_seen)
+                             AVRational *rate_seen, enum view_half *half_seen)
 {
-    bool alt = st->alternate != *alt_seen, moved;
+    bool alt = st->half != *half_seen, moved;
     char label[64];
 
     /* Every other frame changes the clip's own rate as far as the slower
@@ -4281,11 +4302,12 @@ static void view_rate_follow(struct view_state *st, AVRational *choice_seen,
         *choice_seen = st->rate_choice;
         st->rate = view_rate_clamp(st, st->rate_choice);
     }
-    /* The half that is shown is the one the picture on screen is in: it
-     * stays, and so does every second frame either side of it. */
     if (alt) {
-        *alt_seen = st->alternate;
-        st->alt_phase = (int)(st->index % 2);
+        *half_seen = st->half;
+        if (st->have_frame && !view_frame_shown(st, st->index)) {
+            st->seek_to = st->index;
+            st->need_frame = true;
+        }
     }
     if (view_rate_same(st->rate, *rate_seen) && !alt)
         return;
@@ -4439,7 +4461,7 @@ static int view_run_window(struct view_state *st)
     /* The rate choice and the rate as the loop last acted on them; see
      * view_rate_follow(). */
     AVRational choice_seen = { 0, 0 }, rate_seen = { 0, 0 };
-    bool alt_seen = false;
+    enum view_half half_seen = VIEW_HALF_OFF;
     bool playing_seen = false;
     int w = VIEW_WINDOW_W, h = VIEW_WINDOW_H;
     int ret;
@@ -4511,7 +4533,7 @@ static int view_run_window(struct view_state *st)
         return ret;
     choice_seen = st->rate_choice;
     rate_seen = st->rate;
-    alt_seen = st->alternate;
+    half_seen = st->half;
     playing_seen = st->playing;
 
     ret = view_ui_open(st, win);
@@ -4704,7 +4726,7 @@ static int view_run_window(struct view_state *st)
         /* Before anything this iteration reads the clock: a key may have
          * opened another clip, and the panel may have moved the rate row
          * when it was laid out last time round. */
-        view_rate_follow(st, &choice_seen, &rate_seen, &alt_seen);
+        view_rate_follow(st, &choice_seen, &rate_seen, &half_seen);
 
         /* A pause with Auto on: the picture that stopped goes on settling
          * to its own reading through replays (struct view_awb, `pending`)
@@ -5063,8 +5085,7 @@ static int view_headless_pick(struct view_state *st, int64_t frame)
     int ret;
 
     /* The frame the export will write, which with every other frame is
-     * the shown one at or before it - itself, since a headless run's half
-     * is counted from it (view_run_headless()). */
+     * the shown one at or before it. */
     frame = view_frame_snap(st, frame);
     st->seek_to = frame;
     while (1) {
@@ -5117,11 +5138,6 @@ static int view_run_headless(struct view_state *st)
     if (ret < 0)
         return ret;
     t0 = view_phase(st, t0, "decoder, profile and LUT");
-
-    /* No frame is on screen, so every other frame counts from the first
-     * one the run writes: that one is kept. */
-    st->alt_phase = (int)((st->cfg.export_video ? st->cfg.video_start
-                                                : st->cfg.export_frame) % 2);
 
     if (st->pick.pending) {
         ret = view_headless_pick(st, st->cfg.export_video ? st->cfg.video_start

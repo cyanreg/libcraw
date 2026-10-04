@@ -2221,8 +2221,8 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     /* Every other frame: the range starts on a frame that is shown, the
      * first in it, or the one before it when the range is a single frame
      * that is not - or the one after, when there is none before. The half
-     * is the one on screen (struct view_state, `alt_phase`), so the file
-     * has the frames that were looked at. */
+     * is the one chosen for the screen (struct view_state, `half`), so the
+     * file has the frames that were looked at. */
     e->step = view_frame_step(st);
     if (!view_frame_shown(st, e->start)) {
         int64_t from = e->start;
@@ -2702,11 +2702,11 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
 
             view_rate_name(e->fr, name, sizeof(name));
             snprintf(audio, sizeof(audio), ", no sound at %s fps", name);
-            snprintf(slowed, sizeof(slowed), ", slowed from %d/%d%s",
-                     e->own.num, e->own.den,
-                     e->step > 1 ? ", every other frame" : "");
+            snprintf(slowed, sizeof(slowed), ", slowed from %d/%d%s%s",
+                     e->own.num, e->own.den, st->half ? ", " : "",
+                     st->half ? view_half_name(st->half) : "");
         } else if (e->step > 1) {
-            snprintf(slowed, sizeof(slowed), ", every other frame");
+            snprintf(slowed, sizeof(slowed), ", %s", view_half_name(st->half));
             if (e->nb_audio)
                 snprintf(audio, sizeof(audio), ", audio %s",
                          view_presets_audio_label(&e->sel, label, sizeof(label)));

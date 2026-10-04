@@ -1875,17 +1875,28 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
     /* A still is not played, so there is nothing for it to be slowed to,
      * nor frames for it to leave out. */
     if (st->dec.fmt && !st->dec.still) {
-        nk_bool alt = st->alternate;
+        static const char *const names[] = { "all", "odd", "even" };
+        const struct nk_user_font *f = ctx->style.font;
 
         view_panel_rate(ctx, st);
 
-        /* Every other frame: the switch and nothing else. The run loop
-         * takes it up with the rate (view_rate_follow()), and the rate's
-         * readout above says what came of it, "29.97 fps, every other
-         * frame". */
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        if (nk_checkbox_label(ctx, "every other frame", &alt))
-            st->alternate = alt;
+        /* Every frame, or every other one: the odd-numbered or the
+         * even-numbered, counted from frame 0 as the readout counts. The
+         * choice and nothing else; the run loop takes it up with the rate
+         * (view_rate_follow()), and the rate's readout above says what
+         * came of it, "29.97 fps, odd frames". The label column is the
+         * rate row's, so the two read as one block. */
+        nk_layout_row_template_begin(ctx, VIEW_ROW);
+        nk_layout_row_template_push_static(ctx, f->width(f->userdata, f->height,
+                                                         "frames", 6) + 12.0f);
+        for (int i = 0; i < 3; i++)
+            nk_layout_row_template_push_dynamic(ctx);
+        nk_layout_row_template_end(ctx);
+
+        nk_label(ctx, "frames", NK_TEXT_LEFT);
+        for (int i = 0; i < 3; i++)
+            if (nk_option_label(ctx, names[i], (int)st->half == i))
+                st->half = (enum view_half)i;
     }
 }
 
