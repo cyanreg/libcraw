@@ -1328,9 +1328,9 @@ struct view_state {
      * `rate`, in the same step as it moves the clock and the sound. 0/0 for
      * the clip's own. */
     AVRational rate_choice;
-    /* Every other frame: the clip's frames 0, 2, 4 and so on and none of
-     * those between, at half the clip's rate and its own speed, sound and
-     * all. For light that pulses in step with half the frame rate - a
+    /* Every other frame: every second frame of the clip, counted from the
+     * one on screen when it went on, and none of those between, at half
+     * the clip's rate and its own speed, sound and all. For light that pulses in step with half the frame rate - a
      * street lamp's LEDs on a mains-rate driver under a high-speed clip -
      * which leaves every second frame bright and the ones between dark:
      * one of the two halves is a clip without the flicker. The frames
@@ -1338,6 +1338,13 @@ struct view_state {
      * before they cost anything else. Transport like the rate, carried
      * across clips; DESIGN.md 23.6. */
     bool alternate;
+    /* Which half: the frames whose number is this modulo 2. Counted from
+     * the frame on screen when the switch went on, which is kept, rather
+     * than from the top of the file, so which half is shown is picked by
+     * looking: turned on over a bright frame, the bright ones stay. A clip
+     * that opens starts from its first frame, and a headless run from the
+     * first frame it exports. */
+    int alt_phase;
     bool need_frame;            /* decode one more even while paused */
     int64_t seek_to;            /* >= 0: seek before the next decode */
     int64_t seek_target;        /* the frame a seek is still looking for */
@@ -1839,6 +1846,12 @@ AVRational view_rate_native(const struct view_state *st);
  * other frame, 1 otherwise. Output frame k is source frame N k from where
  * it starts, and every frame a seek lands on is a multiple of N. */
 int view_frame_step(const struct view_state *st);
+/* Whether frame `index` of the clip is one that is shown: every one
+ * without every other frame, every second one from `alt_phase` with it. */
+bool view_frame_shown(const struct view_state *st, int64_t index);
+/* The shown frame at or before `index`, or the first shown one when there
+ * is none before it: where a seek to `index` lands. */
+int64_t view_frame_snap(const struct view_state *st, int64_t index);
 /* The clip's own rate over N: the rate it plays at its own speed, which is
  * what every slower rate is measured against. */
 AVRational view_rate_base(const struct view_state *st);

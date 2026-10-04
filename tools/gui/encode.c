@@ -2220,12 +2220,17 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     }
     /* Every other frame: the range starts on a frame that is shown, the
      * first in it, or the one before it when the range is a single frame
-     * that is not. */
+     * that is not - or the one after, when there is none before. The half
+     * is the one on screen (struct view_state, `alt_phase`), so the file
+     * has the frames that were looked at. */
     e->step = view_frame_step(st);
-    if (e->start % e->step) {
-        e->start += e->step - e->start % e->step;
-        if (e->start > e->end)
-            e->start -= e->step;
+    if (!view_frame_shown(st, e->start)) {
+        int64_t from = e->start;
+
+        e->start = view_frame_snap(st, from);
+        if (e->start < from && e->start + e->step <= e->end)
+            e->start += e->step;
+        e->end = CRAW_MAX(e->end, e->start);
     }
     e->next  = e->start;
     e->t0 = e->last_report = av_gettime_relative();

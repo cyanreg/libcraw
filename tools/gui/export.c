@@ -66,8 +66,7 @@ void view_export_begin(struct view_state *st, int64_t frame, const char *path,
 
     /* With every other frame, the shown frame at or before it, as a seek
      * lands: the frames between are never developed. */
-    e->frame = CRAW_MAX(frame, 0);
-    e->frame -= e->frame % view_frame_step(st);
+    e->frame = view_frame_snap(st, CRAW_MAX(frame, 0));
     e->active = true;
     e->sought = false;
     snprintf(e->codec, sizeof(e->codec), "%s", codec ? codec : "");

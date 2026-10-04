@@ -825,6 +825,26 @@ int view_frame_step(const struct view_state *st)
     return st->alternate ? 2 : 1;
 }
 
+bool view_frame_shown(const struct view_state *st, int64_t index)
+{
+    int64_t n = view_frame_step(st);
+
+    return n == 1 || ((index - st->alt_phase) % n + n) % n == 0;
+}
+
+int64_t view_frame_snap(const struct view_state *st, int64_t index)
+{
+    int64_t n = view_frame_step(st);
+
+    if (n == 1)
+        return index;
+    index -= ((index - st->alt_phase) % n + n) % n;
+    if (index < 0)
+        index += n;
+
+    return index;
+}
+
 AVRational view_rate_base(const struct view_state *st)
 {
     return av_div_q(view_rate_native(st), (AVRational) { view_frame_step(st), 1 });
@@ -2076,7 +2096,7 @@ static int view_preroll(struct view_state *st, int64_t first, int64_t want,
          * as it is while playing, so the ones between are not developed
          * here either - averaged in, they would be the flicker the mode is
          * there to leave out. */
-        if (index % view_frame_step(st)) {
+        if (!view_frame_shown(st, index)) {
             av_frame_unref(f);
             continue;
         }
@@ -2143,7 +2163,7 @@ int view_step_frame(struct view_state *st)
          * frame is then the shown one before it, and the step forward is
          * the next picture out of the decoder, which skips the one between
          * by itself. */
-        st->seek_to -= st->seek_to % view_frame_step(st);
+        st->seek_to = view_frame_snap(st, st->seek_to);
 
         /* Replaying the picture already on screen, which is how a grade
          * change repaints while paused, is not a move in time and must not
@@ -2278,7 +2298,7 @@ int view_step_frame(struct view_state *st)
      * which the decoder needed, and goes no further - not developed, not
      * mapped, not counted as a drop. The caller asks for the next, as for
      * a late frame. The lens record went with it above. */
-    if (st->index % view_frame_step(st)) {
+    if (!view_frame_shown(st, st->index)) {
         av_frame_unref(st->frame);
         return 2;
     }
@@ -3577,6 +3597,8 @@ static int view_open_clip(struct view_state *st, int index, bool first)
     }
 
     st->clip = index;
+    /* A clip starts from its first frame, which is the one on screen. */
+    st->alt_phase = 0;
     st->cfg.input = st->cfg.inputs[index];
 
     view_log(st, "clip %d/%d: %s\n", index + 1, st->cfg.nb_inputs, st->cfg.input);
@@ -4259,12 +4281,11 @@ static void view_rate_follow(struct view_state *st, AVRational *choice_seen,
         *choice_seen = st->rate_choice;
         st->rate = view_rate_clamp(st, st->rate_choice);
     }
+    /* The half that is shown is the one the picture on screen is in: it
+     * stays, and so does every second frame either side of it. */
     if (alt) {
         *alt_seen = st->alternate;
-        if (st->have_frame && st->index % view_frame_step(st)) {
-            st->seek_to = st->index;
-            st->need_frame = true;
-        }
+        st->alt_phase = (int)(st->index % 2);
     }
     if (view_rate_same(st->rate, *rate_seen) && !alt)
         return;
@@ -5042,8 +5063,9 @@ static int view_headless_pick(struct view_state *st, int64_t frame)
     int ret;
 
     /* The frame the export will write, which with every other frame is
-     * the shown one at or before it. */
-    frame -= frame % view_frame_step(st);
+     * the shown one at or before it - itself, since a headless run's half
+     * is counted from it (view_run_headless()). */
+    frame = view_frame_snap(st, frame);
     st->seek_to = frame;
     while (1) {
         ret = view_step_frame(st);
@@ -5095,6 +5117,11 @@ static int view_run_headless(struct view_state *st)
     if (ret < 0)
         return ret;
     t0 = view_phase(st, t0, "decoder, profile and LUT");
+
+    /* No frame is on screen, so every other frame counts from the first
+     * one the run writes: that one is kept. */
+    st->alt_phase = (int)((st->cfg.export_video ? st->cfg.video_start
+                                                : st->cfg.export_frame) % 2);
 
     if (st->pick.pending) {
         ret = view_headless_pick(st, st->cfg.export_video ? st->cfg.video_start

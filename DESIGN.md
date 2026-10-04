@@ -5125,6 +5125,15 @@ flickers at half its rate. Either half alone does not flicker. The panel's
 "every other frame" switch under the rate row, and `--every-other-frame`,
 keep the clip's frames 0, 2, 4 and so on and drop the rest.
 
+Which half is kept is counted from the frame on screen when the switch goes
+on, not from the top of the file: `alt_phase` is that frame's number modulo
+2, and frame i is shown when i - alt_phase is a multiple of N
+(`view_frame_shown()`). Turned on over a frame where the lamps are lit, the
+lit half stays, which is how the half is chosen - by looking - and why
+nothing has to seek when the switch goes on. A clip that opens starts from
+its first frame, alt_phase 0, and a headless run from the first frame it
+writes, the start of `--export-video`'s range or `--export`'s frame.
+
 It is a step N in the retime, 2 with the switch and 1 without. Output frame
 k is source frame N k from where the run starts, and the clip's own rate as
 far as the rate goes is its rate over N, `view_rate_base()`: R is that base
@@ -5141,21 +5150,23 @@ watched is still five seconds of the clip.
 The frames between are decoded, because a long-GOP decoder needs them, and
 `view_step_frame()` drops each the moment its index is known, before it is
 developed or mapped, and returns 2, the "call again" a late frame returns,
-without counting it as a drop. Every seek is snapped down to a multiple of
-N at the top of the seek, which is the one place a seek is taken: Home,
+without counting it as a drop. Every seek is snapped down to a shown frame
+(`view_frame_snap()`, the first shown one when there is none before) at the
+top of the seek, which is the one place a seek is taken: Home,
 the scrub bar, a loop point and `,` all land on a shown frame, and `,` from
 a shown frame lands on the shown one before it, while `.` is the next
 picture out of the decoder and skips the frame between by itself. The
-temporal denoise's pre-roll before a seek target develops only multiples of
-N, VIEW_PREROLL of them, so the average after a seek is of the same frames
-as the average while playing - with the frames between in it, the flicker
-would be averaged back in. Turning the switch on while a frame between is
-on screen seeks back to the shown one before it; turning it on or off at the
+temporal denoise's pre-roll before a seek target develops only shown
+frames, VIEW_PREROLL of them, so the average after a seek is of the same
+frames as the average while playing - with the frames between in it, the
+flicker would be averaged back in. Turning the switch on or off at the
 clip's own speed touches neither the sound nor the clock. `--export FRAME`
 and `--wb pick:X,Y` snap their frame the same way.
 
-The video export snaps its range's start up to a multiple of N (down, for a
-one-frame range that holds none), steps `next` by N and numbers each frame
+The video export keeps the half on screen, so the file has the frames that
+were looked at. It moves its range's start up to the next shown frame (back
+to the one before, for a one-frame range that holds none, or on to the next
+when there is none before), steps `next` by N and numbers each frame
 by its place in the file, `(index - start) / N`. The file's rate is R. The
 sound's first sample is the start frame at the clip's own rate, and its
 length is the file's frames at the file's rate, the same stretch of the
@@ -5173,8 +5184,12 @@ With `--rate 24` as well, 30 frames at 24/1, 1.25 s, no sound; `--rate 50`
 is refused, exit 1, no file. In a window, nested, dance.mp4 played 156
 pictures in five seconds, every one even, two apart, 32.8 ms apart on the
 dummy audio driver's clock with a/v within 3 ms; P1000003 (ProRes RAW)
-stepped back from 124 to 122 and 120 and forward to 122 and 124, stepped
-125 and 126 with the switch off, and turned on at 213 went back to 212.
+stepped back from 124 to 122 and 120 and forward to 122 and 124, and 125
+and 126 with the switch off. Counted from the frame on screen: dance.mp4
+frames 1 to 60 headless are file frame k = clip frame 2k + 1 for all 30,
+and 0 to 59 are 2k; P1000003 paused at 93 with the switch turned on there
+played 45 pictures, 95, 97, 99 and on, not one even, and stepped back from
+183 to 181 and 179 and forward to 181.
 Stepping back on dance.mp4 lands on a keyframe with or without the switch
 (181 and then 0 from 310): a long-GOP developed clip does not seek exactly,
 which is older than this and the same with N = 1.
