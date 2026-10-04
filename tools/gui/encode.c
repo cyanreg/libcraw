@@ -239,7 +239,8 @@ void view_encode_list(void)
  * codec is for. A lossless or an intermediate codec gets deep RGB, because
  * that is what the export renders and anything else is a conversion nobody
  * asked for; ProRes gets the ten bit 4:2:2 it was designed around; a
- * delivery codec gets the deepest 4:2:0 it will take. */
+ * delivery codec gets the deepest 4:2:0 it will take, except H.264, which
+ * gets the eight bits everything can play. */
 static const enum AVPixelFormat view_enc_want_rgb[] = {
     AV_PIX_FMT_GBRP16LE, AV_PIX_FMT_GBRP16BE,
     AV_PIX_FMT_GBRP14LE, AV_PIX_FMT_GBRP12LE, AV_PIX_FMT_GBRP10LE,
@@ -266,6 +267,17 @@ static const enum AVPixelFormat view_enc_want_420[] = {
     AV_PIX_FMT_GBRP10LE,    AV_PIX_FMT_GBRP,
 };
 
+/* H.264 is the one delivery codec whose deeper profiles next to nothing
+ * decodes: High 10 plays in software players and on almost no hardware, so
+ * eight bit 4:2:0 comes first, as NV12, which is what x264 works in and
+ * the only format h264_vulkan takes on RADV. */
+static const enum AVPixelFormat view_enc_want_h264[] = {
+    AV_PIX_FMT_NV12,        AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_P010LE,
+    AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV444P10LE, AV_PIX_FMT_YUV444P,
+};
+
 /* The same three for the Vulkan path, where the choice is the frames
  * context's software format rather than the codec's pixel format. */
 static const enum AVPixelFormat view_enc_vk_rgb[] = {
@@ -288,6 +300,10 @@ static const enum AVPixelFormat view_enc_vk_420[] = {
     AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV420P,
 };
 
+static const enum AVPixelFormat view_enc_vk_h264[] = {
+    AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_P010, AV_PIX_FMT_YUV420P10,
+};
+
 /* Which of the three a codec belongs to. Nothing here is a guess about a
  * particular encoder: it is what the format is for. */
 static void view_enc_wanted(enum AVCodecID id, bool hw,
@@ -303,6 +319,11 @@ static void view_enc_wanted(enum AVCodecID id, bool hw,
         *list = hw ? view_enc_vk_rgb : view_enc_want_rgb;
         *n    = hw ? CRAW_ARRAY_ELEMS(view_enc_vk_rgb)
                    : CRAW_ARRAY_ELEMS(view_enc_want_rgb);
+        return;
+    case AV_CODEC_ID_H264:
+        *list = hw ? view_enc_vk_h264 : view_enc_want_h264;
+        *n    = hw ? CRAW_ARRAY_ELEMS(view_enc_vk_h264)
+                   : CRAW_ARRAY_ELEMS(view_enc_want_h264);
         return;
     case AV_CODEC_ID_PRORES:
     case AV_CODEC_ID_APV:
@@ -2257,7 +2278,15 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
      * labelled as something it is not: the panel greys such an entry, but
      * --pix-fmt and --preset can still be combined into one. */
     e->pin = view_presets_sel_fmt(&e->sel);
-    if (!e->col->scene) {
+    /* A --codec that is not the family's own encoder has nothing to do with
+     * the preset's pin or its profile's rules - FFV1's gbrp16 handed to
+     * h264_vulkan is a refusal, not a default - so only a --pix-fmt pins
+     * it, and otherwise the engine picks what the codec is for, which for
+     * H.264 is eight bit NV12. */
+    if (o->codec && o->codec[0] && strcmp(o->codec, view_presets_encoder(&e->sel)))
+        e->pin = e->sel.pix_fmt_family == e->sel.family
+               ? (enum AVPixelFormat)e->sel.pix_fmt : AV_PIX_FMT_NONE;
+    else if (!e->col->scene) {
         const char *why = view_presets_fmt_why_not(e->sel.family,
                                                    e->sel.preset, e->pin);
 

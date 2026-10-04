@@ -170,18 +170,20 @@ static const struct view_preset view_presets_av1_vk[] = {
 /* ---------------------------------------------------------------- x264 */
 
 /* x264's own preset names, which are what the family's presets are. The
- * pinned format is ten bit 4:2:0, which x264 writes as High 10; the
- * profile is not set alongside it, because x264 picks the lowest profile
- * that can carry the format it is given and the pixel format row would
- * otherwise be a row that refuses everything it offers. Checked: with no
- * `profile` at all, yuv420p10 still comes out High 10 and yuv444p10 comes
- * out High 4:4:4 Predictive. */
+ * pinned format is eight bit 4:2:0 as NV12, which x264 writes as High and
+ * which is the one H.264 every player and every hardware decoder takes;
+ * NV12 rather than yuv420p because it is x264's own internal layout, so
+ * the encoder takes it without a conversion of its own. The profile is not
+ * set alongside it, because x264 picks the lowest profile that can carry
+ * the format it is given and the pixel format row would otherwise be a row
+ * that refuses everything it offers. Checked: with no `profile` at all,
+ * yuv420p10 comes out High 10 and yuv444p10 High 4:4:4 Predictive. */
 static const struct view_preset view_presets_x264[] = {
-    { "veryfast", "preset=veryfast", AV_PIX_FMT_YUV420P10 },
-    { "fast",     "preset=fast",     AV_PIX_FMT_YUV420P10 },
-    { "medium",   "preset=medium",   AV_PIX_FMT_YUV420P10 },
-    { "slow",     "preset=slow",     AV_PIX_FMT_YUV420P10 },
-    { "veryslow", "preset=veryslow", AV_PIX_FMT_YUV420P10 },
+    { "veryfast", "preset=veryfast", AV_PIX_FMT_NV12 },
+    { "fast",     "preset=fast",     AV_PIX_FMT_NV12 },
+    { "medium",   "preset=medium",   AV_PIX_FMT_NV12 },
+    { "slow",     "preset=slow",     AV_PIX_FMT_NV12 },
+    { "veryslow", "preset=veryslow", AV_PIX_FMT_NV12 },
 };
 #define VIEW_X264_DEF 4         /* veryslow */
 
@@ -224,7 +226,7 @@ static const enum AVPixelFormat view_fmts_svtav1[] = {
     AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV420P,
 };
 static const enum AVPixelFormat view_fmts_x264[] = {
-    AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV12,
+    AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV420P10,
     AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P10, AV_PIX_FMT_YUV444P,
 };
 static const enum AVPixelFormat view_fmts_av1_vk[] = {
