@@ -313,14 +313,44 @@ int view_ui_resize(struct view_state *st, int w, int h)
     return 0;
 }
 
+/* A click whose press and release both land in one input cycle is lost to
+ * nuklear: a button fires on a press it sees down when the panel is built,
+ * and by then this one is up again. A panel that is built a few times a
+ * second - under a video export developing 5.8K frames, which holds the
+ * lock the panel waits for - loses most clicks that way, the stop button's
+ * among them. So the release of a button pressed in the same cycle is held
+ * back and handed over when the next one opens, after the panel has been
+ * built with the press. */
+static bool view_ui_down[4];            /* SDL's left, middle, right */
+static SDL_Event view_ui_held[8];
+static int view_ui_nb_held;
+
 bool view_ui_event(void *sdl_event)
 {
+    SDL_Event *e = sdl_event;
+    int b = e->button.button;
+
+    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && b > 0 && b < 4) {
+        view_ui_down[b] = true;
+    } else if (e->type == SDL_EVENT_MOUSE_BUTTON_UP && b > 0 && b < 4 &&
+               view_ui_down[b] &&
+               view_ui_nb_held < (int)CRAW_ARRAY_ELEMS(view_ui_held)) {
+        view_ui_held[view_ui_nb_held++] = *e;
+        return true;
+    }
+
     return nk_sdl_handle_event(sdl_event) != 0;
 }
 
 void view_ui_input_begin(void)
 {
+    int held = view_ui_nb_held;
+
     nk_input_begin(view_nk);
+    memset(view_ui_down, 0, sizeof(view_ui_down));
+    view_ui_nb_held = 0;
+    for (int i = 0; i < held; i++)
+        view_ui_event(&view_ui_held[i]);
 }
 
 void view_ui_input_end(void)
