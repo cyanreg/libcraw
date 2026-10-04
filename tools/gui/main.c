@@ -834,6 +834,11 @@ const char *view_half_name(enum view_half half)
     }
 }
 
+void view_half_next(struct view_state *st)
+{
+    st->half = (enum view_half)((st->half + 1) % 3);
+}
+
 /* The frame number every shown one is, modulo N: 1 for the odd ones. */
 static int64_t view_half_phase(const struct view_state *st)
 {
@@ -2602,7 +2607,8 @@ static void view_usage(FILE *f)
 "                      rate and its own speed, with its sound: the cure for\n"
 "                      lights that pulse at half the frame rate, which leave\n"
 "                      every second frame darker. --rate slows that further,\n"
-"                      as it slows a clip\n"
+"                      as it slows a clip. In the window, f and the panel's\n"
+"                      frames button go through all, odd and even\n"
 "  --audio-dump FILE   write exactly the float samples handed to the audio\n"
 "                      device, raw interleaved float32 48 kHz stereo. The\n"
 "                      file is the clip\'s: switching clips starts it again\n"
@@ -4230,6 +4236,13 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
     /* The playlist, one clip per press: holding the key down would tear
      * through a card's worth of files, so the repeats are ignored the way
      * every other toggle's are. */
+    /* All frames, the odd ones, the even ones and round again: the
+     * panel's button under the rate row. */
+    case SDLK_F:
+        if (!repeat && !ctrl && !alt && st->dec.fmt && !st->dec.still)
+            view_half_next(st);
+        break;
+
     /* Marks the file on screen for deletion, or unmarks it. Nothing is
      * deleted here: that is the panel's button (struct view_bin). */
     case SDLK_DELETE:

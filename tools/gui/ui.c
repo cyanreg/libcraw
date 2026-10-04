@@ -1875,28 +1875,30 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
     /* A still is not played, so there is nothing for it to be slowed to,
      * nor frames for it to leave out. */
     if (st->dec.fmt && !st->dec.still) {
-        static const char *const names[] = { "all", "odd", "even" };
-        const struct nk_user_font *f = ctx->style.font;
+        static const char *const names[] = { "all frames", "odd frames",
+                                             "even frames" };
+        struct nk_style_button bs = ctx->style.button;
 
         view_panel_rate(ctx, st);
 
         /* Every frame, or every other one: the odd-numbered or the
-         * even-numbered, counted from frame 0 as the readout counts. The
-         * choice and nothing else; the run loop takes it up with the rate
-         * (view_rate_follow()), and the rate's readout above says what
-         * came of it, "29.97 fps, odd frames". The label column is the
-         * rate row's, so the two read as one block. */
-        nk_layout_row_template_begin(ctx, VIEW_ROW);
-        nk_layout_row_template_push_static(ctx, f->width(f->userdata, f->height,
-                                                         "frames", 6) + 12.0f);
-        for (int i = 0; i < 3; i++)
-            nk_layout_row_template_push_dynamic(ctx);
-        nk_layout_row_template_end(ctx);
-
-        nk_label(ctx, "frames", NK_TEXT_LEFT);
-        for (int i = 0; i < 3; i++)
-            if (nk_option_label(ctx, names[i], (int)st->half == i))
-                st->half = (enum view_half)i;
+         * even-numbered, counted from frame 0 as the readout counts. One
+         * button for the three, which each press moves on - all, odd,
+         * even and round again, as `f` does - saying what is in effect,
+         * and lit in the switches' colour while frames are left out.
+         * nuklear has no three-state widget of its own; this is its button
+         * with the section switches' styling. The choice and nothing else:
+         * the run loop takes it up with the rate (view_rate_follow()), and
+         * the rate's readout above says what came of it, "29.97 fps, odd
+         * frames". */
+        if (st->half != VIEW_HALF_OFF) {
+            bs.border_color = VIEW_SWITCH_ON;
+            bs.text_normal = bs.text_hover = bs.text_active = VIEW_SWITCH_ON;
+        }
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
+        if (nk_button_label_styled(ctx, &bs, names[st->half]))
+            view_half_next(st);
+        nk_spacer(ctx);
     }
 }
 

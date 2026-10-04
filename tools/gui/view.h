@@ -1853,6 +1853,8 @@ int view_frame_step(const struct view_state *st);
 bool view_frame_shown(const struct view_state *st, int64_t index);
 /* "odd frames" or "even frames", NULL for all of them. */
 const char *view_half_name(enum view_half half);
+/* All, odd, even and round again: the panel's button and `f`. */
+void view_half_next(struct view_state *st);
 /* The shown frame at or before `index`, or the first shown one when there
  * is none before it: where a seek to `index` lands. */
 int64_t view_frame_snap(const struct view_state *st, int64_t index);

@@ -5122,9 +5122,12 @@ LED street lamps on a mains-rate driver pulse at a frequency that a
 high-speed clip can sample in step with half its frame rate: every second
 frame catches the light on and the ones between catch it off, and the clip
 flickers at half its rate. Either half alone does not flicker. The panel's
-"frames" row under the rate row - all, odd, even - and `--every-other-frame
-odd|even` keep the clip's odd-numbered or its even-numbered frames and drop
-the rest.
+"frames" button under the rate row, which each press and `f` move on from
+all to odd to even and round, and `--every-other-frame odd|even` keep the
+clip's odd-numbered or its even-numbered frames and drop the rest. nuklear
+has no three-state widget; the button is its ordinary one, reading the state
+in effect and lit in the section switches' colour while frames are left
+out.
 
 Which half is the user's choice and is counted from the clip's frame 0, as
 the frame readout counts: `half` in `struct view_state`, and frame i is
