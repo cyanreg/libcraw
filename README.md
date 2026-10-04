@@ -211,6 +211,25 @@ seconds. A 23.976 clip has nothing slower to go to and its row is greyed.
 refused when that clip opens: a headless run stops there, a window plays
 the clip at its own rate (DESIGN.md 23).
 
+Under the rate row, "every other frame" plays and exports frames 0, 2, 4
+and so on and none of those between: half the clip's rate at its own speed,
+with its sound. It is for light that pulses in step with half the frame
+rate, LED street lamps on a mains-rate driver under a high-speed clip, which
+leave every second frame darker than the ones either side; the shown half is
+a clip without that flicker. The rate row's readout says it, "59.94 fps,
+every other frame" on a 119.88 clip, and its slower stops are measured
+against that half rate, so the two combine. The frames between are still
+decoded, since a decoder needs them, and dropped before they are developed.
+A seek lands on the shown frame at or before where it was sent, so `,` and
+`.` step from one shown frame to the next, and the temporal denoise averages
+only shown frames, after a seek as well. The video export writes the shown
+frames of its range, numbered in the file at the half rate: frames 0 to 59
+of a 60 fps clip are 30 frames lasting one second, sound and all, and file
+frame k is the clip's frame 2k. A range that starts on a frame between
+starts at the next shown one. `--every-other-frame` sets it from the command
+line for every clip of a playlist, and the switch carries from clip to clip
+like the rate.
+
 On Wayland the window follows the compositor's colour management
 (`wp_color_manager_v1`): it asks for the image description the compositor
 would like the window in, renders the picture into exactly that - the

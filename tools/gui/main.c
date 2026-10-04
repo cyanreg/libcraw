@@ -820,6 +820,16 @@ AVRational view_rate_native(const struct view_state *st)
     return (AVRational) { 30000, 1001 };
 }
 
+int view_frame_step(const struct view_state *st)
+{
+    return st->alternate ? 2 : 1;
+}
+
+AVRational view_rate_base(const struct view_state *st)
+{
+    return av_div_q(view_rate_native(st), (AVRational) { view_frame_step(st), 1 });
+}
+
 /* -1, 0 or 1 as `r` is below, at or above the clip's own rate `own`, where
  * anything within a thousandth of a frame a second of it is it: the stream
  * says 30000/1001 where a container may say 2997/100, while 30 and 29.97,
@@ -840,7 +850,7 @@ double view_speed(const struct view_state *st)
     if (st->rate.num <= 0 || st->rate.den <= 0)
         return 1.0;
 
-    return av_q2d(av_div_q(st->rate, view_rate_native(st)));
+    return av_q2d(av_div_q(st->rate, view_rate_base(st)));
 }
 
 bool view_slowed(const struct view_state *st)
@@ -850,7 +860,7 @@ bool view_slowed(const struct view_state *st)
 
 AVRational view_rate_out(const struct view_state *st)
 {
-    return view_slowed(st) ? st->rate : view_rate_native(st);
+    return view_slowed(st) ? st->rate : view_rate_base(st);
 }
 
 double view_out_frame_duration(const struct view_state *st)
@@ -860,7 +870,7 @@ double view_out_frame_duration(const struct view_state *st)
 
 int view_rate_stops(const struct view_state *st, AVRational *stops, int max)
 {
-    AVRational own = view_rate_native(st);
+    AVRational own = view_rate_base(st);
     int n = 0;
 
     for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_rates) && n < max - 1; i++)
@@ -883,13 +893,14 @@ void view_rate_name(AVRational r, char *buf, size_t n)
 void view_rate_label(const struct view_state *st, AVRational r, char *buf,
                      size_t n)
 {
-    AVRational own = view_rate_native(st);
+    AVRational own = view_rate_base(st);
     char name[16], x[16];
     size_t len;
 
     view_rate_name(r, name, sizeof(name));
     if (view_rate_cmp(r, own) >= 0) {
-        snprintf(buf, n, "%s fps, the clip's own", name);
+        snprintf(buf, n, "%s fps, %s", name,
+                 st->alternate ? "every other frame" : "the clip's own");
         return;
     }
 
@@ -914,7 +925,7 @@ void view_rate_label(const struct view_state *st, AVRational r, char *buf,
 static AVRational view_rate_clamp(const struct view_state *st, AVRational want)
 {
     if (want.num > 0 && want.den > 0 &&
-        view_rate_cmp(want, view_rate_native(st)) < 0)
+        view_rate_cmp(want, view_rate_base(st)) < 0)
         return want;
 
     return (AVRational) { 0, 0 };
@@ -932,7 +943,7 @@ static bool view_rate_same(AVRational a, AVRational b)
  * shows what came of it. */
 static int view_rate_open(struct view_state *st)
 {
-    AVRational want = st->rate_choice, own = view_rate_native(st);
+    AVRational want = st->rate_choice, own = view_rate_base(st);
     char name[16];
 
     st->rate = view_rate_clamp(st, want);
@@ -941,8 +952,8 @@ static int view_rate_open(struct view_state *st)
 
     if (view_rate_cmp(want, own) > 0 && view_rate_same(want, st->cfg.rate)) {
         view_rate_name(own, name, sizeof(name));
-        fprintf(stderr, "`%s` runs at %s fps; --rate can only slow a clip down\n",
-                st->cfg.input, name);
+        fprintf(stderr, "`%s` runs at %s fps%s; --rate can only slow a clip down\n",
+                st->cfg.input, name, st->alternate ? " every other frame" : "");
         if (st->cfg.headless)
             return CRAW_ERROR(EINVAL);
     }
@@ -1045,7 +1056,8 @@ static void view_wall_restart(struct view_state *st, double pts)
 
 double view_frame_duration(const struct view_state *st)
 {
-    return st->dec.frame_rate.num ? 1.0 / av_q2d(st->dec.frame_rate) : 1.0 / 29.97;
+    return (st->dec.frame_rate.num ? 1.0 / av_q2d(st->dec.frame_rate) : 1.0 / 29.97) *
+           view_frame_step(st);
 }
 
 /* Audio is the master clock and is never made to wait for the picture. The
@@ -2022,7 +2034,7 @@ static int view_preroll(struct view_state *st, int64_t first, int64_t want,
         if (ret == 2) {
             if (av_gettime_relative() - idle > VIEW_PREROLL_PATIENCE_MS * 1000) {
                 why = "the medium stopped delivering";
-                if (at == want - 1)
+                if (at >= want - view_frame_step(st))
                     break;
                 goto abandon;
             }
@@ -2059,6 +2071,15 @@ static int view_preroll(struct view_state *st, int64_t first, int64_t want,
 
         /* The ring hands each record out once; this one is spoken for. */
         view_decoder_lens(&st->dec, f->pts, &lens);
+
+        /* Every other frame: the average is of the frames that are shown,
+         * as it is while playing, so the ones between are not developed
+         * here either - averaged in, they would be the flicker the mode is
+         * there to leave out. */
+        if (index % view_frame_step(st)) {
+            av_frame_unref(f);
+            continue;
+        }
 
         ret = view_preroll_frame(st, f, index, !done);
         av_frame_unref(f);
@@ -2117,6 +2138,13 @@ int view_step_frame(struct view_state *st)
     }
 
     if (st->seek_to >= 0) {
+        /* Every other frame: a seek lands on a frame that is shown, the
+         * one at or before where it was sent. A step back from a shown
+         * frame is then the shown one before it, and the step forward is
+         * the next picture out of the decoder, which skips the one between
+         * by itself. */
+        st->seek_to -= st->seek_to % view_frame_step(st);
+
         /* Replaying the picture already on screen, which is how a grade
          * change repaints while paused, is not a move in time and must not
          * throw the illuminant track away. An export's first frame is a
@@ -2139,7 +2167,7 @@ int view_step_frame(struct view_state *st)
          * nothing before it, and the seeks of a knob being dragged go
          * without (ui.c). */
         if (jump && !st->scrubbing && view_preroll_wanted(st))
-            first = CRAW_MAX(want - VIEW_PREROLL, 0);
+            first = CRAW_MAX(want - VIEW_PREROLL * view_frame_step(st), 0);
         st->seek_to = -1;
         st->seek_cold = false;
 
@@ -2245,6 +2273,15 @@ int view_step_frame(struct view_state *st)
     st->index = st->dec.frame_rate.num
               ? (int64_t)llrint(st->pts * av_q2d(st->dec.frame_rate))
               : st->index + 1;
+
+    /* Every other frame: the one between two shown ones has been decoded,
+     * which the decoder needed, and goes no further - not developed, not
+     * mapped, not counted as a drop. The caller asks for the next, as for
+     * a late frame. The lens record went with it above. */
+    if (st->index % view_frame_step(st)) {
+        av_frame_unref(st->frame);
+        return 2;
+    }
 
     if (!st->dec.raw) {
         /* Already developed: straight from the decoder to libplacebo, with
@@ -2523,6 +2560,11 @@ static void view_usage(FILE *f)
 "  --rate FPS          play and export every frame at FPS, slower than the\n"
 "                      clip and without its sound: 23.976, 24, 25, 29.97, 30,\n"
 "                      48, 50, 59.94, 60, or clip (the default)\n"
+"  --every-other-frame play and export frames 0, 2, 4 and so on only, at half\n"
+"                      the clip's rate and its own speed, with its sound: the\n"
+"                      cure for lights that pulse at half the frame rate, which\n"
+"                      leave every second frame darker. --rate slows that\n"
+"                      further, as it slows a clip\n"
 "  --audio-dump FILE   write exactly the float samples handed to the audio\n"
 "                      device, raw interleaved float32 48 kHz stereo. The\n"
 "                      file is the clip\'s: switching clips starts it again\n"
@@ -2817,6 +2859,7 @@ enum {
     VIEW_OPT_LOOPS,
     VIEW_OPT_NO_LOOP,
     VIEW_OPT_RATE,
+    VIEW_OPT_ALTERNATE,
     VIEW_OPT_AUDIO_DUMP,
     VIEW_OPT_AUDIO_MAP,
     VIEW_OPT_ZOOM,
@@ -2872,6 +2915,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "loops",    required_argument, NULL, VIEW_OPT_LOOPS     },
         { "no-loop",  no_argument,       NULL, VIEW_OPT_NO_LOOP   },
         { "rate",     required_argument, NULL, VIEW_OPT_RATE      },
+        { "every-other-frame", no_argument, NULL, VIEW_OPT_ALTERNATE },
         { "audio-dump", required_argument, NULL, VIEW_OPT_AUDIO_DUMP },
         { "audio-map", required_argument,  NULL, VIEW_OPT_AUDIO_MAP },
         { "zoom",     required_argument, NULL, VIEW_OPT_ZOOM      },
@@ -2934,6 +2978,10 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         case VIEW_OPT_RATE:
             if ((ret = view_parse_rate(st, optarg)) < 0)
                 return ret;
+            break;
+        case VIEW_OPT_ALTERNATE:
+            st->cfg.alternate = true;
+            st->alternate = true;
             break;
         case VIEW_OPT_AUDIO_DUMP:
             st->cfg.audio_dump = optarg;
@@ -3503,6 +3551,8 @@ static void view_log_look(const struct view_state *st)
     } else {
         fprintf(stderr, ", rate the clip's own");
     }
+    if (st->alternate)
+        fprintf(stderr, ", every other frame");
     fprintf(stderr, ", volume %.0f%%%s\n", st->volume * 100.0f,
             st->mute ? ", muted" : "");
 }
@@ -3935,10 +3985,13 @@ static bool view_over_picture(const struct view_state *st, float x, float y)
  * frames and not 149. The seconds are the ones watched, at the output rate
  * R rather than the clip's own (DESIGN.md 23): five seconds of a 59.94 clip
  * slowed to 23.976 is 120 frames, two seconds of the clip, which is what
- * five seconds of the picture on screen are. */
+ * five seconds of the picture on screen are. Output frames are N source
+ * frames apart: five seconds of a 59.94 clip with every other frame are
+ * 150 pictures and 300 frames of the clip, five seconds of it. */
 static int64_t view_seek_frames(const struct view_state *st, double seconds)
 {
-    return (int64_t)(seconds / view_out_frame_duration(st) + 0.5);
+    return (int64_t)(seconds / view_out_frame_duration(st) + 0.5) *
+           view_frame_step(st);
 }
 
 /* `frame` held to the clip: never past its last frame when the count is
@@ -4193,23 +4246,43 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
  * read the paused track as the clock on the way back, fourteen seconds
  * behind. */
 static void view_rate_follow(struct view_state *st, AVRational *choice_seen,
-                             AVRational *rate_seen)
+                             AVRational *rate_seen, bool *alt_seen)
 {
+    bool alt = st->alternate != *alt_seen, moved;
     char label[64];
 
-    if (!view_rate_same(st->rate_choice, *choice_seen)) {
+    /* Every other frame changes the clip's own rate as far as the slower
+     * ones go, so a choice is clamped again against it, and the picture on
+     * screen, which may be one of the frames now left out, goes back to
+     * the shown one at or before it. */
+    if (!view_rate_same(st->rate_choice, *choice_seen) || alt) {
         *choice_seen = st->rate_choice;
         st->rate = view_rate_clamp(st, st->rate_choice);
     }
-    if (view_rate_same(st->rate, *rate_seen))
+    if (alt) {
+        *alt_seen = st->alternate;
+        if (st->have_frame && st->index % view_frame_step(st)) {
+            st->seek_to = st->index;
+            st->need_frame = true;
+        }
+    }
+    if (view_rate_same(st->rate, *rate_seen) && !alt)
         return;
+    moved = !view_rate_same(st->rate, *rate_seen);
     *rate_seen = st->rate;
 
-    if (view_slowed(st))
+    /* Slowed, the clock runs at a speed that every other frame changes as
+     * well (S is the rate over the clip's own over N), so it starts again
+     * from the picture. Back at the clip's own speed the sound picks up
+     * there. Every other frame turned on or off at the clip's own speed
+     * changes neither the clock nor the sound, and touches neither. */
+    if (view_slowed(st)) {
         view_audio_pause(&st->audio);
-    else
+        view_wall_restart(st, st->pts);
+    } else if (moved) {
         view_audio_seek(&st->audio, st->pts);
-    view_wall_restart(st, st->pts);
+        view_wall_restart(st, st->pts);
+    }
 
     view_rate_label(st, view_rate_out(st), label, sizeof(label));
     view_log(st, "rate: %s from %.3f s; %s\n", label, st->pts,
@@ -4345,6 +4418,7 @@ static int view_run_window(struct view_state *st)
     /* The rate choice and the rate as the loop last acted on them; see
      * view_rate_follow(). */
     AVRational choice_seen = { 0, 0 }, rate_seen = { 0, 0 };
+    bool alt_seen = false;
     bool playing_seen = false;
     int w = VIEW_WINDOW_W, h = VIEW_WINDOW_H;
     int ret;
@@ -4416,6 +4490,7 @@ static int view_run_window(struct view_state *st)
         return ret;
     choice_seen = st->rate_choice;
     rate_seen = st->rate;
+    alt_seen = st->alternate;
     playing_seen = st->playing;
 
     ret = view_ui_open(st, win);
@@ -4608,7 +4683,7 @@ static int view_run_window(struct view_state *st)
         /* Before anything this iteration reads the clock: a key may have
          * opened another clip, and the panel may have moved the rate row
          * when it was laid out last time round. */
-        view_rate_follow(st, &choice_seen, &rate_seen);
+        view_rate_follow(st, &choice_seen, &rate_seen, &alt_seen);
 
         /* A pause with Auto on: the picture that stopped goes on settling
          * to its own reading through replays (struct view_awb, `pending`)
@@ -4966,6 +5041,9 @@ static int view_headless_pick(struct view_state *st, int64_t frame)
 {
     int ret;
 
+    /* The frame the export will write, which with every other frame is
+     * the shown one at or before it. */
+    frame -= frame % view_frame_step(st);
     st->seek_to = frame;
     while (1) {
         ret = view_step_frame(st);

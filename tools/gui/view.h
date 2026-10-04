@@ -807,6 +807,7 @@ struct view_cfg {
     /* --rate FPS: the output rate every clip of the playlist opens at,
      * clamped to its own (DESIGN.md 23); 0/0 for the clip's own. */
     AVRational rate;
+    bool alternate;             /* --every-other-frame */
     const char *audio_dump;
     const char *audio_map;
 
@@ -1327,6 +1328,16 @@ struct view_state {
      * `rate`, in the same step as it moves the clock and the sound. 0/0 for
      * the clip's own. */
     AVRational rate_choice;
+    /* Every other frame: the clip's frames 0, 2, 4 and so on and none of
+     * those between, at half the clip's rate and its own speed, sound and
+     * all. For light that pulses in step with half the frame rate - a
+     * street lamp's LEDs on a mains-rate driver under a high-speed clip -
+     * which leaves every second frame bright and the ones between dark:
+     * one of the two halves is a clip without the flicker. The frames
+     * between are decoded, since the decoder needs them, and thrown away
+     * before they cost anything else. Transport like the rate, carried
+     * across clips; DESIGN.md 23.6. */
+    bool alternate;
     bool need_frame;            /* decode one more even while paused */
     int64_t seek_to;            /* >= 0: seek before the next decode */
     int64_t seek_target;        /* the frame a seek is still looking for */
@@ -1810,19 +1821,27 @@ int  view_replay_frame_flags(struct view_state *st, uint32_t flags);
 void view_log(const struct view_state *st, const char *fmt, ...)
               craw_printf_format(2, 3);
 
-/* One frame period of the clip, in seconds; 29.97 fps when it says none. */
+/* The clip seconds between one picture and the next: a frame period of the
+ * clip, 29.97 fps when it says none, times N. */
 double view_frame_duration(const struct view_state *st);
 
 /* The retime, DESIGN.md 23: the output rate R the picture is shown and
  * written at, and the speed S, the clip seconds that pass per second of what
- * is watched. Today S = R / the clip's own rate, never above 1, and output
- * frame k is source frame k. These are the only places either mapping - an
- * output frame to clip time, clip time to output time - is worked out; the
- * comment above them in main.c says why. */
+ * is watched. Today S = R / (the clip's own rate / N), never above 1, and
+ * output frame k is source frame N k, N being 2 with every other frame and
+ * 1 without (23.6). These are the only places either mapping - an output
+ * frame to clip time, clip time to output time - is worked out; the comment
+ * above them in main.c says why. */
 
-/* The clip's own rate, 29.97 when it says none, as view_frame_duration()
- * assumes. */
+/* The clip's own rate, 29.97 when it says none. */
 AVRational view_rate_native(const struct view_state *st);
+/* N, the source frames per output frame before any slowing: 2 with every
+ * other frame, 1 otherwise. Output frame k is source frame N k from where
+ * it starts, and every frame a seek lands on is a multiple of N. */
+int view_frame_step(const struct view_state *st);
+/* The clip's own rate over N: the rate it plays at its own speed, which is
+ * what every slower rate is measured against. */
+AVRational view_rate_base(const struct view_state *st);
 /* R: the chosen rate, or the clip's own when none is. */
 AVRational view_rate_out(const struct view_state *st);
 /* S, 1.0 when the clip is not slowed. */

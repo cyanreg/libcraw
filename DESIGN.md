@@ -5115,6 +5115,70 @@ the same as the headless one, which was run), and a playlist switch
 between clips of different rates, for want of a way to send keys to the
 nested compositor.
 
+
+### 23.6 Every other frame
+
+LED street lamps on a mains-rate driver pulse at a frequency that a
+high-speed clip can sample in step with half its frame rate: every second
+frame catches the light on and the ones between catch it off, and the clip
+flickers at half its rate. Either half alone does not flicker. The panel's
+"every other frame" switch under the rate row, and `--every-other-frame`,
+keep the clip's frames 0, 2, 4 and so on and drop the rest.
+
+It is a step N in the retime, 2 with the switch and 1 without. Output frame
+k is source frame N k from where the run starts, and the clip's own rate as
+far as the rate goes is its rate over N, `view_rate_base()`: R is that base
+at the clip's own speed, the slower stops are those below it, and S is R
+over it. So the clock, still in clip seconds, runs at S = 1 with the switch
+alone, and the sound plays as it does without it; slowed as well, a 119.88
+clip at 23.976 runs at S = 0.4 with no sound, its 59.94 pictures each held
+for a 23.976 frame. `view_frame_duration()` is the clip seconds between two
+pictures, N frame periods, which is what its three readers want: the
+auto white balance smoother's clock, the late-frame drop and the catch-up
+loop. `view_seek_frames()` is N times the output frames, so five seconds
+watched is still five seconds of the clip.
+
+The frames between are decoded, because a long-GOP decoder needs them, and
+`view_step_frame()` drops each the moment its index is known, before it is
+developed or mapped, and returns 2, the "call again" a late frame returns,
+without counting it as a drop. Every seek is snapped down to a multiple of
+N at the top of the seek, which is the one place a seek is taken: Home,
+the scrub bar, a loop point and `,` all land on a shown frame, and `,` from
+a shown frame lands on the shown one before it, while `.` is the next
+picture out of the decoder and skips the frame between by itself. The
+temporal denoise's pre-roll before a seek target develops only multiples of
+N, VIEW_PREROLL of them, so the average after a seek is of the same frames
+as the average while playing - with the frames between in it, the flicker
+would be averaged back in. Turning the switch on while a frame between is
+on screen seeks back to the shown one before it; turning it on or off at the
+clip's own speed touches neither the sound nor the clock. `--export FRAME`
+and `--wb pick:X,Y` snap their frame the same way.
+
+The video export snaps its range's start up to a multiple of N (down, for a
+one-frame range that holds none), steps `next` by N and numbers each frame
+by its place in the file, `(index - start) / N`. The file's rate is R. The
+sound's first sample is the start frame at the clip's own rate, and its
+length is the file's frames at the file's rate, the same stretch of the
+clip: `src_fr` and `fr` in `struct view_encode`, one rate when N is 1.
+
+Verified on the RX 6900 XT. dance.mp4 (H.264, 60 fps, AAC), frames 0 to 59
+to FFV1: 60 frames and 1.000 s without the switch, 30 frames, pts 1/30 apart
+and 1.000 s with it, the sound the same length in both; decoded to rgb48le,
+file frame k is the clip's frame 2k for all 30 (md5) and never 2k + 1.
+P1000387 (ProRes RAW, 29.97), frames 1 to 9 with the switch: 4 frames at
+15000/1001 from frame 2, each at 97 to 99 dB against the clip's frames 2, 4,
+6 and 8 exported without it and about 40 dB against their neighbours - the
+rest is the tone mapper's peak detection having seen half as many frames.
+With `--rate 24` as well, 30 frames at 24/1, 1.25 s, no sound; `--rate 50`
+is refused, exit 1, no file. In a window, nested, dance.mp4 played 156
+pictures in five seconds, every one even, two apart, 32.8 ms apart on the
+dummy audio driver's clock with a/v within 3 ms; P1000003 (ProRes RAW)
+stepped back from 124 to 122 and 120 and forward to 122 and 124, stepped
+125 and 126 with the switch off, and turned on at 213 went back to 212.
+Stepping back on dance.mp4 lands on a keyframe with or without the switch
+(181 and then 0 from 310): a long-GOP developed clip does not seek exactly,
+which is older than this and the same with N = 1.
+
 ## 24. Stills in cineview
 
 ### 24.1 What a still is

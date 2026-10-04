@@ -129,11 +129,18 @@ struct view_encode {
      * place in the range, in 1 / R; the clip's own timestamps never reach
      * the file. */
     AVRational fr;
-    /* Whether the run is slowed, and the clip's own rate it is slowed from,
-     * taken at the start of the run with the rest of the selection. A slowed
-     * run carries no sound. */
+    /* Whether the run is slowed, and the clip's own rate it is slowed from
+     * - over N, with every other frame - taken at the start of the run with
+     * the rest of the selection. A slowed run carries no sound. */
     bool slowed;
     AVRational own;
+    /* N, the clip's frames per frame of the file: 2 with every other frame
+     * (DESIGN.md 23.6), when `start` is a multiple of it and so is every
+     * frame the run writes, start, start + N and on to `end`. */
+    int step;
+    /* The clip's own rate, which places the range's first frame in the
+     * clip's sound; `fr` is the file's, N times slower or slowed. */
+    AVRational src_fr;
     int64_t start, end, next;
     int64_t encoded;
     /* The output cannot be opened until a frame has been decoded: the
@@ -1078,6 +1085,19 @@ static int view_enc_audio_open_enc(struct view_encode *e, struct view_enc_audio 
     return 0;
 }
 
+/* How many frames the file holds: the range's frames, or with every other
+ * frame those of them that are shown, start, start + N and on to the end. */
+static int64_t view_enc_total(const struct view_encode *e)
+{
+    return e->end >= e->start ? (e->end - e->start) / e->step + 1 : 0;
+}
+
+/* A frame of the clip's place in the file, which is its pts in 1 / R. */
+static int64_t view_enc_out_index(const struct view_encode *e, int64_t index)
+{
+    return (index - e->start) / e->step;
+}
+
 /* Opens the clip a second time for its audio and adds the streams to the
  * output. A clip with no sound is not an error: the video is still worth
  * writing, and the mode is greyed in the panel for the same reason. A
@@ -1167,10 +1187,14 @@ static int view_enc_audio_open(struct view_encode *e, struct view_state *st)
          * the clip's own sample rate and in the file's. Integer arithmetic
          * throughout: at 48 kHz these come out exact for every frame rate
          * a camera writes, 29.97 included. */
-        a->first = av_rescale(e->start * e->fr.den, a->src_rate, e->fr.num);
-        a->want  = av_rescale((e->end - e->start + 1) * e->fr.den,
+        /* Where the range starts is a frame of the clip, at the clip's own
+         * rate; how long it lasts is the file's frames at the file's rate,
+         * which with every other frame are half as many at half the rate,
+         * the same stretch of the clip. Without, the two rates are one. */
+        a->first = av_rescale(e->start * e->src_fr.den, a->src_rate, e->src_fr.num);
+        a->want  = av_rescale(view_enc_total(e) * e->fr.den,
                               a->src_rate, e->fr.num);
-        a->out_want = av_rescale((e->end - e->start + 1) * e->fr.den,
+        a->out_want = av_rescale(view_enc_total(e) * e->fr.den,
                                  a->rate, e->fr.num);
     }
 
@@ -2194,6 +2218,15 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
         e->start = CRAW_MIN(e->start, st->dec.nb_frames - 1);
         e->end   = CRAW_MIN(e->end, st->dec.nb_frames - 1);
     }
+    /* Every other frame: the range starts on a frame that is shown, the
+     * first in it, or the one before it when the range is a single frame
+     * that is not. */
+    e->step = view_frame_step(st);
+    if (e->start % e->step) {
+        e->start += e->step - e->start % e->step;
+        if (e->start > e->end)
+            e->start -= e->step;
+    }
     e->next  = e->start;
     e->t0 = e->last_report = av_gettime_relative();
 
@@ -2207,7 +2240,8 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     /* The rate goes with it: the panel is locked for the run, but the file
      * is what was asked for at the press, all of it. */
     e->slowed = view_slowed(st);
-    e->own = view_rate_native(st);
+    e->own = view_rate_base(st);
+    e->src_fr = view_rate_native(st);
 
     if (e->sel.colour < 0 || e->sel.colour >= VIEW_NB_COLOURS)
         e->sel.colour = VIEW_COLOUR_709;
@@ -2395,8 +2429,10 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
      * rate makes it 2.5025. A clip that says no rate at all and is not
      * slowed is written at 25, as it always was. */
     e->fr = view_rate_out(st);
-    if (!e->slowed && (st->dec.frame_rate.num <= 0 || st->dec.frame_rate.den <= 0))
-        e->fr = (AVRational) { 25, 1 };
+    if (!e->slowed && (st->dec.frame_rate.num <= 0 || st->dec.frame_rate.den <= 0)) {
+        e->fr = (AVRational) { 25, e->step };
+        e->src_fr = (AVRational) { 25, 1 };
+    }
 
     ret = avformat_alloc_output_context2(&e->oc, NULL, NULL, v->path);
     if (ret < 0 || !e->oc) {
@@ -2661,8 +2697,14 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
 
             view_rate_name(e->fr, name, sizeof(name));
             snprintf(audio, sizeof(audio), ", no sound at %s fps", name);
-            snprintf(slowed, sizeof(slowed), ", slowed from %d/%d",
-                     e->own.num, e->own.den);
+            snprintf(slowed, sizeof(slowed), ", slowed from %d/%d%s",
+                     e->own.num, e->own.den,
+                     e->step > 1 ? ", every other frame" : "");
+        } else if (e->step > 1) {
+            snprintf(slowed, sizeof(slowed), ", every other frame");
+            if (e->nb_audio)
+                snprintf(audio, sizeof(audio), ", audio %s",
+                         view_presets_audio_label(&e->sel, label, sizeof(label)));
         } else if (e->nb_audio) {
             snprintf(audio, sizeof(audio), ", audio %s",
                      view_presets_audio_label(&e->sel, label, sizeof(label)));
@@ -2670,7 +2712,7 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
 
         snprintf(v->status, sizeof(v->status), "%s %dx%d %s, %" PRId64
                  " frames%s%s", e->codec->name, e->w, e->h,
-                 av_get_pix_fmt_name(e->sw_fmt), e->end - e->start + 1,
+                 av_get_pix_fmt_name(e->sw_fmt), view_enc_total(e),
                  threads, audio);
         view_log(st, "encoding frames %" PRId64 " to %" PRId64 " into %s: %s %s "
                      "%dx%d %s, %d/%d fps%s%s%s%s%s\n",
@@ -2739,7 +2781,7 @@ static int view_enc_walk(struct view_encode *e, struct view_state *st,
 static void view_enc_progress(struct view_encode *e, struct view_state *st)
 {
     struct view_video *v = &st->video;
-    int64_t total = e->end - e->start + 1;
+    int64_t total = view_enc_total(e);
     int64_t now = av_gettime_relative();
     double el = (double)(now - e->t0) / 1.0e6;
     double left;
@@ -2841,7 +2883,7 @@ int view_encode_step(struct view_state *st)
             goto finish;
 
         view_enc_wait_slot(e, prev);
-        ret = view_enc_send_sw(e, prev, prev->index - e->start);
+        ret = view_enc_send_sw(e, prev, view_enc_out_index(e, prev->index));
         if (ret < 0)
             goto fail;
         e->encoded++;
@@ -2862,12 +2904,12 @@ int view_encode_step(struct view_state *st)
     }
 
     if (e->direct) {
-        ret = view_enc_send_direct(e, st, e->next - e->start);
+        ret = view_enc_send_direct(e, st, view_enc_out_index(e, e->next));
         if (ret < 0)
             goto fail;
         e->encoded++;
     } else if (e->hw) {
-        ret = view_enc_send_hw(e, st, e->next - e->start);
+        ret = view_enc_send_hw(e, st, view_enc_out_index(e, e->next));
         if (ret < 0)
             goto fail;
         e->encoded++;
@@ -2881,7 +2923,7 @@ int view_encode_step(struct view_state *st)
 
         if (prev->busy) {
             view_enc_wait_slot(e, prev);
-            ret = view_enc_send_sw(e, prev, prev->index - e->start);
+            ret = view_enc_send_sw(e, prev, view_enc_out_index(e, prev->index));
             if (ret < 0)
                 goto fail;
             e->encoded++;
@@ -2889,7 +2931,7 @@ int view_encode_step(struct view_state *st)
         e->cur ^= 1;
     }
 
-    e->next++;
+    e->next += e->step;
 
 wrote:
     ret = view_enc_drain(e);

@@ -1872,9 +1872,21 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
         view_scrub_bar(ctx, st, total);
     }
 
-    /* A still is not played, so there is nothing for it to be slowed to. */
-    if (st->dec.fmt && !st->dec.still)
+    /* A still is not played, so there is nothing for it to be slowed to,
+     * nor frames for it to leave out. */
+    if (st->dec.fmt && !st->dec.still) {
+        nk_bool alt = st->alternate;
+
         view_panel_rate(ctx, st);
+
+        /* Every other frame: the switch and nothing else. The run loop
+         * takes it up with the rate (view_rate_follow()), and the rate's
+         * readout above says what came of it, "29.97 fps, every other
+         * frame". */
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        if (nk_checkbox_label(ctx, "every other frame", &alt))
+            st->alternate = alt;
+    }
 }
 
 /* A labelled slider with its value beside it, the rate row's shape: label,
