@@ -1322,8 +1322,10 @@ struct view_state {
     struct view_pipeline_look processed;    /* what it was processed with */
     bool playing;
     /* The output frame rate the clip is shown and written at, 0/0 for the
-     * clip's own. Only rates at or below the clip's own are ever set: the
-     * clip is slowed, frame for frame, never sped up. Carries across clips,
+     * clip's own. Only rates below the clip's own are ever set: the clip
+     * is slowed, frame for frame - except that the frames every other
+     * frame keeps can be shown faster than they were shot, up to just
+     * under the clip's own rate (DESIGN.md 23.6). Carries across clips,
      * clamped to each one's own rate. Not in the look, and not saved or
      * restored with one: it is about the clip's transport, not about the
      * picture, which is the same frame by frame at any rate. DESIGN.md 23. */
@@ -1871,10 +1873,13 @@ bool view_slowed(const struct view_state *st);
 double view_out_frame_duration(const struct view_state *st);
 
 /* The panel row's stops for the open clip: every fixed rate strictly below
- * the clip's own, slowest first, then the clip's own as the last. Fills up
- * to `max` and returns how many; one for a clip at 23.976 or slower. */
-#define VIEW_RATE_MAX_STOPS 10
-int  view_rate_stops(const struct view_state *st, AVRational *stops, int max);
+ * the clip's own, slowest first, with the rate it plays at its own speed
+ * among them at `*own` - the clip's own rate, the last stop, or with every
+ * other frame half of it, wherever that falls. Fills up to `max` and
+ * returns how many; one for a clip at 23.976 or slower. */
+#define VIEW_RATE_MAX_STOPS 11
+int  view_rate_stops(const struct view_state *st, AVRational *stops, int max,
+                     int *own);
 /* A rate the way the Clip block spells one: "24", "23.98", "59.94". */
 void view_rate_name(AVRational r, char *buf, size_t n);
 /* A stop as the panel reads it: "23.98 fps, 2.5x slower", or "29.97 fps,

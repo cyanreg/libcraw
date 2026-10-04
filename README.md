@@ -207,24 +207,29 @@ neither seeks nor pauses, and back at the clip's own rate the sound picks
 up at the picture on screen. Left and Right then step five seconds as
 watched, and the frame readout above stays in the clip's own frames and
 seconds. A 23.976 clip has nothing slower to go to and its row is greyed.
+Like the scrub bar, the row goes where it is pressed and follows the
+pointer while the button is held; there is no knob to catch first.
 `--rate FPS` sets the same from the command line, one of those nine or
 `clip`, for every clip of a playlist, and a rate above a clip's own is
 refused when that clip opens: a headless run stops there, a window plays
 the clip at its own rate (DESIGN.md 23).
 
-Under the rate row, the "every other frame" checkbox plays and exports all
-of a clip's frames, or every other one: its odd-numbered frames or its
-even-numbered ones, counted from frame 0 as the frame readout counts. It has
-three states, and each click moves it on, as `f` does: empty for all
-frames, checked for the odd ones ("every other frame: odd"), and a bar
-across the box for the even ones ("every other frame: even"). That is half the
-clip's rate at its own speed, with its sound. It is for light that pulses
-in step with half the frame rate, LED street lamps on a mains-rate driver
-under a high-speed clip, which leave every second frame darker than the
-ones either side; one half is a clip without that flicker, and the
-checkbox picks which. The rate row's readout says it, "59.94 fps, odd frames" on a 119.88
-clip, and its slower stops are measured against that half rate, so the two
-combine. The frames left out are still decoded, since a decoder needs them,
+At the right end of the rate row a checkbox with three states plays and
+exports all of a clip's frames, or every other one: its odd-numbered frames
+or its even-numbered ones, counted from frame 0 as the frame readout counts.
+Each click moves it on, as `f` does: empty for all frames, the upper left
+half of the box filled for the odd ones, the lower right half for the even
+ones. That is half the clip's rate at its own speed, with its sound, and the
+rate row's readout beside it says which, "14.99 fps, odd frames". It is for
+light that pulses in step with half the frame rate, LED street lamps on a
+mains-rate driver under a high-speed clip, which leave every second frame
+darker than the ones either side; one half is a clip without that flicker,
+and the checkbox picks which. The rate row keeps the stops the clip has
+without it, with the half rate in its place among them, so the kept frames
+can still be slowed - or shown faster than they were shot, which nothing
+else does: a 29.97 clip on its odd frames plays at 14.99 and can be set to
+23.98, 24 or 25, "25 fps, 1.67x faster", without sound like any other rate
+than its own. The frames left out are still decoded, since a decoder needs them,
 and dropped before they are developed. A seek lands on the shown frame at
 or before where it was sent, picking the other half while a frame of it is
 on screen goes back one frame, `,` and `.` step from one shown frame to the

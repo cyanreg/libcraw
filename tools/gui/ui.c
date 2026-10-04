@@ -1686,6 +1686,134 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
     view_menu_draw(ctx, st);
 }
 
+/* A slider over `n` stops that goes where it is pressed, as the scrub bar
+ * does: a press anywhere on it is the stop under the pointer, and the
+ * pointer moving while the button is held takes it along. nuklear's own has
+ * to be caught by its knob, and in this nuklear the place it is caught is
+ * half a knob to the left of where the knob is drawn - at the left end a
+ * press on the knob mostly missed, so the rate row's knob, once there,
+ * could hardly be picked up again; with every other frame that is where
+ * the clip's own rate starts. Drawn by nuklear's slider drawing, so it
+ * looks, hovers and greys out as a slider does; one stop is drawn at the
+ * right end. True when the stop changed. */
+static bool view_stop_slider(struct nk_context *ctx, int *pos, int n)
+{
+    struct nk_window *win = ctx->current;
+    const struct nk_style_slider *style = &ctx->style.slider;
+    struct nk_rect bounds, bar, knob;
+    struct nk_input *in;
+    nk_flags state = NK_WIDGET_STATE_INACTIVE;
+    int at = n > 1 ? CRAW_CLAMP(*pos, 0, n - 1) : 0;
+    bool moved = false;
+    float t;
+
+    if (!nk_widget(&bounds, ctx))
+        return false;
+    in = win->widgets_disabled || (win->layout->flags & NK_WINDOW_ROM)
+         ? NULL : &ctx->input;
+
+    bar = bounds;
+    bar.x += style->padding.x;
+    bar.y += style->padding.y;
+    bar.w = CRAW_MAX(bar.w, 2.0f * style->padding.x + style->cursor_size.x)
+          - 2.0f * style->padding.x;
+    bar.h = CRAW_MAX(bar.h, 2.0f * style->padding.y) - 2.0f * style->padding.y;
+
+    if (n > 1 && in &&
+        nk_input_has_mouse_click_down_in_rect(in, NK_BUTTON_LEFT, bounds, nk_true)) {
+        float u = CRAW_CLAMP((in->mouse.pos.x - bar.x) / bar.w, 0.0f, 1.0f);
+        int want = (int)lrintf(u * (float)(n - 1));
+
+        state = NK_WIDGET_STATE_ACTIVE;
+        if (want != at) {
+            at = want;
+            moved = true;
+        }
+    } else if (in && nk_input_is_mouse_hovering_rect(in, bounds)) {
+        state = NK_WIDGET_STATE_HOVERED;
+    }
+
+    t = n > 1 ? (float)at / (float)(n - 1) : 1.0f;
+    knob.w = style->cursor_size.x;
+    knob.h = style->cursor_size.y;
+    knob.x = bar.x + bar.w * t - knob.w * 0.5f;
+    knob.y = bar.y + bar.h * 0.5f - knob.h * 0.5f;
+
+    if (style->draw_begin)
+        style->draw_begin(&win->buffer, style->userdata);
+    nk_draw_slider(&win->buffer, state, style, &bar, &knob, 0.0f, t, 1.0f);
+    if (style->draw_end)
+        style->draw_end(&win->buffer, style->userdata);
+
+    *pos = at;
+    return moved;
+}
+
+/* A checkbox with three states, which nuklear does not have: empty for 0,
+ * and for 1 and 2 the box half filled along its diagonal, the upper left
+ * triangle for 1 and the lower right for 2, in the colour a checked box is
+ * filled with. Made of nuklear's own checkbox - its geometry, copied from
+ * nk_do_toggle(), its click (nk_toggle_behavior()) and its drawing
+ * (nk_draw_checkbox()), which the implementation in this file makes
+ * available - so it looks, hovers and greys out as every other checkbox of
+ * the panel does. `text` may be empty, for the box alone. A click moves
+ * the state on, 0, 1, 2 and round. True when it did. */
+static bool view_check3(struct nk_context *ctx, const char *text, int *state)
+{
+    struct nk_window *win = ctx->current;
+    const struct nk_style_toggle *ts = &ctx->style.checkbox;
+    const struct nk_user_font *font = ctx->style.font;
+    const struct nk_input *in;
+    struct nk_rect r, bounds, select, cursor, label;
+    enum nk_widget_layout_states ws;
+    bool clicked;
+
+    ws = nk_widget(&r, ctx);
+    if (!ws)
+        return false;
+    in = ws == NK_WIDGET_ROM || ws == NK_WIDGET_DISABLED ||
+         win->layout->flags & NK_WINDOW_ROM ? NULL : &ctx->input;
+
+    r.w = NK_MAX(r.w, font->height + 2 * ts->padding.x);
+    r.h = NK_MAX(r.h, font->height + 2 * ts->padding.y);
+    bounds = nk_rect(r.x - ts->touch_padding.x, r.y - ts->touch_padding.y,
+                     r.w + 2 * ts->touch_padding.x, r.h + 2 * ts->touch_padding.y);
+    select = nk_rect(r.x, r.y + r.h / 2.0f - font->height / 2.0f,
+                     font->height, font->height);
+    label = nk_rect(select.x + select.w + ts->spacing, select.y, 0.0f, select.w);
+    label.w = NK_MAX(r.x + r.w, label.x) - label.x;
+    cursor = nk_rect(select.x + ts->padding.x + ts->border,
+                     select.y + ts->padding.y + ts->border,
+                     select.w - (2 * ts->padding.x + 2 * ts->border),
+                     select.h - (2 * ts->padding.y + 2 * ts->border));
+
+    clicked = nk_toggle_behavior(in, bounds, &ctx->last_widget_state, nk_false);
+    if (clicked)
+        *state = (*state + 1) % 3;
+
+    nk_draw_checkbox(&win->buffer, ctx->last_widget_state, ts, nk_false,
+                     &label, &select, &cursor, text, (int)strlen(text), font,
+                     NK_TEXT_LEFT);
+    if (*state) {
+        const struct nk_style_item *c =
+            ctx->last_widget_state & (NK_WIDGET_STATE_HOVER | NK_WIDGET_STATE_ACTIVED)
+            ? &ts->cursor_hover : &ts->cursor_normal;
+        float x0 = cursor.x, y0 = cursor.y;
+        float x1 = cursor.x + cursor.w, y1 = cursor.y + cursor.h;
+
+        if (c->type == NK_STYLE_ITEM_COLOR) {
+            struct nk_color col = nk_rgb_factor(c->data.color, ts->color_factor);
+
+            if (*state == 1)
+                nk_fill_triangle(&win->buffer, x0, y0, x1, y0, x0, y1, col);
+            else
+                nk_fill_triangle(&win->buffer, x1, y0, x1, y1, x0, y1, col);
+        }
+    }
+
+    return clicked;
+}
+
 /* The rate row under the scrub bar, DESIGN.md 23: the clip shown and
  * written at a lower fixed rate, frame for frame, so that a 59.94 clip at
  * 23.976 plays two and a half times slower and exports as a 23.976 file two
@@ -1701,19 +1829,22 @@ static void view_menu_frame(struct nk_context *ctx, struct view_state *st)
  * loop makes the choice the rate, and does what that means for the sound
  * and the clock, in one step. A clip at 23.976 has nothing slower to go
  * to, and its row is greyed with the knob at the right, where the clip's
- * own rate is. */
+ * own rate is. With every other frame the stops stay the clip's, and the
+ * half rate it then plays at its own speed sits among them, so the knob
+ * can go either side of it (DESIGN.md 23.6). The every-other-frame box is
+ * the row's last column. */
 static void view_panel_rate(struct nk_context *ctx, struct view_state *st)
 {
     const struct nk_user_font *f = ctx->style.font;
     AVRational stops[VIEW_RATE_MAX_STOPS];
     char text[64], shown[64];
-    int n = view_rate_stops(st, stops, VIEW_RATE_MAX_STOPS);
-    int cur = n - 1, pos;
-    float label_w, read_w = 0.0f, gap, avail;
+    int own = 0, n = view_rate_stops(st, stops, VIEW_RATE_MAX_STOPS, &own);
+    int cur = own, pos, half = st->half;
+    float label_w, read_w = 0.0f, gap, avail, box_w;
 
     if (view_slowed(st))
-        for (int i = 0; i < n - 1; i++)
-            if (!av_cmp_q(stops[i], st->rate))
+        for (int i = 0; i < n; i++)
+            if (i != own && !av_cmp_q(stops[i], st->rate))
                 cur = i;
 
     for (int i = 0; i < n; i++) {
@@ -1727,37 +1858,34 @@ static void view_panel_rate(struct nk_context *ctx, struct view_state *st)
      * of that width between the two keeps them apart. */
     gap = ctx->style.slider.cursor_size.x * 0.5f;
     read_w += 4.0f;
+    /* The every-other-frame box at the right end of the row: a checkbox's
+     * own square and its padding. */
+    box_w = f->height + 2.0f * ctx->style.checkbox.padding.x + 4.0f;
     /* A face wider than this one still leaves the slider something to be
      * dragged along; the readout is cut with an ellipsis instead. */
     avail = nk_window_get_content_region(ctx).w
-          - 2.0f * ctx->style.window.padding.x - 3.0f * ctx->style.window.spacing.x;
-    read_w = CRAW_MAX(CRAW_MIN(read_w, avail - label_w - gap - 96.0f), 32.0f);
-
-    if (n < 2)
-        view_disable_begin(ctx);
+          - 2.0f * ctx->style.window.padding.x - 4.0f * ctx->style.window.spacing.x;
+    read_w = CRAW_MAX(CRAW_MIN(read_w, avail - label_w - gap - box_w - 96.0f), 32.0f);
 
     nk_layout_row_template_begin(ctx, VIEW_ROW);
     nk_layout_row_template_push_static(ctx, label_w);
     nk_layout_row_template_push_dynamic(ctx);
     nk_layout_row_template_push_static(ctx, gap);
     nk_layout_row_template_push_static(ctx, read_w);
+    nk_layout_row_template_push_static(ctx, box_w);
     nk_layout_row_template_end(ctx);
+
+    if (n < 2)
+        view_disable_begin(ctx);
 
     nk_label(ctx, "rate", NK_TEXT_LEFT);
 
-    if (n < 2) {
-        /* Drawn as a slider of two stops at its right end: nuklear's slider
-         * divides by its range, and a range of nothing is a NaN knob. */
-        pos = 1;
-        nk_slider_int(ctx, 0, &pos, 1, 1);
-        pos = 0;
-    } else {
-        /* The choice, and only the choice: the run loop makes it the rate
-         * before the clock is next read (view_rate_follow()). */
-        pos = cur;
-        if (nk_slider_int(ctx, 0, &pos, n - 1, 1) && pos != cur)
-            st->rate_choice = pos == n - 1 ? (AVRational) { 0, 0 } : stops[pos];
-    }
+    /* The choice, and only the choice: the run loop makes it the rate
+     * before the clock is next read (view_rate_follow()). One stop alone
+     * is drawn at the right end, greyed. */
+    pos = cur;
+    if (view_stop_slider(ctx, &pos, n) && pos != cur)
+        st->rate_choice = pos == own ? (AVRational) { 0, 0 } : stops[pos];
     nk_spacing(ctx, 1);
 
     view_rate_label(st, stops[pos], text, sizeof(text));
@@ -1766,6 +1894,18 @@ static void view_panel_rate(struct nk_context *ctx, struct view_state *st)
 
     if (n < 2)
         view_disable_end(st, ctx);
+
+    /* Every frame, or every other one: the odd-numbered or the
+     * even-numbered, counted from frame 0 as the readout counts. A
+     * checkbox with three states, moved on by each click as by `f`: empty
+     * for all frames, its upper left half filled for the odd ones and its
+     * lower right half for the even ones. The readout beside it says which
+     * ("14.99 fps, odd frames"). The choice and nothing else: the run loop
+     * takes it up with the rate (view_rate_follow()). Live whatever the
+     * slider is, since leaving frames out is what gives a clip with
+     * nothing slower than its own rate stops to move to. */
+    if (view_check3(ctx, "", &half))
+        st->half = (enum view_half)half;
 }
 
 /* The scrub bar. Not nuklear's slider, whose knob has to be caught before
@@ -1858,66 +1998,6 @@ static void view_scrub_bar(struct nk_context *ctx, struct view_state *st,
         style->draw_end(&win->buffer, style->userdata);
 }
 
-/* A checkbox with three states, which nuklear does not have: empty for 0,
- * checked for 1, and for 2 a bar across the box, the usual look of a
- * checkbox's third state. Made of nuklear's own checkbox - its geometry,
- * copied from nk_do_toggle(), its click (nk_toggle_behavior()) and its
- * drawing (nk_draw_checkbox()), which the implementation in this file
- * makes available - so it looks, hovers and greys out as every other
- * checkbox of the panel does. A click moves the state on, 0, 1, 2 and
- * round. True when it did. */
-static bool view_check3(struct nk_context *ctx, const char *text, int *state)
-{
-    struct nk_window *win = ctx->current;
-    const struct nk_style_toggle *ts = &ctx->style.checkbox;
-    const struct nk_user_font *font = ctx->style.font;
-    const struct nk_input *in;
-    struct nk_rect r, bounds, select, cursor, label;
-    enum nk_widget_layout_states ws;
-    bool clicked;
-
-    ws = nk_widget(&r, ctx);
-    if (!ws)
-        return false;
-    in = ws == NK_WIDGET_ROM || ws == NK_WIDGET_DISABLED ||
-         win->layout->flags & NK_WINDOW_ROM ? NULL : &ctx->input;
-
-    r.w = NK_MAX(r.w, font->height + 2 * ts->padding.x);
-    r.h = NK_MAX(r.h, font->height + 2 * ts->padding.y);
-    bounds = nk_rect(r.x - ts->touch_padding.x, r.y - ts->touch_padding.y,
-                     r.w + 2 * ts->touch_padding.x, r.h + 2 * ts->touch_padding.y);
-    select = nk_rect(r.x, r.y + r.h / 2.0f - font->height / 2.0f,
-                     font->height, font->height);
-    label = nk_rect(select.x + select.w + ts->spacing, select.y, 0.0f, select.w);
-    label.w = NK_MAX(r.x + r.w, label.x) - label.x;
-    cursor = nk_rect(select.x + ts->padding.x + ts->border,
-                     select.y + ts->padding.y + ts->border,
-                     select.w - (2 * ts->padding.x + 2 * ts->border),
-                     select.h - (2 * ts->padding.y + 2 * ts->border));
-
-    clicked = nk_toggle_behavior(in, bounds, &ctx->last_widget_state, nk_false);
-    if (clicked)
-        *state = (*state + 1) % 3;
-
-    nk_draw_checkbox(&win->buffer, ctx->last_widget_state, ts, *state == 1,
-                     &label, &select, &cursor, text, (int)strlen(text), font,
-                     NK_TEXT_LEFT);
-    if (*state == 2) {
-        const struct nk_style_item *c =
-            ctx->last_widget_state & (NK_WIDGET_STATE_HOVER | NK_WIDGET_STATE_ACTIVED)
-            ? &ts->cursor_hover : &ts->cursor_normal;
-        float bh = (float)(int)(cursor.h / 3.0f + 0.5f);
-
-        if (c->type == NK_STYLE_ITEM_COLOR)
-            nk_fill_rect(&win->buffer,
-                         nk_rect(cursor.x, cursor.y + (cursor.h - bh) / 2.0f,
-                                 cursor.w, bh),
-                         0.0f, nk_rgb_factor(c->data.color, ts->color_factor));
-    }
-
-    return clicked;
-}
-
 static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
 {
     int64_t total = st->dec.nb_frames;
@@ -1934,26 +2014,8 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
 
     /* A still is not played, so there is nothing for it to be slowed to,
      * nor frames for it to leave out. */
-    if (st->dec.fmt && !st->dec.still) {
-        static const char *const names[] = { "every other frame",
-                                             "every other frame: odd",
-                                             "every other frame: even" };
-        int half = st->half;
-
+    if (st->dec.fmt && !st->dec.still)
         view_panel_rate(ctx, st);
-
-        /* Every frame, or every other one: the odd-numbered or the
-         * even-numbered, counted from frame 0 as the readout counts. One
-         * checkbox with three states, moved on by each click as by `f`:
-         * empty for all frames, checked for the odd ones, a bar for the
-         * even ones, the label saying which. The choice and nothing else:
-         * the run loop takes it up with the rate (view_rate_follow()), and
-         * the rate's readout above says what came of it, "29.97 fps, odd
-         * frames". */
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-        if (view_check3(ctx, names[st->half], &half))
-            st->half = (enum view_half)half;
-    }
 }
 
 /* A labelled slider with its value beside it, the rate row's shape: label,
@@ -2518,13 +2580,13 @@ static void view_panel_export_audio(struct nk_context *ctx, struct view_state *s
         snprintf(label, sizeof(label), "#%s", m->field);
         nk_property_int(ctx, label, m->min, &sel->audio_q[mode], m->max, step,
                         (float)step * 0.2f);
-        nk_label(ctx, slowed                  ? "no sound while slowed"
+        nk_label(ctx, slowed                  ? "no sound at this rate"
                     : mode == VIEW_AUDIO_OPUS ? "120 ms frames" : "", NK_TEXT_LEFT);
     } else {
         /* The second column is simply left empty: nk_spacing() over the
          * last column of a row opens a whole new row, which is a blank
          * line in the panel. */
-        nk_label(ctx, slowed                 ? "no sound while slowed"
+        nk_label(ctx, slowed                 ? "no sound at this rate"
                : mode == VIEW_AUDIO_COPY ? "the clip's own track"
                : mode == VIEW_AUDIO_WAV  ? "PCM at the clip's depth"
                : "no sound", NK_TEXT_LEFT);

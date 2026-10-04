@@ -908,16 +908,36 @@ double view_out_frame_duration(const struct view_state *st)
     return 1.0 / av_q2d(view_rate_out(st));
 }
 
-int view_rate_stops(const struct view_state *st, AVRational *stops, int max)
+int view_rate_stops(const struct view_state *st, AVRational *stops, int max,
+                    int *own)
 {
-    AVRational own = view_rate_base(st);
+    AVRational native = view_rate_native(st), base = view_rate_base(st);
+    bool placed = false;
     int n = 0;
 
-    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_rates) && n < max - 1; i++)
-        if (view_rate_cmp(view_rates[i].rate, own) < 0)
-            stops[n++] = view_rates[i].rate;
-    if (n < max)
-        stops[n++] = own;
+    /* The fixed rates below the clip's own, whether frames are left out
+     * or not, with the rate it plays at its own speed - the clip's own, or
+     * half of it - in its place among them. With every other frame that is
+     * not the last: a 29.97 clip on its odd frames plays at 14.99 and can
+     * still be shown at 23.98, 24 or 25, its kept frames faster than they
+     * were shot. */
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_rates) && n < max - 1; i++) {
+        AVRational r = view_rates[i].rate;
+
+        if (view_rate_cmp(r, native) >= 0)
+            break;
+        if (!placed && view_rate_cmp(r, base) >= 0) {
+            *own = n;
+            stops[n++] = base;
+            placed = true;
+        }
+        if (view_rate_cmp(r, base) && n < max - 1)
+            stops[n++] = r;
+    }
+    if (!placed && n < max) {
+        *own = n;
+        stops[n++] = base;
+    }
 
     return n;
 }
@@ -934,11 +954,13 @@ void view_rate_label(const struct view_state *st, AVRational r, char *buf,
                      size_t n)
 {
     AVRational own = view_rate_base(st);
+    int cmp = view_rate_cmp(r, own);
+    double f;
     char name[16], x[16];
     size_t len;
 
     view_rate_name(r, name, sizeof(name));
-    if (view_rate_cmp(r, own) >= 0) {
+    if (!cmp) {
         snprintf(buf, n, "%s fps, %s", name,
                  st->half ? view_half_name(st->half) : "the clip's own");
         return;
@@ -946,26 +968,31 @@ void view_rate_label(const struct view_state *st, AVRational r, char *buf,
 
     /* Two decimals with the zeros taken off, 2.5 and 1.25, except where
      * that would say 1: a 30 fps clip at 29.97 is 1.001 times slower, and
-     * "1x slower" is not a thing. */
-    snprintf(x, sizeof(x), "%.2f", av_q2d(own) / av_q2d(r));
+     * "1x slower" is not a thing. Faster only ever happens to the frames
+     * every other frame keeps. */
+    f = cmp < 0 ? av_q2d(own) / av_q2d(r) : av_q2d(r) / av_q2d(own);
+    snprintf(x, sizeof(x), "%.2f", f);
     len = strlen(x);
     while (len > 1 && x[len - 1] == '0')
         x[--len] = '\0';
     if (len > 1 && x[len - 1] == '.')
         x[--len] = '\0';
     if (!strcmp(x, "1"))
-        snprintf(x, sizeof(x), "%.3f", av_q2d(own) / av_q2d(r));
+        snprintf(x, sizeof(x), "%.3f", f);
 
-    snprintf(buf, n, "%s fps, %sx slower", name, x);
+    snprintf(buf, n, "%s fps, %sx %s", name, x, cmp < 0 ? "slower" : "faster");
 }
 
 /* The rate the open clip plays at for a chosen one: that rate if it is
  * below the clip's own, the clip's own otherwise, so that a choice carries
- * from clip to clip and each one is clamped to what it has. */
+ * from clip to clip and each one is clamped to what it has. One that is
+ * the rate the clip plays at its own speed - half its own, with every other
+ * frame - is that speed, 0/0, sound and all. */
 static AVRational view_rate_clamp(const struct view_state *st, AVRational want)
 {
     if (want.num > 0 && want.den > 0 &&
-        view_rate_cmp(want, view_rate_base(st)) < 0)
+        view_rate_cmp(want, view_rate_native(st)) < 0 &&
+        view_rate_cmp(want, view_rate_base(st)))
         return want;
 
     return (AVRational) { 0, 0 };
@@ -983,7 +1010,7 @@ static bool view_rate_same(AVRational a, AVRational b)
  * shows what came of it. */
 static int view_rate_open(struct view_state *st)
 {
-    AVRational want = st->rate_choice, own = view_rate_base(st);
+    AVRational want = st->rate_choice, own = view_rate_native(st);
     char name[16];
 
     st->rate = view_rate_clamp(st, want);
@@ -992,9 +1019,8 @@ static int view_rate_open(struct view_state *st)
 
     if (view_rate_cmp(want, own) > 0 && view_rate_same(want, st->cfg.rate)) {
         view_rate_name(own, name, sizeof(name));
-        fprintf(stderr, "`%s` runs at %s fps%s%s; --rate can only slow a clip down\n",
-                st->cfg.input, name, st->half ? " in its " : "",
-                st->half ? view_half_name(st->half) : "");
+        fprintf(stderr, "`%s` runs at %s fps; --rate takes a rate below that\n",
+                st->cfg.input, name);
         if (st->cfg.headless)
             return CRAW_ERROR(EINVAL);
     }

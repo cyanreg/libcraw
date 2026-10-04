@@ -2702,7 +2702,8 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
 
             view_rate_name(e->fr, name, sizeof(name));
             snprintf(audio, sizeof(audio), ", no sound at %s fps", name);
-            snprintf(slowed, sizeof(slowed), ", slowed from %d/%d%s%s",
+            snprintf(slowed, sizeof(slowed), ", %s from %d/%d%s%s",
+                     view_speed(st) > 1.0 ? "sped up" : "slowed",
                      e->own.num, e->own.den, st->half ? ", " : "",
                      st->half ? view_half_name(st->half) : "");
         } else if (e->step > 1) {
@@ -2725,7 +2726,7 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
                  e->codec->name, e->w, e->h, av_get_pix_fmt_name(e->sw_fmt),
                  e->fr.num, e->fr.den, slowed, e->hw ? ", Vulkan frames" : "",
                  e->direct ? ", straight from the pipeline" : "",
-                 threads, e->slowed   ? ", no sound (slowed)"
+                 threads, e->slowed   ? ", no sound at this rate"
                         : e->nb_audio ? audio : ", no audio");
     }
 

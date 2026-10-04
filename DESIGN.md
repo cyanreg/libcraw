@@ -5122,16 +5122,17 @@ LED street lamps on a mains-rate driver pulse at a frequency that a
 high-speed clip can sample in step with half its frame rate: every second
 frame catches the light on and the ones between catch it off, and the clip
 flickers at half its rate. Either half alone does not flicker. The panel's
-"every other frame" checkbox under the rate row, which each click and `f`
-move on from all to odd to even and round, and `--every-other-frame
+three-state checkbox at the right end of the rate row, which each click and
+`f` move on from all to odd to even and round, and `--every-other-frame
 odd|even` keep the clip's odd-numbered or its even-numbered frames and drop
 the rest. nuklear's checkbox has two states; `view_check3()` in ui.c is
-that checkbox with a third, made of nuklear's own toggle pieces - the
-geometry of `nk_do_toggle()`, `nk_toggle_behavior()` for the click and
-`nk_draw_checkbox()` for the box and label, which the implementation being
-compiled into ui.c makes available - so it hovers and greys out like the
-rest: empty, checked, and for the third a bar across the box in the check's
-colour, the usual look of a checkbox's third state.
+that checkbox with more, made of nuklear's own toggle pieces - the geometry
+of `nk_do_toggle()`, `nk_toggle_behavior()` for the click and
+`nk_draw_checkbox()` for the box, which the implementation being compiled
+into ui.c makes available - so it hovers and greys out like the rest: empty
+for all frames, the upper left triangle of the box filled in the check's
+colour for the odd ones, the lower right for the even ones. It has no label;
+the rate's readout beside it says which.
 
 Which half is the user's choice and is counted from the clip's frame 0, as
 the frame readout counts: `half` in `struct view_state`, and frame i is
@@ -5142,13 +5143,28 @@ with the choice on the row says the same thing in a way an export, a
 playlist and a headless run all agree on without a frame on screen to ask.
 
 It is a step N in the retime, 2 with the switch and 1 without. Output frame
-k is source frame N k from where the run starts, and the clip's own rate as
-far as the rate goes is its rate over N, `view_rate_base()`: R is that base
-at the clip's own speed, the slower stops are those below it, and S is R
-over it. So the clock, still in clip seconds, runs at S = 1 with the switch
+k is source frame N k from where the run starts, and the rate the clip plays
+at its own speed is its rate over N, `view_rate_base()`: R is that base at
+S = 1, and S is R over it. The rate row's stops do not change with N - the
+fixed rates below the clip's own - and the base takes its place among them
+(`view_rate_stops()` returns its index), so with N = 2 the stops either side
+of it are slower and faster: S runs from 0.8 to just under 2 on a 59.94
+clip, and above 1 on a 29.97 one, whose half rate 14.99 is below every fixed
+rate - a 29.97 clip's odd frames at 25 are S = 1.67. S above 1 is new and
+needs nothing new: the clock runs at S either way, the hold divides by it,
+and the sound, which is played only at S = 1, is left out as it is for a
+slowed clip. The clock, still in clip seconds, runs at S = 1 with the switch
 alone, and the sound plays as it does without it; slowed as well, a 119.88
 clip at 23.976 runs at S = 0.4 with no sound, its 59.94 pictures each held
-for a 23.976 frame. `view_frame_duration()` is the clip seconds between two
+for a 23.976 frame.
+
+The row itself is no longer nuklear's slider. Its knob has to be caught
+before it moves, and in this nuklear the rectangle that catches it is half
+a knob to the left of where the knob is drawn (`nk_do_slider()` leaves out
+the half-cursor inset its drawing has), so a knob at the left end could
+hardly be picked up again - where, with N = 2, a 29.97 clip's own speed
+starts. `view_stop_slider()` is the scrub bar's behaviour over stops: a
+press anywhere is the stop under the pointer, and a drag follows it. `view_frame_duration()` is the clip seconds between two
 pictures, N frame periods, which is what its three readers want: the
 auto white balance smoother's clock, the late-frame drop and the catch-up
 loop. `view_seek_frames()` is N times the output frames, so five seconds
@@ -5201,6 +5217,15 @@ frames over the range 0 to 59 are file frame k = clip frame 2k + 1 for all
 frames played 47 pictures, not one even, two apart; switched to even while
 paused on 93 it went back to 92 and played 38 pictures, not one odd; on all
 again it stepped 169 and 170.
+Faster: dance.mp4 headless on its odd frames at `--rate 50`, frames 0 to
+59, is 30 frames at 50/1, 0.600 s, no sound, "sped up from 314700/10489";
+`--rate 60` on P1000003 is refused, `runs at 29.97 fps; --rate takes a rate
+below that`. In a window P1000003 on its odd frames, with the rate row
+pressed at its right end, read "25 fps, 1.67x faster" and played 90
+pictures, every one odd, 40.0 ms apart, the clip running 1.669 seconds a
+second (25 / 14.985 is 1.668); pressed at its left end it went back to
+14.99 with the sound. dance.mp4 on either half puts the knob mid-row, at
+"30.00 fps, odd frames".
 Stepping back on dance.mp4 lands on a keyframe with or without the switch
 (181 and then 0 from 310): a long-GOP developed clip does not seek exactly,
 which is older than this and the same with N = 1.
