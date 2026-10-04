@@ -335,6 +335,11 @@ struct nk_sdl_device {
     uint32_t framebuffers_len;
     VkCommandBuffer *command_buffers;
     uint32_t command_buffers_len;
+    /* One per command buffer, signalled by its last submission: the vertex,
+     * index and uniform buffers and the descriptor sets are single, so a
+     * frame waits for every earlier one before it writes any of them, and
+     * a command buffer is never begun again while it is pending. */
+    VkFence *fences;
     VkSampler sampler;
     VkCommandPool command_pool;
     VkSemaphore render_completed;
@@ -456,6 +461,26 @@ NK_INTERN void nk_sdl_create_command_buffers(struct nk_sdl_device *dev) {
     result = vkAllocateCommandBuffers(dev->logical_device, &allocate_info,
                                       dev->command_buffers);
     NK_ASSERT(result == VK_SUCCESS);
+
+    dev->fences = (VkFence *)calloc(dev->command_buffers_len, sizeof(VkFence));
+    NK_ASSERT(dev->fences);
+    for (uint32_t i = 0; i < dev->command_buffers_len; i++) {
+        VkFenceCreateInfo fence_info;
+
+        memset(&fence_info, 0, sizeof(fence_info));
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        result = vkCreateFence(dev->logical_device, &fence_info, NULL,
+                               &dev->fences[i]);
+        NK_ASSERT(result == VK_SUCCESS);
+    }
+}
+
+/* Every submission so far has finished. */
+NK_INTERN void nk_sdl_wait_idle(struct nk_sdl_device *dev) {
+    if (dev->fences && dev->command_buffers_len)
+        vkWaitForFences(dev->logical_device, dev->command_buffers_len,
+                        dev->fences, VK_TRUE, UINT64_MAX);
 }
 
 NK_INTERN void nk_sdl_create_semaphore(struct nk_sdl_device *dev) {
@@ -1175,6 +1200,9 @@ NK_API void nk_sdl_resize(uint32_t framebuffer_width,
     sdl.display_width = framebuffer_width;
     sdl.display_height = framebuffer_height;
 
+    /* The framebuffers and descriptor sets go, so nothing may still be
+     * drawing with them. */
+    nk_sdl_wait_idle(dev);
     nk_sdl_destroy_render_resources(dev);
     nk_sdl_create_render_resources(dev, sdl.display_width, sdl.display_height);
 }
@@ -1186,6 +1214,10 @@ NK_API void nk_sdl_device_destroy(void) {
 
     nk_sdl_destroy_render_resources(dev);
 
+    for (uint32_t i = 0; dev->fences && i < dev->command_buffers_len; i++)
+        vkDestroyFence(dev->logical_device, dev->fences[i], NULL);
+    free(dev->fences);
+    dev->fences = NULL;
     vkFreeCommandBuffers(dev->logical_device, dev->command_pool,
                          dev->command_buffers_len, dev->command_buffers);
     vkDestroyCommandPool(dev->logical_device, dev->command_pool, NULL);
@@ -1567,6 +1599,13 @@ VkSemaphore nk_sdl_render(VkQueue graphics_queue, uint32_t buffer_index,
     projection.m[0] /= sdl.display_width;
     projection.m[5] /= sdl.display_height;
 
+    /* Nothing below may be touched while an earlier frame is still being
+     * drawn with it. The caller keeps a frame or two in flight, so this is
+     * normally a frame that finished long ago. */
+    nk_sdl_wait_idle(dev);
+    result = vkResetFences(dev->logical_device, 1, &dev->fences[buffer_index]);
+    NK_ASSERT(result == VK_SUCCESS);
+
     memcpy(dev->mapped_uniform, &projection, sizeof(projection));
 
     memset(&begin_info, 0, sizeof(VkCommandBufferBeginInfo));
@@ -1710,7 +1749,8 @@ VkSemaphore nk_sdl_render(VkQueue graphics_queue, uint32_t buffer_index,
     submit_info.signalSemaphoreCount = 1;
     submit_info.pSignalSemaphores = &dev->render_completed;
 
-    result = vkQueueSubmit(graphics_queue, 1, &submit_info, NULL);
+    result = vkQueueSubmit(graphics_queue, 1, &submit_info,
+                           dev->fences[buffer_index]);
     NK_ASSERT(result == VK_SUCCESS);
 
     return dev->render_completed;
