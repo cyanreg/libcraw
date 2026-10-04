@@ -66,6 +66,27 @@
  * busy: one is being read back while the other is scaled and encoded. */
 #define VIEW_ENC_SLOTS 2
 
+/* The rate a stream is being written at, as the panel shows it: the bytes
+ * of its last second of packets over the time they hold. A sliding window
+ * over the packets as they come out of the encoder, after txproto's
+ * sp_sliding_win(), but on each packet's duration rather than on its
+ * timestamp - an encoder with B-frames hands its packets over out of
+ * presentation order, and what the window needs to know of a packet is
+ * only how long it lasts - and divided by the time the window really
+ * holds, so that the first second of a run reads right as well. The
+ * duration is in the stream's own time base, so the sums are exact. */
+#define VIEW_ENC_BITRATE_MAX 1024
+
+struct view_enc_bitrate {
+    AVRational tb;
+    int64_t len;                /* one second, in `tb` */
+    struct {
+        int64_t bytes, dur;
+    } e[VIEW_ENC_BITRATE_MAX];
+    int head, count;
+    int64_t bytes, dur;         /* over what the window holds */
+};
+
 struct view_enc_slot {
     pl_tex tex;
     uint16_t *rgba;
@@ -115,8 +136,8 @@ struct view_encode {
     float *rgba;                /* crop_w * crop_h packed RGBA floats */
     size_t rgba_values;
     AVFrame *df;                /* gbrpf32, the staging for a Vulkan upload */
-    /* Where the time went, summed over the run: the device, the read-back,
-     * the de-interleave, the upload and the encoder. */
+    /* Where the time went, summed over the run: the recording, the device
+     * and the read-back, the de-interleave, the upload and the encoder. */
     double ms_gpu, ms_dl, ms_pack, ms_up, ms_enc;
 
     int w, h;
@@ -180,6 +201,8 @@ struct view_encode {
         int64_t pts;            /* the next encoder frame's first sample */
         int64_t src_pos;        /* where the next decoded sample falls */
         bool flushed;
+
+        struct view_enc_bitrate bitrate;
     } a[2];
     bool audio_eof;
 
@@ -187,9 +210,56 @@ struct view_encode {
      * for the status line: some encoders clamp what they were asked for. */
     int threads;
 
+    /* The rate the picture is being written at; each sound stream keeps
+     * its own. */
+    struct view_enc_bitrate bitrate;
+
     int64_t t0, last_report;
     double fps;
 };
+
+/* ---------------------------------------------------------------- the rate */
+
+static void view_enc_bitrate_init(struct view_enc_bitrate *r, AVRational tb)
+{
+    *r = (struct view_enc_bitrate) {
+        .tb  = tb,
+        .len = CRAW_MAX(av_rescale_q(1, (AVRational) { 1, 1 }, tb), 1),
+    };
+}
+
+static void view_enc_bitrate_add(struct view_enc_bitrate *r, int64_t bytes,
+                              int64_t dur)
+{
+    int tail;
+
+    if (!r->len || dur <= 0)
+        return;
+
+    /* The oldest packets go once the rest still make a second with this
+     * one, or when there is no room for it: a window that always holds at
+     * least a second, and no more of the past than that needs. */
+    while (r->count && (r->count == VIEW_ENC_BITRATE_MAX ||
+                        r->dur - r->e[r->head].dur + dur >= r->len)) {
+        r->bytes -= r->e[r->head].bytes;
+        r->dur   -= r->e[r->head].dur;
+        r->head   = (r->head + 1) % VIEW_ENC_BITRATE_MAX;
+        r->count--;
+    }
+
+    tail = (r->head + r->count) % VIEW_ENC_BITRATE_MAX;
+    r->e[tail].bytes = bytes;
+    r->e[tail].dur   = dur;
+    r->count++;
+    r->bytes += bytes;
+    r->dur   += dur;
+}
+
+/* Bits per second, 0 before the first packet. */
+static double view_enc_bitrate_bps(const struct view_enc_bitrate *r)
+{
+    return r->dur > 0 ? (double)r->bytes * 8.0 / (r->dur * av_q2d(r->tb)) : 0.0;
+}
 
 /* ------------------------------------------------------- the encoder list */
 
@@ -1102,6 +1172,7 @@ static int view_enc_audio_open_enc(struct view_encode *e, struct view_enc_audio 
         return ret;
     os->time_base = (AVRational) { 1, a->enc->sample_rate };
     a->rate = a->enc->sample_rate;
+    view_enc_bitrate_init(&a->bitrate, a->enc->time_base);
 
     return 0;
 }
@@ -1182,6 +1253,7 @@ static int view_enc_audio_open(struct view_encode *e, struct view_state *st)
             os->codecpar->codec_tag = 0;
             os->time_base = (AVRational) { 1, cp->sample_rate };
             a->rate = cp->sample_rate;
+            view_enc_bitrate_init(&a->bitrate, os->time_base);
 
             /* A camera writes LPCM with no channel layout at all, which the
              * QuickTime muxer merely grumbles about and the MP4 one refuses
@@ -1274,6 +1346,7 @@ static int view_enc_audio_drain(struct view_encode *e, struct view_enc_audio *a)
 
         /* The duration is in the encoder's time base, which is samples. */
         a->written += e->apkt->duration;
+        view_enc_bitrate_add(&a->bitrate, e->apkt->size, e->apkt->duration);
         e->apkt->stream_index = a->out;
         av_packet_rescale_ts(e->apkt, a->enc->time_base, os->time_base);
 
@@ -1529,6 +1602,7 @@ static int view_enc_audio_pump(struct view_encode *e, double until)
         av_packet_rescale_ts(e->apkt, sr, e->oc->streams[a->out]->time_base);
 
         a->written += keep1 - keep0;
+        view_enc_bitrate_add(&a->bitrate, e->apkt->size, keep1 - keep0);
 
         ret = av_interleaved_write_frame(e->oc, e->apkt);
         av_packet_unref(e->apkt);
@@ -1839,6 +1913,9 @@ static int view_enc_drain(struct view_encode *e)
             return CRAW_ERROR(EIO);
         }
 
+        /* One frame a packet, whatever the encoder says its duration is:
+         * not every one fills it in. */
+        view_enc_bitrate_add(&e->bitrate, e->pkt->size, 1);
         e->pkt->stream_index = e->vs->index;
         av_packet_rescale_ts(e->pkt, e->avc->time_base, e->vs->time_base);
 
@@ -1851,11 +1928,13 @@ static int view_enc_drain(struct view_encode *e)
     }
 }
 
-/* One frame into the encoder, the Vulkan way: libplacebo renders into the
+/* One frame for the encoder, the Vulkan way: libplacebo renders into the
  * encoder's own image and hands it back on the frame's timeline semaphore,
- * which is the value the encoder then waits for. */
-static int view_enc_send_hw(struct view_encode *e, struct view_state *st,
-                            int64_t pts)
+ * which is the value the encoder then waits for. Under the lock; the
+ * frame goes to the encoder afterwards, in view_enc_send_hw(), without
+ * it. */
+static int view_enc_render_hw(struct view_encode *e, struct view_state *st,
+                              int64_t pts, AVFrame **out)
 {
     struct pl_frame target;
     AVFrame *f = av_frame_alloc();
@@ -1905,14 +1984,27 @@ static int view_enc_send_hw(struct view_encode *e, struct view_state *st,
      * be submitted before the frame is handed over. */
     pl_gpu_flush(e->g->gpu);
 
-    ret = avcodec_send_frame(e->avc, f);
-    if (ret < 0)
-        fprintf(stderr, "avcodec_send_frame: %s\n", av_err2str(ret));
+    *out = f;
+
+    return 0;
 
 out:
     av_frame_free(&f);
 
-    return ret < 0 ? ret : 0;
+    return ret;
+}
+
+static int view_enc_send_hw(struct view_encode *e, AVFrame **f)
+{
+    int ret = avcodec_send_frame(e->avc, *f);
+
+    av_frame_free(f);
+    if (ret < 0) {
+        fprintf(stderr, "avcodec_send_frame: %s\n", av_err2str(ret));
+        return ret;
+    }
+
+    return 0;
 }
 
 /* One frame into the encoder out of a read-back slot. */
@@ -2028,17 +2120,15 @@ static void view_enc_deinterleave(AVFrame *f, const float *rgba,
     }
 }
 
-/* One scene-referred frame: the pipeline again in the export's own space,
- * a read-back, a de-interleave, and for a Vulkan encoder an upload into a
- * picture of its own pool. Nothing between libcraw's output and the encoder
- * looks at a colour. */
-static int view_enc_send_direct(struct view_encode *e, struct view_state *st,
-                                int64_t pts)
+/* One scene-referred frame, in two halves. This one, under the lock: the
+ * pipeline again in the export's own space, and the read-back of it
+ * started. Then, in view_enc_send_direct() and without the lock, the wait
+ * for both, a de-interleave and for a Vulkan encoder an upload into a
+ * picture of its own pool. Nothing between libcraw's output and the
+ * encoder looks at a colour. */
+static int view_enc_read_direct(struct view_encode *e, struct view_state *st)
 {
-    AVFrame *hw = NULL;
-    AVFrame *f = e->df;
-    double gpu_ms = 0.0, dl_ms = 0.0;
-    int64_t t0;
+    double ms = 0.0;
     /* The read-back is the source rectangle; the frame the encoder takes is
      * that rectangle turned, which for a quarter turn is the same number of
      * pixels the other way up. */
@@ -2055,12 +2145,27 @@ static int view_enc_send_direct(struct view_encode *e, struct view_state *st,
     }
 
     ret = view_gpu_direct_frame(e->g, st, e->direct_space, e->crop_x, e->crop_y,
-                                e->crop_w, e->crop_h, e->rgba, &gpu_ms, &dl_ms);
+                                e->crop_w, e->crop_h, e->rgba, &ms);
     if (ret < 0)
         return ret;
 
-    e->ms_gpu += gpu_ms;
-    e->ms_dl  += dl_ms;
+    e->ms_gpu += ms;
+
+    return 0;
+}
+
+static int view_enc_send_direct(struct view_encode *e, int64_t pts)
+{
+    AVFrame *hw = NULL;
+    AVFrame *f = e->df;
+    double ms = 0.0;
+    int64_t t0;
+    int ret;
+
+    ret = view_gpu_direct_wait(e->g, &ms);
+    if (ret < 0)
+        return ret;
+    e->ms_dl += ms;
 
     /* The encoder may still hold the last one, and a float plane is worth
      * not copying twice. */
@@ -2389,7 +2494,7 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     v->start = e->start;
     v->end   = e->end;
     v->active = true;
-    v->stop = false;
+    SDL_SetAtomicInt(&v->stop, 0);
     v->progress = 0.0;
 
     /* Where the picture was, so that it can go back there when the run has
@@ -2624,6 +2729,7 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     if (ret < 0)
         goto fail;
     e->vs->time_base      = e->avc->time_base;
+    view_enc_bitrate_init(&e->bitrate, e->avc->time_base);
     e->vs->avg_frame_rate = e->fr;
 
     /* H.273 has no code points for the ACES spaces, so a file written in
@@ -2762,10 +2868,7 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     return 0;
 
 fail:
-    view_encode_close(st);
-    v->active = false;
-    snprintf(v->status, sizeof(v->status), "failed: %s", av_err2str(ret));
-
+    /* The caller releases the engine and says so on the status line. */
     return ret;
 }
 
@@ -2813,21 +2916,41 @@ static int view_enc_walk(struct view_encode *e, struct view_state *st,
     return st->index == want ? 2 : 0;
 }
 
+/* What the file is being written at now, in Mbit/s: the picture's last
+ * second and the sound's, added up. */
+static double view_enc_mbps(const struct view_encode *e)
+{
+    double bps = view_enc_bitrate_bps(&e->bitrate);
+
+    for (int i = 0; i < e->nb_audio; i++)
+        bps += view_enc_bitrate_bps(&e->a[i].bitrate);
+
+    return bps / 1.0e6;
+}
+
+/* Under the lock. */
 static void view_enc_progress(struct view_encode *e, struct view_state *st)
 {
     struct view_video *v = &st->video;
     int64_t total = view_enc_total(e);
     int64_t now = av_gettime_relative();
     double el = (double)(now - e->t0) / 1.0e6;
-    double left;
+    double left, mbps = view_enc_mbps(e);
+    char rate[32] = "";
 
     e->fps = el > 0.0 ? (double)e->encoded / el : 0.0;
     v->progress = total > 0 ? (double)e->encoded / (double)total : 0.0;
     left = e->fps > 0.0 ? (double)(total - e->encoded) / e->fps : 0.0;
 
+    /* Nothing to say until the encoder has handed a packet over, which
+     * behind a lookahead is some frames in. */
+    if (mbps > 0.0)
+        snprintf(rate, sizeof(rate), ", %.*f Mbps", mbps < 100.0, mbps);
+
     snprintf(v->status, sizeof(v->status),
-             "exporting: %" PRId64 " of %" PRId64 " frames, %.1f fps, "
-             "%.0f s left", e->encoded, total, e->fps, left);
+             "exporting: %" PRId64 " of %" PRId64 " frames, %.1f fps%s, "
+             "%.0f s left", e->encoded, total, e->fps, rate, left);
+    v->updates++;
 
     if (e->report && now - e->last_report >= 1000000) {
         e->last_report = now;
@@ -2873,182 +2996,24 @@ static int view_enc_finish(struct view_encode *e, struct view_state *st)
     return 0;
 }
 
-int view_encode_step(struct view_state *st)
+/* ------------------------------------------------------------ the thread */
+
+void view_encode_lock(struct view_state *st)
 {
-    struct view_video *v = &st->video;
-    struct view_encode *e = v->e;
-    struct view_enc_slot *s, *prev;
-    double el, mb = 0.0;
-    int64_t total;
-    int ret, got;
-
-    if (!e || !v->active)
-        return 0;
-
-    if (v->stop || e->done)
-        goto finish;
-
-    if (!e->opened) {
-        /* Nothing can be opened before a frame has been through the
-         * pipeline, because nothing knows how big it is until then. */
-        got = view_enc_walk(e, st, e->next);
-        if (got < 0) {
-            ret = got;
-            goto fail;
-        }
-        if (got == 0)
-            return 0;
-        if (got == 1) {
-            fprintf(stderr, "the clip has no frame %" PRId64 "\n", e->next);
-            ret = CRAW_ERROR(ERANGE);
-            goto fail;
-        }
-
-        ret = view_enc_setup(e, st);
-        if (ret < 0)
-            return ret;         /* view_enc_setup() has already cleaned up */
-    }
-
-    if (e->next > e->end) {
-        /* The software path runs a frame behind the renderer, so the last
-         * slot is still waiting to be encoded when the range runs out. The
-         * direct path never runs behind: its read-back is synchronous. */
-        prev = &e->slot[e->cur ^ 1];
-        if (e->hw || e->direct || !prev->busy)
-            goto finish;
-
-        view_enc_wait_slot(e, prev);
-        ret = view_enc_send_sw(e, prev, view_enc_out_index(e, prev->index));
-        if (ret < 0)
-            goto fail;
-        e->encoded++;
-        goto wrote;
-    }
-
-    got = view_enc_walk(e, st, e->next);
-    if (got < 0) {
-        ret = got;
-        goto fail;
-    }
-    if (got == 0)
-        return 0;
-    if (got == 1) {
-        fprintf(stderr, "the clip ends before frame %" PRId64 "\n", e->next);
-        e->end = e->next - 1;
-        goto finish;
-    }
-
-    if (e->direct) {
-        ret = view_enc_send_direct(e, st, view_enc_out_index(e, e->next));
-        if (ret < 0)
-            goto fail;
-        e->encoded++;
-    } else if (e->hw) {
-        ret = view_enc_send_hw(e, st, view_enc_out_index(e, e->next));
-        if (ret < 0)
-            goto fail;
-        e->encoded++;
-    } else {
-        s = &e->slot[e->cur];
-        prev = &e->slot[e->cur ^ 1];
-
-        ret = view_enc_render_sw(e, st, s);
-        if (ret < 0)
-            goto fail;
-
-        if (prev->busy) {
-            view_enc_wait_slot(e, prev);
-            ret = view_enc_send_sw(e, prev, view_enc_out_index(e, prev->index));
-            if (ret < 0)
-                goto fail;
-            e->encoded++;
-        }
-        e->cur ^= 1;
-    }
-
-    e->next += e->step;
-
-wrote:
-    ret = view_enc_drain(e);
-    if (ret < 0)
-        goto fail;
-
-    /* Audio as far as the picture has got, so the muxer never has to hold
-     * more than a frame of interleaving. */
-    ret = view_enc_audio_pump(e, (double)e->encoded * e->fr.den / e->fr.num);
-    if (ret < 0)
-        goto fail;
-
-    view_enc_progress(e, st);
-
-    return 0;
-
-finish:
-    /* A run stopped before the first frame has nothing open to close. */
-    if (!e->opened) {
-        v->active = false;
-        view_encode_close(st);
-        return 1;
-    }
-
-    ret = view_enc_finish(e, st);
-    if (ret < 0)
-        goto fail;
-
-    total = e->encoded;
-    el = (double)(av_gettime_relative() - e->t0) / 1.0e6;
-    if (e->oc->pb)
-        mb = (double)avio_size(e->oc->pb) / 1e6;
-
-    /* The line the panel keeps once the run is over, so a slowed file says
-     * there that it has no sound and what rate it runs at; the rate before
-     * it is how fast the export went. */
-    {
-        char name[16] = "";
-
-        if (e->slowed)
-            view_rate_name(e->fr, name, sizeof(name));
-        snprintf(v->status, sizeof(v->status),
-                 "%" PRId64 " frames, %.1f fps, %.1f MB%s%s%s", total,
-                 el > 0.0 ? (double)total / el : 0.0, mb,
-                 e->slowed ? ", no sound at " : "", name,
-                 e->slowed ? " fps" : "");
-    }
-    view_log(st, "%s: %s in %.1f s\n", v->path, v->status, el);
-
-    /* Where the direct path's time went, per frame. The decode and the
-     * display pass are not in here - they are the viewer's own and happen
-     * whether anything is being exported or not - so these five add up to
-     * what the export costs on top of playing the clip. */
-    if (e->direct && total > 0)
-        view_log(st, "  per frame: pipeline %.1f ms, read-back %.1f, "
-                     "de-interleave %.1f, upload %.1f, encoder %.1f\n",
-                 e->ms_gpu / (double)total, e->ms_dl / (double)total,
-                 e->ms_pack / (double)total, e->ms_up / (double)total,
-                 e->ms_enc / (double)total);
-
-    v->progress = 1.0;
-    v->active = false;
-    view_encode_close(st);
-
-    return 1;
-
-fail:
-    snprintf(v->status, sizeof(v->status), "failed: %s", av_err2str(ret));
-    fprintf(stderr, "%s: %s\n", v->path, v->status);
-    v->active = false;
-    view_encode_close(st);
-
-    return ret;
+    if (st->video.lock)
+        SDL_LockMutex(st->video.lock);
 }
 
-void view_encode_cancel(struct view_state *st)
+void view_encode_unlock(struct view_state *st)
 {
-    if (st->video.e)
-        st->video.stop = true;
+    if (st->video.lock)
+        SDL_UnlockMutex(st->video.lock);
 }
 
-void view_encode_close(struct view_state *st)
+/* The engine and everything it holds, on whichever thread ran it and under
+ * the lock: the walk back to the picture that was on screen is the
+ * viewer's state. */
+static void view_enc_release(struct view_state *st)
 {
     struct view_encode *e = st->video.e;
 
@@ -3095,10 +3060,12 @@ void view_encode_close(struct view_state *st)
 
     free(e);
     st->video.e = NULL;
+    st->video.updates++;
 
-    /* The run walked the decoder; the window gets its picture back. A
-     * headless run has no picture to get back and no loop left to fetch
-     * it, and a run that never got as far as a frame moved nothing. */
+    /* The run walked the decoder; the window gets its picture back once it
+     * has the decoder back. A headless run has no picture to get back and
+     * no loop left to fetch it, and a run that never got as far as a frame
+     * moved nothing. */
     if (st->win && st->video.resume) {
         st->video.resume = false;
         if (st->have_frame && st->index != st->video.resume_index) {
@@ -3106,4 +3073,337 @@ void view_encode_close(struct view_state *st)
             st->need_frame = true;
         }
     }
+}
+
+/* The end of a run that failed: said on the status line and in the log,
+ * and the engine released, which writes the trailer on what there is. */
+static int view_enc_fail(struct view_state *st, int ret)
+{
+    struct view_video *v = &st->video;
+
+    view_encode_lock(st);
+    snprintf(v->status, sizeof(v->status), "failed: %s", av_err2str(ret));
+    fprintf(stderr, "%s: %s\n", v->path, v->status);
+    view_enc_release(st);
+    view_encode_unlock(st);
+
+    return ret;
+}
+
+/* The end of a run that has written its last frame, or was stopped. */
+static int view_enc_end(struct view_encode *e, struct view_state *st)
+{
+    struct view_video *v = &st->video;
+    double el, secs, mbps, mb = 0.0;
+    char name[16] = "";
+    int64_t total;
+    int ret;
+
+    /* A run stopped before the first frame has nothing open to close. */
+    if (!e->opened) {
+        view_encode_lock(st);
+        view_enc_release(st);
+        view_encode_unlock(st);
+        return 1;
+    }
+
+    ret = view_enc_finish(e, st);
+    if (ret < 0)
+        return view_enc_fail(st, ret);
+
+    total = e->encoded;
+    el = (double)(av_gettime_relative() - e->t0) / 1.0e6;
+    secs = (double)total * e->fr.den / e->fr.num;
+    if (e->oc->pb)
+        mb = (double)avio_size(e->oc->pb) / 1e6;
+    if (e->slowed)
+        view_rate_name(e->fr, name, sizeof(name));
+
+    view_encode_lock(st);
+
+    /* The line the panel keeps once the run is over, so a slowed file says
+     * there that it has no sound and what rate it runs at; the frame rate
+     * before the size is how fast the export went, and the bit rate after
+     * it is the file's own, the whole of it over the time it plays. */
+    mbps = secs > 0.0 ? mb * 8.0 / secs : 0.0;
+    snprintf(v->status, sizeof(v->status),
+             "%" PRId64 " frames, %.1f fps, %.1f MB, %.*f Mbps%s%s%s", total,
+             el > 0.0 ? (double)total / el : 0.0, mb, mbps < 100.0, mbps,
+             e->slowed ? ", no sound at " : "", name,
+             e->slowed ? " fps" : "");
+    view_log(st, "%s: %s in %.1f s\n", v->path, v->status, el);
+
+    /* Where the direct path's time went, per frame. The decode and the
+     * display pass are not in here - they are the viewer's own and happen
+     * whether anything is being exported or not - so these five add up to
+     * what the export costs on top of playing the clip. The first is the
+     * recording and submission, under the lock; the second the wait for
+     * the device to run the pipeline and the transfer, outside it. */
+    if (e->direct && total > 0)
+        view_log(st, "  per frame: record %.1f ms, device and read-back %.1f, "
+                     "de-interleave %.1f, upload %.1f, encoder %.1f\n",
+                 e->ms_gpu / (double)total, e->ms_dl / (double)total,
+                 e->ms_pack / (double)total, e->ms_up / (double)total,
+                 e->ms_enc / (double)total);
+
+    v->progress = 1.0;
+    view_enc_release(st);
+    view_encode_unlock(st);
+
+    return 1;
+}
+
+/* The packets the frame made, the sound up to it, and the panel told. */
+static int view_enc_wrote(struct view_encode *e, struct view_state *st)
+{
+    int ret;
+
+    ret = view_enc_drain(e);
+    if (ret < 0)
+        return view_enc_fail(st, ret);
+
+    /* Audio as far as the picture has got, so the muxer never has to hold
+     * more than a frame of interleaving. */
+    ret = view_enc_audio_pump(e, (double)e->encoded * e->fr.den / e->fr.num);
+    if (ret < 0)
+        return view_enc_fail(st, ret);
+
+    view_encode_lock(st);
+    view_enc_progress(e, st);
+    view_encode_unlock(st);
+
+    return 0;
+}
+
+/* One frame of the run, in two halves. Under the lock, everything that
+ * touches the viewer: the decoder walked to the frame, the pipeline, and
+ * the render into whatever the encoder is handed. Without it, everything
+ * that does not: the conversion, the encoder, the muxer and the sound,
+ * which with a software encoder is most of what a frame costs. 0 while
+ * there is more to do, 1 when the file is written, negative on an error;
+ * anything but 0 has released the engine. */
+static int view_enc_frame(struct view_state *st)
+{
+    struct view_video *v = &st->video;
+    struct view_encode *e = v->e;
+    struct view_enc_slot *prev = NULL;
+    AVFrame *hw = NULL;
+    int64_t pts;
+    int ret, got;
+
+    view_encode_lock(st);
+
+    if (SDL_GetAtomicInt(&v->stop)) {
+        view_encode_unlock(st);
+        return view_enc_end(e, st);
+    }
+
+    if (!e->opened) {
+        /* Nothing can be opened before a frame has been through the
+         * pipeline, because nothing knows how big it is until then. */
+        got = view_enc_walk(e, st, e->next);
+        if (got == 1) {
+            fprintf(stderr, "the clip has no frame %" PRId64 "\n", e->next);
+            got = CRAW_ERROR(ERANGE);
+        }
+        if (got == 2)
+            got = view_enc_setup(e, st);
+        if (got < 0) {
+            view_encode_unlock(st);
+            return view_enc_fail(st, got);
+        }
+        if (!e->opened) {
+            view_encode_unlock(st);
+            goto behind;
+        }
+    }
+
+    if (e->next > e->end) {
+        view_encode_unlock(st);
+
+        /* The software path runs a frame behind the renderer, so the last
+         * slot is still waiting to be encoded when the range runs out. The
+         * direct path never runs behind: its read-back is synchronous. */
+        prev = &e->slot[e->cur ^ 1];
+        if (e->hw || e->direct || !prev->busy)
+            return view_enc_end(e, st);
+
+        view_enc_wait_slot(e, prev);
+        ret = view_enc_send_sw(e, prev, view_enc_out_index(e, prev->index));
+        if (ret < 0)
+            return view_enc_fail(st, ret);
+        e->encoded++;
+
+        return view_enc_wrote(e, st);
+    }
+
+    got = view_enc_walk(e, st, e->next);
+    if (got < 0) {
+        view_encode_unlock(st);
+        return view_enc_fail(st, got);
+    }
+    if (got == 0) {
+        view_encode_unlock(st);
+        goto behind;
+    }
+    if (got == 1) {
+        fprintf(stderr, "the clip ends before frame %" PRId64 "\n", e->next);
+        e->end = e->next - 1;
+        view_encode_unlock(st);
+        return view_enc_end(e, st);
+    }
+
+    pts = view_enc_out_index(e, e->next);
+    if (e->direct) {
+        ret = view_enc_read_direct(e, st);
+    } else if (e->hw) {
+        ret = view_enc_render_hw(e, st, pts, &hw);
+    } else {
+        prev = &e->slot[e->cur ^ 1];
+        ret = view_enc_render_sw(e, st, &e->slot[e->cur]);
+        e->cur ^= 1;
+    }
+    e->next += e->step;
+
+    view_encode_unlock(st);
+
+    if (ret < 0)
+        return view_enc_fail(st, ret);
+
+    if (e->direct) {
+        ret = view_enc_send_direct(e, pts);
+        e->encoded++;
+    } else if (e->hw) {
+        ret = view_enc_send_hw(e, &hw);
+        e->encoded++;
+    } else if (prev->busy) {
+        view_enc_wait_slot(e, prev);
+        ret = view_enc_send_sw(e, prev, view_enc_out_index(e, prev->index));
+        e->encoded++;
+    }
+    if (ret < 0)
+        return view_enc_fail(st, ret);
+
+    return view_enc_wrote(e, st);
+
+behind:
+    /* The reader has not caught up with the walk, which happens right
+     * after the seek to the first frame. Waited for here and without the
+     * lock, so the window goes on drawing; the wait ends as soon as a
+     * packet is in, and at once when one already is. */
+    view_decoder_wait(&st->dec, 20);
+
+    return 0;
+}
+
+/* The run, from its first frame to its trailer. */
+static int view_enc_run(struct view_state *st)
+{
+    int ret;
+
+    do {
+        ret = view_enc_frame(st);
+    } while (!ret);
+
+    return ret;
+}
+
+static int SDLCALL view_enc_thread(void *opaque)
+{
+    struct view_state *st = opaque;
+    int ret = view_enc_run(st);
+
+    view_encode_lock(st);
+    st->video.result = ret;
+    st->video.finished = true;
+    st->video.updates++;
+    view_encode_unlock(st);
+
+    return 0;
+}
+
+int view_encode_poll(struct view_state *st, bool *moved)
+{
+    struct view_video *v = &st->video;
+    bool finished;
+
+    *moved = false;
+    if (!v->active)
+        return 0;
+
+    if (!v->thread) {
+        v->finished = false;
+        v->result = 0;
+        v->lock = SDL_CreateMutex();
+        if (v->lock)
+            v->thread = SDL_CreateThread(view_enc_thread, "cineview export", st);
+        if (!v->thread) {
+            snprintf(v->status, sizeof(v->status), "cannot start the export: %s",
+                     SDL_GetError());
+            fprintf(stderr, "%s\n", v->status);
+            if (v->lock)
+                SDL_DestroyMutex(v->lock);
+            v->lock = NULL;
+            view_enc_release(st);
+            v->active = false;
+            *moved = true;
+            return CRAW_ERROR(EAGAIN);
+        }
+        return 0;
+    }
+
+    view_encode_lock(st);
+    finished = v->finished;
+    *moved = v->updates != v->updates_seen;
+    v->updates_seen = v->updates;
+    view_encode_unlock(st);
+
+    if (!finished)
+        return 0;
+
+    SDL_WaitThread(v->thread, NULL);
+    v->thread = NULL;
+    SDL_DestroyMutex(v->lock);
+    v->lock = NULL;
+    v->active = false;
+    *moved = true;
+
+    return v->result;
+}
+
+int view_encode_run(struct view_state *st)
+{
+    int ret;
+
+    if (!st->video.active || !st->video.e)
+        return 0;
+
+    ret = view_enc_run(st);
+    st->video.active = false;
+
+    return ret;
+}
+
+void view_encode_cancel(struct view_state *st)
+{
+    if (st->video.active)
+        SDL_SetAtomicInt(&st->video.stop, 1);
+}
+
+void view_encode_close(struct view_state *st)
+{
+    struct view_video *v = &st->video;
+
+    /* A run still on its thread stops at the next frame and writes its
+     * trailer; the engine is released there. */
+    if (v->thread) {
+        SDL_SetAtomicInt(&v->stop, 1);
+        SDL_WaitThread(v->thread, NULL);
+        v->thread = NULL;
+        SDL_DestroyMutex(v->lock);
+        v->lock = NULL;
+        v->active = false;
+    }
+
+    view_enc_release(st);
 }

@@ -588,7 +588,16 @@ encoder **threads** — 0 for FFmpeg's own auto, 1 to the machine's core
 count, applied to the software encoders and greyed for a Vulkan one, which
 has none; `--threads N` sets it and `-v` prints the count the encoder
 settled on since some clamp it — and, while a run is going, an *exporting: N
-of M frames* line, a progress bar and a stop button. From the moment the
+of M frames, F fps, R Mbps, S s left* line, a progress bar and a stop
+button. R is the rate the file is being written at: the bytes of the
+picture's last second of packets and the sound's, over the time they hold,
+so it reads right from the first packet and moves with the picture's
+content; the line the run leaves behind gives the whole file's instead.
+The run has a thread of its own, decoding, developing, rendering and
+encoding as fast as the device and the encoder go: the window draws the
+progress and the frame the run last developed when either changes, and a
+window that is covered, minimised or on another workspace - one the
+compositor sends no frame callbacks - does not slow it down. From the moment the
 export starts until it ends or is stopped, every panel section and every row
 but the stop button is disabled and the Export video section held open:
 nothing can be scrubbed, seeked or changed by mouse, wheel or keyboard, the

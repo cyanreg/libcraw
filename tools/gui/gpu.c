@@ -2273,6 +2273,13 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
         target.num_overlays = 1;
     }
 
+    /* The picture, under the lock a video export on its own thread holds
+     * while it develops the next one: the pass reads the pipeline's output
+     * and the viewer's state, and both are the run's while it is on. Not
+     * the swapchain on either side of it, whose waits are the compositor's
+     * and must never be the export's (encode.h). */
+    view_encode_lock(st);
+
     /* Normally a no-op: view_gpu_prepare() has already put this picture in
      * the texture, off the present path. It still has to be asked, because
      * the first frame, a resize and a look the panel changed a moment ago
@@ -2306,6 +2313,7 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
         target.crop = (pl_rect2df) { 0, 0, (float)tw, (float)th };
 
         if (!pl_render_image(g->rr_compose, &src_frame, &target, &crp)) {
+            view_encode_unlock(st);
             fprintf(stderr, "composing the window failed\n");
             return CRAW_ERROR(EIO);
         }
@@ -2343,6 +2351,7 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
 
         if (!pl_render_image(g->rr, st->have_frame ? &image : NULL,
                              &target, &rp)) {
+            view_encode_unlock(st);
             fprintf(stderr, "pl_render_image failed\n");
             return CRAW_ERROR(EIO);
         }
@@ -2357,6 +2366,7 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
         else
             g->measured_peak = 0.0;
     }
+    view_encode_unlock(st);
     if (g->rec)
         g->rec->t_image = av_gettime_relative();
     if (g->rec)
@@ -2571,6 +2581,7 @@ void view_gpu_direct_close(struct view_gpu *g)
         vkDestroyFence(g->vk->device, g->direct_fence, NULL);
         g->direct_fence = VK_NULL_HANDLE;
     }
+    g->direct_busy = false;
     if (g->direct_cmd != VK_NULL_HANDLE) {
         vkFreeCommandBuffers(g->vk->device, g->pool, 1, &g->direct_cmd);
         g->direct_cmd = VK_NULL_HANDLE;
@@ -2751,6 +2762,17 @@ static int view_gpu_direct_record(struct view_gpu *g, const AVFrame *frame,
         .height = g->direct_h,
     };
 
+    /* One command buffer, recorded again for every frame, so the last run
+     * has to be off it first. That is the only wait on the run itself -
+     * what comes after it on the device waits on its semaphores - and by
+     * the time the next frame has been decoded it is normally long over. */
+    if (g->direct_busy) {
+        if (vkWaitForFences(g->vk->device, 1, &g->direct_fence, VK_TRUE,
+                            UINT64_MAX) != VK_SUCCESS)
+            return CRAW_ERROR(EIO);
+        g->direct_busy = false;
+    }
+
     hold = g->out_value + 1;
     if (!pl_vulkan_hold_ex(g->gpu, pl_vulkan_hold_params(
             .tex       = g->direct_tex,
@@ -2870,14 +2892,10 @@ static int view_gpu_direct_record(struct view_gpu *g, const AVFrame *frame,
         vkf->access[0] = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
         if (vkf->queue_family[0] != VK_QUEUE_FAMILY_IGNORED)
             vkf->queue_family[0] = g->qf;
+        g->direct_busy = true;
     }
 
     vkfc->unlock_frame(fc, vkf);
-
-    if (ret >= 0 &&
-        vkWaitForFences(g->vk->device, 1, &g->direct_fence, VK_TRUE,
-                        UINT64_MAX) != VK_SUCCESS)
-        ret = CRAW_ERROR(EIO);
 
 release:
     pl_vulkan_release_ex(g->gpu, pl_vulkan_release_params(
@@ -2892,9 +2910,14 @@ release:
     return ret;
 }
 
+static void view_gpu_direct_read(void *priv)
+{
+    SDL_SetAtomicInt(priv, 1);
+}
+
 int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
                           enum CRAWColorSpace space, int x, int y, int w, int h,
-                          float *rgba, double *gpu_ms, double *dl_ms)
+                          float *rgba, double *ms)
 {
     CRAWFrameParams fp;
     int64_t t0;
@@ -2917,25 +2940,47 @@ int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
     if (ret < 0)
         return ret;
 
-    if (gpu_ms)
-        *gpu_ms = (double)(av_gettime_relative() - t0) / 1000.0;
-
-    t0 = av_gettime_relative();
-
     /* The crop is a rectangle of the read-back and nothing else: no
      * resample, no second pass, and the rows come out tightly packed
-     * because the default row pitch is the rectangle's own width. */
+     * because the default row pitch is the rectangle's own width. With a
+     * callback the transfer is asynchronous, which without one it is not:
+     * libplacebo would wait for it right here. */
+    SDL_SetAtomicInt(&g->direct_read, 0);
     if (!pl_tex_download(g->gpu, pl_tex_transfer_params(
-            .tex = g->direct_tex,
-            .rc  = { x, y, 0, x + w, y + h, 1 },
-            .ptr = rgba,
+            .tex      = g->direct_tex,
+            .rc       = { x, y, 0, x + w, y + h, 1 },
+            .ptr      = rgba,
+            .callback = view_gpu_direct_read,
+            .priv     = &g->direct_read,
         ))) {
         fprintf(stderr, "cannot read the export texture back\n");
         return CRAW_ERROR(EIO);
     }
+    /* On the queue now, so that the wait is for the device and not for
+     * whoever happens to flush next. */
+    pl_gpu_flush(g->gpu);
 
-    if (dl_ms)
-        *dl_ms = (double)(av_gettime_relative() - t0) / 1000.0;
+    if (ms)
+        *ms = (double)(av_gettime_relative() - t0) / 1000.0;
+
+    return 0;
+}
+
+int view_gpu_direct_wait(struct view_gpu *g, double *ms)
+{
+    int64_t t0 = av_gettime_relative();
+
+    /* The callback runs from whichever thread polls the device next, so
+     * this one polls until it has: a poll that finds the texture idle with
+     * the flag still clear has met another thread in the middle of running
+     * it. */
+    while (!SDL_GetAtomicInt(&g->direct_read)) {
+        if (!pl_tex_poll(g->gpu, g->direct_tex, 10000000))
+            SDL_Delay(1);
+    }
+
+    if (ms)
+        *ms = (double)(av_gettime_relative() - t0) / 1000.0;
 
     return 0;
 }

@@ -4597,6 +4597,7 @@ static int view_run_window(struct view_state *st)
         bool was_playing = st->playing;
         bool stepped = false;
         bool events_seen = false;
+        bool export_moved = false;
         bool presented = false;
         double hold;
         SDL_Event e;
@@ -4794,7 +4795,12 @@ static int view_run_window(struct view_state *st)
             break;
 
         if (st->video.active) {
-            view_encode_step(st);
+            /* The run takes the decoder onto a thread of its own, and the
+             * clip's sound with it: stopped here first, before the thread
+             * starts, and not touched again until the run is over. */
+            if (!st->video.thread)
+                view_audio_pause(&st->audio);
+            view_encode_poll(st, &export_moved);
             /* q, or the window closing, during the run: the file has its
              * trailer now, so this is where the program leaves. */
             if (st->quit_pending && !st->video.active)
@@ -4842,11 +4848,25 @@ static int view_run_window(struct view_state *st)
          * enough to open its column - which only a rebuild acts on: a hand
          * that has stopped sends no events, and left to the idle tick the
          * column opened up to a fifth of a second late. */
-        if (stepped || events_seen || !st->warm || st->gpu.pic_redrew ||
-            st->exp.active || st->video.active || st->need_frame ||
-            st->seek_to >= 0 || now - st->last_present >= VIEW_IDLE_PRESENT ||
-            view_ui_menu_due(st, now))
+        /* A video export on its thread owns the transport, so nothing of
+         * it is asked here: the window draws when the run has written a
+         * frame - the progress and the picture it last developed - or when
+         * there is input, and otherwise waits. Drawing every refresh, as it
+         * did when the run was stepped from this loop, was what held the
+         * export to the compositor's frame callbacks, and to none at all on
+         * a window nobody could see. */
+        if (st->video.thread) {
+            if (export_moved || events_seen ||
+                now - st->last_present >= VIEW_IDLE_PRESENT ||
+                view_ui_menu_due(st, now))
+                st->present_due = true;
+        } else if (stepped || events_seen || export_moved || !st->warm ||
+                   st->gpu.pic_redrew || st->exp.active || st->need_frame ||
+                   st->seek_to >= 0 ||
+                   now - st->last_present >= VIEW_IDLE_PRESENT ||
+                   view_ui_menu_due(st, now)) {
             st->present_due = true;
+        }
 
         /* The transport drives the audio, never the other way round. A
          * pause folds the wall time since the start into the wall clock at
@@ -4861,7 +4881,7 @@ static int view_run_window(struct view_state *st)
 
         view_audio_set_volume(&st->audio, st->volume, st->mute);
 
-        if (!st->exp.active && view_audio_live(st)) {
+        if (!st->exp.active && !st->video.active && view_audio_live(st)) {
             if (st->playing && st->warm && !st->audio.playing)
                 view_audio_start(st);
             else if ((!st->playing || !st->warm) && st->audio.playing)
@@ -4890,7 +4910,11 @@ static int view_run_window(struct view_state *st)
              ? st->pts - view_clock(st) : 0.0;
 
         if (st->present_due && hold <= 0.0) {
+            /* The panel reads the viewer's state all over, and a video
+             * export on its thread is changing it. */
+            view_encode_lock(st);
             view_ui_build(st);
+            view_encode_unlock(st);
             ui_input_consumed = true;
 
             /* A grade change while paused replays the picture on screen;
@@ -4898,8 +4922,8 @@ static int view_run_window(struct view_state *st)
              * and so does a decode that is already pending. So does a
              * paused picture whose white balance step read no histogram
              * (struct view_awb, `pending`), once. */
-            if (!st->playing && !st->exp.active && st->have_frame &&
-                !st->need_frame && st->seek_to < 0) {
+            if (!st->playing && !st->exp.active && !st->video.active &&
+                st->have_frame && !st->need_frame && st->seek_to < 0) {
                 struct view_pipeline_look look = view_pipeline_look(st);
                 bool awb = st->awb.pending && st->look.wb == VIEW_WB_AUTO;
 
@@ -4933,7 +4957,7 @@ static int view_run_window(struct view_state *st)
             if (ret < 0)
                 break;
 
-            if (st->trace.on) {
+            if (st->trace.on && !st->video.active) {
                 view_gpu_poll_fence(&st->gpu);
                 st->trace.cur.index = st->index;
                 st->trace.cur.pts = st->pts;
@@ -5027,6 +5051,8 @@ static int view_run_window(struct view_state *st)
             iter_t0 = now;
         }
         if (now - fps_t0 >= 500000) {
+            /* The timings are added to by a video export's thread as well. */
+            view_encode_lock(st);
             st->fps = (double)fps_frames * 1.0e6 / (double)(now - fps_t0);
             st->proc_fps = (double)proc_frames * 1.0e6 / (double)(now - fps_t0);
             fps_frames = proc_frames = 0;
@@ -5049,6 +5075,7 @@ static int view_run_window(struct view_state *st)
                          view_decoder_queued(&st->dec), tm->starved);
                 *tm = (struct view_timing) { 0 };
             }
+            view_encode_unlock(st);
         }
     }
 
@@ -5200,11 +5227,9 @@ static int view_run_headless(struct view_state *st)
         if (ret < 0)
             return ret;
 
-        while (st->video.active) {
-            ret = view_encode_step(st);
-            if (ret < 0)
-                return ret;
-        }
+        ret = view_encode_run(st);
+        if (ret < 0)
+            return ret;
 
         view_phase(st, t0, "seek, decode, render and encode");
         fprintf(stderr, "%s\n", st->video.status);

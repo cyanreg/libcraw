@@ -686,6 +686,11 @@ struct view_gpu {
     VkImageView direct_view;
     VkCommandBuffer direct_cmd;
     VkFence direct_fence;
+    /* `direct_cmd` is in a submission nothing has waited for yet. */
+    bool direct_busy;
+    /* The read-back view_gpu_direct_frame() started has landed: set by
+     * libplacebo's transfer callback, from whichever thread polls it. */
+    SDL_AtomicInt direct_read;
 
     double last_gpu_ms;
     /* What libplacebo's peak detection measured for the last displayed
@@ -1534,11 +1539,18 @@ void view_gpu_direct_close(struct view_gpu *g);
 
 /* Runs the picture on screen through that pipeline in `space` - no gamut
  * clamp, the reference gamut compression left to the space's own rule - and
- * reads the rectangle (x, y, w, h) back as w * h packed RGBA floats. The two
- * times are the device's own and the read-back's, in milliseconds. */
+ * starts reading the rectangle (x, y, w, h) back as w * h packed RGBA
+ * floats. Neither is waited for: view_gpu_direct_wait() does that, and
+ * needs nothing of the viewer's state, so a video export calls it outside
+ * the lock it shares with the window. `rgba` is not to be read before.
+ * `ms` is the time the recording and the submission took. */
 int  view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
                            enum CRAWColorSpace space, int x, int y, int w, int h,
-                           float *rgba, double *gpu_ms, double *dl_ms);
+                           float *rgba, double *ms);
+
+/* Waits for the read-back view_gpu_direct_frame() started, which is the
+ * pipeline's run on the device and the transfer; `ms` is how long. */
+int  view_gpu_direct_wait(struct view_gpu *g, double *ms);
 
 /* A pre-roll frame through that pipeline, with the parameters the display's
  * got, for its temporal state alone: nothing is read back. */

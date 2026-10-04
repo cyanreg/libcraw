@@ -27,14 +27,26 @@
  * and cut to the sample, or decoded and encoded again with opus, aac, flac
  * or PCM, cut to the same range and interleaved with the video.
  *
- * Everything is stepped: one call is at most one frame, so the caller can
- * draw a progress bar, pump its event loop, and stop.
+ * In the window the run is a thread of its own, so that nothing about the
+ * window - the compositor's frame callbacks, a window on another workspace
+ * that gets none - sets the pace of an export: the window draws the
+ * progress and the picture the run last developed when there is something
+ * new to draw, and the run goes as fast as the device and the encoder go.
+ * The two share one lock (view_encode_lock()), which the run holds while
+ * it walks the decoder, develops and renders, and the window while it
+ * builds the panel and draws the picture; the encoder, the muxer and the
+ * sound run outside it. A headless run is the same loop on the only thread
+ * there is.
  *
  * Included from view.h, which owns the struct below; the engine itself is
  * opaque. */
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#include <SDL3/SDL_atomic.h>
+#include <SDL3/SDL_mutex.h>
+#include <SDL3/SDL_thread.h>
 
 struct view_state;
 struct view_encode;
@@ -87,9 +99,26 @@ struct view_video {
     int64_t resume_index;
     bool resume;
 
-    bool stop;                  /* the panel's stop button */
+    /* The panel's stop button, q and the window closing, all on the
+     * window's thread, read by the run's. */
+    SDL_AtomicInt stop;
+    /* The run's side of the panel, written by the run under the lock;
+     * `updates` counts the writes, so that the window draws when one has
+     * happened and not otherwise. */
     char status[192];
     double progress;            /* 0 to 1 */
+    uint64_t updates;
+    uint64_t updates_seen;      /* the window's own */
+
+    /* The run's thread, from the first view_encode_poll() after the press
+     * to the one that finds it finished, and the lock it shares with the
+     * window. Both are the window's to create and destroy, and NULL on a
+     * headless run, where the lock is no lock at all. `finished` and
+     * `result` are the thread's last words, under the lock. */
+    SDL_Thread *thread;
+    SDL_Mutex *lock;
+    bool finished;
+    int result;
 
     struct view_encode *e;
 };
@@ -134,17 +163,31 @@ const char *view_encode_video_why_not(const struct view_state *st,
                                       const struct view_preset_sel *sel,
                                       const char *codec);
 
-/* Starts a run. An empty `path` means the default one above. Nothing about
+/* Sets a run up. An empty `path` means the default one above. Nothing about
  * the file is written here - the size is not known until a frame has been
  * decoded - but everything the name decides is checked, so a refusal is a
- * sentence in `st->video.status` rather than a half written file. */
+ * sentence in `st->video.status` rather than a half written file. Nothing
+ * runs yet either: view_encode_poll() or view_encode_run() starts it. */
 int  view_encode_begin(struct view_state *st, const struct view_encode_opts *o);
 
-/* One iteration: decodes, renders and encodes at most one frame, and
- * writes whatever audio belongs before it. Returns 0 while there is more
- * to do or nothing to do yet, 1 when the file is finished, negative on an
- * error. `st->video.active` is cleared either way. */
-int  view_encode_step(struct view_state *st);
+/* The window's side of a run, once an iteration while `st->video.active`
+ * is set. The first call starts the run on its own thread - the clip's
+ * sound has to be stopped by then, since the run takes the decoder and the
+ * sound with it - and the call that finds it finished joins the thread and
+ * clears `active`. Returns 0 while it runs, 1 when the file is finished,
+ * negative on an error; `*moved` says whether the run has changed what the
+ * panel shows since the last call. */
+int  view_encode_poll(struct view_state *st, bool *moved);
+
+/* A headless run, from the first frame to the trailer on the calling
+ * thread. 1 when the file is finished, negative on an error; `active` is
+ * cleared either way. */
+int  view_encode_run(struct view_state *st);
+
+/* The lock a run on its thread shares with the window. Does nothing when
+ * no run is on a thread. */
+void view_encode_lock(struct view_state *st);
+void view_encode_unlock(struct view_state *st);
 
 /* A frame the seek to the first frame of the range develops ahead of it
  * for the temporal denoise's state (main.c), which a scene-referred run's
@@ -158,7 +201,8 @@ int  view_encode_preroll(struct view_state *st, const struct AVFrame *f,
 /* Stops a run early, writing what has been encoded so far. */
 void view_encode_cancel(struct view_state *st);
 
-/* Releases the engine. Safe on a run that never started. */
+/* Releases the engine, stopping a run that is still on its thread and
+ * waiting for it first. Safe on a run that never started. */
 void view_encode_close(struct view_state *st);
 
 #endif /* CINEVIEW_ENCODE_H */
