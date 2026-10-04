@@ -1858,6 +1858,66 @@ static void view_scrub_bar(struct nk_context *ctx, struct view_state *st,
         style->draw_end(&win->buffer, style->userdata);
 }
 
+/* A checkbox with three states, which nuklear does not have: empty for 0,
+ * checked for 1, and for 2 a bar across the box, the usual look of a
+ * checkbox's third state. Made of nuklear's own checkbox - its geometry,
+ * copied from nk_do_toggle(), its click (nk_toggle_behavior()) and its
+ * drawing (nk_draw_checkbox()), which the implementation in this file
+ * makes available - so it looks, hovers and greys out as every other
+ * checkbox of the panel does. A click moves the state on, 0, 1, 2 and
+ * round. True when it did. */
+static bool view_check3(struct nk_context *ctx, const char *text, int *state)
+{
+    struct nk_window *win = ctx->current;
+    const struct nk_style_toggle *ts = &ctx->style.checkbox;
+    const struct nk_user_font *font = ctx->style.font;
+    const struct nk_input *in;
+    struct nk_rect r, bounds, select, cursor, label;
+    enum nk_widget_layout_states ws;
+    bool clicked;
+
+    ws = nk_widget(&r, ctx);
+    if (!ws)
+        return false;
+    in = ws == NK_WIDGET_ROM || ws == NK_WIDGET_DISABLED ||
+         win->layout->flags & NK_WINDOW_ROM ? NULL : &ctx->input;
+
+    r.w = NK_MAX(r.w, font->height + 2 * ts->padding.x);
+    r.h = NK_MAX(r.h, font->height + 2 * ts->padding.y);
+    bounds = nk_rect(r.x - ts->touch_padding.x, r.y - ts->touch_padding.y,
+                     r.w + 2 * ts->touch_padding.x, r.h + 2 * ts->touch_padding.y);
+    select = nk_rect(r.x, r.y + r.h / 2.0f - font->height / 2.0f,
+                     font->height, font->height);
+    label = nk_rect(select.x + select.w + ts->spacing, select.y, 0.0f, select.w);
+    label.w = NK_MAX(r.x + r.w, label.x) - label.x;
+    cursor = nk_rect(select.x + ts->padding.x + ts->border,
+                     select.y + ts->padding.y + ts->border,
+                     select.w - (2 * ts->padding.x + 2 * ts->border),
+                     select.h - (2 * ts->padding.y + 2 * ts->border));
+
+    clicked = nk_toggle_behavior(in, bounds, &ctx->last_widget_state, nk_false);
+    if (clicked)
+        *state = (*state + 1) % 3;
+
+    nk_draw_checkbox(&win->buffer, ctx->last_widget_state, ts, *state == 1,
+                     &label, &select, &cursor, text, (int)strlen(text), font,
+                     NK_TEXT_LEFT);
+    if (*state == 2) {
+        const struct nk_style_item *c =
+            ctx->last_widget_state & (NK_WIDGET_STATE_HOVER | NK_WIDGET_STATE_ACTIVED)
+            ? &ts->cursor_hover : &ts->cursor_normal;
+        float bh = (float)(int)(cursor.h / 3.0f + 0.5f);
+
+        if (c->type == NK_STYLE_ITEM_COLOR)
+            nk_fill_rect(&win->buffer,
+                         nk_rect(cursor.x, cursor.y + (cursor.h - bh) / 2.0f,
+                                 cursor.w, bh),
+                         0.0f, nk_rgb_factor(c->data.color, ts->color_factor));
+    }
+
+    return clicked;
+}
+
 static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
 {
     int64_t total = st->dec.nb_frames;
@@ -1875,30 +1935,24 @@ static void view_panel_transport(struct nk_context *ctx, struct view_state *st)
     /* A still is not played, so there is nothing for it to be slowed to,
      * nor frames for it to leave out. */
     if (st->dec.fmt && !st->dec.still) {
-        static const char *const names[] = { "all frames", "odd frames",
-                                             "even frames" };
-        struct nk_style_button bs = ctx->style.button;
+        static const char *const names[] = { "every other frame",
+                                             "every other frame: odd",
+                                             "every other frame: even" };
+        int half = st->half;
 
         view_panel_rate(ctx, st);
 
         /* Every frame, or every other one: the odd-numbered or the
          * even-numbered, counted from frame 0 as the readout counts. One
-         * button for the three, which each press moves on - all, odd,
-         * even and round again, as `f` does - saying what is in effect,
-         * and lit in the switches' colour while frames are left out.
-         * nuklear has no three-state widget of its own; this is its button
-         * with the section switches' styling. The choice and nothing else:
+         * checkbox with three states, moved on by each click as by `f`:
+         * empty for all frames, checked for the odd ones, a bar for the
+         * even ones, the label saying which. The choice and nothing else:
          * the run loop takes it up with the rate (view_rate_follow()), and
          * the rate's readout above says what came of it, "29.97 fps, odd
          * frames". */
-        if (st->half != VIEW_HALF_OFF) {
-            bs.border_color = VIEW_SWITCH_ON;
-            bs.text_normal = bs.text_hover = bs.text_active = VIEW_SWITCH_ON;
-        }
-        nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
-        if (nk_button_label_styled(ctx, &bs, names[st->half]))
-            view_half_next(st);
-        nk_spacer(ctx);
+        nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+        if (view_check3(ctx, names[st->half], &half))
+            st->half = (enum view_half)half;
     }
 }
 

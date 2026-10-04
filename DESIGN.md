@@ -5122,12 +5122,16 @@ LED street lamps on a mains-rate driver pulse at a frequency that a
 high-speed clip can sample in step with half its frame rate: every second
 frame catches the light on and the ones between catch it off, and the clip
 flickers at half its rate. Either half alone does not flicker. The panel's
-"frames" button under the rate row, which each press and `f` move on from
-all to odd to even and round, and `--every-other-frame odd|even` keep the
-clip's odd-numbered or its even-numbered frames and drop the rest. nuklear
-has no three-state widget; the button is its ordinary one, reading the state
-in effect and lit in the section switches' colour while frames are left
-out.
+"every other frame" checkbox under the rate row, which each click and `f`
+move on from all to odd to even and round, and `--every-other-frame
+odd|even` keep the clip's odd-numbered or its even-numbered frames and drop
+the rest. nuklear's checkbox has two states; `view_check3()` in ui.c is
+that checkbox with a third, made of nuklear's own toggle pieces - the
+geometry of `nk_do_toggle()`, `nk_toggle_behavior()` for the click and
+`nk_draw_checkbox()` for the box and label, which the implementation being
+compiled into ui.c makes available - so it hovers and greys out like the
+rest: empty, checked, and for the third a bar across the box in the check's
+colour, the usual look of a checkbox's third state.
 
 Which half is the user's choice and is counted from the clip's frame 0, as
 the frame readout counts: `half` in `struct view_state`, and frame i is

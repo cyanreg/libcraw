@@ -212,16 +212,17 @@ seconds. A 23.976 clip has nothing slower to go to and its row is greyed.
 refused when that clip opens: a headless run stops there, a window plays
 the clip at its own rate (DESIGN.md 23).
 
-Under the rate row, the "frames" button plays and exports all of a clip's
-frames, or every other one: its odd-numbered frames or its even-numbered
-ones, counted from frame 0 as the frame readout counts. Each press moves it
-on, all, odd, even and round again, and so does `f`; it reads "all frames",
-"odd frames" or "even frames", lit while frames are left out. That is half the
+Under the rate row, the "every other frame" checkbox plays and exports all
+of a clip's frames, or every other one: its odd-numbered frames or its
+even-numbered ones, counted from frame 0 as the frame readout counts. It has
+three states, and each click moves it on, as `f` does: empty for all
+frames, checked for the odd ones ("every other frame: odd"), and a bar
+across the box for the even ones ("every other frame: even"). That is half the
 clip's rate at its own speed, with its sound. It is for light that pulses
 in step with half the frame rate, LED street lamps on a mains-rate driver
 under a high-speed clip, which leave every second frame darker than the
-ones either side; one half is a clip without that flicker, and the button
-picks which. The rate row's readout says it, "59.94 fps, odd frames" on a 119.88
+ones either side; one half is a clip without that flicker, and the
+checkbox picks which. The rate row's readout says it, "59.94 fps, odd frames" on a 119.88
 clip, and its slower stops are measured against that half rate, so the two
 combine. The frames left out are still decoded, since a decoder needs them,
 and dropped before they are developed. A seek lands on the shown frame at
