@@ -198,6 +198,18 @@ static const struct view_preset view_presets_h264_vk[] = {
     { "Main", "profile=main", AV_PIX_FMT_NV12 },
 };
 
+/* ------------------------------------------------------- HEVC (Vulkan) */
+
+/* hevc_vulkan picks Main or Main 10 from the format it is handed and
+ * refuses a profile that says otherwise ("hevc profile "Main" not
+ * supported" for p010 under profile=main), so the preset sets none and
+ * the pixel format row is the choice: p010 is Main 10, which every HEVC
+ * hardware decoder plays, nv12 is Main. RExt's 4:4:4 does not open on
+ * RADV. */
+static const struct view_preset view_presets_hevc_vk[] = {
+    { "standard", "", AV_PIX_FMT_P010 },
+};
+
 /* --------------------------------------------------------- the families */
 
 /* The parameters every SVT-AV1 encode carries, whatever the mode. */
@@ -245,6 +257,9 @@ static const enum AVPixelFormat view_fmts_av1_vk[] = {
 };
 static const enum AVPixelFormat view_fmts_h264_vk[] = {
     AV_PIX_FMT_NV12,
+};
+static const enum AVPixelFormat view_fmts_hevc_vk[] = {
+    AV_PIX_FMT_P010, AV_PIX_FMT_NV12,
 };
 
 #define VIEW_FMTS(l) .fmts = (l), .nb_fmts = (int)CRAW_ARRAY_ELEMS(l)
@@ -360,6 +375,24 @@ const struct view_preset_family view_preset_families[] = {
             { "CBR", true },
             /* The engine's constant quantiser, H.264's own 0 to 51. */
             { "CQP", false, 0, 51, 20 },
+        },
+        .nb_rc = 3, .rc_def = 0, .kbit_def = 40000,
+    },
+    {
+        .name = "HEVC (Vulkan)", .encoder = "hevc_vulkan",
+        VIEW_FMTS(view_fmts_hevc_vk),
+        .presets = view_presets_hevc_vk,
+        .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_hevc_vk),
+        .def = 0,
+        .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_RC, .container = "mp4",
+        .scene_fmt = AV_PIX_FMT_NONE,
+        .async_min = 1, .async_max = 4, .async_def = 2,
+        .rc = {
+            { "VBR", true },
+            { "CBR", true },
+            /* Honoured on RADV now: qp 24 and qp 40 are 2.7 and 0.5 Mbit/s
+             * of the same 4K range. */
+            { "CQP", false, 0, 51, 24 },
         },
         .nb_rc = 3, .rc_def = 0, .kbit_def = 40000,
     },
@@ -824,7 +857,8 @@ const char *view_presets_opts(const struct view_preset_sel *s, char *buf, size_t
     /* The Vulkan encoders say which mode they are in, through the option
      * their common code shares; the two software encoders are put into one
      * by what is and is not set, which is what their code reads. */
-    if (!strcmp(f->encoder, "av1_vulkan") || !strcmp(f->encoder, "h264_vulkan")) {
+    if (!strcmp(f->encoder, "av1_vulkan") || !strcmp(f->encoder, "h264_vulkan") ||
+        !strcmp(f->encoder, "hevc_vulkan")) {
         if (rc->bitrate)
             view_opt_add(buf, n, "rc_mode=%s,b=%" PRId64,
                          strcmp(rc->label, "CBR") ? "vbr" : "cbr", bps);
@@ -1006,20 +1040,32 @@ static const struct {
 static struct {
     bool known;
     bool have[CRAW_ARRAY_ELEMS(view_engines)];
-    /* The largest picture each engine encodes, as the driver said at
-     * device open; 0 when it was not asked or did not say. */
+    /* The largest picture each engine encodes and the granularity it
+     * takes pictures in, as the driver said at device open; 0 when it was
+     * not asked or did not say. */
     int max_w[CRAW_ARRAY_ELEMS(view_engines)];
     int max_h[CRAW_ARRAY_ELEMS(view_engines)];
+    int gran_w[CRAW_ARRAY_ELEMS(view_engines)];
+    int gran_h[CRAW_ARRAY_ELEMS(view_engines)];
 } view_dev;
 
-void view_presets_engine_extent(enum AVCodecID id, int w, int h)
+void view_presets_engine_extent(enum AVCodecID id, int max_w, int max_h,
+                                int gran_w, int gran_h)
 {
     for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_engines); i++) {
         if (view_engines[i].id != id)
             continue;
-        view_dev.max_w[i] = w;
-        view_dev.max_h[i] = h;
+        view_dev.max_w[i] = max_w;
+        view_dev.max_h[i] = max_h;
+        view_dev.gran_w[i] = CRAW_MAX(gran_w, 1);
+        view_dev.gran_h[i] = CRAW_MAX(gran_h, 1);
     }
+}
+
+/* Up to the next multiple of `g`, which need not be a power of two. */
+static int view_align(int v, int g)
+{
+    return (v + g - 1) / g * g;
 }
 
 const char *view_presets_extent_why_not(const AVCodec *c, int w, int h)
@@ -1030,11 +1076,12 @@ const char *view_presets_extent_why_not(const AVCodec *c, int w, int h)
         return NULL;
 
     for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_engines); i++) {
-        /* An engine codes whole macroblocks, so 1080 lines are 1088 to it
-         * and the limit is on those. */
+        /* The engine takes pictures in whole blocks of its granularity -
+         * 1080 lines are 1088 to an H.264 engine - and FFmpeg rounds up to
+         * them before it checks the limit, so this does too. */
         if (view_engines[i].id != c->id || !view_dev.max_w[i] ||
-            (((w + 15) & ~15) <= view_dev.max_w[i] &&
-             ((h + 15) & ~15) <= view_dev.max_h[i]))
+            (view_align(w, view_dev.gran_w[i]) <= view_dev.max_w[i] &&
+             view_align(h, view_dev.gran_h[i]) <= view_dev.max_h[i]))
             continue;
         snprintf(buf, sizeof(buf), "%s on this GPU encodes at most %dx%d, "
                  "and this is %dx%d; pick a smaller size", c->name,

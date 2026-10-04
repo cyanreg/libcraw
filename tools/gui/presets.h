@@ -113,7 +113,7 @@ struct view_preset_family {
     int nb_fmts;
 };
 
-/* The nine families, in the order the menu's first column shows them. */
+/* The ten families, in the order the menu's first column shows them. */
 extern const struct view_preset_family view_preset_families[];
 extern const int view_nb_preset_families;
 
@@ -403,9 +403,11 @@ void view_presets_device_exts(const char *const *exts, int n);
  * told about. */
 const char *view_presets_engine_why_not(const AVCodec *c);
 
-/* The largest picture the device's engine for `id` encodes, told once at
- * device open from the driver's video capabilities. */
-void view_presets_engine_extent(enum AVCodecID id, int w, int h);
+/* The largest picture the device's engine for `id` encodes and the
+ * granularity it takes pictures in, told once at device open from the
+ * driver's video capabilities. */
+void view_presets_engine_extent(enum AVCodecID id, int max_w, int max_h,
+                                int gran_w, int gran_h);
 
 /* Why this encoder cannot write a `w` by `h` picture on this GPU, or NULL:
  * a hardware engine's maximum, which RADV puts at 4096 for H.264 - under a

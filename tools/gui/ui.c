@@ -2726,7 +2726,7 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     fam = &view_preset_families[sel->family];
     vulkan = view_presets_family_is_vulkan(sel->family);
 
-    /* --codec still wins, for an encoder that is not one of the nine. */
+    /* --codec still wins, for an encoder that is not one of the ten. */
     codec = st->cfg.export_codec;
     if (!codec || !codec[0])
         codec = fam->encoder;

@@ -737,7 +737,14 @@ RADV - and VBR, CBR or a constant quantiser. An engine has a largest
 picture, which the driver is asked for when the device opens - 4096x4096
 on RADV - and a size past it is refused in the panel with that number
 rather than by the encoder failing to open, so a 5.8K clip goes out at
-3840 wide or half size. APV takes its profile from the format too, so
+3840 wide or half size. **HEVC (Vulkan)** is the HEVC engine through
+`hevc_vulkan`, with the same three rate controls. It takes its profile
+from the format and refuses one that says otherwise, so it has no profile
+presets: the pixel format row is the choice, `p010` for Main 10, the
+default, which every HEVC hardware decoder plays, and `nv12` for Main.
+RADV's HEVC engine goes to 8192x4352, so a 5.8K clip goes out at full
+size. In an MP4 or a QuickTime file HEVC is tagged `hvc1`, which Apple's
+players need, rather than the muxer's default `hev1`. APV takes its profile from the format too, so
 there is nothing there to refuse.
 
 The engine renders straight into whatever was chosen. On the Vulkan path it

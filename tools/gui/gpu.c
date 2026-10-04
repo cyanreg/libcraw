@@ -299,42 +299,37 @@ static VkPhysicalDevice view_pick_device(struct view_gpu *g, const struct view_c
     return best;
 }
 
-/* The largest picture the H.264 engine encodes, High profile, 4:2:0 eight
- * bit - what the H.264 (Vulkan) family writes - as the driver says, for
- * the export's size row: RADV says 4096 by 4096, and a 5.8K clip at full
- * size would otherwise only find out when the encoder failed to open. */
-static void view_gpu_encode_extents(struct view_gpu *g)
+/* The largest picture an encode engine takes and the granularity it takes
+ * pictures in, for one profile of it, as the driver says - for the
+ * export's size row: RADV's H.264 engine stops at 4096x4096, and a 5.8K
+ * clip at full size would otherwise only find out when the encoder failed
+ * to open. `codec` is the profile's codec-specific struct and `codec_caps`
+ * the capabilities struct the query requires for that codec. */
+static void view_gpu_encode_extent(struct view_gpu *g,
+                                   PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR get_caps,
+                                   const char *ext, enum AVCodecID id,
+                                   VkVideoCodecOperationFlagBitsKHR op,
+                                   const void *codec, void *codec_caps,
+                                   const char *name)
 {
-    PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR get_caps;
     bool have = false;
 
     for (int i = 0; i < g->vk->num_extensions; i++)
-        have |= !strcmp(g->vk->extensions[i],
-                        VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME);
-    get_caps = (PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR)
-        g->vk->get_proc_addr(g->vk->instance,
-                             "vkGetPhysicalDeviceVideoCapabilitiesKHR");
-    if (!have || !get_caps)
+        have |= !strcmp(g->vk->extensions[i], ext);
+    if (!have)
         return;
 
-    VkVideoEncodeH264ProfileInfoKHR h264 = {
-        .sType         = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR,
-        .stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_HIGH,
-    };
     VkVideoProfileInfoKHR profile = {
         .sType               = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR,
-        .pNext               = &h264,
-        .videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR,
+        .pNext               = codec,
+        .videoCodecOperation = op,
         .chromaSubsampling   = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR,
         .lumaBitDepth        = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR,
         .chromaBitDepth      = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR,
     };
-    VkVideoEncodeH264CapabilitiesKHR h264_caps = {
-        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR,
-    };
     VkVideoEncodeCapabilitiesKHR enc_caps = {
         .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR,
-        .pNext = &h264_caps,
+        .pNext = codec_caps,
     };
     VkVideoCapabilitiesKHR caps = {
         .sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,
@@ -344,11 +339,52 @@ static void view_gpu_encode_extents(struct view_gpu *g)
     if (get_caps(g->vk->phys_device, &profile, &caps) != VK_SUCCESS)
         return;
 
-    view_presets_engine_extent(AV_CODEC_ID_H264, (int)caps.maxCodedExtent.width,
-                               (int)caps.maxCodedExtent.height);
+    view_presets_engine_extent(id, (int)caps.maxCodedExtent.width,
+                               (int)caps.maxCodedExtent.height,
+                               (int)enc_caps.encodeInputPictureGranularity.width,
+                               (int)enc_caps.encodeInputPictureGranularity.height);
     if (g->verbose)
-        fprintf(stderr, "H.264 encode engine: at most %ux%u\n",
-                caps.maxCodedExtent.width, caps.maxCodedExtent.height);
+        fprintf(stderr, "%s encode engine: at most %ux%u, in blocks of %ux%u\n",
+                name, caps.maxCodedExtent.width, caps.maxCodedExtent.height,
+                enc_caps.encodeInputPictureGranularity.width,
+                enc_caps.encodeInputPictureGranularity.height);
+}
+
+/* The two engines the panel has families for, each asked in its plain
+ * eight bit 4:2:0 profile: the size limits are the engine's, not the
+ * profile's. */
+static void view_gpu_encode_extents(struct view_gpu *g)
+{
+    PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR get_caps =
+        (PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR)
+        g->vk->get_proc_addr(g->vk->instance,
+                             "vkGetPhysicalDeviceVideoCapabilitiesKHR");
+    VkVideoEncodeH264ProfileInfoKHR h264 = {
+        .sType         = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR,
+        .stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_HIGH,
+    };
+    VkVideoEncodeH264CapabilitiesKHR h264_caps = {
+        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR,
+    };
+    VkVideoEncodeH265ProfileInfoKHR hevc = {
+        .sType         = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR,
+        .stdProfileIdc = STD_VIDEO_H265_PROFILE_IDC_MAIN,
+    };
+    VkVideoEncodeH265CapabilitiesKHR hevc_caps = {
+        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR,
+    };
+
+    if (!get_caps)
+        return;
+
+    view_gpu_encode_extent(g, get_caps, VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME,
+                           AV_CODEC_ID_H264,
+                           VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR,
+                           &h264, &h264_caps, "H.264");
+    view_gpu_encode_extent(g, get_caps, VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME,
+                           AV_CODEC_ID_HEVC,
+                           VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR,
+                           &hevc, &hevc_caps, "HEVC");
 }
 
 static void view_craw_log(void *opaque, enum CRAWLogLevel level, const char *fmt,

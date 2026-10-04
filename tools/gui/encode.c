@@ -2744,6 +2744,13 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     ret = avcodec_parameters_from_context(e->vs->codecpar, e->avc);
     if (ret < 0)
         goto fail;
+    /* HEVC in an MP4 or a QuickTime file is `hvc1`, the parameter sets in
+     * the sample description, rather than the muxer's default `hev1`:
+     * Apple's players and QuickTime itself play only the former. */
+    if (e->codec->id == AV_CODEC_ID_HEVC &&
+        (!strcmp(e->oc->oformat->name, "mp4") ||
+         !strcmp(e->oc->oformat->name, "mov")))
+        e->vs->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
     e->vs->time_base      = e->avc->time_base;
     view_enc_bitrate_init(&e->bitrate, e->avc->time_base);
     e->vs->avg_frame_rate = e->fr;
