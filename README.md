@@ -729,9 +729,15 @@ and High is 4:4:4. x264 sets no profile of its own precisely so that this row
 means something: it picks High, High 10, High 4:2:2 or High 4:4:4 Predictive
 from the format it is given. Every x264 preset starts on `4:2:0 8-bit
 (nv12)`, which is High and plays everywhere, where High 10 plays on almost
-no hardware; an H.264 encoder named with `--codec` - `h264_vulkan`, say -
-starts on NV12 too, since only `--pix-fmt` pins a format for an encoder that
-is not the family's own. APV takes its profile from the format too, so
+no hardware; an H.264 encoder named with `--codec` starts on NV12 too,
+since only `--pix-fmt` pins a format for an encoder that is not the
+family's own. **H.264 (Vulkan)** is the GPU's own H.264 engine through
+`h264_vulkan`: High or Main, NV12 - the one layout the engine takes on
+RADV - and VBR, CBR or a constant quantiser. An engine has a largest
+picture, which the driver is asked for when the device opens - 4096x4096
+on RADV - and a size past it is refused in the panel with that number
+rather than by the encoder failing to open, so a 5.8K clip goes out at
+3840 wide or half size. APV takes its profile from the format too, so
 there is nothing there to refuse.
 
 The engine renders straight into whatever was chosen. On the Vulkan path it

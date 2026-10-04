@@ -187,6 +187,17 @@ static const struct view_preset view_presets_x264[] = {
 };
 #define VIEW_X264_DEF 4         /* veryslow */
 
+/* ------------------------------------------------------ H.264 (Vulkan) */
+
+/* The profiles h264_vulkan names, which on a hardware engine is the choice
+ * there is to make: High for anything made today, Main for the players
+ * that stop there. Both are eight bit 4:2:0, the one layout the engine
+ * takes on RADV. */
+static const struct view_preset view_presets_h264_vk[] = {
+    { "High", "profile=high", AV_PIX_FMT_NV12 },
+    { "Main", "profile=main", AV_PIX_FMT_NV12 },
+};
+
 /* --------------------------------------------------------- the families */
 
 /* The parameters every SVT-AV1 encode carries, whatever the mode. */
@@ -231,6 +242,9 @@ static const enum AVPixelFormat view_fmts_x264[] = {
 };
 static const enum AVPixelFormat view_fmts_av1_vk[] = {
     AV_PIX_FMT_P010, AV_PIX_FMT_NV12,
+};
+static const enum AVPixelFormat view_fmts_h264_vk[] = {
+    AV_PIX_FMT_NV12,
 };
 
 #define VIEW_FMTS(l) .fmts = (l), .nb_fmts = (int)CRAW_ARRAY_ELEMS(l)
@@ -329,6 +343,23 @@ const struct view_preset_family view_preset_families[] = {
             { "CRF", false, 0, 51, 18 },
             { "VBR", true },
             { "CBR", true },
+        },
+        .nb_rc = 3, .rc_def = 0, .kbit_def = 40000,
+    },
+    {
+        .name = "H.264 (Vulkan)", .encoder = "h264_vulkan",
+        VIEW_FMTS(view_fmts_h264_vk),
+        .presets = view_presets_h264_vk,
+        .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_h264_vk),
+        .def = 0,
+        .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_RC, .container = "mp4",
+        .scene_fmt = AV_PIX_FMT_NONE,
+        .async_min = 1, .async_max = 4, .async_def = 2,
+        .rc = {
+            { "VBR", true },
+            { "CBR", true },
+            /* The engine's constant quantiser, H.264's own 0 to 51. */
+            { "CQP", false, 0, 51, 20 },
         },
         .nb_rc = 3, .rc_def = 0, .kbit_def = 40000,
     },
@@ -790,10 +821,10 @@ const char *view_presets_opts(const struct view_preset_sel *s, char *buf, size_t
     rc = &f->rc[s->rc];
     bps = (int64_t)CRAW_MAX(s->kbit, 1) * 1000;
 
-    /* av1_vulkan says which mode it is in; the two software encoders are
-     * put into one by what is and is not set, which is what their code
-     * reads. */
-    if (!strcmp(f->encoder, "av1_vulkan")) {
+    /* The Vulkan encoders say which mode they are in, through the option
+     * their common code shares; the two software encoders are put into one
+     * by what is and is not set, which is what their code reads. */
+    if (!strcmp(f->encoder, "av1_vulkan") || !strcmp(f->encoder, "h264_vulkan")) {
         if (rc->bitrate)
             view_opt_add(buf, n, "rc_mode=%s,b=%" PRId64,
                          strcmp(rc->label, "CBR") ? "vbr" : "cbr", bps);
@@ -975,7 +1006,44 @@ static const struct {
 static struct {
     bool known;
     bool have[CRAW_ARRAY_ELEMS(view_engines)];
+    /* The largest picture each engine encodes, as the driver said at
+     * device open; 0 when it was not asked or did not say. */
+    int max_w[CRAW_ARRAY_ELEMS(view_engines)];
+    int max_h[CRAW_ARRAY_ELEMS(view_engines)];
 } view_dev;
+
+void view_presets_engine_extent(enum AVCodecID id, int w, int h)
+{
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_engines); i++) {
+        if (view_engines[i].id != id)
+            continue;
+        view_dev.max_w[i] = w;
+        view_dev.max_h[i] = h;
+    }
+}
+
+const char *view_presets_extent_why_not(const AVCodec *c, int w, int h)
+{
+    static char buf[160];
+
+    if (!c || !view_presets_codec_is_vulkan(c))
+        return NULL;
+
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(view_engines); i++) {
+        /* An engine codes whole macroblocks, so 1080 lines are 1088 to it
+         * and the limit is on those. */
+        if (view_engines[i].id != c->id || !view_dev.max_w[i] ||
+            (((w + 15) & ~15) <= view_dev.max_w[i] &&
+             ((h + 15) & ~15) <= view_dev.max_h[i]))
+            continue;
+        snprintf(buf, sizeof(buf), "%s on this GPU encodes at most %dx%d, "
+                 "and this is %dx%d; pick a smaller size", c->name,
+                 view_dev.max_w[i], view_dev.max_h[i], w, h);
+        return buf;
+    }
+
+    return NULL;
+}
 
 void view_presets_device_exts(const char *const *exts, int n)
 {

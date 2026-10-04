@@ -299,6 +299,58 @@ static VkPhysicalDevice view_pick_device(struct view_gpu *g, const struct view_c
     return best;
 }
 
+/* The largest picture the H.264 engine encodes, High profile, 4:2:0 eight
+ * bit - what the H.264 (Vulkan) family writes - as the driver says, for
+ * the export's size row: RADV says 4096 by 4096, and a 5.8K clip at full
+ * size would otherwise only find out when the encoder failed to open. */
+static void view_gpu_encode_extents(struct view_gpu *g)
+{
+    PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR get_caps;
+    bool have = false;
+
+    for (int i = 0; i < g->vk->num_extensions; i++)
+        have |= !strcmp(g->vk->extensions[i],
+                        VK_KHR_VIDEO_ENCODE_H264_EXTENSION_NAME);
+    get_caps = (PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR)
+        g->vk->get_proc_addr(g->vk->instance,
+                             "vkGetPhysicalDeviceVideoCapabilitiesKHR");
+    if (!have || !get_caps)
+        return;
+
+    VkVideoEncodeH264ProfileInfoKHR h264 = {
+        .sType         = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR,
+        .stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_HIGH,
+    };
+    VkVideoProfileInfoKHR profile = {
+        .sType               = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR,
+        .pNext               = &h264,
+        .videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR,
+        .chromaSubsampling   = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR,
+        .lumaBitDepth        = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR,
+        .chromaBitDepth      = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR,
+    };
+    VkVideoEncodeH264CapabilitiesKHR h264_caps = {
+        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR,
+    };
+    VkVideoEncodeCapabilitiesKHR enc_caps = {
+        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR,
+        .pNext = &h264_caps,
+    };
+    VkVideoCapabilitiesKHR caps = {
+        .sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,
+        .pNext = &enc_caps,
+    };
+
+    if (get_caps(g->vk->phys_device, &profile, &caps) != VK_SUCCESS)
+        return;
+
+    view_presets_engine_extent(AV_CODEC_ID_H264, (int)caps.maxCodedExtent.width,
+                               (int)caps.maxCodedExtent.height);
+    if (g->verbose)
+        fprintf(stderr, "H.264 encode engine: at most %ux%u\n",
+                caps.maxCodedExtent.width, caps.maxCodedExtent.height);
+}
+
 static void view_craw_log(void *opaque, enum CRAWLogLevel level, const char *fmt,
                           va_list args)
 {
@@ -561,6 +613,7 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
     vkGetPhysicalDeviceProperties(g->vk->phys_device, &props);
     g->timestamp_period = props.limits.timestampPeriod;
     g->verbose = cfg->verbose;
+    view_gpu_encode_extents(g);
 
     if (cfg->verbose)
         fprintf(stderr, "device %s, Vulkan %u.%u, queue family %u\n", props.deviceName,

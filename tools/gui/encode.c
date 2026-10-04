@@ -210,6 +210,10 @@ struct view_encode {
      * for the status line: some encoders clamp what they were asked for. */
     int threads;
 
+    /* A refusal in words, which the status line shows instead of the
+     * error code it comes back as. */
+    const char *refusal;
+
     /* The rate the picture is being written at; each sound stream keeps
      * its own. */
     struct view_enc_bitrate bitrate;
@@ -2609,6 +2613,18 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
 
     e->hw = view_presets_codec_is_vulkan(e->codec);
 
+    /* What the panel refuses before the press, said here for --size and
+     * --codec, in a sentence rather than as the encoder failing to open. */
+    {
+        const char *why = view_presets_extent_why_not(e->codec, e->w, e->h);
+
+        if (why) {
+            e->refusal = why;
+            ret = CRAW_ERROR(EINVAL);
+            goto fail;
+        }
+    }
+
     /* view_encode_begin() has asked this already; asked again here of the
      * context that is about to be written, so the two can never disagree. */
     if (avformat_query_codec(e->oc->oformat, e->codec->id,
@@ -3082,7 +3098,11 @@ static int view_enc_fail(struct view_state *st, int ret)
     struct view_video *v = &st->video;
 
     view_encode_lock(st);
-    snprintf(v->status, sizeof(v->status), "failed: %s", av_err2str(ret));
+    if (v->e && v->e->refusal)
+        snprintf(v->status, sizeof(v->status), "%.*s",
+                 (int)sizeof(v->status) - 1, v->e->refusal);
+    else
+        snprintf(v->status, sizeof(v->status), "failed: %s", av_err2str(ret));
     fprintf(stderr, "%s: %s\n", v->path, v->status);
     view_enc_release(st);
     view_encode_unlock(st);

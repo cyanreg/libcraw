@@ -2726,7 +2726,7 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     fam = &view_preset_families[sel->family];
     vulkan = view_presets_family_is_vulkan(sel->family);
 
-    /* --codec still wins, for an encoder that is not one of the eight. */
+    /* --codec still wins, for an encoder that is not one of the nine. */
     codec = st->cfg.export_codec;
     if (!codec || !codec[0])
         codec = fam->encoder;
@@ -2797,6 +2797,17 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
     if (!why && scene && !st->dec.raw)
         why = "a scene-referred export comes out of the raw pipeline, and "
               "this clip is already developed";
+    /* A hardware engine's largest picture, against what the size row
+     * makes of the crop: H.264 on RADV stops at 4096, and a 5.8K clip at
+     * full size is past it. */
+    if (!why && !scene) {
+        int x, y, cw, ch, w, h;
+
+        view_crop_disp_rect(st, &x, &y, &cw, &ch);
+        view_presets_size(sel, cw, ch, &w, &h);
+        why = view_presets_extent_why_not(avcodec_find_encoder_by_name(codec),
+                                          w, h);
+    }
     /* What the file's name decides - the container, whether it carries the
      * encoder and the sound - is judged when the button is pressed, by
      * view_encode_begin(), and never while the name is being typed: every
