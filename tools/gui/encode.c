@@ -2268,9 +2268,9 @@ int view_encode_preroll(struct view_state *st, const AVFrame *f,
 }
 
 /* The extension the selection writes by default. The family names its own
- * container - QuickTime for the codecs a camera writes, Matroska for the
- * archival ones it does not, MP4 for x264 - because a .mov with FFV1 in it
- * is not a file anything else will open. A --codec that is not one of the
+ * container - QuickTime for the codecs a camera writes, Matroska for FFV1,
+ * MP4 for the delivery codecs, H.264, HEVC and AV1 - because a .mov with
+ * FFV1 in it is not a file anything else will open. A --codec that is not one of the
  * families falls back to what its name says. */
 static const char *view_enc_ext(const struct view_preset_sel *sel,
                                 const char *codec)

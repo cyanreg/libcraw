@@ -331,7 +331,7 @@ const struct view_preset_family view_preset_families[] = {
         .presets = view_presets_svtav1,
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_svtav1),
         .def = 0,
-        .ctrl = VIEW_CTRL_CPU | VIEW_CTRL_RC, .container = "mkv",
+        .ctrl = VIEW_CTRL_CPU | VIEW_CTRL_RC, .container = "mp4",
         .always = "svtav1-params=" VIEW_SVT_PARAMS,
         .scene_fmt = AV_PIX_FMT_NONE,
         /* SVT's own default speed, so an untouched slider is the encoder's
@@ -402,7 +402,7 @@ const struct view_preset_family view_preset_families[] = {
         .presets = view_presets_av1_vk,
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_av1_vk),
         .def = 0,
-        .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_RC, .container = "mkv",
+        .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_RC, .container = "mp4",
         .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
         .rc = {

@@ -128,9 +128,9 @@ struct view_video {
 void view_encode_list(void);
 
 /* Next to the clip, named after it and the range, with the extension the
- * selected family names: .mov for what a camera writes, .mkv for FFV1 and
- * the archival ones, .mp4 for x264. `sel` may be NULL, in which case the
- * extension is guessed from `codec`'s name. */
+ * selected family names: .mov for what a camera writes, .mkv for FFV1,
+ * .mp4 for the delivery codecs - H.264, HEVC and AV1. `sel` may be NULL,
+ * in which case the extension is guessed from `codec`'s name. */
 void view_encode_default_path(const struct view_state *st, int64_t start,
                               int64_t end, const struct view_preset_sel *sel,
                               const char *codec, char *out, size_t size);
