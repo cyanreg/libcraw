@@ -154,7 +154,10 @@ others from a text file.
 `cineview` is the interactive viewer and exporter built on SDL3, nuklear
 and libplacebo, when those are found. It decodes with FFmpeg's Vulkan
 hwaccel on libplacebo's device, runs libcraw on the same device, reads the
-file on its own thread and loops by default (`--no-loop`). An RW2 still,
+file on its own thread and loops by default (`--no-loop`). The device must
+have internally synchronized queues (`VK_KHR_internally_synchronized_queues`):
+the window, the reader, a video export and FFmpeg's coders all submit to the
+same queues from their own threads, and none of them takes a lock to do it. An RW2 still,
 whose decoder has no hwaccel, is decoded on the CPU with slice threads and
 uploaded to the device once, and from there it is developed like a ProRes
 RAW frame. A still - an RW2, or any file of one frame - is not looped: it

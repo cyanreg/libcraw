@@ -257,9 +257,7 @@ int view_ui_open(struct view_state *st, void *sdl_window)
 
     nk_sdl_font_stash_begin(&atlas);
     font = view_font_load(st, atlas);
-    view_gpu_lock(g);
     nk_sdl_font_stash_end(g->queue, &aw, &ah);
-    view_gpu_unlock(g);
     /* The backend only installs the built-in face by itself. */
     if (font)
         nk_style_set_font(view_nk, &font->handle);
@@ -3690,10 +3688,8 @@ int view_ui_render(struct view_state *st)
         return CRAW_ERROR(EBUSY);
     }
 
-    view_gpu_lock(g);
     done = nk_sdl_render(g->queue, (uint32_t)slot, view_ui_hold_sem[slot],
                          NK_ANTI_ALIASING_ON);
-    view_gpu_unlock(g);
 
     pl_vulkan_release_ex(g->gpu, pl_vulkan_release_params(
         .tex       = g->ui_tex[slot],

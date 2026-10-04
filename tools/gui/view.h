@@ -1584,10 +1584,6 @@ int  view_gpu_probe_poll(struct view_gpu *g, bool wait, float **rgba,
 int  view_gpu_ui_resize(struct view_gpu *g, int w, int h);
 void view_gpu_ui_drop_old(struct view_gpu *g);
 
-/* The queue lock libplacebo, FFmpeg and we all go through. */
-void view_gpu_lock(struct view_gpu *g);
-void view_gpu_unlock(struct view_gpu *g);
-
 /* ----------------------------------------------------------- decode.c */
 
 int  view_decoder_open(struct view_decoder *d, const char *path,

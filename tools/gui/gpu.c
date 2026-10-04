@@ -126,7 +126,11 @@ static bool view_device_ok(VkPhysicalDevice pd, const CRAWVulkanRequirements *rq
     VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &f14 };
     VkPhysicalDeviceVulkan12Features f12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13 };
     VkPhysicalDeviceVulkan11Features f11 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12 };
-    VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11 };
+    VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR isq = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR,
+        .pNext = &f11,
+    };
+    VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &isq };
     VkPhysicalDeviceProperties props;
     VkQueueFamilyProperties *qprops = NULL;
     VkExtensionProperties *exts = NULL;
@@ -174,6 +178,25 @@ static bool view_device_ok(VkPhysicalDevice pd, const CRAWVulkanRequirements *rq
             if (verbose)
                 fprintf(stderr, "  %s: no %s\n", props.deviceName,
                         rq->required_device_extensions[i]);
+            goto done;
+        }
+    }
+
+    /* Every queue is shared between threads - the window, the export's,
+     * the decoder's and FFmpeg's encoders - and none of them takes a lock
+     * to submit: the driver serialises them. libplacebo enables the
+     * extension and the feature by itself wherever they exist; here they
+     * are what a device is not chosen without. */
+    {
+        bool found = false;
+
+        for (uint32_t j = 0; j < nb_ext; j++)
+            found |= !strcmp(exts[j].extensionName,
+                             VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME);
+        if (!found || !isq.internallySynchronizedQueues) {
+            if (verbose)
+                fprintf(stderr, "  %s: no internally synchronized queues\n",
+                        props.deviceName);
             goto done;
         }
     }
@@ -274,16 +297,6 @@ static VkPhysicalDevice view_pick_device(struct view_gpu *g, const struct view_c
                 cfg->device ? " and matches " : "", cfg->device ? cfg->device : "");
 
     return best;
-}
-
-void view_gpu_lock(struct view_gpu *g)
-{
-    g->vk->lock_queue(g->vk, g->qf, 0);
-}
-
-void view_gpu_unlock(struct view_gpu *g)
-{
-    g->vk->unlock_queue(g->vk, g->qf, 0);
 }
 
 static void view_craw_log(void *opaque, enum CRAWLogLevel level, const char *fmt,
@@ -524,10 +537,16 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
         g->queue_flags = g->vk->queue_graphics.flags;
     }
 
-    /* libplacebo may create the queues with
-     * VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR, and a queue
-     * created with any flag can only be retrieved through
-     * vkGetDeviceQueue2 with the same flags. */
+    /* view_device_ok() chose a device that has internally synchronized
+     * queues, and libplacebo creates every queue with the flag when it
+     * does; this is the one thing nothing here would survive without, so
+     * it is checked rather than assumed. A queue created with a flag can
+     * only be retrieved through vkGetDeviceQueue2 with the same flags. */
+    if (!(g->queue_flags & VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR)) {
+        fprintf(stderr, "libplacebo did not create internally synchronized "
+                        "queues\n");
+        return CRAW_ERROR(ENOTSUP);
+    }
     vkGetDeviceQueue2(g->vk->device, &(VkDeviceQueueInfo2) {
         .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
         .flags            = g->queue_flags,
@@ -1204,9 +1223,7 @@ static int view_gpu_develop(struct view_gpu *g, const AVFrame *frame,
 
     vkResetFences(g->vk->device, 1, &sl->fence);
 
-    view_gpu_lock(g);
     ret = vkQueueSubmit2(g->queue, 1, &submit, sl->fence) == VK_SUCCESS ? 0 : CRAW_ERROR(EIO);
-    view_gpu_unlock(g);
 
     if (ret >= 0)
         sl->busy = true;
@@ -2842,10 +2859,8 @@ static int view_gpu_direct_record(struct view_gpu *g, const AVFrame *frame,
 
     vkResetFences(g->vk->device, 1, &g->direct_fence);
 
-    view_gpu_lock(g);
     ret = vkQueueSubmit2(g->queue, 1, &submit, g->direct_fence) == VK_SUCCESS
         ? 0 : CRAW_ERROR(EIO);
-    view_gpu_unlock(g);
 
     /* The same hand-back contract view_gpu_process() keeps: the value we
      * signalled is what the next user waits on. */

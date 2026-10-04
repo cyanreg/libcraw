@@ -201,18 +201,6 @@ static void view_reader_stop(struct view_decoder *d);
 
 /* ---------------------------------------------------- the device context */
 
-static void view_lock_queue(AVHWDeviceContext *ctx, uint32_t qf, uint32_t idx)
-{
-    pl_vulkan vk = ctx->user_opaque;
-    vk->lock_queue(vk, qf, idx);
-}
-
-static void view_unlock_queue(AVHWDeviceContext *ctx, uint32_t qf, uint32_t idx)
-{
-    pl_vulkan vk = ctx->user_opaque;
-    vk->unlock_queue(vk, qf, idx);
-}
-
 /* Once per program: the device is libplacebo's and lives as long as the
  * window does. */
 static int view_hw_device_create(struct view_decoder *d, struct view_gpu *g)
@@ -245,14 +233,9 @@ static int view_hw_device_create(struct view_decoder *d, struct view_gpu *g)
     vkctx->enabled_dev_extensions     = g->vk->extensions;
     vkctx->nb_enabled_dev_extensions  = g->vk->num_extensions;
 
-    /* Deprecated in favour of VK_KHR_internally_synchronized_queues, but the
-     * installed libavutil still uses them, and without them FFmpeg would
-     * take its own mutex while libplacebo takes a different one. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    vkctx->lock_queue   = view_lock_queue;
-    vkctx->unlock_queue = view_unlock_queue;
-#pragma GCC diagnostic pop
+    /* No queue locks: the queues are internally synchronized (gpu.c), which
+     * FFmpeg reads off the extension and the feature above and takes no
+     * mutex of its own for. */
 
     /* The family this tool works on comes first, and every other family
      * libplacebo enabled queues for follows. More than one entry is what
