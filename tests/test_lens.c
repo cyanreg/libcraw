@@ -587,6 +587,299 @@ static void test_keep_all(const CRAWLensCorrection *real)
                "a zero width was accepted");
 }
 
+/* ---------------------------------------------- turning the picture (16.9) */
+
+/* The scale of a turned frame, both ways, checked against its contract
+ * rather than against a second copy of the walk: filling, every point of
+ * the output frame's outline has a source in all three channels and a
+ * scale a thousandth smaller leaves one without; keeping everything, every
+ * point of the source's outline lands inside the turned frame and a scale a
+ * thousandth larger puts one outside. The outlines are sampled where the
+ * library does not sample them, 331 points a side offset by half a step,
+ * the way the keep-everything test above samples them. */
+
+#define TEST_DEG (3.14159265358979323846 / 180.0)
+
+/* tools/prr_lens.md section 5, P1000261 at 24 mm: the barrel end of the
+ * 24-60, where the record's own frame throws away 209 px of the source at
+ * each corner. */
+static const CRAWLensCorrection test_w24 = {
+    .k = { { 0.99965795f, -1.19016e-01f, 6.71727e-02f, -1.21451e-02f },
+           { 0.99908949f, -1.18440e-01f, 6.67320e-02f, -1.19222e-02f },
+           { 0.99902956f, -1.17697e-01f, 6.61432e-02f, -1.16425e-02f } },
+    .centre = { 0.5f, 0.5f },
+    .valid  = true,
+};
+
+/* No correction: what a frame without a record is turned with. */
+static const CRAWLensCorrection test_none = {
+    .k = { { 1.0f, 0.0f, 0.0f, 0.0f },
+           { 1.0f, 0.0f, 0.0f, 0.0f },
+           { 1.0f, 0.0f, 0.0f, 0.0f } },
+    .centre = { 0.5f, 0.5f },
+    .valid  = true,
+};
+
+static void test_outline(int side, double t, double w, double h, double *px, double *py)
+{
+    switch (side) {
+    case 0:  *px = t * w;         *py = 0.0;           break;
+    case 1:  *px = w;             *py = t * h;         break;
+    case 2:  *px = (1.0 - t) * w; *py = h;             break;
+    default: *px = 0.0;           *py = (1.0 - t) * h; break;
+    }
+}
+
+static double test_half_diag(const CRAWLensCorrection *lc, double w, double h)
+{
+    double hx = (double)(lc->centre[0] > 1.0f - lc->centre[0] ? lc->centre[0]
+                                                              : 1.0f - lc->centre[0]) * w;
+    double hy = (double)(lc->centre[1] > 1.0f - lc->centre[1] ? lc->centre[1]
+                                                              : 1.0f - lc->centre[1]) * h;
+
+    return hypot(hx, hy);
+}
+
+/* How far outside the frame the furthest of an output point's three
+ * sources lies, in pixels, filling at scale `s` turned `deg` clockwise:
+ * the corrected position is the output offset turned back and divided by
+ * the scale, and each channel's source is on its ray at r * poly(r). */
+static double test_fill_over(const CRAWLensCorrection *lc, double w, double h,
+                             double deg, double s, double px, double py)
+{
+    double cx = lc->centre[0] * w, cy = lc->centre[1] * h;
+    double half_diag = test_half_diag(lc, w, h);
+    double ct = cos(deg * TEST_DEG), st = sin(deg * TEST_DEG);
+    double dx = px - cx, dy = py - cy;
+    double qx = (ct * dx + st * dy) / s, qy = (ct * dy - st * dx) / s;
+    double r = hypot(qx, qy) / half_diag, worst = -HUGE_VAL;
+
+    for (int c = 0; c < 3; c++) {
+        const float *k = lc->k[c];
+        double r2 = r * r;
+        double poly = k[0] + r2 * (k[1] + r2 * (k[2] + r2 * k[3]));
+        double sx = cx + qx * poly, sy = cy + qy * poly;
+
+        worst = fmax(worst, fmax(fmax(-sx, sx - w), fmax(-sy, sy - h)));
+    }
+
+    return worst;
+}
+
+/* The same for a source point keeping everything: where it lands in the
+ * output, turned, and how far outside the frame that is. The channel that
+ * needs the largest output radius is the one that has to fit. */
+static double test_keep_over(const CRAWLensCorrection *lc, double w, double h,
+                             double deg, double s, double px, double py)
+{
+    double cx = lc->centre[0] * w, cy = lc->centre[1] * h;
+    double half_diag = test_half_diag(lc, w, h);
+    double ct = cos(deg * TEST_DEG), st = sin(deg * TEST_DEG);
+    double dx = px - cx, dy = py - cy, len = hypot(dx, dy), needed = 0.0;
+    double qx, qy, ox, oy;
+
+    if (!(len > 0.0))
+        return -HUGE_VAL;
+
+    for (int c = 0; c < 3; c++)
+        needed = fmax(needed, test_keep_invert(lc->k[c], len / half_diag));
+
+    /* Corrected position, then turned clockwise on screen: with y down
+     * that is (x cos - y sin, x sin + y cos). */
+    qx = dx / len * needed * half_diag;
+    qy = dy / len * needed * half_diag;
+    ox = cx + s * (ct * qx - st * qy);
+    oy = cy + s * (st * qx + ct * qy);
+
+    return fmax(fmax(-ox, ox - w), fmax(-oy, oy - h));
+}
+
+/* The worst point of an outline under one of the two contracts. */
+static double test_turn_worst(const CRAWLensCorrection *lc, double w, double h,
+                              double deg, double s, bool keep_all, int segs,
+                              double offset)
+{
+    double worst = -HUGE_VAL;
+
+    for (int side = 0; side < 4; side++) {
+        for (int i = 0; i < segs; i++) {
+            double px, py;
+
+            test_outline(side, ((double)i + offset) / segs, w, h, &px, &py);
+            worst = fmax(worst, keep_all ? test_keep_over(lc, w, h, deg, s, px, py)
+                                         : test_fill_over(lc, w, h, deg, s, px, py));
+        }
+    }
+
+    return worst;
+}
+
+static float test_turn_scale(const char *what, const CRAWLensCorrection *lc,
+                             uint32_t width, uint32_t height, float deg, bool keep_all)
+{
+    double w = width, h = height, worst;
+    float s = 0.0f;
+    int ret;
+
+    ret = craw_lens_rotation_scale(lc, width, height, deg, keep_all, &s);
+    TEST_CHECK(ret == 0, "%s at %+.2f deg %s: craw_lens_rotation_scale returned %d",
+               what, (double)deg, keep_all ? "keep" : "fill", ret);
+    if (ret < 0)
+        return 0.0f;
+
+    /* The contract at the answer. */
+    worst = test_turn_worst(lc, w, h, deg, s, keep_all, 331, 0.5);
+    TEST_CHECK(worst <= 1e-6 * w, "%s at %+.2f deg %s: scale %.6f leaves a point %.4f px "
+               "outside the frame", what, (double)deg, keep_all ? "keep" : "fill",
+               (double)s, worst);
+
+    /* And that it is the tightest one, unless the cap decided: a fill that
+     * needs no magnification sits at exactly 1, and so does a keep that
+     * needs no shrink. */
+    if (s != 1.0f) {
+        double tighter = keep_all ? (double)s * 1.001 : (double)s / 1.001;
+        double over = test_turn_worst(lc, w, h, deg, tighter, keep_all, 512, 0.0);
+
+        TEST_CHECK(over > 0.0, "%s at %+.2f deg %s: a scale 0.1%% %s than %.6f still "
+                   "holds, so it is not the %s one", what, (double)deg,
+                   keep_all ? "keep" : "fill", keep_all ? "larger" : "smaller",
+                   (double)s, keep_all ? "largest" : "smallest");
+    }
+
+    return s;
+}
+
+/* No correction is a rectangle turned inside a rectangle, which has a
+ * closed form: the turned frame's extent along each axis over the frame's,
+ * whichever is larger, and keeping everything is its reciprocal. */
+static double test_turn_closed(double w, double h, double deg)
+{
+    double ct = cos(deg * TEST_DEG), st = fabs(sin(deg * TEST_DEG));
+
+    return fmax((w * st + h * ct) / h, (w * ct + h * st) / w);
+}
+
+static void test_rotation(const CRAWLensCorrection *real)
+{
+    static const float degs[] = { 0.01f, 0.5f, 2.0f, 5.0f, 12.5f, 30.0f, 44.9f };
+    static const struct {
+        const char *name;
+        const CRAWLensCorrection *lc;
+    } recs[] = {
+        { "no correction", &test_none },
+        { "the real 24 mm record", &test_w24 },
+        { "the real 60 mm record", NULL },
+    };
+    CRAWLensCorrection invalid = { 0 };
+    float s, s2;
+
+    /* Every record, both ways, both directions: the contract. */
+    for (size_t r = 0; r < CRAW_ARRAY_ELEMS(recs); r++) {
+        const CRAWLensCorrection *lc = recs[r].lc ? recs[r].lc : real;
+
+        for (size_t i = 0; i < CRAW_ARRAY_ELEMS(degs); i++) {
+            for (int sign = -1; sign <= 1; sign += 2) {
+                float deg = (float)sign * degs[i];
+                float fill = test_turn_scale(recs[r].name, lc, FRAME_W, FRAME_H, deg, false);
+                float keep = test_turn_scale(recs[r].name, lc, FRAME_W, FRAME_H, deg, true);
+
+                if (sign > 0)
+                    printf("%s, turned %5.2f deg: fill %.5f, keep %.5f (no correction "
+                           "%.5f)\n", recs[r].name, (double)deg, (double)fill,
+                           (double)keep, test_turn_closed(FRAME_W, FRAME_H, deg));
+            }
+        }
+    }
+
+    /* No correction against the closed form, which a walk of the outline
+     * has no way to know: the binding point of a turned rectangle is a
+     * corner, which the walk lands on, and nothing else. NULL and an
+     * invalid record are both that. */
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(degs); i++) {
+        double want = test_turn_closed(FRAME_W, FRAME_H, degs[i]);
+
+        s = s2 = 0.0f;
+        craw_lens_rotation_scale(NULL, FRAME_W, FRAME_H, degs[i], false, &s);
+        craw_lens_rotation_scale(&invalid, FRAME_W, FRAME_H, -degs[i], true, &s2);
+        TEST_CHECK(fabs(s - want) <= 1e-6 * want,
+                   "no correction at %.2f deg fills at %.7f, the closed form says %.7f",
+                   (double)degs[i], (double)s, want);
+        TEST_CHECK(fabs(s2 - 1.0 / want) <= 1e-6 / want,
+                   "no correction at %.2f deg keeps at %.7f, the closed form says %.7f",
+                   -(double)degs[i], (double)s2, 1.0 / want);
+    }
+
+    /* Unturned: filling is the record's own frame, exactly 1 whatever the
+     * record does, and keeping everything is craw_lens_keep_all_scale() to
+     * the bit, so that a frame at 0 degrees is the frame it always was. */
+    for (size_t r = 0; r < CRAW_ARRAY_ELEMS(recs); r++) {
+        const CRAWLensCorrection *lc = recs[r].lc ? recs[r].lc : real;
+
+        s = 0.0f;
+        TEST_CHECK(craw_lens_rotation_scale(lc, FRAME_W, FRAME_H, 0.0f, false, &s) == 0 &&
+                   s == 1.0f, "%s unturned fills at %.9f, not exactly 1", recs[r].name,
+                   (double)s);
+        TEST_CHECK(craw_lens_rotation_scale(lc, FRAME_W, FRAME_H, 0.0f, true, &s) == 0 &&
+                   craw_lens_keep_all_scale(lc, FRAME_W, FRAME_H, &s2) == 0 && s == s2,
+                   "%s unturned keeps at %.9f, craw_lens_keep_all_scale says %.9f",
+                   recs[r].name, (double)s, (double)s2);
+
+        /* And turning starts from there rather than jumping: every record
+         * seen keeps its own frame on the source, so the first thousandth
+         * of a degree costs nothing measurable either way. */
+        craw_lens_rotation_scale(lc, FRAME_W, FRAME_H, 1e-3f, false, &s);
+        craw_lens_rotation_scale(lc, FRAME_W, FRAME_H, -1e-3f, true, &s2);
+        TEST_CHECK(s >= 1.0f && s - 1.0f < 1e-4f,
+                   "%s at a thousandth of a degree fills at %.7f", recs[r].name, (double)s);
+        craw_lens_rotation_scale(lc, FRAME_W, FRAME_H, 0.0f, true, &s);
+        TEST_CHECK(fabsf(s2 - s) < 1e-4f,
+                   "%s at a thousandth of a degree keeps at %.7f against %.7f unturned",
+                   recs[r].name, (double)s2, (double)s);
+    }
+
+    /* What the whole thing is for. At the wide end the correction pulls
+     * the source's corners out past the frame and the record's own frame
+     * throws them away; a turn swings the frame's corners out into them.
+     * Up to a couple of degrees that costs no magnification at all, where
+     * the uncorrected frame already needs 6.6%; past it, it still costs
+     * clearly less. */
+    craw_lens_rotation_scale(&test_w24, FRAME_W, FRAME_H, 2.0f, false, &s);
+    TEST_CHECK(s == 1.0f, "the 24 mm record turned 2 deg fills at %.6f; its thrown away "
+               "corners should cover the turn", (double)s);
+    craw_lens_rotation_scale(&test_w24, FRAME_W, FRAME_H, 5.0f, false, &s);
+    TEST_CHECK(s < test_turn_closed(FRAME_W, FRAME_H, 5.0) - 0.05,
+               "the 24 mm record turned 5 deg fills at %.6f, hardly better than the "
+               "%.6f with no correction", (double)s, test_turn_closed(FRAME_W, FRAME_H, 5.0));
+    /* The pincushion end throws away the bulge beyond each edge under k0's
+     * crop, which the turned corners reach less of; it still has to help
+     * and never hurt. */
+    craw_lens_rotation_scale(real, FRAME_W, FRAME_H, 5.0f, false, &s);
+    TEST_CHECK(s < test_turn_closed(FRAME_W, FRAME_H, 5.0),
+               "the 60 mm record turned 5 deg fills at %.6f, no better than the %.6f "
+               "with no correction", (double)s, test_turn_closed(FRAME_W, FRAME_H, 5.0));
+
+    /* Either direction is the same magnification for a centred record, the
+     * frame being symmetric about both axes. */
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(degs); i++) {
+        craw_lens_rotation_scale(&test_w24, FRAME_W, FRAME_H, degs[i], false, &s);
+        craw_lens_rotation_scale(&test_w24, FRAME_W, FRAME_H, -degs[i], false, &s2);
+        TEST_CHECK(fabsf(s - s2) <= 1e-6f * s, "the 24 mm record fills at %.7f turned "
+                   "%.2f deg and %.7f turned back", (double)s, (double)degs[i], (double)s2);
+    }
+
+    s = 0.0f;
+    TEST_CHECK(craw_lens_rotation_scale(real, FRAME_W, FRAME_H, 45.0f, false, &s) ==
+               CRAW_ERROR(EINVAL), "a turn of 45 degrees was accepted");
+    TEST_CHECK(craw_lens_rotation_scale(real, FRAME_W, FRAME_H, -45.0f, true, &s) ==
+               CRAW_ERROR(EINVAL), "a turn of -45 degrees was accepted");
+    TEST_CHECK(craw_lens_rotation_scale(real, FRAME_W, FRAME_H, NAN, false, &s) ==
+               CRAW_ERROR(EINVAL), "a turn that is not a number was accepted");
+    TEST_CHECK(craw_lens_rotation_scale(real, FRAME_W, FRAME_H, 1.0f, false, NULL) ==
+               CRAW_ERROR(EINVAL), "a NULL output was accepted");
+    TEST_CHECK(craw_lens_rotation_scale(NULL, FRAME_W, 0, 1.0f, false, &s) ==
+               CRAW_ERROR(EINVAL), "a zero height was accepted");
+}
+
 #if CRAW_TEST_HAVE_LAVF
 /* The same parser on a packet straight out of libavformat, when a clip is
  * pointed at. Nothing is decoded. */
@@ -669,6 +962,8 @@ int main(void)
     test_record(&lc);
 
     test_keep_all(&lc);
+
+    test_rotation(&lc);
 
     test_malformed(frame, size, tbl, trailer_off);
 

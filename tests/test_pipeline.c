@@ -1485,6 +1485,8 @@ done:
  * expected; at 14 pixels a sigma 3 Gaussian is down by e^-10.9. */
 #define TEST_LENS_WIN 14
 
+#define TEST_DEG (3.14159265358979323846 / 180.0)
+
 /* P1000387.MOV frame 0, tools/prr_lens.md 5: the LUMIX S 24-60 at 60 mm,
  * +81 px of pincushion corrected at the corner of a 5760x3040 frame. */
 static const CRAWLensCorrection test_lens_real = {
@@ -1618,13 +1620,14 @@ static bool test_lens_centroid(const float *img, uint32_t w, uint32_t h, int c,
 static int test_lens_geometry(const char *what, const float *off, const float *on,
                               uint32_t w, uint32_t h, const CRAWLensCorrection *lc,
                               const double (*dots)[2], const int *wins, int nb,
-                              double scale, double bg, double tol)
+                              double scale, double deg, double bg, double tol)
 {
     double cx = lc->centre[0] * (double)w;
     double cy = lc->centre[1] * (double)h;
     double hx = (double)CRAW_MAX(lc->centre[0], 1.0f - lc->centre[0]) * (double)w;
     double hy = (double)CRAW_MAX(lc->centre[1], 1.0f - lc->centre[1]) * (double)h;
     double half_diag = sqrt(hx * hx + hy * hy);
+    double ct = cos(deg * TEST_DEG), st = sin(deg * TEST_DEG);
     double worst = 0.0;
     int fails = 0;
 
@@ -1642,12 +1645,15 @@ static int test_lens_geometry(const char *what, const float *off, const float *o
 
             /* Where the warp has to put what sits at `src`. Filling the
              * frame is `scale` 1; keeping everything shrinks the whole
-             * picture by the mode's own factor on top of the inverse. */
+             * picture by the mode's own factor on top of the inverse, and
+             * a turn magnifies it by its own. Then the turn itself,
+             * clockwise as looked at, which with y down is
+             * (x cos - y sin, x sin + y cos) about the centre. */
             r_src = hypot(src[0] - cx, src[1] - cy) / half_diag;
             r_dst = test_lens_invert(lc->k[c], r_src) * scale;
             factor = r_dst / r_src;
-            want[0] = cx + (src[0] - cx) * factor;
-            want[1] = cy + (src[1] - cy) * factor;
+            want[0] = cx + ct * (src[0] - cx) * factor - st * (src[1] - cy) * factor;
+            want[1] = cy + st * (src[0] - cx) * factor + ct * (src[1] - cy) * factor;
 
             if (!test_lens_centroid(on, w, h, c, want[0], want[1], wins[i], bg, got)) {
                 fprintf(stderr, "%s: mark %d channel %c was not found near "
@@ -1751,7 +1757,7 @@ static int test_lens_analytic(CRAWTestDevice *td, CRAWContext *ctx,
         goto done;
 
     ret = test_lens_geometry("gpu", off, on, TEST_LENS_W, TEST_LENS_H,
-                             &test_lens_synth, dots, wins, nb_dots, 1.0, 0.0, 0.25);
+                             &test_lens_synth, dots, wins, nb_dots, 1.0, 0.0, 0.0, 0.25);
     if (ret < 0)
         goto done;
 
@@ -1768,7 +1774,7 @@ static int test_lens_analytic(CRAWTestDevice *td, CRAWContext *ctx,
         goto done;
 
     ret = test_lens_geometry("ref", off, on, TEST_LENS_W, TEST_LENS_H,
-                             &test_lens_synth, dots, wins, nb_dots, 1.0, 0.0, 0.25);
+                             &test_lens_synth, dots, wins, nb_dots, 1.0, 0.0, 0.0, 0.25);
 
 done:
     if (ret < 0)
@@ -1814,14 +1820,18 @@ static const int test_keep_wins[] = { TEST_LENS_WIN, TEST_LENS_WIN, 4 };
  * the frame and negative inside, in pixels, so that the pixels the two
  * arithmetics can legitimately disagree about are the ones near zero. */
 static bool test_keep_outside(const CRAWLensCorrection *lc, double w, double h,
-                              double s, int x, int y, double *margin)
+                              double s, double deg, int x, int y, double *margin)
 {
     double cx = lc->centre[0] * w, cy = lc->centre[1] * h;
     double hx = (double)CRAW_MAX(lc->centre[0], 1.0f - lc->centre[0]) * w;
     double hy = (double)CRAW_MAX(lc->centre[1], 1.0f - lc->centre[1]) * h;
     double half_diag = hypot(hx, hy);
-    double dx = ((double)x + 0.5 - cx) / s;
-    double dy = ((double)y + 0.5 - cy) / s;
+    double ct = cos(deg * TEST_DEG), st = sin(deg * TEST_DEG);
+    double ox = (double)x + 0.5 - cx, oy = (double)y + 0.5 - cy;
+    /* The output offset turned back onto the corrected picture, DESIGN.md
+     * 16.9, then divided by the scale. */
+    double dx = (ct * ox + st * oy) / s;
+    double dy = (ct * oy - st * ox) / s;
     double r2 = (dx * dx + dy * dy) / (half_diag * half_diag);
     double worst = -HUGE_VAL;
 
@@ -1975,7 +1985,7 @@ static int test_lens_keep(CRAWTestDevice *td, CRAWContext *ctx,
      * in the corrected one. */
     ret = test_lens_geometry("keep", off, keep, TEST_LENS_W, TEST_LENS_H,
                              &test_lens_synth, dots, wins, TEST_KEEP_MEASURED,
-                             (double)scale, TEST_KEEP_BASE, 0.25);
+                             (double)scale, 0.0, TEST_KEEP_BASE, 0.25);
     if (ret < 0)
         goto done;
 
@@ -2038,7 +2048,7 @@ static int test_lens_keep(CRAWTestDevice *td, CRAWContext *ctx,
             const float *px = &keep[((size_t)y * TEST_LENS_W + x) * 4];
             double margin;
             bool outside = test_keep_outside(&test_lens_synth, TEST_LENS_W,
-                                             TEST_LENS_H, (double)scale,
+                                             TEST_LENS_H, (double)scale, 0.0,
                                              (int)x, (int)y, &margin);
 
             if (fabs(margin) < 0.01) {
@@ -2115,7 +2125,7 @@ static int test_lens_keep(CRAWTestDevice *td, CRAWContext *ctx,
 
         if (gb == rb)
             continue;
-        test_keep_outside(&test_lens_synth, TEST_LENS_W, TEST_LENS_H, (double)scale,
+        test_keep_outside(&test_lens_synth, TEST_LENS_W, TEST_LENS_H, (double)scale, 0.0,
                           (int)(i % TEST_LENS_W), (int)(i / TEST_LENS_W), &margin);
         if (fabs(margin) < 0.01)
             continue;
@@ -2137,6 +2147,485 @@ done:
     free(ref);
     free(keep);
     free(fill2);
+    free(fill);
+    free(off);
+    free(mosaic);
+
+    return ret;
+}
+
+/* ------------------------------------- turning the picture (DESIGN.md 16.9) */
+
+/* The turn, clockwise. On this frame with the synthetic barrel record five
+ * degrees is more than the corners the record's own frame throws away can
+ * cover on their own, so both halves of the claim are exercised: the turn
+ * uses them, and then magnifies by what is still missing, which is a
+ * fraction of what the uncorrected frame needs. Two degrees is a turn they
+ * cover entirely. */
+#define TEST_TURN_DEG 5.0
+#define TEST_TURN_FREE_DEG 2.0
+
+/* The mark that only the turn can show sits this far inside the frame's
+ * top right corner, at a pixel centre. */
+#define TEST_TURN_INSET 6
+
+/* Where the marks of the turn test sit, as a fraction of the half
+ * diagonal, and in which direction: down and right, and up and left, so
+ * that the turn is measured on two sides of the centre. */
+static const double test_turn_radii[] = { 0.35, 0.55 };
+static const double test_turn_dirs[][2] = { { 1.0, 1.0 }, { -1.0, -1.0 } };
+#define TEST_TURN_MEASURED 2
+
+/* One frame on a pipeline that already exists, so that whatever it keeps
+ * between recordings - the scale and what it was worked out for - is part
+ * of what is tested. */
+static int test_run_pipe(CRAWTestDevice *td, CRAWPipeline *pipe, CRAWTestImage *src,
+                         CRAWTestImage *dst, const CRAWFrameParams *fp, float *out,
+                         size_t npix)
+{
+    struct test_run run = { .pipe = pipe, .src = src, .dst = dst, .fp = fp };
+    uint16_t *half;
+    double ms = 0.0;
+    int ret;
+
+    ret = craw_testdev_run_timed(td, test_record, &run, &ms);
+    if (ret < 0)
+        return ret;
+
+    half = malloc(npix * 4 * sizeof(*half));
+    if (!half)
+        return CRAW_ERROR(ENOMEM);
+
+    ret = craw_testdev_image_download(td, dst, half, npix * 4 * sizeof(*half));
+    if (ret == 0)
+        for (size_t i = 0; i < npix * 4; i++)
+            out[i] = test_half_to_float(half[i]);
+    free(half);
+
+    return ret;
+}
+
+/* The corrected picture's offset from the centre that the output pixel
+ * centre (x, y) shows once turned `deg` clockwise and magnified by `s`, and
+ * the channel's source position of it, in double. */
+static void test_turn_source(const CRAWLensCorrection *lc, double w, double h,
+                             double deg, double s, double x, double y, int c,
+                             double q[2], double src[2])
+{
+    double cx = lc->centre[0] * w, cy = lc->centre[1] * h;
+    double half_diag = hypot(CRAW_MAX(lc->centre[0], 1.0f - lc->centre[0]) * w,
+                             CRAW_MAX(lc->centre[1], 1.0f - lc->centre[1]) * h);
+    double ct = cos(deg * TEST_DEG), st = sin(deg * TEST_DEG);
+    double dx = x - cx, dy = y - cy, poly;
+
+    q[0] = (ct * dx + st * dy) / s;
+    q[1] = (ct * dy - st * dx) / s;
+    poly = test_lens_poly(lc->k[c], hypot(q[0], q[1]) / half_diag);
+    src[0] = cx + q[0] * poly;
+    src[1] = cy + q[1] * poly;
+}
+
+/* The angle of a mark about the frame's centre, in degrees, growing
+ * clockwise as looked at because y grows downwards. */
+static double test_turn_angle(const float *img, int c, double x, double y,
+                              int win, double bg)
+{
+    double at[2];
+
+    if (!test_lens_centroid(img, TEST_LENS_W, TEST_LENS_H, c, x, y, win, bg, at))
+        return NAN;
+
+    return atan2(at[1] - TEST_LENS_H * 0.5, at[0] - TEST_LENS_W * 0.5) / TEST_DEG;
+}
+
+/* The turn end to end on the synthetic frame. The marks land where the
+ * record's inverse, the scale and the turn say; the turn is clockwise; a
+ * mark the record's own frame throws away comes back in the turned frame's
+ * corner; filling leaves no pixel without a source and keeping everything
+ * paints black exactly where there is none; the GPU agrees with the
+ * reference in every mode; and nothing a turn leaves behind in the
+ * pipeline changes the next frame. */
+static int test_lens_turn(CRAWTestDevice *td, CRAWContext *ctx,
+                          const CRAWProfile *identity)
+{
+    const size_t npix = (size_t)TEST_LENS_W * TEST_LENS_H;
+    const double half_diag = sqrt((double)(TEST_LENS_W * TEST_LENS_W +
+                                           TEST_LENS_H * TEST_LENS_H)) * 0.5;
+    const double corner[2] = { TEST_LENS_W - TEST_TURN_INSET + 0.5,
+                               TEST_TURN_INSET + 0.5 };
+    CRAWLensCorrection none = { 0 };
+    double dots[8][2], q[2], csrc[2], err, over;
+    int wins[8];
+    CRAWTestImage src = { 0 }, dst = { 0 };
+    bool have_src = false, have_dst = false;
+    CRAWPipeline *pipe = NULL;
+    CRAWPipelineParams pp;
+    CRAWFrameParams fp;
+    uint16_t *mosaic = NULL;
+    float *off = NULL, *fill = NULL, *turn = NULL, *again = NULL, *ref = NULL;
+    float s_turn, s_free, s_none, s_keep;
+    size_t black = 0, lit = 0, guard = 0;
+    int ret;
+
+    /* The identity, for the turn of a frame with no record: what the
+     * library turns such a frame with, about the frame's centre. */
+    none = test_lens_synth;
+    for (int c = 0; c < 3; c++) {
+        none.k[c][0] = 1.0f;
+        none.k[c][1] = 0.0f;
+    }
+
+    if ((ret = craw_lens_rotation_scale(&test_lens_synth, TEST_LENS_W, TEST_LENS_H,
+                                        TEST_TURN_DEG, false, &s_turn)) < 0 ||
+        (ret = craw_lens_rotation_scale(&test_lens_synth, TEST_LENS_W, TEST_LENS_H,
+                                        TEST_TURN_FREE_DEG, false, &s_free)) < 0 ||
+        (ret = craw_lens_rotation_scale(NULL, TEST_LENS_W, TEST_LENS_H,
+                                        TEST_TURN_DEG, false, &s_none)) < 0 ||
+        (ret = craw_lens_rotation_scale(&test_lens_synth, TEST_LENS_W, TEST_LENS_H,
+                                        TEST_TURN_DEG, true, &s_keep)) < 0) {
+        fprintf(stderr, "craw_lens_rotation_scale failed: %d\n", ret);
+        return ret;
+    }
+
+    printf("  turned %.0f deg: fills at %.5f with the record, %.5f without one; "
+           "%.0f deg fills at %.5f; keeping everything %.5f\n", TEST_TURN_DEG,
+           (double)s_turn, (double)s_none, TEST_TURN_FREE_DEG, (double)s_free,
+           (double)s_keep);
+
+    /* The test frame has to be one that shows what it claims: a turn the
+     * thrown away corners cover entirely, and one they cover in part. */
+    if (s_free != 1.0f || !(s_turn > 1.0f) || !(s_turn < 1.0f + 0.5f * (s_none - 1.0f))) {
+        fprintf(stderr, "the synthetic record does not separate the cases on this "
+                        "frame; the test proves nothing\n");
+        return -1;
+    }
+
+    for (int i = 0; i < TEST_TURN_MEASURED; i++) {
+        double n = hypot(test_turn_dirs[i][0] * TEST_LENS_W, test_turn_dirs[i][1] * TEST_LENS_H);
+
+        dots[i][0] = TEST_LENS_W * 0.5 + test_turn_dirs[i][0] * TEST_LENS_W / n *
+                                         test_turn_radii[i] * half_diag;
+        dots[i][1] = TEST_LENS_H * 0.5 + test_turn_dirs[i][1] * TEST_LENS_H / n *
+                                         test_turn_radii[i] * half_diag;
+        wins[i] = TEST_LENS_WIN;
+    }
+
+    /* The third mark is put where the turned frame's top right corner
+     * takes green from. Unturned, the record's own frame shows the
+     * corrected picture as it is, so that mark would have to be shown at
+     * `q` - which is past the frame's top edge. */
+    test_turn_source(&test_lens_synth, TEST_LENS_W, TEST_LENS_H, TEST_TURN_DEG,
+                     (double)s_turn, corner[0], corner[1], 1, q, csrc);
+    dots[TEST_TURN_MEASURED][0] = csrc[0];
+    dots[TEST_TURN_MEASURED][1] = csrc[1];
+    over = -(TEST_LENS_H * 0.5 + q[1]);
+    printf("  the turned corner shows the source at (%.1f, %.1f), which the record's "
+           "own frame puts %.1f px above its top edge\n", csrc[0], csrc[1], over);
+    if (!(over > 5.0)) {
+        fprintf(stderr, "the corner mark is only %.2f px past the unturned frame; it "
+                        "is not something the record's own frame throws away\n", over);
+        return -1;
+    }
+
+    mosaic = malloc(npix * sizeof(*mosaic));
+    off = malloc(npix * 4 * sizeof(*off));
+    fill = malloc(npix * 4 * sizeof(*fill));
+    turn = malloc(npix * 4 * sizeof(*turn));
+    again = malloc(npix * 4 * sizeof(*again));
+    ref = malloc(npix * 4 * sizeof(*ref));
+    if (!mosaic || !off || !fill || !turn || !again || !ref) {
+        ret = CRAW_ERROR(ENOMEM);
+        goto done;
+    }
+
+    test_lens_gen_dots(mosaic, TEST_LENS_W, TEST_LENS_H, dots, TEST_TURN_MEASURED + 1,
+                       3.0, 0.40, TEST_KEEP_BASE);
+
+    ret = craw_testdev_image_create(td, &src, TEST_LENS_W, TEST_LENS_H, VK_FORMAT_R16_UNORM);
+    if (ret < 0)
+        goto done;
+    have_src = true;
+    ret = craw_testdev_image_create(td, &dst, TEST_LENS_W, TEST_LENS_H,
+                                    VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (ret < 0)
+        goto done;
+    have_dst = true;
+    ret = craw_testdev_image_upload(td, &src, mosaic, npix * sizeof(*mosaic));
+    if (ret < 0)
+        goto done;
+
+    craw_pipeline_params_init(&pp);
+    pp.width = TEST_LENS_W;
+    pp.height = TEST_LENS_H;
+    pp.debayer = CRAW_DEBAYER_RCD;
+    pp.out_space = CRAW_CS_XYZ_D65;
+    pp.flags = CRAW_PIPELINE_FLAG_LENS;
+
+    /* One pipeline for everything that follows, recorded frame after frame
+     * the way a player records it. */
+    ret = craw_pipeline_create(ctx, &pp, &pipe);
+    if (ret < 0)
+        goto done;
+
+    /* Unturned, without and with the record: where the marks are in the
+     * source, and the record's own frame. */
+    craw_frame_params_init(&fp);
+    fp.profile = identity;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, off, npix)) < 0)
+        goto done;
+    fp.lens = test_lens_synth;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, fill, npix)) < 0)
+        goto done;
+
+    /* 1. Turned with the record. */
+    fp.rotation = (float)TEST_TURN_DEG;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, turn, npix)) < 0)
+        goto done;
+
+    ret = test_lens_geometry("turn", off, turn, TEST_LENS_W, TEST_LENS_H,
+                             &test_lens_synth, dots, wins, TEST_TURN_MEASURED,
+                             (double)s_turn, TEST_TURN_DEG, TEST_KEEP_BASE, 0.25);
+    if (ret < 0)
+        goto done;
+
+    /* The corner mark, by its peak, the way the keep test finds the mark
+     * that sits too close to an edge for a centroid window. */
+    {
+        double peak = -HUGE_VAL, at[2] = { 0, 0 };
+        int x0 = (int)floor(corner[0]) - 4, x1 = (int)floor(corner[0]) + 4;
+        int y0 = (int)floor(corner[1]) - 4, y1 = (int)floor(corner[1]) + 4;
+
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                double v = turn[((size_t)y * TEST_LENS_W + x) * 4 + 1];
+
+                if (v > peak) {
+                    peak = v;
+                    at[0] = (double)x + 0.5;
+                    at[1] = (double)y + 0.5;
+                }
+            }
+        }
+
+        printf("    turn corner mark G: peak %.3f at (%.1f, %.1f), %.2f px from the "
+               "prediction\n", peak, at[0], at[1],
+               hypot(at[0] - corner[0], at[1] - corner[1]));
+
+        if (!(peak > TEST_KEEP_BASE + 0.15) ||
+            !(hypot(at[0] - corner[0], at[1] - corner[1]) <= 1.0)) {
+            fprintf(stderr, "the mark the record's own frame throws away is not in the "
+                            "turned frame's corner\n");
+            ret = -1;
+            goto done;
+        }
+    }
+
+    /* Filling: every pixel has a source, so the flat field is everywhere. */
+    for (size_t i = 0; i < npix; i++) {
+        if (!(turn[i * 4 + 1] > 0.5 * TEST_KEEP_BASE)) {
+            fprintf(stderr, "pixel (%zu, %zu) of the turned frame came out at %g, under "
+                    "the %.2f flat field: it had no source\n", i % TEST_LENS_W,
+                    i / TEST_LENS_W, (double)turn[i * 4 + 1], TEST_KEEP_BASE);
+            ret = -1;
+            goto done;
+        }
+    }
+
+    /* Clockwise as looked at, measured rather than derived: the inner
+     * mark's angle about the centre grows by the turn. The lens is radial
+     * and cannot move it round the centre. The window is put where the
+     * turn says the mark is, so a turn the wrong way finds nothing there. */
+    {
+        double dx = dots[0][0] - TEST_LENS_W * 0.5, dy = dots[0][1] - TEST_LENS_H * 0.5;
+        double r_dst = test_lens_invert(test_lens_synth.k[1], hypot(dx, dy) / half_diag) *
+                       half_diag * (double)s_turn;
+        double ang = atan2(dy, dx) + TEST_TURN_DEG * TEST_DEG;
+        double a0 = test_turn_angle(off, 1, dots[0][0], dots[0][1], TEST_LENS_WIN,
+                                    TEST_KEEP_BASE);
+        double a1 = test_turn_angle(turn, 1, TEST_LENS_W * 0.5 + cos(ang) * r_dst,
+                                    TEST_LENS_H * 0.5 + sin(ang) * r_dst, TEST_LENS_WIN,
+                                    TEST_KEEP_BASE);
+
+        printf("    turn: the inner mark sits at %.3f deg unturned and %.3f deg turned, "
+               "%+.3f\n", a0, a1, a1 - a0);
+        if (!(fabs(a1 - a0 - TEST_TURN_DEG) < 0.15)) {
+            fprintf(stderr, "a turn of %+.1f deg moved the mark by %+.3f deg about the "
+                    "centre\n", TEST_TURN_DEG, a1 - a0);
+            ret = -1;
+            goto done;
+        }
+    }
+
+    ret = craw_ref_process(mosaic, TEST_LENS_W, TEST_LENS_H, TEST_LENS_W, &pp, &fp, ref);
+    if (ret < 0)
+        goto done;
+    err = test_max_abs(turn, ref, npix);
+    printf("  turn: max abs %.3e against the reference (tol %.1e)\n", err, TEST_LENS_TOL);
+    if (!(err <= TEST_LENS_TOL)) {
+        fprintf(stderr, "the GPU turn differs from the reference by %.3e\n", err);
+        ret = -1;
+        goto done;
+    }
+
+    /* 2. A turn the thrown away corners cover: no magnification at all,
+     *    so the inner marks only turn. */
+    fp.rotation = (float)TEST_TURN_FREE_DEG;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, again, npix)) < 0)
+        goto done;
+    ret = test_lens_geometry("turn free", off, again, TEST_LENS_W, TEST_LENS_H,
+                             &test_lens_synth, dots, wins, TEST_TURN_MEASURED,
+                             1.0, TEST_TURN_FREE_DEG, TEST_KEEP_BASE, 0.25);
+    if (ret < 0)
+        goto done;
+
+    /* 3. The real record, turned the other way, against the reference. */
+    fp.lens = test_lens_real;
+    fp.rotation = -(float)TEST_TURN_DEG;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, again, npix)) < 0)
+        goto done;
+    ret = craw_ref_process(mosaic, TEST_LENS_W, TEST_LENS_H, TEST_LENS_W, &pp, &fp, ref);
+    if (ret < 0)
+        goto done;
+    err = test_max_abs(again, ref, npix);
+    printf("  turn, real record, %+.0f deg: max abs %.3e against the reference\n",
+           -TEST_TURN_DEG, err);
+    if (!(err <= TEST_LENS_TOL)) {
+        fprintf(stderr, "the GPU turn differs from the reference by %.3e\n", err);
+        ret = -1;
+        goto done;
+    }
+
+    /* 4. No record: the warp runs anyway, with no correction in it, and the
+     *    marks only turn and magnify, by the closed form's amount. */
+    fp.lens = (CRAWLensCorrection) { 0 };
+    fp.rotation = (float)TEST_TURN_DEG;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, again, npix)) < 0)
+        goto done;
+    ret = test_lens_geometry("turn, no record", off, again, TEST_LENS_W, TEST_LENS_H,
+                             &none, dots, wins, TEST_TURN_MEASURED, (double)s_none,
+                             TEST_TURN_DEG, TEST_KEEP_BASE, 0.25);
+    if (ret < 0)
+        goto done;
+    ret = craw_ref_process(mosaic, TEST_LENS_W, TEST_LENS_H, TEST_LENS_W, &pp, &fp, ref);
+    if (ret < 0)
+        goto done;
+    err = test_max_abs(again, ref, npix);
+    printf("  turn, no record: max abs %.3e against the reference\n", err);
+    if (!(err <= TEST_LENS_TOL)) {
+        fprintf(stderr, "the GPU turn differs from the reference by %.3e\n", err);
+        ret = -1;
+        goto done;
+    }
+
+    /* 5. Keeping everything, turned: the marks shrink and turn, and black is
+     *    exactly where the source is not. */
+    fp.lens = test_lens_synth;
+    fp.flags = CRAW_FRAME_FLAG_LENS_KEEP_ALL;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, again, npix)) < 0)
+        goto done;
+    ret = test_lens_geometry("turn keep", off, again, TEST_LENS_W, TEST_LENS_H,
+                             &test_lens_synth, dots, wins, TEST_TURN_MEASURED,
+                             (double)s_keep, TEST_TURN_DEG, TEST_KEEP_BASE, 0.25);
+    if (ret < 0)
+        goto done;
+    ret = craw_ref_process(mosaic, TEST_LENS_W, TEST_LENS_H, TEST_LENS_W, &pp, &fp, ref);
+    if (ret < 0)
+        goto done;
+    err = test_max_abs(again, ref, npix);
+    printf("  turn keep: max abs %.3e against the reference\n", err);
+    if (!(err <= TEST_LENS_TOL)) {
+        fprintf(stderr, "the GPU turned keep differs from the reference by %.3e\n", err);
+        ret = -1;
+        goto done;
+    }
+
+    for (size_t i = 0; i < npix; i++) {
+        const float *gp = &again[i * 4], *rp = &ref[i * 4];
+        bool gb = gp[0] == 0.0f && gp[1] == 0.0f && gp[2] == 0.0f;
+        bool rb = rp[0] == 0.0f && rp[1] == 0.0f && rp[2] == 0.0f;
+        double margin;
+        bool outside = test_keep_outside(&test_lens_synth, TEST_LENS_W, TEST_LENS_H,
+                                         (double)s_keep, TEST_TURN_DEG,
+                                         (int)(i % TEST_LENS_W), (int)(i / TEST_LENS_W),
+                                         &margin);
+
+        if (fabs(margin) < 0.01) {
+            guard++;
+            continue;
+        }
+        if (outside != gb || outside != rb || (outside && gp[3] != 1.0f)) {
+            fprintf(stderr, "turned keep: pixel (%zu, %zu) is %.4f px %s the source and "
+                    "came out %s on the GPU, %s in the reference\n", i % TEST_LENS_W,
+                    i / TEST_LENS_W, fabs(margin), outside ? "outside" : "inside",
+                    gb ? "black" : "lit", rb ? "black" : "lit");
+            ret = -1;
+            goto done;
+        }
+        if (outside)
+            black++;
+        else
+            lit++;
+    }
+    printf("  turn keep: %zu pixels black, %zu lit, %zu within a hundredth of a pixel "
+           "of the boundary\n", black, lit, guard);
+    if (!black || !lit) {
+        ret = -1;
+        goto done;
+    }
+
+    /* 6. Unturned again on the same pipeline: the record's own frame, bit
+     *    for bit, whatever the turns before it left behind; and the first
+     *    turn again, to the bit, now that the scale is remembered. */
+    fp.flags = 0;
+    fp.rotation = 0.0f;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, again, npix)) < 0)
+        goto done;
+    if (memcmp(fill, again, npix * 4 * sizeof(*fill))) {
+        fprintf(stderr, "the unturned frame changed after the turns; the turn has to be "
+                        "the only difference\n");
+        ret = -1;
+        goto done;
+    }
+    fp.rotation = (float)TEST_TURN_DEG;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, again, npix)) < 0)
+        goto done;
+    if ((ret = test_run_pipe(td, pipe, &src, &dst, &fp, again, npix)) < 0)
+        goto done;
+    if (memcmp(turn, again, npix * 4 * sizeof(*turn))) {
+        fprintf(stderr, "the same turn came out different the second time\n");
+        ret = -1;
+        goto done;
+    }
+
+    /* 7. Out of range is refused, both ways and as not a number, before
+     *    anything is recorded. */
+    {
+        static const float bad[] = { 45.0f, -45.0f, NAN };
+
+        for (size_t i = 0; i < CRAW_ARRAY_ELEMS(bad); i++) {
+            fp.rotation = bad[i];
+            if (test_run_pipe(td, pipe, &src, &dst, &fp, again, npix) != CRAW_ERROR(EINVAL)) {
+                fprintf(stderr, "a turn of %g degrees was not refused\n", (double)bad[i]);
+                ret = -1;
+                goto done;
+            }
+        }
+        printf("  turns of 45, -45 and NaN degrees refused\n");
+    }
+
+    ret = 0;
+
+done:
+    if (ret < 0)
+        fprintf(stderr, "the turn check failed: %d\n", ret);
+    craw_pipeline_free(&pipe);
+    if (have_dst)
+        craw_testdev_image_free(td, &dst);
+    if (have_src)
+        craw_testdev_image_free(td, &src);
+    free(ref);
+    free(again);
+    free(turn);
     free(fill);
     free(off);
     free(mosaic);
@@ -2249,6 +2738,10 @@ static int test_lens(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *id
         goto done;
 
     ret = test_lens_keep(td, ctx, identity);
+    if (ret < 0)
+        goto done;
+
+    ret = test_lens_turn(td, ctx, identity);
 
 done:
     free(plain);

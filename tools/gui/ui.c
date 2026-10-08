@@ -2322,11 +2322,13 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
                   (double)ln->record.centre[0], (double)ln->record.centre[1]);
 
         /* The scale is the price of keeping the corners, so it is only
-         * shown while the mode that charges it is on. */
+         * shown while the mode that charges it is on. It is the turned
+         * frame's when the Rotate section turns it. */
         if (view_lens_keep_all(st)) {
-            if (ln->scale > 0.0f)
-                nk_labelf(ctx, NK_TEXT_LEFT, "keep all: scaled %.3f",
-                          (double)ln->scale);
+            float scale = view_warp_scale(st);
+
+            if (scale > 0.0f)
+                nk_labelf(ctx, NK_TEXT_LEFT, "keep all: scaled %.3f", (double)scale);
             else
                 nk_label(ctx, "keep all: this record cannot be inverted",
                          NK_TEXT_LEFT);
@@ -2348,6 +2350,43 @@ static void view_panel_lens(struct nk_context *ctx, struct view_state *st)
                       st->gpu.last_gpu_ms);
         }
     }
+}
+
+/* The "Rotate" section: the turn of DESIGN.md 16.9, clockwise for a
+ * positive angle. It is the lens warp's own resample, so it is offered for
+ * raw clips, with or without a lens record, and the picture is magnified
+ * just enough that the turned frame stays filled - using the corners the
+ * lens correction would otherwise cut off before magnifying at all. The
+ * number under the slider is how much that is, the only thing the turn
+ * costs; with the Lens section keeping everything it is the shrink
+ * instead. */
+static void view_panel_rotate(struct nk_context *ctx, struct view_state *st)
+{
+    struct view_rotate *r = &st->rotate;
+    float before = r->degrees;
+    float scale;
+
+    nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
+    nk_property_float(ctx, "#degrees", -VIEW_ROTATE_MAX, &r->degrees, VIEW_ROTATE_MAX,
+                      0.1f, 0.01f);
+    nk_slider_float(ctx, -VIEW_ROTATE_MAX, &r->degrees, VIEW_ROTATE_MAX, 0.05f);
+
+    /* A touched control switches the section on, RawTherapee's way. */
+    if (r->degrees != before)
+        r->on = true;
+
+    if (view_rotation(st) == 0.0f)
+        return;
+
+    scale = view_warp_scale(st);
+    if (!(scale > 0.0f))
+        nk_label(ctx, "this record cannot be inverted", NK_TEXT_LEFT);
+    else if (view_lens_keep_all(st))
+        nk_labelf(ctx, NK_TEXT_LEFT, "scaled %.3f to keep everything", (double)scale);
+    else if (scale == 1.0f)
+        nk_label(ctx, "fills the frame without magnifying", NK_TEXT_LEFT);
+    else
+        nk_labelf(ctx, NK_TEXT_LEFT, "magnified %.3f to fill the frame", (double)scale);
 }
 
 /* The "Sharpen" section: the capture sharpening of DESIGN.md 20, the last
@@ -3291,8 +3330,8 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
      * The white balance is offered for both kinds of clip, but only a
      * developed clip's can be switched off: a raw clip's is always applied,
      * so its header carries the empty switch slot that keeps the column
-     * lined up. A developed clip has no mosaic, so Debayer, Denoise, Lens
-     * and Sharpen are not offered for one at all. */
+     * lined up. A developed clip has no mosaic, so Debayer, Denoise, Lens,
+     * Rotate and Sharpen are not offered for one at all. */
     if (view_section_header(ctx, st, VIEW_SEC_WB, "White balance",
                             st->dec.raw ? NULL : &st->sections.wb, false)) {
         view_panel_wb(ctx, st);
@@ -3343,6 +3382,12 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         view_section_header(ctx, st, VIEW_SEC_LENS, "Lens", &st->lens.on,
                             !st->lens.record.valid)) {
         view_panel_lens(ctx, st);
+        view_section_end(ctx);
+    }
+
+    if (st->dec.raw &&
+        view_section_header(ctx, st, VIEW_SEC_ROTATE, "Rotate", &st->rotate.on, false)) {
+        view_panel_rotate(ctx, st);
         view_section_end(ctx);
     }
 

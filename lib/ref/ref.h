@@ -164,14 +164,16 @@ static inline enum CRAWColorSpace craw_ref_out_space(const CRAWPipelineParams *p
 
 /* Lens correction, DESIGN.md 16: the per-channel radial warp of the camera
  * RGB intermediate. `src` and `dst` are width*height*4 floats and must not be the
- * same buffer. A correction with valid = false is a copy, which is what
- * the pipeline's skipping the pass amounts to.
+ * same buffer. A correction with valid = false and no turn is a copy, which
+ * is what the pipeline's skipping the pass amounts to.
  *
- * `keep_all` is CRAW_FRAME_FLAG_LENS_KEEP_ALL (16.8): the scale comes from
- * craw_lens_keep_all_scale(), the same call the pipeline makes, so the two
+ * `rotation` is CRAWFrameParams.rotation (16.9) and `keep_all`
+ * CRAW_FRAME_FLAG_LENS_KEEP_ALL (16.8): the scale comes from
+ * craw_lens_rotation_scale(), the same call the pipeline makes, so the two
  * cannot drift apart. */
 int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
-                  const CRAWLensCorrection *lc, bool keep_all, float *dst);
+                  const CRAWLensCorrection *lc, float rotation, bool keep_all,
+                  float *dst);
 
 /* Whole chain: [denoise,] [highlight reconstruction,] debayer, [false
  * colour,] [lens,] [defringe,] [chroma denoise,] [sharpen,] colour. `out` receives
@@ -186,7 +188,8 @@ int craw_ref_lens(const float *src, uint32_t width, uint32_t height,
  * positive, the chroma denoise when it carries
  * CRAW_PIPELINE_FLAG_CHROMA_DENOISE and `fp->denoise_chroma_strength` is
  * positive, and the warp when it carries CRAW_PIPELINE_FLAG_LENS and
- * `fp->lens` is valid, and the sharpening when it carries
+ * `fp->lens` is valid or `fp->rotation` is not zero, and the sharpening
+ * when it carries
  * CRAW_PIPELINE_FLAG_SHARPEN and `fp->sharpen_iterations` and
  * `fp->sharpen_radius` are both positive; all seven are the conditions
  * craw_pipeline_record() applies. A single frame has no history, so the

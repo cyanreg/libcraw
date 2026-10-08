@@ -171,6 +171,9 @@ struct view_pipeline_look {
      * record. */
     bool lens;
     bool lens_keep;
+    /* The turn the warp ran with, 0 when it did not: a slider moved while
+     * paused puts the held frame through again. */
+    float rotation;
     /* The sharpening as it ran, all zero when it did not. The iteration
      * count is the one the pass ran with, which is fewer while playing than
      * while paused: pausing is a change of look, so the held picture is put
@@ -1137,18 +1140,40 @@ struct view_lens {
      * while `record.valid`. */
     float corner[3];
 
-    /* Keep every source pixel instead of filling the frame, DESIGN.md 16.8,
-     * and the scale that takes for the record on screen. `keep_sel` is the
-     * panel row's index, 0 fill and 1 keep all, because a cycle row wants
-     * an int. The scale is worked out once per frame beside `corner`, not
-     * once per panel redraw. */
+    /* Keep every source pixel instead of filling the frame, DESIGN.md 16.8.
+     * `keep_sel` is the panel row's index, 0 fill and 1 keep all, because a
+     * cycle row wants an int. What it costs is view_warp_scale(). */
     bool keep;
     int keep_sel;
-    float scale;
 
     /* libcraw's own pass time with and without the warp, smoothed
      * separately, the way the Denoise section measures its own. */
     double ms_on, ms_off;
+};
+
+/* The most the Rotate section turns the picture either way, in degrees:
+ * just under the library's CRAW_LENS_MAX_ROTATION, which is exclusive. */
+#define VIEW_ROTATE_MAX 44.9f
+
+/* Turning the picture, DESIGN.md 16.9. It is the lens warp's own
+ * resample, so it exists for raw clips only, and it turns them whether or
+ * not their frames carry a record. `degrees` is clockwise as looked at;
+ * `on` is the section's switch, which starts off and switches on when the
+ * angle is touched, so a lit switch means the picture is turned.
+ *
+ * The rest is view_warp_scale()'s cache: how much the warp magnifies (or,
+ * keeping everything, shrinks) the picture on screen, and what that was
+ * worked out for. A boundary walk of under a millisecond, so it is worked
+ * out when one of those changes and not on every panel redraw. */
+struct view_rotate {
+    bool on;
+    float degrees;
+
+    float scale;
+    CRAWLensCorrection scale_lc;
+    float scale_deg;
+    bool scale_keep;
+    int scale_w, scale_h;
 };
 
 /* Capture sharpening, as the panel holds it, DESIGN.md 20. `iterations` is
@@ -1206,6 +1231,7 @@ enum view_section {
     VIEW_SEC_DEBAYER,
     VIEW_SEC_DENOISE,
     VIEW_SEC_LENS,
+    VIEW_SEC_ROTATE,
     VIEW_SEC_SHARPEN,
     VIEW_SEC_LOOK,
     VIEW_SEC_ADJUST,
@@ -1224,9 +1250,9 @@ enum view_section {
  * table because these headers are not nk_tree_push()es any more: a nuklear
  * tree header owns its whole row and cannot hold a switch beside its title.
  *
- * Five of the switches are the sections' own flags - denoise.on, lens.on,
- * sharpen.on, grain.on and crop.on - which the header shows instead of a
- * row inside the body. The three below are the new ones, and like every
+ * Six of the switches are the sections' own flags - denoise.on, lens.on,
+ * rotate.on, sharpen.on, grain.on and crop.on - which the header shows
+ * instead of a row inside the body. The three below are the new ones, and like every
  * other setting they carry from clip to clip. */
 struct view_sections {
     bool open[VIEW_NB_SECTIONS];
@@ -1273,6 +1299,7 @@ struct view_state {
     struct view_grain grain;
     struct view_denoise denoise;
     struct view_lens lens;
+    struct view_rotate rotate;
     struct view_sharpen sharpen;
     struct view_adjust adjustments;
 
@@ -1795,6 +1822,16 @@ bool view_lens_active(const struct view_state *st);
 /* And whether it will run in the keep-everything mode of DESIGN.md 16.8,
  * which is the same question plus the panel's fill / keep all row. */
 bool view_lens_keep_all(const struct view_state *st);
+
+/* The turn the picture on screen is developed with, DESIGN.md 16.9, in
+ * degrees clockwise: the Rotate section's angle while its switch is on and
+ * the clip is raw, otherwise 0. */
+float view_rotation(const struct view_state *st);
+
+/* How much the warp scales the picture on screen: magnified to fill a
+ * turned frame, or shrunk to keep everything, 1 when it does neither, and
+ * 0 for a record that cannot be inverted. The number the panel shows. */
+float view_warp_scale(struct view_state *st);
 
 /* The strength the denoise stage will actually run at: zero unless the
  * switch is on, the strength is positive and a model exists. */

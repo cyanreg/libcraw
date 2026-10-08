@@ -59,7 +59,8 @@ typedef struct CRAWLensCorrection {
     float centre[2];
 
     /* False means "no correction for this frame": craw_pipeline_record()
-     * then leaves the frame untouched, at the cost of a copy. */
+     * then leaves the frame untouched, unless it is turned
+     * (CRAWFrameParams.rotation). */
     bool valid;
 
     /* Padding to allow for future options. Must always be set to 0. */
@@ -130,9 +131,48 @@ CRAW_API int craw_lens_corner_shift(const CRAWLensCorrection *lc,
  * The pipeline works this out for itself when the frame carries
  * CRAW_FRAME_FLAG_LENS_KEEP_ALL; this is exported so that a tool can show
  * the number, which is the only way a person can see how much of the frame
- * the mode costs. */
+ * the mode costs. It is craw_lens_rotation_scale() at 0 degrees with
+ * `keep_all` set, to the bit. */
 CRAW_API int craw_lens_keep_all_scale(const CRAWLensCorrection *lc,
                                       uint32_t width, uint32_t height,
+                                      float *scale);
+
+/* Turning the picture, DESIGN.md 16.9: the most CRAWFrameParams.rotation
+ * may be either way, exclusive. Up to it the frame keeps its size and its
+ * aspect ratio, and the picture is magnified until it covers the turned
+ * frame. */
+#define CRAW_LENS_MAX_ROTATION 45.0f
+
+/* The scale the warp applies to the corrected picture on a frame of
+ * `width` x `height` turned by `degrees` clockwise, about the record's
+ * optical centre: the corrected picture is magnified by it, so above 1 is
+ * a zoom in and below 1 a shrink. `lc` may be NULL or invalid, which is
+ * the picture with no correction, turned about the frame's centre.
+ *
+ * Filling the frame, `keep_all` false, it is the smallest scale, never
+ * below 1, at which every output pixel still has a source in all three
+ * channels. The source is what the correction makes of the readout, not
+ * the readout's rectangle: a barrel correction pulls the source's corners
+ * out past the frame and a pincushion one, under the crop of its k0,
+ * leaves a bulge of source beyond each edge, and filling throws both away.
+ * A turned frame's corners swing out into exactly those places, so the
+ * scale is measured against the corrected source's own outline, and a
+ * small turn at the wide end of a zoom costs no magnification at all. At
+ * 0 degrees it is exactly 1 without anything being walked: the frame is
+ * the record's own, which is the camera's choice.
+ *
+ * Keeping everything, `keep_all` true, it is craw_lens_keep_all_scale()'s
+ * scale for the turned frame: the largest one, at most 1, for which every
+ * source pixel still lands inside the frame once turned.
+ *
+ * Both are boundary walks of the kind craw_lens_keep_all_scale() does,
+ * under a millisecond, no allocation and no Vulkan. Fails with
+ * CRAW_ERROR(EINVAL) for a NULL `scale`, a zero frame size, a turn of
+ * CRAW_LENS_MAX_ROTATION or more either way, a valid record whose centre is
+ * outside the frame, or one whose polynomial cannot be inverted. */
+CRAW_API int craw_lens_rotation_scale(const CRAWLensCorrection *lc,
+                                      uint32_t width, uint32_t height,
+                                      float degrees, bool keep_all,
                                       float *scale);
 
 #endif /* CRAW_LENS_H */

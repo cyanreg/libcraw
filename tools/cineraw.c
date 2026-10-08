@@ -130,6 +130,7 @@ struct tool_cfg {
     float sharpen_contrast;
 
     enum tool_lens lens;
+    float rotation;           /* DESIGN.md 16.9, degrees clockwise, 0 = none */
 
     const char *tables;
     const char *profile;
@@ -369,6 +370,17 @@ static void tool_usage(FILE *f)
 "                      pixel instead of filling the frame: the corrected\n"
 "                      picture is scaled down until all of it fits and the\n"
 "                      rest of the frame is black. -v prints the scale\n"
+"  --rotate DEGREES    turn the picture clockwise (negative: anticlockwise),\n"
+"                      less than 45 either way, about the centre. The frame\n"
+"                      keeps its size: the picture is magnified until the\n"
+"                      turned frame is filled, and the corners the lens\n"
+"                      correction would otherwise cut off are used first, so\n"
+"                      a couple of degrees at the wide end of a zoom cost no\n"
+"                      magnification at all. With --lens keep the picture is\n"
+"                      shrunk until all of it fits instead. It is the lens\n"
+"                      correction's own resample, so it works with --lens off\n"
+"                      and on clips without a record too. -v prints the\n"
+"                      scale. DESIGN.md 16.9\n"
 "  --noise-estimate    fit A and B on every decoded frame and print them,\n"
 "                      then a summary; no GPU work and no output is written.\n"
 "                      Point it at a flat, evenly lit, unclipped field (a\n"
@@ -1621,6 +1633,27 @@ static void tool_lens_take(struct tool_decoder *d, int64_t pts,
     }
 }
 
+/* -v's line for what the warp does to the picture's size: the shrink that
+ * keeps every source pixel, or the magnification that fills a turned
+ * frame. `lc` NULL is a frame with no record. */
+static void tool_report_scale(const struct tool_cfg *cfg, const CRAWLensCorrection *lc,
+                              uint32_t w, uint32_t h)
+{
+    bool keep = cfg->lens == TOOL_LENS_KEEP;
+    char turned[48] = "";
+    float scale = 0.0f;
+
+    if (cfg->rotation != 0.0f)
+        snprintf(turned, sizeof(turned), "rotated %+.2f deg, ", (double)cfg->rotation);
+
+    if (craw_lens_rotation_scale(lc, w, h, cfg->rotation, keep, &scale) < 0)
+        fprintf(stderr, "              %s%s: this record cannot be inverted\n",
+                turned, keep ? "keep all" : "fill");
+    else
+        fprintf(stderr, "              %s%s %.4f\n", turned,
+                keep ? "keep all: scaled" : "fill: magnified", (double)scale);
+}
+
 static void tool_decoder_close(struct tool_decoder *d)
 {
     av_packet_free(&d->pkt);
@@ -2103,6 +2136,7 @@ enum {
     TOOL_OPT_NOISE,
     TOOL_OPT_NOISE_EST,
     TOOL_OPT_LENS,
+    TOOL_OPT_ROTATE,
     TOOL_OPT_TABLES,
     TOOL_OPT_PROFILE,
 };
@@ -2135,6 +2169,7 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
         { "noise",          required_argument, NULL, TOOL_OPT_NOISE     },
         { "noise-estimate", no_argument,       NULL, TOOL_OPT_NOISE_EST },
         { "lens",           required_argument, NULL, TOOL_OPT_LENS      },
+        { "rotate",         required_argument, NULL, TOOL_OPT_ROTATE    },
         { "tables",         required_argument, NULL, TOOL_OPT_TABLES    },
         { "profile",        required_argument, NULL, TOOL_OPT_PROFILE   },
         { "help",           no_argument,       NULL, 'h'                },
@@ -2306,6 +2341,16 @@ static int tool_parse_args(struct tool_cfg *cfg, int argc, char **argv)
                 return ret;
             cfg->lens = (enum tool_lens)v;
             break;
+        case TOOL_OPT_ROTATE:
+            if ((ret = tool_parse_double("--rotate", optarg, &d)) < 0)
+                return ret;
+            if (!(fabs(d) < CRAW_LENS_MAX_ROTATION)) {
+                fprintf(stderr, "--rotate: expected less than %g degrees either way, "
+                        "got %g\n", (double)CRAW_LENS_MAX_ROTATION, d);
+                return CRAW_ERROR(EINVAL);
+            }
+            cfg->rotation = (float)d;
+            break;
         case TOOL_OPT_DEFRINGE:
             if ((ret = tool_parse_double("--defringe", optarg, &d)) < 0)
                 return ret;
@@ -2394,7 +2439,7 @@ int main(int argc, char **argv)
     AVRational time_base = { 1, 1 };
     double gpu_ms_total = 0.0, decode_ms_total = 0.0, decode_ms_warm = 0.0;
     float last_lens_dist = 0.0f;
-    bool have_lens_report = false, warned_no_lens = false;
+    bool have_lens_report = false, have_turn_report = false, warned_no_lens = false;
     /* The camera is to be found in the first frame's metadata rather than
      * the container's: a still. */
     bool detect_late = false;
@@ -2718,23 +2763,22 @@ have_device:
                 /* The scale is what the mode costs: the corrected picture
                  * is the filled one shrunk about the centre by exactly
                  * this much, which is what makes room for the corners fill
-                 * mode cuts off. Under the same "only when the lens moved"
-                 * rule as the line above, because it moves with the
-                 * record. */
-                if (cfg.lens == TOOL_LENS_KEEP) {
-                    float scale = 0.0f;
-
-                    if (craw_lens_keep_all_scale(&lens, w, h, &scale) == 0)
-                        fprintf(stderr, "              keep all: scaled %.4f\n",
-                                (double)scale);
-                    else
-                        fprintf(stderr, "              keep all: this record "
-                                        "cannot be inverted\n");
-                }
+                 * mode cuts off, or magnified by it to fill a turned
+                 * frame. Under the same "only when the lens moved" rule as
+                 * the line above, because it moves with the record. */
+                if (cfg.lens == TOOL_LENS_KEEP || cfg.rotation != 0.0f)
+                    tool_report_scale(&cfg, &lens, w, h);
 
                 last_lens_dist = dist[1];
                 have_lens_report = true;
             }
+        }
+
+        /* Without a record the turn's scale depends on nothing but the
+         * frame, so once is enough. */
+        if (cfg.verbose && !lens.valid && cfg.rotation != 0.0f && !have_turn_report) {
+            tool_report_scale(&cfg, NULL, w, h);
+            have_turn_report = true;
         }
 
         if ((cfg.lens == TOOL_LENS_ON || cfg.lens == TOOL_LENS_KEEP) &&
@@ -2746,8 +2790,10 @@ have_device:
         }
 
         /* The pass is only built once a frame has been seen to carry a
-         * record, so a clip without one never allocates the extra image. */
-        ret = tool_gpu_resize(&gpu, &cfg, w, h, prof.cfa, dec.lens_any);
+         * record, so a clip without one never allocates the extra image -
+         * unless the picture is turned, which is the same pass. */
+        ret = tool_gpu_resize(&gpu, &cfg, w, h, prof.cfa,
+                              dec.lens_any || cfg.rotation != 0.0f);
         if (ret < 0)
             goto fail;
 
@@ -2781,6 +2827,7 @@ have_device:
         fp.sharpen_iterations = cfg.sharpen_iterations;
         fp.sharpen_contrast = cfg.sharpen_contrast;
         fp.lens = lens;
+        fp.rotation = cfg.rotation;
 
         if (cfg.wb == TOOL_WB_FIXED) {
             fp.wb_mode = CRAW_WB_REBALANCE;

@@ -17,6 +17,8 @@
 
 #include <craw/lens.h>
 
+#include "lens_warp.h"
+
 /* The `psim` key, without a terminator: the record's key is a Pascal
  * string. */
 static const char craw_lens_key[] = "com.panasonic.Semi-Pro.optical_correction";
@@ -337,13 +339,51 @@ static double craw_lens_frame_radius(double ux, double uy, double cx, double cy,
     return t;
 }
 
-int craw_lens_keep_all_scale(const CRAWLensCorrection *lc, uint32_t width,
-                             uint32_t height, float *scale)
+/* -------------------------------------------- turning the picture (16.9) */
+
+#define CRAW_LENS_DEG (3.14159265358979323846 / 180.0)
+
+const CRAWLensCorrection craw_lens_identity = {
+    .k = { { 1.0f, 0.0f, 0.0f, 0.0f },
+           { 1.0f, 0.0f, 0.0f, 0.0f },
+           { 1.0f, 0.0f, 0.0f, 0.0f } },
+    .centre = { 0.5f, 0.5f },
+    .valid  = true,
+};
+
+void craw_lens_turn(float degrees, float scale, float turn[2])
+{
+    double rad = (double)degrees * CRAW_LENS_DEG;
+
+    turn[0] = (float)(cos(rad) / (double)scale);
+    turn[1] = (float)(sin(rad) / (double)scale);
+}
+
+/* Both scales of DESIGN.md 16.8 and 16.9 are one walk around the frame's
+ * rectangle, which is both the source's outline and the output's. The map
+ * is radial, so the corrected picture's outline along a direction is where
+ * the source rectangle is left along that same direction, put through the
+ * inverse of r * poly(r); the turn only changes which direction of the
+ * output frame meets which direction of the corrected picture.
+ *
+ * Keeping everything walks the source's outline and asks how far out each
+ * point lands, turned, against the output frame along the turned
+ * direction: the smallest ratio is the largest shrink that keeps it all.
+ * Filling walks the output frame's outline and asks how far the corrected
+ * source reaches along the direction each point is turned onto: the
+ * largest ratio of the point's radius to that reach is the smallest
+ * magnification that leaves no output pixel without a source. Both are
+ * exact for the same reason the keep walk was: the map is monotone along
+ * each ray and both outlines are seen from the centre, which is inside
+ * both, so a boundary inside means everything inside. */
+static int craw_lens_walk(const CRAWLensCorrection *lc, uint32_t width,
+                          uint32_t height, float degrees, bool keep_all,
+                          float *scale)
 {
     double k[3][4], w, h, cx, cy, hx, hy, half_diag, s = 1.0;
+    double rad = (double)degrees * CRAW_LENS_DEG;
+    double ct = cos(rad), st = sin(rad);
 
-    if (!lc || !lc->valid || !scale || !width || !height)
-        return CRAW_ERROR(EINVAL);
     if (lc->centre[0] < 0.0f || lc->centre[0] > 1.0f ||
         lc->centre[1] < 0.0f || lc->centre[1] > 1.0f)
         return CRAW_ERROR(EINVAL);
@@ -365,11 +405,12 @@ int craw_lens_keep_all_scale(const CRAWLensCorrection *lc, uint32_t width,
     /* Every source pixel lies inside the source rectangle, and the map is
      * radial and monotone along each ray, so an interior point never needs
      * a larger output radius than the boundary point on its own ray: the
-     * boundary is the whole constraint. */
+     * boundary is the whole constraint. The same holds the other way round
+     * for the output frame when filling. */
     for (int side = 0; side < 4; side++) {
         for (int i = 0; i < CRAW_LENS_KEEP_SEGS; i++) {
             double t = (double)i / CRAW_LENS_KEEP_SEGS;
-            double px, py, dx, dy, len, r_src, r_frame, u[3], needed = 0.0;
+            double px, py, dx, dy, len, ux, uy, r_src, r_frame, u[3];
 
             switch (side) {
             case 0:  px = t * w;         py = 0.0;           break;
@@ -385,28 +426,83 @@ int craw_lens_keep_all_scale(const CRAWLensCorrection *lc, uint32_t width,
              * record has: that one point constrains nothing. */
             if (!(len > 0.0))
                 continue;
-            r_src = len / half_diag;
+            ux = dx / len;
+            uy = dy / len;
 
-            /* The channel that needs the largest output radius decides, so
-             * that one scale serves all three and the black border is one
-             * shape rather than three coloured ones. */
-            if (!craw_lens_invert3(k, r_src, u))
-                return CRAW_ERROR(EINVAL);
-            for (int c = 0; c < 3; c++)
-                needed = CRAW_MAX(needed, u[c]);
+            if (keep_all) {
+                double needed = 0.0;
 
-            r_frame = craw_lens_frame_radius(dx / len, dy / len, cx, cy, w, h) / half_diag;
-            s = CRAW_MIN(s, r_frame / needed);
+                /* A point of the source's outline: the channel that needs
+                 * the largest output radius decides, so that one scale
+                 * serves all three and the black border is one shape rather
+                 * than three coloured ones. Unturned, the output direction
+                 * is the source's own, exactly: one times it, less nothing. */
+                r_src = len / half_diag;
+                if (!craw_lens_invert3(k, r_src, u))
+                    return CRAW_ERROR(EINVAL);
+                for (int c = 0; c < 3; c++)
+                    needed = CRAW_MAX(needed, u[c]);
+
+                r_frame = craw_lens_frame_radius(ct * ux - st * uy, st * ux + ct * uy,
+                                                 cx, cy, w, h) / half_diag;
+                s = CRAW_MIN(s, r_frame / needed);
+            } else {
+                double reach;
+
+                /* A point of the output frame's outline, turned onto the
+                 * corrected picture: the source rectangle ends at r_src
+                 * along that direction, and the corrected picture at the
+                 * inverse of it. The channel that runs out first decides,
+                 * so that no pixel is left with one channel off the
+                 * source. */
+                r_src = craw_lens_frame_radius(ct * ux + st * uy, ct * uy - st * ux,
+                                               cx, cy, w, h) / half_diag;
+                if (!craw_lens_invert3(k, r_src, u))
+                    return CRAW_ERROR(EINVAL);
+                reach = CRAW_MIN(CRAW_MIN(u[0], u[1]), u[2]);
+
+                s = CRAW_MAX(s, (len / half_diag) / reach);
+            }
         }
     }
 
-    /* Capped at 1 by the initial value: a correction that samples outward
-     * everywhere would otherwise be magnified to fill the frame, which is
-     * not what keeping everything means. */
+    /* Bounded by the initial value either way. Keeping everything is capped
+     * at 1: a correction that samples outward everywhere would otherwise be
+     * magnified to fill the frame, which is not what keeping everything
+     * means. Filling never goes below 1: the turn may use what the record's
+     * own frame throws away, not show more of it than that frame does. */
     if (!(s > 0.0) || !isfinite(s))
         return CRAW_ERROR(EINVAL);
 
     *scale = (float)s;
 
     return 0;
+}
+
+int craw_lens_keep_all_scale(const CRAWLensCorrection *lc, uint32_t width,
+                             uint32_t height, float *scale)
+{
+    if (!lc || !lc->valid || !scale || !width || !height)
+        return CRAW_ERROR(EINVAL);
+
+    return craw_lens_walk(lc, width, height, 0.0f, true, scale);
+}
+
+int craw_lens_rotation_scale(const CRAWLensCorrection *lc, uint32_t width,
+                             uint32_t height, float degrees, bool keep_all,
+                             float *scale)
+{
+    if (!scale || !width || !height || !(fabsf(degrees) < CRAW_LENS_MAX_ROTATION))
+        return CRAW_ERROR(EINVAL);
+    if (!lc || !lc->valid)
+        lc = &craw_lens_identity;
+
+    /* The record's own frame, the camera's choice and the one every other
+     * decoder shows. Nothing to walk. */
+    if (!keep_all && degrees == 0.0f) {
+        *scale = 1.0f;
+        return 0;
+    }
+
+    return craw_lens_walk(lc, width, height, degrees, keep_all, scale);
 }

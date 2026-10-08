@@ -301,11 +301,12 @@ White balance, which is always applied; they carry an empty slot so the
 titles stay in line. A developed clip's White balance does have a switch,
 and off shows the picture balanced as the camera balanced it. A lit switch
 always means the section is doing something:
-Exposure, Look, Adjustments and a developed clip's White balance start off
-and switch themselves on the moment one of their parameters is touched — a
-slider moved, a film simulation picked, a white balance mode chosen or
-picked, `--exposure`, `--ei`, `--lut`, `--softlight`, `--vibrance` or a
-`--wb` other than `as-shot` given — the way RawTherapee's tools do. `--denoise 0`, `--lens
+Exposure, Look, Adjustments, Rotate and a developed clip's White balance
+start off and switch themselves on the moment one of their parameters is
+touched — a slider moved, a film simulation picked, a white balance mode
+chosen or picked, `--exposure`, `--ei`, `--lut`, `--softlight`,
+`--vibrance`, `--rotate` or a `--wb` other than `as-shot` given — the way
+RawTherapee's tools do. `--denoise 0`, `--lens
 off` and the absence of `--grain` start those three off, and `--bypass
 exposure,look,adjustments` pins the other three off whatever the other
 options set, which is how a headless export is handed the state the panel
@@ -423,7 +424,7 @@ ProRes RAW and already developed, different sizes, stereo or four-channel or
 no audio at all — and a switch keeps every setting exactly as it was: the
 white balance mode and a manual CCT, the exposure index and bias, debayer
 and its false colour passes, highlight switch and defringe, denoise, lens correction
-and its fit, the sharpening, the
+and its fit, the turn, the sharpening, the
 export's colour space, size,
 pixel format, audio mode and threads, the two export file paths once typed,
 the film simulation, the tone map, the adjustments, the grain, every
@@ -514,6 +515,20 @@ own orientation. The clip line says which turn it is — `P1001019.MOV
 [prores_raw raw, 90°]` — and a matrix that is not a multiple of ninety
 degrees, or that mirrors as well as turns, is reported and left alone rather
 than approximated.
+
+Levelling a raw clip by hand is a different thing and does happen in
+libcraw: the Rotate section, or `--rotate DEGREES` in both tools, turns the
+picture clockwise by up to just under 45 degrees either way, in the lens
+correction's own resample. The frame keeps its size, so the picture is
+magnified until the turned frame is filled, and the turned frame's corners
+are first sent into the parts of the source the lens correction would
+otherwise have cut off: at the wide end of the 24-60 a turn of up to two
+degrees costs no magnification at all, and five degrees costs 9% where an
+uncorrected frame needs 16%. The section says how much it is
+magnifying; with the Lens section keeping everything, the picture is shrunk
+until all of the turned source fits instead. It works on clips without a
+lens record too, and the quarter turn above is applied after it, so
+clockwise is clockwise as the picture is looked at. DESIGN.md 16.9.
 
 The picture can be cropped for the export. `c` turns crop mode on, a left
 drag over the picture then draws the rectangle instead of panning, and

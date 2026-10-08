@@ -2934,8 +2934,8 @@ pointer. The record is different on every frame of a clip that is zooming,
 and a player with several frames in flight must be able to keep each
 frame's parameters self-contained; a pointer would mean the parameters
 outliving whatever the panel or the decoder owned. A correction with
-`valid` false means "leave this frame alone", and it is not a cheap copy
-but no pass at all: the warp drops out of the recording and the colour pass
+`valid` false and no turn (16.9) means "leave this frame alone", and it is
+not a cheap copy but no pass at all: the warp drops out of the recording and the colour pass
 writes the caller's destination, so the frame is **bit for bit** what a
 pipeline built without the flag produces. That is what makes the switch a
 live control and what makes a clip with no record cost nothing.
@@ -3284,6 +3284,165 @@ ms a frame, keep 6.684 / 6.302 / 5.994 / 6.375, which is the same number
 inside a ±0.35 ms spread — the in-bounds test is six comparisons against
 49 image loads, and the border pixels skip the taps entirely. The cost of
 the mode is the host-side scale above.
+
+### 16.9 Turning the picture
+
+`CRAWFrameParams.rotation` turns the picture clockwise as it is looked at,
+by less than `CRAW_LENS_MAX_ROTATION`, 45 degrees, either way, about the
+optical centre. The frame keeps its size and its aspect ratio, so a turned
+frame is filled by magnifying the picture, or with
+`CRAW_FRAME_FLAG_LENS_KEEP_ALL` the picture is shrunk until all of it fits.
+Both tools take `--rotate DEGREES`, and cineview has a Rotate section for
+raw clips.
+
+**Why it is the warp.** A turn is a resample, and 16.4 is the case for doing
+only one: the second Catmull-Rom of a separate turn would take its own
+share of the detail. More to the point, only the warp knows what the
+correction throws away. The correction maps the source rectangle onto a
+shape that is not the frame. At the wide end of the 24-60, a barrel
+correction, the source's corners land past the frame's, 209 px along the
+diagonal on P1000261 at 24 mm, and its edges past the frame's edges by less;
+under a pincushion correction the record's own k0 crop puts the source's
+corners just inside the frame's and leaves it bulging past each edge,
+rounder than the frame. Filling the record's own frame crops both away. A
+turned frame swings its corners out, which is exactly where the barrel case
+has picture to spare, so the turn is measured against the corrected
+source's own outline and not the readout's rectangle, and it uses that
+picture before it magnifies anything.
+
+**The mapping.** For an output pixel's offset `d` from the centre,
+
+    q        = (cos t d.x + sin t d.y, cos t d.y - sin t d.x) / s
+    source_c = centre + q * poly_c(|q|)
+
+with `t` the turn and `s` the scale: `d` turned back by `t`, divided by
+`s`, then 16.2's mapping. With y down, `q` turned back is the picture
+turned clockwise. The host hands the shader `turn = (cos t, sin t) / s`,
+worked out in double by `craw_lens_turn()` and narrowed once. A frame with
+no record is turned with no correction: k = (1, 0, 0, 0) for every channel
+about the frame's centre, `craw_lens_identity`, so the turn works with the
+correction off and on clips from other cameras.
+
+**Filling.** `s` is the smallest scale, never below 1, for which every
+output pixel has a source in all three channels. `craw_lens_rotation_scale()`
+walks the output frame's outline the way 16.8 walks the source's, 2048
+points with every corner and edge midpoint on one. Each point at radius `|P|`
+is turned back onto the corrected picture; along that direction the source
+rectangle ends at `frame_radius(u)`, and the corrected picture at the
+inverse of it, `reach = min over channels of invert_c(frame_radius(u))`,
+the channel that runs out first. Then `s = max(1, max over P of |P| / reach)`.
+That is exact for the same reason 16.8's walk is: the map is monotone along
+each ray and both outlines are seen from the centre, which is inside both,
+so an outline inside means everything inside. The answer is checked
+against its contract in `test_lens` rather than against a second copy of
+the walk: at 331 points a side the library does not sample, every output
+point has its three sources on the readout, and a scale a thousandth
+smaller leaves one without. With no correction it equals the closed form
+`max((w |sin t| + h cos t) / h, (w cos t + h |sin t|) / w)` to a millionth,
+which the walk has no way to know.
+
+It never goes below 1 because the turn may use what the record's own frame
+throws away, not show more than that frame does. Below 1 would be a
+different framing from the camera's at every angle, and at 0 degrees the
+picture would jump the moment the angle left zero. At exactly 0 degrees
+the answer is 1 without a walk and the shader takes the record's own path,
+so an unturned frame is bit for bit what it always was. Every record seen
+keeps its own frame on the source, so the first thousandth of a degree
+costs less than 1e-4 and nothing jumps; a record that sampled off the
+frame at 0 degrees, which no camera writes, would jump by its own
+overshoot.
+
+**Keeping everything.** 16.8's walk with the output direction turned: each
+point of the source's outline lands at `needed` along its own direction,
+and that direction turned by `t` meets the output frame at
+`frame_radius`. Unturned the direction is the source's own exactly, one
+times it less nothing, and `craw_lens_keep_all_scale()` is now this function
+at 0 degrees, so its answer is the same to the bit. With no correction it
+is the reciprocal of the filling closed form.
+
+**What it costs in magnification**, 5760x3040, both directions the same:
+
+    turn       no correction   24 mm (P1000261)   60 mm (P1000387)
+    0.5 deg        1.0165           1.0000             1.0139
+    2 deg          1.0655           1.0000             1.0603
+    3 deg          1.0978           1.0287             1.0909
+    5 deg          1.1613           1.0916             1.1512
+    12.5 deg       1.3864           1.3186             1.3661
+    30 deg         1.8134           1.7548             1.7772
+    44.9 deg       2.0458           1.9921             2.0020
+
+At 24 mm a turn of up to 2.09 degrees costs nothing at all and five
+degrees costs 9.2% where the uncorrected frame needs 16.1%. At 60 mm the
+gain is small: k0 is chosen so that the source's corner sits just inside the
+frame's, so a turned corner leaves the source almost at once, and the
+bulge past the edges is where a turned frame's edges move inward, away
+from it. The 60 mm record still costs less than no correction at every
+angle, never more.
+
+**The border.** Filling a turned frame has no inside test: the walk
+measures the frame's edge and the outermost pixel centres sit half a pixel
+inside it, and the mirror of 16.4 takes whatever rounding gets past that.
+A test would turn the same rounding into a black dot in a corner. Keeping
+everything paints black exactly as 16.8 does.
+
+**The shader** has three modes in its push constant, now 80 bytes:
+`FILL`, the record's own frame, written exactly as before anything else
+existed; `TURN`; and `KEEP`, turned or not. `TURN` and `KEEP` share one
+branch, `q` from `turn`, and differ only in the black test. Unturned,
+`turn` is `(1 / s, 0)` and `KEEP` computes `d` times `1 / s` to the bit,
+which is what it always computed. The pipeline caches the scale against
+the record, the turn and the mode, so a still or a clip that is not zooming
+walks once. Verified against the build before the turn existed:
+`cineraw --lens on` and `--lens keep` on P1000352.MOV at 0.96 s and
+`--lens on` on P1000387.MOV frame 0, linear float out, have the same md5
+from both builds.
+
+**Where it sits** is where the warp sits, 16.3: the defringe, the chroma
+denoise, the sharpening and the auto white balance histogram all see the
+turned picture. A magnified frame shows less of the scene, and the
+histogram measures what is shown. The temporal denoise runs on the mosaic
+before it, so turning does not disturb its state.
+
+**Cost.** `cineraw --bench`, 29 frames of P1000261.MOV at 24 mm, twice
+over: the lens pass is 0.924 / 0.933 ms unturned and 0.916 / 0.921 ms
+turned 5 degrees, the same number. With `--lens off` the turn makes the
+pass run where none ran, 0.970 / 0.908 ms; the whole recording goes from
+about 4.15 to 4.83 ms. The host side is the walk of 16.8, once per change
+of record, angle or mode.
+
+**Tests.** `test_lens` checks the scale on no correction, the real 24 mm
+and 60 mm records, at seven angles in both directions and both modes,
+against the contract above; no correction against the closed form; 0
+degrees filling at exactly 1 and keeping at `craw_lens_keep_all_scale()`
+to the bit; the first thousandth of a degree; the 24 mm record covering 2
+degrees with no magnification and costing clearly less at 5; both
+directions agreeing; and the refusals, 45 and -45 degrees and NaN.
+`test_pipeline` turns the 512x320 synthetic frame of 16.5 by 5 degrees on
+one pipeline recorded frame after frame. Two marks land within 0.032 px of
+where the inverse, the scale and the turn put them, per channel; a mark
+placed where the turned frame's top right corner takes its green from, 7.8
+px past the top edge of the record's own frame and therefore not in it,
+peaks in that corner exactly where predicted; the inner mark's angle about
+the centre grows by +5.000 degrees, measured, so clockwise is clockwise;
+every pixel of the filled turn has the flat field under it. A 2 degree turn
+covered by the thrown-away corners only turns, with no magnification. The
+real record turned -5 degrees, a frame with no record turned 5 degrees,
+whose marks land within 0.003 px of the closed form's prediction, and the
+kept turn all agree with `craw_ref_lens()` to 1.4e-3 against the stage's
+8e-3, and the kept turn's black border is where the double arithmetic puts
+it on the GPU and in the reference, pixel for pixel outside a hundredth of a
+pixel of the boundary. The unturned frame after all of that is bit for bit
+the one before it, the same turn twice is bit for bit itself, and 45, -45
+and NaN degrees are refused before anything is recorded.
+
+**On a real frame.** P1000352.MOV at 0.96 s, 24 mm: `cineraw --rotate 2`
+reports a magnification of 1.0000 and its frame is the unturned one's size,
+turned; `--rotate 5` is magnified 1.0917 against 1.1613 with `--lens off`,
+and the window's mullions, curved in the uncorrected frame, come out
+straight and leaning with the turn. The corners of the turned frames show the
+parts of the readout the record's own frame cuts off; on that clip they
+carry the ProRes RAW blocking that the smooth window sill has all along the
+bottom of the readout, which is the source's and not the warp's.
 
 ## 17. False colour suppression
 

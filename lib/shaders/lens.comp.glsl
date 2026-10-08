@@ -23,10 +23,14 @@
  * at the pixel's own position, as the warp used to, was a 140 MB read of
  * its own at 5.8K and a tenth of the pass.
  *
- * With `keep_all` the frame is not filled: the output position is divided
- * by a scale worked out on the host so that the whole warped source fits
- * inside the frame, and an output pixel whose source lies outside the
- * source frame in any channel is written black. See DESIGN.md 16.8. */
+ * The other two modes put the output position through a turn and a scale
+ * worked out on the host before the polynomial. TURN fills a frame turned
+ * by up to 45 degrees, magnified just enough that every output pixel
+ * still has a source, measured against the corrected source's own outline
+ * rather than the readout's rectangle (DESIGN.md 16.9). KEEP shrinks it
+ * instead, turned or not, until the whole warped source fits inside the
+ * frame, and writes black wherever an output pixel's source lies outside
+ * the source frame in any channel (16.8). */
 
 #extension GL_GOOGLE_include_directive : require
 
@@ -41,9 +45,13 @@ layout(push_constant, scalar) uniform CRAWLensPushBuf {
     vec2  centre;          /* optical centre in pixels, pixel centre origin */
     float inv_half_diag;   /* 1 / the corner distance from `centre` */
     vec4  k[3];            /* k0..k3 per channel, R G B */
-    float inv_scale;       /* 1 / s of DESIGN.md 16.8; exactly 1.0 to fill */
-    int   keep_all;        /* 1: black outside the mapped source */
+    vec2  turn;            /* (cos, sin) of the turn over the scale, 16.9 */
+    int   mode;            /* CRAW_LENS_WARP_* in lib/lens_warp.h */
 } pc;
+
+#define CRAW_LENS_WARP_FILL 0
+#define CRAW_LENS_WARP_TURN 1
+#define CRAW_LENS_WARP_KEEP 2
 
 /* Catmull-Rom cubic weights for taps at -1, 0, +1, +2 around a sample
  * whose fractional position is `t` in [0, 1). The Mitchell-Netravali
@@ -99,19 +107,23 @@ void main()
     vec2 d = vec2(p) + 0.5 - pc.centre;
     vec4 o;
 
-    /* The two modes are written out separately, and the filling one is
-     * written exactly as it was before the other existed. `keep_all` is a
-     * push constant, so the branch is uniform across the dispatch and costs
-     * nothing; what it buys is that the compiler sees the same expressions
-     * it always saw on the filling path and contracts them into the same
-     * multiply-adds. Sharing the code instead moved 1557 samples of a
-     * 5760x3040 frame by one unit in the last place of the fp16 output,
-     * which is not a difference anyone can see and is exactly the kind of
-     * difference a mode switch must not make. */
-    if (pc.keep_all != 0) {
-        /* DESIGN.md 16.8: the whole mode is the filling mapping evaluated
-         * at p / s, plus a black border where that lands off the source. */
-        vec2  q  = d * pc.inv_scale;
+    /* The record's own frame is written out separately, exactly as it was
+     * before the other modes existed. `mode` is a push constant, so the
+     * branch is uniform across the dispatch and costs nothing; what it buys
+     * is that the compiler sees the same expressions it always saw on the
+     * filling path and contracts them into the same multiply-adds. Sharing
+     * the code instead moved 1557 samples of a 5760x3040 frame by one unit
+     * in the last place of the fp16 output, which is not a difference
+     * anyone can see and is exactly the kind of difference a mode switch
+     * must not make. */
+    if (pc.mode != CRAW_LENS_WARP_FILL) {
+        /* DESIGN.md 16.8 and 16.9: the filling mapping evaluated at the
+         * output position turned and divided by the scale, plus, keeping
+         * everything, a black border where that lands off the source.
+         * Unturned, `turn` is (1 / s, 0) and this is d times 1 / s to the
+         * bit, which is what keeping everything always computed. */
+        vec2  q  = vec2(pc.turn.x * d.x + pc.turn.y * d.y,
+                        pc.turn.x * d.y - pc.turn.y * d.x);
         float r2 = dot(q, q) * (pc.inv_half_diag * pc.inv_half_diag);
         vec2  sp[3];
         bool  inside = true;
@@ -131,8 +143,13 @@ void main()
                                all(lessThanEqual(sp[c], vec2(pc.size)));
         }
 
-        /* Black, not transparent. */
-        if (!inside) {
+        /* Black, not transparent, and only when keeping everything. A
+         * filled turn is on the source by construction, with half a pixel
+         * to spare, since the host measures the frame's edge and the
+         * outermost pixel centres sit half a pixel inside it; the mirror
+         * takes whatever rounding gets past that, where a test here would
+         * paint a black dot in a corner. */
+        if (pc.mode == CRAW_LENS_WARP_KEEP && !inside) {
             imageStore(dst, p, vec4(0.0, 0.0, 0.0, 1.0));
             return;
         }

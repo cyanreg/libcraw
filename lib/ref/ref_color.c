@@ -176,7 +176,8 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
     /* The warp cannot run in place, so the intermediate is moved aside and
      * the result written back over `out`. DESIGN.md 16.3: on the camera
      * RGB, before the defringe. */
-    if ((params->flags & CRAW_PIPELINE_FLAG_LENS) && fp->lens.valid) {
+    if ((params->flags & CRAW_PIPELINE_FLAG_LENS) &&
+        (fp->lens.valid || fp->rotation != 0.0f)) {
         size_t n = (size_t)width * height * 4;
         float *moved = malloc(n * sizeof(*moved));
 
@@ -186,7 +187,7 @@ int craw_ref_process(const uint16_t *bayer, uint32_t width, uint32_t height,
         }
 
         memcpy(moved, out, n * sizeof(*moved));
-        ret = craw_ref_lens(moved, width, height, &fp->lens,
+        ret = craw_ref_lens(moved, width, height, &fp->lens, fp->rotation,
                             (fp->flags & CRAW_FRAME_FLAG_LENS_KEEP_ALL) != 0, out);
         free(moved);
         if (ret < 0)

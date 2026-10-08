@@ -16,6 +16,7 @@
 #include "vk_runtime.h"
 #include "gamut.h"
 #include "sharpen.h"
+#include "lens_warp.h"
 
 #include "debayer_bilinear.spv.h"
 #include "debayer_mhc.spv.h"
@@ -162,23 +163,23 @@ static_assert(offsetof(CRAWColorPush, flags) == 88, "CRAWColorPush layout");
  * the normalizing radius are turned into pixels on the host, because they
  * depend only on the frame size and the record's own centre and a shader
  * that recomputed them per invocation would be doing the same divide
- * seventeen million times. Scalar layout gives the vec4 array a stride of
- * 16, matching float[3][4]. */
+ * seventeen million times; so are the turn and the scale. Scalar layout
+ * gives the vec4 array a stride of 16, matching float[3][4]. */
 typedef struct CRAWLensPush {
     int32_t size[2];
     float   centre[2];      /* optical centre in pixels, pixel centre origin */
     float   inv_half_diag;  /* 1 / the corner distance from `centre` */
     float   k[3][4];        /* k0..k3 per channel, R G B */
-    float   inv_scale;      /* 1 / s of DESIGN.md 16.8, exactly 1.0 to fill */
-    int32_t keep_all;       /* 1: black outside the mapped source */
+    float   turn[2];        /* (cos, sin) of the turn over the scale, 16.9 */
+    int32_t mode;           /* CRAW_LENS_WARP_* */
 } CRAWLensPush;
 
-static_assert(sizeof(CRAWLensPush) == 76, "CRAWLensPush layout");
+static_assert(sizeof(CRAWLensPush) == 80, "CRAWLensPush layout");
 static_assert(offsetof(CRAWLensPush, centre) == 8, "CRAWLensPush layout");
 static_assert(offsetof(CRAWLensPush, inv_half_diag) == 16, "CRAWLensPush layout");
 static_assert(offsetof(CRAWLensPush, k) == 20, "CRAWLensPush layout");
-static_assert(offsetof(CRAWLensPush, inv_scale) == 68, "CRAWLensPush layout");
-static_assert(offsetof(CRAWLensPush, keep_all) == 72, "CRAWLensPush layout");
+static_assert(offsetof(CRAWLensPush, turn) == 68, "CRAWLensPush layout");
+static_assert(offsetof(CRAWLensPush, mode) == 76, "CRAWLensPush layout");
 
 /* Mirrors CRAWFalseColorPushBuf in lib/shaders/false_color.comp.glsl. */
 typedef struct CRAWFalseColorPush {
@@ -453,15 +454,17 @@ struct CRAWPipeline {
     int32_t blocks[2];   /* whole AWB blocks */
     int32_t qsize[2];    /* chroma denoise quarter grid, ceil(size / 4) */
 
-    /* The last keep-everything scale and the record it was worked out for.
-     * craw_lens_keep_all_scale() is a boundary walk of a few hundred
-     * microseconds, and a clip that is not zooming hands over byte for byte
-     * the same record on every frame; the compare is 64 bytes. A miss only
-     * costs the walk, so a caller whose reserved bytes are not zeroed loses
-     * nothing but the cache. */
-    CRAWLensCorrection keep_lc;
-    float keep_scale;
-    bool have_keep_scale;
+    /* The last scale of DESIGN.md 16.8 and 16.9 and what it was worked out
+     * for: the record, the turn and the mode. craw_lens_rotation_scale() is
+     * a boundary walk of a few hundred microseconds, and a clip that is not
+     * zooming hands over byte for byte the same record on every frame; the
+     * compare is 64 bytes. A miss only costs the walk, so a caller whose
+     * reserved bytes are not zeroed loses nothing but the cache. */
+    CRAWLensCorrection warp_lc;
+    float warp_rotation;
+    bool warp_keep;
+    float warp_scale;
+    bool have_warp_scale;
 
     /* Profiling, CRAW_PIPELINE_FLAG_PROFILE and DESIGN.md 21: a timestamp
      * pair per dispatch, in CRAW_PIPELINE_PROFILE_SLOTS runs of 2 * prof_max
@@ -1515,11 +1518,13 @@ static int craw_pipeline_sharpen_push(CRAWPipeline *p, const CRAWProfile *prof,
  * 16. The record states the centre in normalized frame coordinates and
  * normalizes its radius by the corner distance, so both become pixels here
  * against the pipeline's own frame size: the pipeline develops the whole
- * coded frame, which is the frame the camera normalized against. */
+ * coded frame, which is the frame the camera normalized against. A frame
+ * with no record that is only turned comes here with craw_lens_identity,
+ * which is no correction about the frame's centre (16.9). */
 static int craw_pipeline_lens_push(CRAWPipeline *p, const CRAWLensCorrection *lc,
-                                   bool keep_all, CRAWLensPush *lp)
+                                   float rotation, bool keep_all, CRAWLensPush *lp)
 {
-    float hx, hy, half_diag, scale;
+    float hx, hy, half_diag, scale = 1.0f;
     int ret;
 
     if (lc->centre[0] < 0.0f || lc->centre[0] > 1.0f ||
@@ -1533,32 +1538,39 @@ static int craw_pipeline_lens_push(CRAWPipeline *p, const CRAWLensCorrection *lc
         .size   = { (int32_t)p->params.width, (int32_t)p->params.height },
         .centre = { lc->centre[0] * (float)p->params.width,
                     lc->centre[1] * (float)p->params.height },
-        /* Filling the frame is a scale of exactly one, and the shader's
-         * multiply by it is exact, so the frame it produces is bit for bit
-         * the one it produced before the mode existed. */
-        .inv_scale = 1.0f,
+        /* Filling the record's own frame takes the shader's original path,
+         * so the frame it produces is bit for bit the one it produced
+         * before either of the other modes existed. */
+        .mode   = keep_all         ? CRAW_LENS_WARP_KEEP
+                : rotation != 0.0f ? CRAW_LENS_WARP_TURN
+                                   : CRAW_LENS_WARP_FILL,
     };
 
-    /* DESIGN.md 16.8: the scale is a property of the record and the frame
-     * size, so it is worked out here, once per recording, rather than by
-     * seventeen million invocations that would each get the same answer.
-     * It changes frame by frame on a clip that is zooming. */
-    if (keep_all) {
-        if (p->have_keep_scale && !memcmp(&p->keep_lc, lc, sizeof(*lc))) {
-            scale = p->keep_scale;
+    /* DESIGN.md 16.8 and 16.9: the scale is a property of the record, the
+     * turn and the frame size, so it is worked out here, once per
+     * recording, rather than by seventeen million invocations that would
+     * each get the same answer. It changes frame by frame on a clip that is
+     * zooming, and while a turn is being dragged. */
+    if (lp->mode != CRAW_LENS_WARP_FILL) {
+        if (p->have_warp_scale && p->warp_keep == keep_all &&
+            p->warp_rotation == rotation && !memcmp(&p->warp_lc, lc, sizeof(*lc))) {
+            scale = p->warp_scale;
         } else {
-            ret = craw_lens_keep_all_scale(lc, p->params.width, p->params.height, &scale);
+            ret = craw_lens_rotation_scale(lc, p->params.width, p->params.height,
+                                           rotation, keep_all, &scale);
             if (ret < 0) {
                 craw_log(p->ctx, CRAW_LOG_ERROR, "Lens polynomial cannot be inverted; "
-                         "the keep-everything scale is undefined\n");
+                         "the scale of the %s frame is undefined\n",
+                         keep_all ? "kept" : "turned");
                 return ret;
             }
-            p->keep_lc = *lc;
-            p->keep_scale = scale;
-            p->have_keep_scale = true;
+            p->warp_lc = *lc;
+            p->warp_rotation = rotation;
+            p->warp_keep = keep_all;
+            p->warp_scale = scale;
+            p->have_warp_scale = true;
         }
-        lp->inv_scale = 1.0f / scale;
-        lp->keep_all = 1;
+        craw_lens_turn(rotation, scale, lp->turn);
     }
 
     /* r = 1 is the frame corner as seen from the stated centre, i.e. the
@@ -1864,12 +1876,21 @@ int craw_pipeline_record(CRAWPipeline *p, VkCommandBuffer cmd,
             return ret;
     }
 
-    /* A correction marked invalid is the documented way to leave one frame
-     * alone, so the whole warp drops out and the result is bit for bit the
-     * uncorrected one. */
-    lens = p->has_lens && fp->lens.valid;
+    /* A correction marked invalid and no turn is the documented way to
+     * leave one frame alone, so the whole warp drops out and the result is
+     * bit for bit the uncorrected one. A turn of a frame with no record is
+     * the warp with no correction in it, DESIGN.md 16.9; a turn of 45
+     * degrees or more is refused rather than clamped, like every other
+     * parameter out of its range, and so is one that is not a number. */
+    lens = p->has_lens && (fp->lens.valid || fp->rotation != 0.0f);
     if (lens) {
-        ret = craw_pipeline_lens_push(p, &fp->lens,
+        if (!(fabsf(fp->rotation) < CRAW_LENS_MAX_ROTATION)) {
+            craw_log(ctx, CRAW_LOG_ERROR, "rotation = %g; less than %g degrees either way\n",
+                     (double)fp->rotation, (double)CRAW_LENS_MAX_ROTATION);
+            return CRAW_ERROR(EINVAL);
+        }
+        ret = craw_pipeline_lens_push(p, fp->lens.valid ? &fp->lens : &craw_lens_identity,
+                                      fp->rotation,
                                       !!(fp->flags & CRAW_FRAME_FLAG_LENS_KEEP_ALL), &lp);
         if (ret < 0)
             return ret;

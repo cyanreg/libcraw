@@ -313,6 +313,47 @@ bool view_lens_keep_all(const struct view_state *st)
     return view_lens_active(st) && st->lens.keep;
 }
 
+/* Clamped here rather than trusted: the library refuses 45 degrees, and a
+ * refusal would stop the picture rather than turn it. */
+float view_rotation(const struct view_state *st)
+{
+    if (!st->dec.raw || !st->rotate.on)
+        return 0.0f;
+
+    return CRAW_CLAMP(st->rotate.degrees, -VIEW_ROTATE_MAX, VIEW_ROTATE_MAX);
+}
+
+/* The record is the frame's own and the angle the panel's, so either can
+ * change between two redraws; the walk only runs when one did. The record
+ * is compared only while the correction is on, since off the warp has no
+ * correction in it whatever the frame carried. */
+float view_warp_scale(struct view_state *st)
+{
+    struct view_rotate *r = &st->rotate;
+    const CRAWLensCorrection *lc = view_lens_active(st) ? &st->lens.record : NULL;
+    CRAWLensCorrection key = lc ? *lc : (CRAWLensCorrection) { 0 };
+    float deg = view_rotation(st);
+    bool keep = view_lens_keep_all(st);
+
+    if (!st->frame)
+        return 1.0f;
+
+    if (r->scale_w != st->frame->width || r->scale_h != st->frame->height ||
+        r->scale_deg != deg || r->scale_keep != keep ||
+        memcmp(&r->scale_lc, &key, sizeof(key))) {
+        if (craw_lens_rotation_scale(lc, (uint32_t)st->frame->width,
+                                     (uint32_t)st->frame->height, deg, keep, &r->scale) < 0)
+            r->scale = 0.0f;
+        r->scale_w = st->frame->width;
+        r->scale_h = st->frame->height;
+        r->scale_deg = deg;
+        r->scale_keep = keep;
+        r->scale_lc = key;
+    }
+
+    return r->scale;
+}
+
 /* The full count wherever the picture is looked at or kept: paused, and
  * on every frame an export develops, still or video, since an export never
  * plays. While playing, what fits the frame time. */
@@ -369,6 +410,10 @@ void view_frame_params(const struct view_state *st, CRAWFrameParams *fp)
         fp->lens = st->lens.record;
     if (view_lens_keep_all(st))
         fp->flags |= CRAW_FRAME_FLAG_LENS_KEEP_ALL;
+    /* The same pass, built into the pipeline the same way: a turn of a
+     * frame with no record, or with the correction off, is the warp with no
+     * correction in it. */
+    fp->rotation = view_rotation(st);
     /* Built into the pipeline like the rest; no iterations is not
      * dispatched. */
     fp->sharpen_iterations = (uint32_t)view_sharpen_iterations(st);
@@ -405,6 +450,7 @@ struct view_pipeline_look view_pipeline_look(const struct view_state *st)
         .temporal   = view_temporal_strength(st),
         .lens       = view_lens_active(st),
         .lens_keep  = view_lens_keep_all(st),
+        .rotation   = view_rotation(st),
         .sharpen_iterations = view_sharpen_iterations(st),
         .sharpen_radius = view_sharpen_iterations(st) ? st->sharpen.radius : 0.0f,
         .sharpen_contrast = view_sharpen_contrast(st),
@@ -456,6 +502,7 @@ bool view_pipeline_look_equal(const struct view_pipeline_look *a,
            a->denoise == b->denoise && a->temporal == b->temporal &&
            a->lens == b->lens &&
            a->lens_keep == b->lens_keep &&
+           a->rotation == b->rotation &&
            a->sharpen_radius == b->sharpen_radius &&
            a->sharpen_iterations == b->sharpen_iterations &&
            a->sharpen_contrast == b->sharpen_contrast;
@@ -2038,6 +2085,7 @@ static int view_preroll_frame(struct view_state *st, const AVFrame *f,
     fp.false_color_passes = 0;
     fp.defringe_strength = 0.0f;
     fp.lens = (CRAWLensCorrection) { 0 };
+    fp.rotation = 0.0f;
     fp.sharpen_iterations = 0;
     fp.flags &= ~(uint32_t)(CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION |
                             CRAW_FRAME_FLAG_LENS_KEEP_ALL);
@@ -2179,7 +2227,6 @@ abandon:
 int view_step_frame(struct view_state *st)
 {
     AVStream *vs;
-    CRAWLensCorrection prev_lens;
     bool held = false;
     int64_t t0;
     int ret;
@@ -2317,23 +2364,10 @@ int view_step_frame(struct view_state *st)
     /* The lens record belongs to this picture and is taken exactly once,
      * here: view_process_frame() runs again whenever a paused frame is
      * replayed, and the ring hands each record out only the first time. */
-    prev_lens = st->lens.record;
     view_decoder_lens(&st->dec, st->frame->pts, &st->lens.record);
     if (st->lens.record.valid) {
         craw_lens_corner_shift(&st->lens.record, (uint32_t)st->frame->width,
                                (uint32_t)st->frame->height, true, st->lens.corner);
-
-        /* The keep-everything scale is a boundary walk of about a
-         * millisecond, so it is worked out here rather than by the panel
-         * sixty times a second, and only when the record has actually
-         * changed - which on a clip that is not zooming is once. It is a
-         * readout only: craw_pipeline_record() works out its own. The
-         * record is the whole key because a clip does not change frame size
-         * while it plays. */
-        if (memcmp(&prev_lens, &st->lens.record, sizeof(prev_lens)) &&
-            craw_lens_keep_all_scale(&st->lens.record, (uint32_t)st->frame->width,
-                                     (uint32_t)st->frame->height, &st->lens.scale) < 0)
-            st->lens.scale = 0.0f;
     }
 
     st->pts = view_frame_pts(st, st->frame);
@@ -2721,6 +2755,14 @@ static void view_usage(FILE *f)
 "                      itself makes; keep shrinks the corrected picture until\n"
 "                      every source pixel fits and paints the rest black. The\n"
 "                      Lens section cycles the same row and prints the scale\n"
+"  --rotate DEGREES    turn a raw clip's picture clockwise (negative:\n"
+"                      anticlockwise), up to %.1f either way. The frame keeps\n"
+"                      its size and the picture is magnified until it is\n"
+"                      filled, using the corners the lens correction would\n"
+"                      otherwise cut off first, so a couple of degrees at the\n"
+"                      wide end of a zoom cost no magnification at all; with\n"
+"                      --lens-fit keep it shrinks until all of it fits. The\n"
+"                      Rotate section holds the same angle\n"
 "  --lut NAME          a .cube LUT applied by the renderer: a file, or the\n"
 "                      name or slug of one of the embedded film simulations\n"
 "                      (a file of that name wins). --list-luts prints them\n"
@@ -2898,7 +2940,7 @@ static void view_usage(FILE *f)
 "panel and every key but q are locked; q stops the export, finishes the\n"
 "file and quits.\n",
     (double)CRAW_SHARPEN_MAX_RADIUS, CRAW_SHARPEN_MAX_ITERATIONS, VIEW_SHARPEN_PLAY_ITERATIONS,
-    craw_tool_profile_builtin_list());
+    (double)VIEW_ROTATE_MAX, craw_tool_profile_builtin_list());
 }
 
 enum {
@@ -2942,6 +2984,7 @@ enum {
     VIEW_OPT_DEFRINGE,
     VIEW_OPT_SHARPEN,
     VIEW_OPT_LENS_FIT,
+    VIEW_OPT_ROTATE,
     VIEW_OPT_SOFTLIGHT,
     VIEW_OPT_VIBRANCE,
     VIEW_OPT_PIX_FMT,
@@ -2996,6 +3039,7 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
         { "defringe", required_argument, NULL, VIEW_OPT_DEFRINGE },
         { "sharpen",  required_argument, NULL, VIEW_OPT_SHARPEN   },
         { "lens-fit", required_argument, NULL, VIEW_OPT_LENS_FIT  },
+        { "rotate",   required_argument, NULL, VIEW_OPT_ROTATE    },
         { "softlight", required_argument, NULL, VIEW_OPT_SOFTLIGHT },
         { "vibrance", required_argument, NULL, VIEW_OPT_VIBRANCE  },
         { "pix-fmt",  required_argument, NULL, VIEW_OPT_PIX_FMT   },
@@ -3159,6 +3203,16 @@ static int view_parse_args(struct view_state *st, int argc, char **argv,
                 return CRAW_ERROR(EINVAL);
             }
             st->lens.keep_sel = st->lens.keep ? 1 : 0;
+            break;
+        case VIEW_OPT_ROTATE:
+            st->rotate.degrees = strtof(optarg, &end);
+            if (end == optarg || *end || !(fabsf(st->rotate.degrees) <= VIEW_ROTATE_MAX)) {
+                fprintf(stderr, "--rotate: expected degrees, up to %.1f either way, "
+                        "got `%s`\n", (double)VIEW_ROTATE_MAX, optarg);
+                return CRAW_ERROR(EINVAL);
+            }
+            /* Touched, like any of the panel's angles: the switch comes on. */
+            st->rotate.on = true;
             break;
 
         case VIEW_OPT_DENOISE: {
@@ -3593,6 +3647,8 @@ static void view_log_look(const struct view_state *st)
 
     fprintf(stderr, ", lens %s", st->lens.on ? st->lens.keep ? "on (keep all)"
                                                              : "on (fill)" : "off");
+    if (st->rotate.on && st->rotate.degrees != 0.0f)
+        fprintf(stderr, ", rotated %+.2f deg", st->rotate.degrees);
     if (st->sharpen.on)
         fprintf(stderr, ", sharpen %.2f x%d contrast %.2f", st->sharpen.radius,
                 st->sharpen.iterations, st->sharpen.contrast);
@@ -3724,7 +3780,6 @@ static int view_open_clip(struct view_state *st, int index, bool first)
     st->vwb.converging = false;
 
     st->lens.record = (CRAWLensCorrection) { 0 };
-    st->lens.scale = 0.0f;
     st->lens.ms_on = st->lens.ms_off = 0.0;
     st->denoise.have_model = false;
     st->denoise.ms_on = st->denoise.ms_off = 0.0;

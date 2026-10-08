@@ -1201,7 +1201,8 @@ static int view_gpu_develop(struct view_gpu *g, const AVFrame *frame,
      * the slot comes round. */
     g->slot_denoise[g->slot] = fp->denoise_strength > 0.0f ||
                                fp->denoise_temporal_strength > 0.0f;
-    g->slot_lens[g->slot] = fp->lens.valid;
+    /* The warp ran if it corrected or turned the picture. */
+    g->slot_lens[g->slot] = fp->lens.valid || fp->rotation != 0.0f;
 
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
