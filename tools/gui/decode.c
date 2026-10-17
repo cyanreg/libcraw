@@ -50,26 +50,58 @@ static bool view_codec_has_vulkan(const AVCodec *codec)
     return false;
 }
 
+/* Whether two lists of stream side data say the same thing, entry for
+ * entry, in whatever order. */
+static bool view_side_data_equal(const AVPacketSideData *a, int na,
+                                 const AVPacketSideData *b, int nb)
+{
+    if (na != nb)
+        return false;
+
+    for (int i = 0; i < na; i++) {
+        const AVPacketSideData *e = av_packet_side_data_get(b, nb, a[i].type);
+
+        if (!e || e->size != a[i].size || (a[i].size && memcmp(e->data, a[i].data, a[i].size)))
+            return false;
+    }
+
+    return true;
+}
+
 /* Whether a decoder in the pool can take this stream through a flush and
  * the stream's extradata on its first packet, which is how every codec
- * this viewer has met so far takes the next clip. The RW2 decoder cannot:
- * it reads the file's whole header - the stripes, the levels, the white
- * balance - from the context's extradata at every picture and looks at
- * nothing on the packet, so a decoder opened on one still would decode the
- * next still's stripes with the first one's header. It is kept only for a
- * stream with the same header, which is the same file again as a playlist
- * comes back round to it; anything else gets a decoder of its own, which
- * for a software decoder with nothing to set up costs nothing. */
+ * this viewer has met so far takes the next clip.
+ *
+ * Not when the stream's side data differs from the one the decoder was
+ * opened on. avcodec_parameters_to_context() copied that stream's - the
+ * display matrix of a clip shot with the camera on its side, an HDR
+ * clip's mastering display, an ICC profile - into the context, the API
+ * takes it only before avcodec_open2(), and libavcodec puts it on every
+ * picture the context decodes from then on. A decoder opened on a sideways
+ * clip turned every clip of its codec after it on its side: the picture's
+ * matrix is what a clip with none of its own goes by (view_read_frame_info()).
+ * So a clip whose stream says something else gets a decoder of its own,
+ * which costs the switch an open.
+ *
+ * The RW2 decoder cannot take another file at all: it reads the file's
+ * whole header - the stripes, the levels, the white balance - from the
+ * context's extradata at every picture and looks at nothing on the packet,
+ * so a decoder opened on one still would decode the next still's stripes
+ * with the first one's header. It is kept only for a stream with the same
+ * header, which is the same file again as a playlist comes back round to
+ * it; anything else gets a decoder of its own, which for a software
+ * decoder with nothing to set up costs nothing. */
 static bool view_decoder_takes(const AVCodecContext *avc, const AVCodecParameters *par)
 {
+    if (!view_side_data_equal(avc->coded_side_data, avc->nb_coded_side_data,
+                              par->coded_side_data, par->nb_coded_side_data))
+        return false;
+
 #if CRAW_TOOL_HAVE_RW2
     if (par->codec_id == AV_CODEC_ID_RW2)
         return avc->extradata_size == par->extradata_size &&
                (!par->extradata_size ||
                 !memcmp(avc->extradata, par->extradata, (size_t)par->extradata_size));
-#else
-    (void)avc;
-    (void)par;
 #endif
 
     return true;
@@ -105,8 +137,9 @@ static int view_decoder_codec_open(struct view_decoder *d)
             avcodec_free_context(&d->codec.pool[i]);
             d->codec.pool[i] = d->codec.pool[--d->codec.nb_pool];
             if (d->verbose)
-                fprintf(stderr, "decoder: %s from the pool cannot take another "
-                                "file's header; a new one opens\n", codec->name);
+                fprintf(stderr, "decoder: %s from the pool cannot take this stream "
+                                "(another header, or other stream side data); a new "
+                                "one opens\n", codec->name);
             break;
         }
         /* Clean since its last clip closed (view_decoder_close()). */
