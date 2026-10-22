@@ -670,8 +670,8 @@ struct view_gpu {
     int export_w, export_h;
 
     /* The scene-referred export's direct path: a second pipeline writing
-     * RGBA32F, a texture to write into and a command buffer and fence of
-     * its own. Nothing here goes through pl_renderer, pl_shader or
+     * RGBA16F or RGBA32F, a texture to write into and a command buffer and
+     * fence of its own. Nothing here goes through pl_renderer, pl_shader or
      * pl_dispatch - the only libplacebo call on these pixels is the
      * pl_tex_download that reads them back - because linear light must
      * reach the encoder as the numbers libcraw produced and not as
@@ -684,6 +684,7 @@ struct view_gpu {
     CRAWPipeline *direct_pipe;
     enum CRAWDebayer direct_debayer;
     uint32_t direct_w, direct_h;
+    VkFormat direct_format;         /* the texture's, and the pipeline's out_format */
     pl_tex direct_tex;
     VkImage direct_image;
     VkImageView direct_view;
@@ -1558,22 +1559,22 @@ int  view_gpu_render_target(struct view_gpu *g, struct view_state *st,
 
 /* ------------------------------------------------ the direct export path */
 
-/* The second pipeline and the RGBA32F texture a scene-referred export
- * writes through, for the size the clip is now. Idempotent; call again
- * after a clip switch. */
-int  view_gpu_direct_open(struct view_gpu *g);
+/* The second pipeline and the texture a scene-referred export writes
+ * through, for the size the clip is now: RGBA16F for a half float file,
+ * RGBA32F otherwise. Idempotent; call again after a clip switch. */
+int  view_gpu_direct_open(struct view_gpu *g, bool half);
 void view_gpu_direct_close(struct view_gpu *g);
 
 /* Runs the picture on screen through that pipeline in `space` - no gamut
  * clamp, the reference gamut compression left to the space's own rule - and
  * starts reading the rectangle (x, y, w, h) back as w * h packed RGBA
- * floats. Neither is waited for: view_gpu_direct_wait() does that, and
+ * halves or floats, the texture's own. Neither is waited for: view_gpu_direct_wait() does that, and
  * needs nothing of the viewer's state, so a video export calls it outside
  * the lock it shares with the window. `rgba` is not to be read before.
  * `ms` is the time the recording and the submission took. */
 int  view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
                            enum CRAWColorSpace space, int x, int y, int w, int h,
-                           float *rgba, double *ms);
+                           void *rgba, double *ms);
 
 /* Waits for the read-back view_gpu_direct_frame() started, which is the
  * pipeline's run on the device and the transfer; `ms` is how long. */

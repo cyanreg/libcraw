@@ -273,6 +273,20 @@ static const enum AVPixelFormat view_fmts_hevc_vk[] = {
 
 #define VIEW_FMTS(l) .fmts = (l), .nb_fmts = (int)CRAW_ARRAY_ELEMS(l)
 
+/* What the FFv1 families write linear light in. Half floats first, the
+ * default: the pipeline holds the debayered picture in RGBA16F whenever a
+ * lens, false colour, chroma or defringe pass is built, so the digits a
+ * single float adds past them are the output transform's arithmetic, and
+ * a 5.8K ACES frame of P1000387 is 48 MB as gbrpf16 against 149 MB as
+ * gbrpf32, the half floats at most 0.1% under the single ones (the GPU
+ * truncates when it stores a half). Single floats stay for whoever wants
+ * those digits all the same. */
+static const enum AVPixelFormat view_scene_fmts_ffv1[] = {
+    AV_PIX_FMT_GBRPF16, AV_PIX_FMT_GBRPF32,
+};
+
+#define VIEW_SCENE_FMTS(l) .scene_fmts = (l), .nb_scene_fmts = (int)CRAW_ARRAY_ELEMS(l)
+
 const struct view_preset_family view_preset_families[] = {
     {
         .name = "ProRes (Vulkan)", .encoder = "prores_ks_vulkan",
@@ -281,7 +295,6 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_prores),
         .def = VIEW_PRORES_DEF,
         .ctrl = VIEW_CTRL_ASYNC, .container = "mov",
-        .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
     },
     {
@@ -292,10 +305,9 @@ const struct view_preset_family view_preset_families[] = {
         .def = VIEW_FFV1_DEF,
         .ctrl = VIEW_CTRL_ASYNC, .container = "mkv",
         .always = "slices_h=32,slices_v=32",
-        /* The one path that can write linear light: libplacebo renders
-         * straight into the encoder's own float planes, so nothing is
-         * quantised and nothing above diffuse white is clipped. */
-        .scene_fmt = AV_PIX_FMT_GBRPF32,
+        /* Float planes, written straight from the pipeline: nothing
+         * above diffuse white is clipped. */
+        VIEW_SCENE_FMTS(view_scene_fmts_ffv1),
         .async_min = 1, .async_max = 4, .async_def = 2,
     },
     {
@@ -305,7 +317,6 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_apv),
         .def = 0,
         .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_QP, .container = "mov",
-        .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
         .qp_min = 0, .qp_max = 63, .qp_def = 22,
     },
@@ -318,12 +329,12 @@ const struct view_preset_family view_preset_families[] = {
         .container = "mkv",
         .always = "slices=1024",
         /* The software encoder carries float too, and nothing about the
-         * direct path stops it: the read-back is RGBA32F either way and the
+         * direct path stops it: the read-back is the same either way and the
          * frame it is handed is the same planar float the Vulkan one gets.
          * What used to rule this family out was the rendered path's 16 bit
          * unorm texture, and linear light does not go through that any
          * more. */
-        .scene_fmt = AV_PIX_FMT_GBRPF32,
+        VIEW_SCENE_FMTS(view_scene_fmts_ffv1),
     },
     {
         .name = "ProRes", .encoder = "prores_ks",
@@ -332,7 +343,6 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_prores),
         .def = VIEW_PRORES_DEF,
         .container = "mov",
-        .scene_fmt = AV_PIX_FMT_NONE,
     },
     {
         .name = "SVT-AV1", .encoder = "libsvtav1",
@@ -342,7 +352,6 @@ const struct view_preset_family view_preset_families[] = {
         .def = 0,
         .ctrl = VIEW_CTRL_CPU | VIEW_CTRL_RC, .container = "mp4",
         .always = "svtav1-params=" VIEW_SVT_PARAMS,
-        .scene_fmt = AV_PIX_FMT_NONE,
         /* SVT's own default speed, so an untouched slider is the encoder's
          * own behaviour. */
         .cpu_min = 0, .cpu_max = 13, .cpu_def = 10,
@@ -362,7 +371,6 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_x264),
         .def = VIEW_X264_DEF,
         .ctrl = VIEW_CTRL_RC, .container = "mp4",
-        .scene_fmt = AV_PIX_FMT_NONE,
         .rc = {
             { "CRF", false, 0, 51, 18 },
             { "VBR", true },
@@ -377,7 +385,6 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_h264_vk),
         .def = 0,
         .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_RC, .container = "mp4",
-        .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
         .rc = {
             { "VBR", true },
@@ -394,7 +401,6 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_hevc_vk),
         .def = 0,
         .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_RC, .container = "mp4",
-        .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
         .rc = {
             { "VBR", true },
@@ -412,7 +418,6 @@ const struct view_preset_family view_preset_families[] = {
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_av1_vk),
         .def = 0,
         .ctrl = VIEW_CTRL_ASYNC | VIEW_CTRL_RC, .container = "mp4",
-        .scene_fmt = AV_PIX_FMT_NONE,
         .async_min = 1, .async_max = 4, .async_def = 2,
         .rc = {
             { "VBR", true },
@@ -439,7 +444,8 @@ const int view_nb_preset_families =
  *
  * The scene entries are the pipeline's own linear light with nothing
  * display-referred on it, written by the direct path: a second pipeline run
- * per frame into an RGBA32F texture, read back and handed to the encoder.
+ * per frame into a half or a single float texture, read back and handed to
+ * the encoder.
  * H.273 has no code points for the ACES spaces, so those go out as
  * unspecified primaries with a linear transfer and are named in container
  * metadata instead; CIE XYZ does have one, SMPTE ST 428-1's - though note
@@ -662,6 +668,7 @@ void view_presets_default(struct view_preset_sel *s)
      * field AV_PIX_FMT_YUV420P. */
     s->pix_fmt = AV_PIX_FMT_NONE;
     s->pix_fmt_family = -1;
+    s->scene_pix_fmt = AV_PIX_FMT_NONE;
     s->size = VIEW_SIZE_FULL;
     /* The clip's own sound, remuxed: a range of a take without its sound
      * is rarely what anyone wanted. Every encoding mode's number starts on
@@ -1026,6 +1033,8 @@ int view_presets_parse_fmt(struct view_preset_sel *s, const char *arg)
 
     s->pix_fmt = f;
     s->pix_fmt_family = s->family;
+    if (av_pix_fmt_desc_get(f)->flags & AV_PIX_FMT_FLAG_FLOAT)
+        s->scene_pix_fmt = f;
     s->set = true;
 
     return 0;
@@ -1186,8 +1195,8 @@ const char *view_presets_colour_why_not(int family, int preset, int colour)
      * clips at 1.0, which throws away everything above diffuse white -
      * which on a raw clip is most of the highlights. So the scene-referred
      * spaces are offered only where the samples are float, and here that
-     * is FFV1's gbrpf32. */
-    if (f->scene_fmt == AV_PIX_FMT_NONE)
+     * is FFV1's gbrpf16 and gbrpf32. */
+    if (!f->nb_scene_fmts)
         return "linear light needs float samples, which of these families "
                "only the two FFv1 ones can write";
     if (!p->scene_ok)
@@ -1283,6 +1292,27 @@ int view_presets_fmts(int family, const enum AVPixelFormat **out)
     *out = f->fmts;
 
     return f->nb_fmts;
+}
+
+int view_presets_scene_fmts(int family, const enum AVPixelFormat **out)
+{
+    const struct view_preset_family *f = view_family(family);
+
+    *out = f ? f->scene_fmts : NULL;
+
+    return f ? f->nb_scene_fmts : 0;
+}
+
+enum AVPixelFormat view_presets_sel_scene_fmt(const struct view_preset_sel *s)
+{
+    const enum AVPixelFormat *fmts;
+    int n = view_presets_scene_fmts(s->family, &fmts);
+
+    for (int i = 0; i < n; i++)
+        if (fmts[i] == s->scene_pix_fmt)
+            return fmts[i];
+
+    return n ? fmts[0] : AV_PIX_FMT_NONE;
 }
 
 /* ------------------------------------------------------- the names */

@@ -647,8 +647,9 @@ the file than on a fitted window; spline is all but insensitive to it.
 
 A **scene-referred** export — ACEScg, ACES2065-1, CIE XYZ D65 — never goes
 near the renderer. The frame is put through the pipeline a second time with
-the output space asked for, into an RGBA32F texture, and those floats are
-read back and handed to the encoder: no tone curve, no gamut mapping, no
+the output space asked for, into an RGBA16F or an RGBA32F texture as the
+file's format asks, and those floats are read back and handed to the
+encoder unconverted: no tone curve, no gamut mapping, no
 film simulation, no grain, nothing display-referred anywhere between
 libcraw's output and the file. ACEScg carries the ACES 1.3 reference gamut
 compression the display hand-off carries, so the file holds the numbers the
@@ -666,7 +667,7 @@ rows take no input, and the film simulation cascade will not open.
 
 Linear light needs float samples, which of the encoder families here means
 FFV1 at version 4 — `FFv1 (Vulkan)` or `FFv1` with an L4 preset, writing
-gbrpf32. Both FFv1 families offer L3 and L4, each with FFV1's normal context
+gbrpf16 or gbrpf32. Both FFv1 families offer L3 and L4, each with FFV1's normal context
 set or its small one (`context=2`), and small is the default: with a 32 by 32
 slice grid there is too little picture per slice for a bigger set to adapt,
 and it codes smaller at either level. Picking one of the three spaces in the
@@ -776,8 +777,20 @@ subsamples on the way into the encoder's own image; on the software path
 libswscale takes the read-back to it. Either way the stream is tagged as what
 it is: RGB full range, YCbCr studio range with the colour entry's matrix, and
 left chroma siting where there is chroma to site and none stated where there
-is not. A scene-referred export has one format and the row shows it: the
-family's float one, `gbrpf32`.
+is not.
+
+A scene-referred export has the FFv1 families' two float formats, and the
+row offers those instead: `RGB 16-bit float (gbrpf16le)`, the default, and
+`RGB 32-bit float (gbrpf32le)`, also `--pix-fmt gbrpf32le`. Half floats are
+the default because they hold what the pipeline has: its debayered picture
+is RGBA16F whenever a lens, false colour, chroma or defringe pass is built,
+so what a single float adds past it is the arithmetic of the output
+transform. A 5.8K ACES frame of P1000387 is 48 MB as gbrpf16 against
+149 MB as gbrpf32, and the 16-bit file is every sample of the 32-bit one
+cut to a half float - the GPU truncates rather than rounds, so a sample is
+up to 0.1% below the single float, never above. The float choice and the
+display one are kept apart, so each is still there after a trip through
+the other.
 
 ## Layout
 

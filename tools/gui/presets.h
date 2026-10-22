@@ -90,11 +90,10 @@ struct view_preset_family {
      * preset's. */
     const char *always;
 
-    /* The format a scene-referred export uses instead of the preset's, or
-     * AV_PIX_FMT_NONE when this family cannot carry linear light. Spelled
-     * out in every entry, because AV_PIX_FMT_NONE is -1 and a field left
-     * out of a designated initializer is AV_PIX_FMT_YUV420P. */
-    enum AVPixelFormat scene_fmt;
+    /* The formats a scene-referred export can use instead of the preset's,
+     * the default first; none when this family cannot carry linear light. */
+    const enum AVPixelFormat *scene_fmts;
+    int nb_scene_fmts;
 
     int async_min, async_max, async_def;
     int qp_min, qp_max, qp_def;
@@ -129,15 +128,16 @@ extern const int view_nb_preset_families;
  *
  * The scene-referred three never touch the renderer at all. The pipeline is
  * run a second time for the frame with CRAWFrameParams.out_space set to the
- * space asked for, into an RGBA32F texture, and those floats are read back
- * and handed to the encoder through libswscale and, for a Vulkan encoder,
- * an upload - no pl_renderer, no pl_shader, no pl_dispatch. Nothing
+ * space asked for, into a half or a single float texture, and those floats
+ * are read back, split into the encoder's planes and, for a Vulkan encoder,
+ * uploaded - no pl_renderer, no pl_shader, no pl_dispatch. Nothing
  * display-referred can therefore reach them: no tone curve, no gamut
  * mapping, no film simulation, no grain, which is why those sections grey
- * out while one is selected. `needs_deep_rgb`, the family's `scene_fmt` and
- * a preset's `scene_ok` are what that path keys on: FFV1 writes gbrpf32 at
- * version 4 and refuses it below, so the only family that can carry linear
- * light is FFv1 (Vulkan) with an L4 preset. */
+ * out while one is selected. `needs_deep_rgb`, the family's `scene_fmts`
+ * and a preset's `scene_ok` are what that path keys on: FFV1 writes
+ * gbrpf16 and gbrpf32 at version 4 and refuses them below, so the only
+ * families that can carry linear light are the FFv1 ones with an L4
+ * preset. */
 enum view_colour_id {
     VIEW_COLOUR_709 = 0,
     VIEW_COLOUR_2020_SDR,
@@ -213,6 +213,11 @@ struct view_preset_sel {
      * survives a preset change, like every other export setting. */
     int pix_fmt;
     int pix_fmt_family;
+    /* The same row's choice under a scene-referred colour, kept apart from
+     * the one above so that each survives a trip through the other:
+     * AV_PIX_FMT_NONE, or a format the family does not list, is the
+     * family's default, 16 bit float. */
+    int scene_pix_fmt;
 
     /* What the export does with the clip's sound, enum view_audio_mode,
      * and the one number each encoding mode takes - a bitrate in kbit/s
@@ -356,6 +361,13 @@ int  view_presets_fmts(int family, const enum AVPixelFormat **out);
  * belongs to this family, and the preset's own pin otherwise. */
 enum AVPixelFormat view_presets_sel_fmt(const struct view_preset_sel *s);
 
+/* The float formats a scene-referred export of the family can be written
+ * in, the default first, and the one a selection writes: the row's choice
+ * if the family lists it, the default otherwise, AV_PIX_FMT_NONE for a
+ * family that cannot carry linear light. */
+int  view_presets_scene_fmts(int family, const enum AVPixelFormat **out);
+enum AVPixelFormat view_presets_sel_scene_fmt(const struct view_preset_sel *s);
+
 /* Why this preset cannot be written in this format, or NULL. The encoder
  * would take it - a format it does not take is never offered at all - but
  * the profile the preset selects is a chroma layout in the standard, and
@@ -365,7 +377,8 @@ const char *view_presets_fmt_why_not(int family, int preset,
                                      enum AVPixelFormat fmt);
 
 /* `--pix-fmt NAME`, by FFmpeg's own names ("nv12", "yuv422p10le", and the
- * unsuffixed "gbrp16" for the native-endian one). */
+ * unsuffixed "gbrp16" for the native-endian one). A float format is the
+ * scene-referred choice as well, for `--colour aces` and the other two. */
 int view_presets_parse_fmt(struct view_preset_sel *s, const char *arg);
 
 /* The whole option string a selection means: the family's always-options,

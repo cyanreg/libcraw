@@ -753,28 +753,23 @@ static int view_menu_colour_group(int g, int *count)
 /* A leaf column's entries select rather than opening another column. */
 /* The pixel formats the export's format row offers, and how many.
  *
- * A scene-referred export has exactly one - the family's float format,
- * which is the only thing the direct path writes - and it is shown rather
- * than hidden so that the row still says what the file will hold. Anything
- * else is what the probe found the family's encoder opens with; a format
- * it does not open with is never offered at all, and one it opens with
- * that the preset's profile forbids is offered greyed. */
+ * A scene-referred export has the family's float formats, half and single,
+ * which are the only things the direct path writes. Anything else is what
+ * the probe found the family's encoder opens with; a format it does not
+ * open with is never offered at all, and one it opens with that the
+ * preset's profile forbids is offered greyed. */
 static int view_menu_fmts(const struct view_state *st,
                           const enum AVPixelFormat **out)
 {
     const struct view_preset_sel *s = &st->look.video_preset;
-    const struct view_preset_family *f;
 
     if (s->family < 0 || s->family >= view_nb_preset_families) {
         *out = NULL;
         return 0;
     }
 
-    f = &view_preset_families[s->family];
-    if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene) {
-        *out = &f->scene_fmt;
-        return f->scene_fmt == AV_PIX_FMT_NONE ? 0 : 1;
-    }
+    if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene)
+        return view_presets_scene_fmts(s->family, out);
 
     return view_presets_fmts(s->family, out);
 }
@@ -1048,6 +1043,11 @@ static void view_menu_select(struct view_state *st, int col, int i)
     case VIEW_MENU_PIXFMT:
         if (ix >= view_menu_fmts(st, &fmts))
             break;
+        if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene) {
+            s->scene_pix_fmt = fmts[ix];
+            s->set = true;
+            break;
+        }
         s->pix_fmt = fmts[ix];
         /* Stamped with the family it was chosen under: the row falls back
          * to the preset's own pin the moment the family moves, since the
@@ -1078,16 +1078,16 @@ static int view_menu_current(const struct view_state *st, int col)
     const struct view_lut_menu *m = &st->menu;
     const struct view_preset_sel *s = &st->look.video_preset;
     const enum AVPixelFormat *fmts;
+    enum AVPixelFormat cur;
     int first, n;
 
     switch (m->kind) {
     case VIEW_MENU_PIXFMT:
         n = view_menu_fmts(st, &fmts);
-        /* A scene-referred export's one format is the one in use. */
-        if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene)
-            return n ? 0 : -1;
+        cur = view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene
+            ? view_presets_sel_scene_fmt(s) : view_presets_sel_fmt(s);
         for (int i = 0; i < n; i++)
-            if (fmts[i] == view_presets_sel_fmt(s))
+            if (fmts[i] == cur)
                 return i;
         return -1;
     case VIEW_MENU_PRESET:
@@ -2803,10 +2803,11 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
      * in use is the preset's own pin until the row is touched, after which
      * the choice outlives a preset change and dies with a family one. */
     {
-        /* A scene-referred export is written in the family's float format
-         * whatever the row held before: say that one. */
-        enum AVPixelFormat f = scene && fam->scene_fmt != AV_PIX_FMT_NONE
-                             ? fam->scene_fmt : view_presets_sel_fmt(sel);
+        /* A scene-referred export is written in one of the family's float
+         * formats whatever the row held before: say which. */
+        enum AVPixelFormat f = scene && fam->nb_scene_fmts
+                             ? view_presets_sel_scene_fmt(sel)
+                             : view_presets_sel_fmt(sel);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
         /* The format is known from the table the moment the preset is,

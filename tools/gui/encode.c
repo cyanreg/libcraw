@@ -124,18 +124,19 @@ struct view_encode {
     AVFrame *ss;                /* the RGBA64 read-back, as libswscale input */
     SwsContext *sws;
 
-    /* The scene-referred path: the pipeline's own RGBA32F read-back and the
-     * planar float frame the encoder takes. No renderer, no slots, no
-     * double buffering - the read-back is synchronous because the second
-     * pipeline run it belongs to is, and a lossless float encode is the
-     * slow end of this anyway. */
+    /* The scene-referred path: the pipeline's own read-back, RGBA16F or
+     * RGBA32F as the format asks, and the planar float frame the encoder
+     * takes. No renderer, no slots, no double buffering - the read-back is
+     * synchronous because the second pipeline run it belongs to is, and a
+     * lossless float encode is the slow end of this anyway. */
     bool direct;
     enum CRAWColorSpace direct_space;
+    enum AVPixelFormat direct_fmt;  /* gbrpf16 or gbrpf32 */
     int crop_x, crop_y;         /* where the read-back rectangle starts */
     int crop_w, crop_h;         /* and how big it is, in source pixels */
-    float *rgba;                /* crop_w * crop_h packed RGBA floats */
-    size_t rgba_values;
-    AVFrame *df;                /* gbrpf32, the staging for a Vulkan upload */
+    void *rgba;                 /* crop_w * crop_h packed RGBA halves or floats */
+    size_t rgba_bytes;
+    AVFrame *df;                /* direct_fmt, the staging for a Vulkan upload */
     /* Where the time went, summed over the run: the recording, the device
      * and the read-back, the de-interleave, the upload and the encoder. */
     double ms_gpu, ms_dl, ms_pack, ms_up, ms_enc;
@@ -2078,48 +2079,62 @@ static int view_enc_send_sw(struct view_encode *e, struct view_enc_slot *s,
  * `sw` and `sh` are the read-back's own dimensions, which the caller keeps
  * even, so the walk covers it exactly.
  *
+ * The samples are halves for gbrpf16 and floats for gbrpf32, read back in
+ * the same precision the frame holds, so either way they are moved as they
+ * are and never converted.
+ *
  * GBRP is G, B, R in that order, which is the one thing about the format
  * worth saying out loud. */
-static void view_enc_deinterleave(AVFrame *f, const float *rgba,
+static void view_enc_deinterleave(AVFrame *f, const void *rgba,
                                   int sw, int sh, pl_rotation rot)
 {
     int w = f->width, h = f->height;
-    ptrdiff_t step, row;
-    const float *base;
+    ptrdiff_t base, step, row;
 
     switch (pl_rotation_normalize(rot)) {
     case PL_ROTATION_90:
-        base = rgba + (size_t)(sh - 1) * sw * 4;
+        base = (ptrdiff_t)(sh - 1) * sw * 4;
         step = -(ptrdiff_t)sw * 4;
         row  = 4;
         break;
     case PL_ROTATION_180:
-        base = rgba + ((size_t)(sh - 1) * sw + sw - 1) * 4;
+        base = ((ptrdiff_t)(sh - 1) * sw + sw - 1) * 4;
         step = -4;
         row  = -(ptrdiff_t)sw * 4;
         break;
     case PL_ROTATION_270:
-        base = rgba + (size_t)(sw - 1) * 4;
+        base = (ptrdiff_t)(sw - 1) * 4;
         step = (ptrdiff_t)sw * 4;
         row  = -4;
         break;
     default:
-        base = rgba;
+        base = 0;
         step = 4;
         row  = (ptrdiff_t)sw * 4;
         break;
     }
 
     for (int y = 0; y < h; y++) {
-        const float *s = base + row * y;
-        float *g = (float *)(f->data[0] + (ptrdiff_t)y * f->linesize[0]);
-        float *b = (float *)(f->data[1] + (ptrdiff_t)y * f->linesize[1]);
-        float *r = (float *)(f->data[2] + (ptrdiff_t)y * f->linesize[2]);
+        uint8_t *g = f->data[0] + (ptrdiff_t)y * f->linesize[0];
+        uint8_t *b = f->data[1] + (ptrdiff_t)y * f->linesize[1];
+        uint8_t *r = f->data[2] + (ptrdiff_t)y * f->linesize[2];
 
-        for (int x = 0; x < w; x++, s += step) {
-            r[x] = s[0];
-            g[x] = s[1];
-            b[x] = s[2];
+        if (f->format == AV_PIX_FMT_GBRPF16) {
+            const uint16_t *s = (const uint16_t *)rgba + base + row * y;
+
+            for (int x = 0; x < w; x++, s += step) {
+                ((uint16_t *)r)[x] = s[0];
+                ((uint16_t *)g)[x] = s[1];
+                ((uint16_t *)b)[x] = s[2];
+            }
+        } else {
+            const float *s = (const float *)rgba + base + row * y;
+
+            for (int x = 0; x < w; x++, s += step) {
+                ((float *)r)[x] = s[0];
+                ((float *)g)[x] = s[1];
+                ((float *)b)[x] = s[2];
+            }
         }
     }
 }
@@ -2136,16 +2151,17 @@ static int view_enc_read_direct(struct view_encode *e, struct view_state *st)
     /* The read-back is the source rectangle; the frame the encoder takes is
      * that rectangle turned, which for a quarter turn is the same number of
      * pixels the other way up. */
-    size_t need = (size_t)e->crop_w * e->crop_h * 4;
+    size_t need = (size_t)e->crop_w * e->crop_h * 4 *
+                  (e->direct_fmt == AV_PIX_FMT_GBRPF16 ? 2 : 4);
     int ret;
 
-    if (e->rgba_values < need) {
-        float *p = realloc(e->rgba, need * sizeof(*p));
+    if (e->rgba_bytes < need) {
+        void *p = realloc(e->rgba, need);
 
         if (!p)
             return CRAW_ERROR(ENOMEM);
         e->rgba = p;
-        e->rgba_values = need;
+        e->rgba_bytes = need;
     }
 
     ret = view_gpu_direct_frame(e->g, st, e->direct_space, e->crop_x, e->crop_y,
@@ -2175,7 +2191,7 @@ static int view_enc_send_direct(struct view_encode *e, int64_t pts)
      * not copying twice. */
     if (!av_frame_is_writable(f)) {
         av_frame_unref(f);
-        f->format = AV_PIX_FMT_GBRPF32;
+        f->format = e->direct_fmt;
         f->width  = e->w;
         f->height = e->h;
         ret = av_frame_get_buffer(f, 0);
@@ -2260,7 +2276,7 @@ int view_encode_preroll(struct view_state *st, const AVFrame *f,
 
     /* Built now rather than when the output is opened, which would be
      * too late for these frames; view_enc_setup() finds it there. */
-    ret = view_gpu_direct_open(e->g);
+    ret = view_gpu_direct_open(e->g, e->direct_fmt == AV_PIX_FMT_GBRPF16);
     if (ret < 0)
         return ret;
 
@@ -2424,6 +2440,7 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
                                                       e->sel.colour);
 
         e->direct_space = view_export_craw_space(st);
+        e->direct_fmt = view_presets_sel_scene_fmt(&e->sel);
 
         /* The panel greys a family or a preset that cannot carry float, but
          * --preset and --colour can still be combined into one, and an
@@ -2651,26 +2668,22 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     if (ret < 0)
         goto fail;
 
-    /* A scene-referred export has exactly one format, whatever the preset
-     * pins: float samples, which for FFV1 is gbrpf32 at version 4. The
-     * family's own scene_fmt says so, and view_presets_colour_why_not() has
-     * already refused every family and preset that cannot open with it. */
+    /* A scene-referred export is written in float samples whatever the
+     * preset pins, which for FFV1 is gbrpf16 or gbrpf32 at version 4, as
+     * the row chose. view_presets_colour_why_not() has already refused
+     * every family and preset that cannot open with them. */
     if (e->direct) {
-        const struct view_preset_family *fam =
-            &view_preset_families[CRAW_CLAMP(e->sel.family, 0,
-                                             view_nb_preset_families - 1)];
-
-        ret = view_enc_try(e, st, fam->scene_fmt, v->enc);
+        ret = view_enc_try(e, st, e->direct_fmt, v->enc);
         if (ret < 0) {
             fprintf(stderr, "%s: cannot open the %s encoder with %s, which is "
                             "what %s needs: %s\n", v->path, e->codec->name,
-                    av_get_pix_fmt_name(fam->scene_fmt), e->col->name,
+                    av_get_pix_fmt_name(e->direct_fmt), e->col->name,
                     av_err2str(ret));
             ret = CRAW_ERROR(EINVAL);
             goto fail;
         }
 
-        ret = view_gpu_direct_open(e->g);
+        ret = view_gpu_direct_open(e->g, e->direct_fmt == AV_PIX_FMT_GBRPF16);
         if (ret < 0)
             goto fail;
 
@@ -2679,7 +2692,7 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
             ret = CRAW_ERROR(ENOMEM);
             goto fail;
         }
-        e->df->format = AV_PIX_FMT_GBRPF32;
+        e->df->format = e->direct_fmt;
         e->df->width  = e->w;
         e->df->height = e->h;
         ret = av_frame_get_buffer(e->df, 0);
@@ -3068,7 +3081,7 @@ static void view_enc_release(struct view_state *st)
     av_buffer_unref(&e->frames);
     view_enc_audio_close(e);
 
-    /* The second pipeline and its RGBA32F texture are most of a gigabyte of
+    /* The second pipeline and its float texture are most of a gigabyte of
      * device memory, and a viewer that is done exporting has no use for
      * them. The encoder is freed first: its frames pool lives on the same
      * device and the finish above has already retired everything. */

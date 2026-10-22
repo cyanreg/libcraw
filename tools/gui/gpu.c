@@ -2637,18 +2637,22 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
 
 /* A scene-referred export never goes near the renderer. The picture is put
  * through the pipeline a second time with CRAWFrameParams.out_space set to
- * the space asked for, into an RGBA32F texture, and the crop of that texture
+ * the space asked for, into an RGBA16F or an RGBA32F texture as the file's
+ * format asks - so that a half float file is read back in half the bytes
+ * and never converted on the host - and the crop of that texture
  * is read straight back: the only libplacebo call these pixels see is
  * pl_tex_download, which is a copy and nothing else. Everything the display
  * path does - the scRGB scale, tone mapping, gamut mapping, the LUT, the
  * grade, the grain - is display-referred by definition and has no business
  * touching linear light on its way to an archive.
  *
- * It costs a second pipeline because the first one writes RGBA16F: libcraw
- * binds the destination as a storage image of the pipeline's own out_format,
- * so a 32 bit target needs a pipeline built for 32 bits. Making the display
- * one RGBA32F instead would double the bandwidth of every frame played for
- * the sake of the frames that are exported, which is the wrong way round. */
+ * It costs a second pipeline even at 16 bits, because a pipeline's
+ * temporal denoise state is its own: the display's, run a second time for
+ * every exported frame, would average each frame in twice. At 32 bits
+ * there is a reason more - libcraw binds the destination as a storage image
+ * of the pipeline's own out_format - and making the display one RGBA32F
+ * instead would double the bandwidth of every frame played for the sake of
+ * the frames that are exported, which is the wrong way round. */
 
 void view_gpu_direct_close(struct view_gpu *g)
 {
@@ -2678,10 +2682,14 @@ void view_gpu_direct_close(struct view_gpu *g)
     }
 
     g->direct_w = g->direct_h = 0;
+    g->direct_format = VK_FORMAT_UNDEFINED;
 }
 
-int view_gpu_direct_open(struct view_gpu *g)
+int view_gpu_direct_open(struct view_gpu *g, bool half)
 {
+    VkFormat want = half ? VK_FORMAT_R16G16B16A16_SFLOAT
+                         : VK_FORMAT_R32G32B32A32_SFLOAT;
+    const char *name = half ? "RGBA16F" : "RGBA32F";
     CRAWPipelineParams pp;
     VkImageUsageFlags usage;
     VkFormat fmt;
@@ -2695,16 +2703,20 @@ int view_gpu_direct_open(struct view_gpu *g)
     }
 
     if (g->direct_pipe && g->direct_w == g->width && g->direct_h == g->height &&
-        g->direct_debayer == g->pipe_debayer)
+        g->direct_debayer == g->pipe_debayer && g->direct_format == want)
         return 0;
 
     view_gpu_direct_close(g);
 
-    plfmt = pl_find_named_fmt(g->gpu, "rgba32f");
+    /* "rgba16hf", not "rgba16f": libplacebo's rgba16f is the half float
+     * texture with a single float host side, so a download of it comes back
+     * twice the size, converted, which is what this is meant to avoid. */
+    plfmt = pl_find_named_fmt(g->gpu, half ? "rgba16hf" : "rgba32f");
     if (!plfmt || !(plfmt->caps & PL_FMT_CAP_STORABLE) ||
         !(plfmt->caps & PL_FMT_CAP_HOST_READABLE)) {
-        fprintf(stderr, "the GPU has no storable, readable RGBA32F format, "
-                        "which a scene-referred export is written through\n");
+        fprintf(stderr, "the GPU has no storable, readable %s format, "
+                        "which a scene-referred export is written through\n",
+                name);
         return CRAW_ERROR(ENOTSUP);
     }
 
@@ -2716,16 +2728,15 @@ int view_gpu_direct_open(struct view_gpu *g)
         .host_readable = true,
     ));
     if (!g->direct_tex) {
-        fprintf(stderr, "cannot create the %ux%u RGBA32F export texture\n",
-                g->width, g->height);
+        fprintf(stderr, "cannot create the %ux%u %s export texture\n",
+                g->width, g->height, name);
         ret = CRAW_ERROR(ENOMEM);
         goto fail;
     }
 
     g->direct_image = pl_vulkan_unwrap(g->gpu, g->direct_tex, &fmt, &usage);
-    if (!g->direct_image || fmt != VK_FORMAT_R32G32B32A32_SFLOAT) {
-        fprintf(stderr, "the export texture is not an R32G32B32A32_SFLOAT "
-                        "image\n");
+    if (!g->direct_image || fmt != want) {
+        fprintf(stderr, "the export texture is not an %s image\n", name);
         ret = CRAW_ERROR(ENOTSUP);
         goto fail;
     }
@@ -2776,7 +2787,7 @@ int view_gpu_direct_open(struct view_gpu *g)
     pp.cfa        = CRAW_CFA_RGGB;
     pp.debayer    = g->pipe_debayer;
     pp.out_space  = CRAW_CS_ACES_AP1_LINEAR;
-    pp.out_format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    pp.out_format = want;
     pp.flags      = CRAW_PIPELINE_FLAG_DENOISE | CRAW_PIPELINE_FLAG_TEMPORAL_DENOISE |
                     CRAW_PIPELINE_FLAG_FALSE_COLOR | CRAW_PIPELINE_FLAG_CHROMA_DENOISE |
                     CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION | CRAW_PIPELINE_FLAG_DEFRINGE |
@@ -2784,18 +2795,19 @@ int view_gpu_direct_open(struct view_gpu *g)
 
     ret = craw_pipeline_create(g->ctx, &pp, &g->direct_pipe);
     if (ret < 0) {
-        fprintf(stderr, "the export pipeline (%ux%u, RGBA32F) failed: %d\n",
-                g->width, g->height, ret);
+        fprintf(stderr, "the export pipeline (%ux%u, %s) failed: %d\n",
+                g->width, g->height, name, ret);
         goto fail;
     }
 
     g->direct_w = g->width;
     g->direct_h = g->height;
     g->direct_debayer = g->pipe_debayer;
+    g->direct_format = want;
 
     if (g->verbose)
-        fprintf(stderr, "export pipeline: built for %ux%u, RGBA32F\n",
-                g->width, g->height);
+        fprintf(stderr, "export pipeline: built for %ux%u, %s\n",
+                g->width, g->height, name);
 
     return 0;
 
@@ -2846,7 +2858,7 @@ static int view_gpu_direct_record(struct view_gpu *g, const AVFrame *frame,
     dst = (CRAWImage) {
         .image  = g->direct_image,
         .view   = g->direct_view,
-        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+        .format = g->direct_format,
         .layout = VK_IMAGE_LAYOUT_GENERAL,
         .width  = g->direct_w,
         .height = g->direct_h,
@@ -3007,7 +3019,7 @@ static void view_gpu_direct_read(void *priv)
 
 int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
                           enum CRAWColorSpace space, int x, int y, int w, int h,
-                          float *rgba, double *ms)
+                          void *rgba, double *ms)
 {
     CRAWFrameParams fp;
     int64_t t0;
