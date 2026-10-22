@@ -184,9 +184,9 @@ static bool view_device_ok(VkPhysicalDevice pd, const CRAWVulkanRequirements *rq
 
     /* Every queue is shared between threads - the window, the export's,
      * the decoder's and FFmpeg's encoders - and none of them takes a lock
-     * to submit: the driver serialises them. libplacebo enables the
-     * extension and the feature by itself wherever they exist; here they
-     * are what a device is not chosen without. */
+     * to submit: the driver serialises them. view_gpu_open() asks
+     * libplacebo for the extension and the feature; here they are what a
+     * device is not chosen without. */
     {
         bool found = false;
 
@@ -570,7 +570,26 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
      * one of its own; the extension above is only there for FFmpeg to see. */
     rq.required_features_14.shaderSubgroupRotate = VK_TRUE;
 
-    feats.pNext = &video_m1;
+    /* The queues every thread here submits to without a lock. libplacebo
+     * creates them internally synchronized only when it is asked for the
+     * feature, and the extension with it: a queue made with the flag can
+     * only be retrieved with the same flags, which every other user of the
+     * device has to know, and here every other user does. */
+    VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR isq = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR,
+        .pNext = &video_m1,
+        .internallySynchronizedQueues = VK_TRUE,
+    };
+
+    feats.pNext = &isq;
+
+    const char *req_exts[16];
+    int nb_req_exts = 0;
+
+    for (uint32_t i = 0; i < rq.nb_required_device_extensions &&
+                         nb_req_exts < (int)CRAW_ARRAY_ELEMS(req_exts) - 1; i++)
+        req_exts[nb_req_exts++] = rq.required_device_extensions[i];
+    req_exts[nb_req_exts++] = VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME;
 
     const char *opt_exts[CRAW_ARRAY_ELEMS(video_exts) + 8];
     int nb_opt_exts = 0;
@@ -595,8 +614,8 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
         .async_compute   = false,
         .queue_count     = 1,
         .extra_queues    = VIEW_EXTRA_QUEUES,
-        .extensions      = rq.required_device_extensions,
-        .num_extensions  = (int)rq.nb_required_device_extensions,
+        .extensions      = req_exts,
+        .num_extensions  = nb_req_exts,
         .opt_extensions  = opt_exts,
         .num_opt_extensions = nb_opt_exts,
     ));
@@ -626,9 +645,9 @@ int view_gpu_open(struct view_gpu *g, const struct view_cfg *cfg, void *sdl_wind
     }
 
     /* view_device_ok() chose a device that has internally synchronized
-     * queues, and libplacebo creates every queue with the flag when it
-     * does; this is the one thing nothing here would survive without, so
-     * it is checked rather than assumed. A queue created with a flag can
+     * queues, and libplacebo creates every queue with the flag when it is
+     * asked for them, as above; this is the one thing nothing here would
+     * survive without, so it is checked rather than assumed. A queue created with a flag can
      * only be retrieved through vkGetDeviceQueue2 with the same flags. */
     if (!(g->queue_flags & VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR)) {
         fprintf(stderr, "libplacebo did not create internally synchronized "

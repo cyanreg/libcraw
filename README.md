@@ -661,7 +661,7 @@ nothing display-referred anywhere between libcraw's output and the file.
 What libplacebo does do is what the file's format needs — the turn of a
 rotated clip, the split into planes, and for ACEScct in a YCbCr format the
 matrix, the range and the chroma subsampling — through 32-bit float
-intermediates (`pl_render_params.high_bit_depth_fbos`, libplacebo 7.377),
+intermediates (`pl_render_params.high_bit_depth_fbos`, libplacebo 7.378),
 so a single float file holds single floats. On a Vulkan encoder the
 picture is one of the encoder's own pool and the frame never leaves the
 device; a software encoder's frame is read back plane by plane in the
