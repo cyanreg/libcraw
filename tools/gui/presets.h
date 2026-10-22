@@ -377,10 +377,9 @@ enum AVPixelFormat view_presets_sel_fmt(const struct view_preset_sel *s);
 int  view_presets_scene_fmts(int family, const enum AVPixelFormat **out);
 enum AVPixelFormat view_presets_sel_scene_fmt(const struct view_preset_sel *s);
 
-/* The format an ACEScct export writes: the row's own, or, where that is
- * fewer than ten bits, the first of the family's formats that is not, of
- * the same chroma layout if there is one - so x264's 8 bit NV12 becomes
- * 10 bit 4:2:0. AV_PIX_FMT_NONE when the family has none. */
+/* The format an ACEScct export writes: the row's own, or, for a preset
+ * that leaves it to the engine (ProRes auto), the family's first of ten
+ * bits or more. An 8 bit row is not moved: the colour is greyed under it. */
 enum AVPixelFormat view_presets_sel_log_fmt(const struct view_preset_sel *s);
 
 /* The format the selection's colour writes, whichever kind it is: the
@@ -425,11 +424,13 @@ const char *view_presets_colour_why_not(int family, int preset, int colour);
 /* Why `colour` cannot be written in `fmt`, or NULL: ACEScct in fewer than
  * ten bits. */
 const char *view_presets_colour_fmt_why_not(int colour, enum AVPixelFormat fmt);
-/* Selects `colour`, and with it what it needs: a scene-referred space
- * picked under a codec that cannot write it moves the selection to the
- * nearest one that can (FFv1 L3 to L4, any other family to FFv1 (Vulkan)
- * L4) and the size to full. Returns false, changing nothing, when no
- * usable codec can write it. */
+/* The same with the whole selection in hand, its pixel format included:
+ * what greys a colour in the menu. */
+const char *view_presets_sel_colour_why_not(const struct view_preset_sel *s,
+                                            int colour);
+/* Selects `colour`, and nothing else: one the codec, the preset or the
+ * pixel format in use cannot write is refused, changing nothing, and the
+ * menu greys it. Returns whether it was taken. */
 bool view_presets_take_colour(struct view_preset_sel *s, int colour);
 /* Selects a family's preset, and with it the family's own defaults for the
  * sliders. The other way round from the above: a scene-referred colour the

@@ -922,17 +922,11 @@ static const char *view_menu_why_not(const struct view_state *st, int col, int i
         return col == 0 ? view_presets_family_why_not(i)
                         : view_presets_preset_why_not(m->sel[0], i);
 
-    /* A colour the codec in use cannot write is not greyed: picking it
-     * takes the codec that can with it. Only one no codec here can write
-     * is. */
     if (m->kind == VIEW_MENU_COLOUR) {
-        struct view_preset_sel t = *s;
-
         ix = view_menu_lut(st, col, i);
         if (ix < 0 && col == 0)
             ix = view_menu_colour_group(i, &(int) { 0 });
-        return ix < 0 || view_presets_take_colour(&t, ix)
-             ? NULL : view_presets_colour_why_not(s->family, s->preset, ix);
+        return ix < 0 ? NULL : view_presets_sel_colour_why_not(s, ix);
     }
 
     return NULL;
@@ -2828,8 +2822,7 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
      * left for the encoder to discover. */
     why = view_presets_preset_why_not(sel->family, sel->preset);
     if (!why)
-        why = view_presets_colour_why_not(sel->family, sel->preset,
-                                          sel->colour);
+        why = view_presets_sel_colour_why_not(sel, sel->colour);
     /* A format the row still holds from a preset whose profile allowed it,
      * under one whose profile does not: the menu greys such an entry, but a
      * preset change can walk the selection into one all the same, and the

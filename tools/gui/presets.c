@@ -1249,80 +1249,24 @@ const char *view_presets_colour_why_not(int family, int preset, int colour)
     return NULL;
 }
 
-/* The context set a preset asks for, or -1 for one that names none. It is
- * the one thing the FFV1 presets differ in besides the level, so a move to
- * the level that carries float keeps it. */
-static int view_preset_context(const struct view_preset *p)
+const char *view_presets_sel_colour_why_not(const struct view_preset_sel *s,
+                                            int colour)
 {
-    const char *c = p && p->opts ? strstr(p->opts, "context=") : NULL;
+    const char *why = view_presets_colour_why_not(s->family, s->preset, colour);
 
-    return c ? atoi(c + strlen("context=")) : -1;
-}
-
-/* The preset of `family` that can write `colour`, the one with context set
- * `ctx` if there is one, or -1. A `ctx` of -1 - a move from a family that
- * has no such thing - means the context of the family's own default. The
- * walk starts at that default, so a family with no contexts at all lands
- * on its own default rather than on its first preset. */
-static int view_presets_carrier(int family, int colour, int ctx)
-{
-    const struct view_preset_family *f = view_family(family);
-    int found = -1;
-
-    if (!f)
-        return -1;
-    if (ctx < 0)
-        ctx = view_preset_context(&f->presets[f->def]);
-
-    for (int k = 0; k < f->nb_presets; k++) {
-        int i = (f->def + k) % f->nb_presets;
-
-        if (view_presets_preset_why_not(family, i) ||
-            view_presets_colour_why_not(family, i, colour))
-            continue;
-        if (view_preset_context(&f->presets[i]) == ctx)
-            return i;
-        if (found < 0)
-            found = i;
-    }
-
-    return found;
+    return why ? why : view_presets_colour_fmt_why_not(colour, view_presets_sel_fmt(s));
 }
 
 bool view_presets_take_colour(struct view_preset_sel *s, int colour)
 {
-    int family = s->family, preset = s->preset;
-
-    if (colour < 0 || colour >= VIEW_NB_COLOURS)
+    if (colour < 0 || colour >= VIEW_NB_COLOURS ||
+        view_presets_sel_colour_why_not(s, colour))
         return false;
-
-    /* The family in use first, so that FFv1 stays FFv1; then the table's
-     * order, which puts FFv1 (Vulkan) ahead of the software one. */
-    if (view_presets_colour_why_not(family, preset, colour)) {
-        int ctx = view_preset_context(view_preset(family, preset));
-
-        preset = view_presets_carrier(family, colour, ctx);
-        for (int i = 0; preset < 0 && i < view_nb_preset_families; i++)
-            preset = view_presets_carrier(family = i, colour, ctx);
-        if (preset < 0)
-            return false;
-    }
-
-    if (family != s->family) {
-        s->family = family;
-        s->preset = preset;
-        view_presets_family_defaults(s);
-    } else {
-        s->preset = preset;
-    }
 
     if (view_colours[colour].scene &&
         !view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene)
         s->display_colour = s->colour;
     s->colour = colour;
-    /* The direct path writes the source's own size and nothing else. */
-    if (view_colours[colour].scene)
-        s->size = VIEW_SIZE_FULL;
     s->set = true;
 
     return true;
@@ -1335,7 +1279,7 @@ void view_presets_take_preset(struct view_preset_sel *s, int family, int preset)
     s->set = true;
     view_presets_family_defaults(s);
 
-    if (view_presets_colour_why_not(family, preset, s->colour)) {
+    if (view_presets_sel_colour_why_not(s, s->colour)) {
         int c = CRAW_CLAMP(s->display_colour, 0, VIEW_NB_COLOURS - 1);
 
         s->colour = view_colours[c].scene ? VIEW_COLOUR_709 : c;
@@ -1362,29 +1306,15 @@ enum AVPixelFormat view_presets_sel_log_fmt(const struct view_preset_sel *s)
 {
     const struct view_preset_family *f = view_family(s->family);
     enum AVPixelFormat fmt = view_presets_sel_fmt(s);
-    const AVPixFmtDescriptor *want = av_pix_fmt_desc_get(fmt);
-    enum AVPixelFormat any = AV_PIX_FMT_NONE;
 
-    if (fmt != AV_PIX_FMT_NONE && view_fmt_bits(fmt) >= VIEW_LOG_MIN_BITS)
+    if (fmt != AV_PIX_FMT_NONE || !f)
         return fmt;
-    if (!f)
-        return AV_PIX_FMT_NONE;
 
-    for (int i = 0; i < f->nb_fmts; i++) {
-        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f->fmts[i]);
-
-        if (view_fmt_bits(f->fmts[i]) < VIEW_LOG_MIN_BITS)
-            continue;
-        if (!want || (d->log2_chroma_w == want->log2_chroma_w &&
-                      d->log2_chroma_h == want->log2_chroma_h &&
-                      !!(d->flags & AV_PIX_FMT_FLAG_RGB) ==
-                      !!(want->flags & AV_PIX_FMT_FLAG_RGB)))
+    for (int i = 0; i < f->nb_fmts; i++)
+        if (view_fmt_bits(f->fmts[i]) >= VIEW_LOG_MIN_BITS)
             return f->fmts[i];
-        if (any == AV_PIX_FMT_NONE)
-            any = f->fmts[i];
-    }
 
-    return any;
+    return AV_PIX_FMT_NONE;
 }
 
 enum AVPixelFormat view_presets_sel_out_fmt(const struct view_preset_sel *s)

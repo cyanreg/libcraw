@@ -675,13 +675,11 @@ FFV1 at version 4 — `FFv1 (Vulkan)` or `FFv1` with an L4 preset, writing
 gbrpf16 or gbrpf32. Both FFv1 families offer L3 and L4, each with FFV1's normal context
 set or its small one (`context=2`), and small is the default: with a 32 by 32
 slice grid there is too little picture per slice for a bigger set to adapt,
-and it codes smaller at either level. Picking one of the three spaces in the
-panel moves the video row there: an L3 preset to its L4 twin with the same
-context, any other family to `FFv1 (Vulkan)` L4 with the small one, and the
-size row to full. The other way round, a family or preset picked afterwards
-that cannot carry the space puts the colour row back on the display space it
-replaced: x264 has no float samples, so ACES under it is not a choice the
-panel can hold. The same pair on the command line is refused with the
+and it codes smaller at either level. The panel greys the three spaces under
+any other family or preset. A family or preset picked afterwards that cannot
+carry the space puts the colour row back on the display space it replaced:
+x264 has no float samples, so ACES under it is not a choice the panel can
+hold. The same pair on the command line is refused with the
 reason rather than opened with whatever format it happened to accept. The
 scene-referred paths
 are written at the source's own resolution only; the size row is refused for
@@ -697,12 +695,12 @@ log curve of S-2016-001, which spreads ten bits evenly over the stops and
 reaches 222.86 in linear terms. It is what ACES footage is graded from in
 ProRes 4444, and it is still scene referred — undoing the curve gives the
 ACEScg numbers back, and the look, the adjustments and the grain stay off
-as for the other three. Any family with a format of ten bits or more takes
-it, so picking it moves no codec; the pixel format row offers the family's
-own formats with the 8 bit ones greyed (fifteen codes a stop, which bands),
-and a row on an 8 bit format moves to the first of ten or more with the same
-layout, so x264's NV12 becomes 10 bit 4:2:0. H.264 (Vulkan), which has only
-NV12, cannot take it. The pipeline's half floats go through a 65,536 entry
+as for the other three. Any family with a format of ten bits or more can
+write it, in that format: the colour row greys it while the pixel format is
+an 8 bit one (fifteen codes a stop, which bands), so under x264, whose
+presets start on NV12, a 10 bit format is picked first, and while it is
+selected the pixel format row greys the 8 bit ones. H.264 (Vulkan), which
+has only NV12, cannot take it at all. The pipeline's half floats go through a 65,536 entry
 table of the curve during the same turned walk, into a full range 16 bit
 code, and from there to the encoder's format the way a display-referred
 frame is: by hand for packed RGB, libswscale for the rest, BT.709's matrix
