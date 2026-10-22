@@ -673,10 +673,12 @@ slice grid there is too little picture per slice for a bigger set to adapt,
 and it codes smaller at either level. Picking one of the three spaces in the
 panel moves the video row there: an L3 preset to its L4 twin with the same
 context, any other family to `FFv1 (Vulkan)` L4 with the small one, and the
-size row to full. A family or preset picked
-afterwards that cannot carry it, or the same choice on the command line, is
-refused with the reason rather than opened with whatever format it happened
-to accept. The scene-referred paths
+size row to full. The other way round, a family or preset picked afterwards
+that cannot carry the space puts the colour row back on the display space it
+replaced: x264 has no float samples, so ACES under it is not a choice the
+panel can hold. The same pair on the command line is refused with the
+reason rather than opened with whatever format it happened to accept. The
+scene-referred paths
 are written at the source's own resolution only; the size row is refused for
 them, while the crop rectangle still works, because a crop is a rectangle of
 the read-back and a resize is a display decision. H.273 has no code points

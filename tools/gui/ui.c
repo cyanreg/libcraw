@@ -1056,10 +1056,7 @@ static void view_menu_select(struct view_state *st, int col, int i)
         s->set = true;
         break;
     case VIEW_MENU_PRESET:
-        s->family = m->sel[0];
-        s->preset = ix;
-        s->set = true;
-        view_presets_family_defaults(s);
+        view_presets_take_preset(s, m->sel[0], ix);
         break;
     case VIEW_MENU_COLOUR:
         view_presets_take_colour(s, ix);
@@ -1258,10 +1255,7 @@ static bool view_menu_click_parent(struct view_state *st, int col, int i)
     if (m->kind == VIEW_MENU_PRESET && col == 0) {
         if (view_presets_family_why_not(i))
             return true;            /* greyed: eat the click, change nothing */
-        s->family = i;
-        s->preset = view_preset_families[i].def;
-        s->set = true;
-        view_presets_family_defaults(s);
+        view_presets_take_preset(s, i, view_preset_families[i].def);
         return true;
     }
 

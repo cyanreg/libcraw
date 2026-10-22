@@ -192,6 +192,10 @@ struct view_preset_sel {
     int quant;                  /* the QP or CRF field */
 
     int colour;                 /* enum view_colour_id */
+    /* The display-referred colour that was in use when a scene-referred
+     * one was picked, which picking a codec that cannot write the scene
+     * one goes back to. */
+    int display_colour;
     /* PQ's target peak in nits: the one mapping parameter that stays,
      * because it is part of what the target *is*. How the picture is
      * mapped into it is libplacebo's defaults, the same as the window's. */
@@ -407,6 +411,12 @@ const char *view_presets_colour_why_not(int family, int preset, int colour);
  * L4) and the size to full. Returns false, changing nothing, when no
  * usable codec can write it. */
 bool view_presets_take_colour(struct view_preset_sel *s, int colour);
+/* Selects a family's preset, and with it the family's own defaults for the
+ * sliders. The other way round from the above: a scene-referred colour the
+ * new preset cannot write goes back to the display-referred one it
+ * replaced, so the colour row never holds a space the codec row cannot
+ * write. */
+void view_presets_take_preset(struct view_preset_sel *s, int family, int preset);
 
 /* The device extensions the viewer's VkDevice was created with, told once
  * at device open. A Vulkan H.264, HEVC or AV1 encoder is a hardware engine

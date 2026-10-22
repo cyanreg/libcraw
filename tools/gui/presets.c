@@ -663,6 +663,7 @@ void view_presets_default(struct view_preset_sel *s)
     s->family = 1;
     s->preset = view_preset_families[1].def;
     s->colour = VIEW_COLOUR_709;
+    s->display_colour = VIEW_COLOUR_709;
     s->hdr_peak = 1000;
     /* Spelled out: AV_PIX_FMT_NONE is -1 and the memset above made this
      * field AV_PIX_FMT_YUV420P. */
@@ -1269,6 +1270,9 @@ bool view_presets_take_colour(struct view_preset_sel *s, int colour)
         s->preset = preset;
     }
 
+    if (view_colours[colour].scene &&
+        !view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene)
+        s->display_colour = s->colour;
     s->colour = colour;
     /* The direct path writes the source's own size and nothing else. */
     if (view_colours[colour].scene)
@@ -1276,6 +1280,20 @@ bool view_presets_take_colour(struct view_preset_sel *s, int colour)
     s->set = true;
 
     return true;
+}
+
+void view_presets_take_preset(struct view_preset_sel *s, int family, int preset)
+{
+    s->family = family;
+    s->preset = preset;
+    s->set = true;
+    view_presets_family_defaults(s);
+
+    if (view_presets_colour_why_not(family, preset, s->colour)) {
+        int c = CRAW_CLAMP(s->display_colour, 0, VIEW_NB_COLOURS - 1);
+
+        s->colour = view_colours[c].scene ? VIEW_COLOUR_709 : c;
+    }
 }
 
 /* ------------------------------------------------------ the formats */
