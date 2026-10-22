@@ -31,7 +31,9 @@ libavutil_dep = dependency('libavutil', required: get_option('ffmpeg'))
 
 # cineview additionally needs a window, a renderer and a UI.
 sdl3 = dependency('sdl3', required: false)
-placebo = dependency('libplacebo', version: '>=7.349', required: false)
+# 7.377 for pl_render_params.high_bit_depth_fbos, which the scene-referred
+# export renders its 32-bit float planes through.
+placebo = dependency('libplacebo', version: '>=7.377', required: false)
 # Audio is optional: without libswresample cineview plays silent and paces
 # the picture off wall time instead of the audio clock.
 swresample = dependency('libswresample', required: false)

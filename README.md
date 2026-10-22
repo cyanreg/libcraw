@@ -651,18 +651,24 @@ follows the frame's average — can come out a percent or two brighter in
 the file than on a fitted window; spline is all but insensitive to it.
 
 A **scene-referred** export — ACEScg, ACES2065-1, CIE XYZ D65, and
-ACEScct below — never goes near the renderer. The frame is put through the pipeline a second time with
-the output space asked for, into an RGBA16F or an RGBA32F texture as the
-file's format asks, and those floats are read back and handed to the
-encoder unconverted: no tone curve, no gamut mapping, no
-film simulation, no grain, nothing display-referred anywhere between
-libcraw's output and the file. ACEScg carries the ACES 1.3 reference gamut
-compression the display hand-off carries, so the file holds the numbers the
-screen was shown; ACES2065-1 and XYZ are uncompressed, and none of the three
-clamp negatives. A rotated clip is turned during the de-interleave that
-splits those floats into the encoder's planes — a strided walk of the
-read-back rather than a pass on the device, which at 5.8K takes the
-de-interleave from 77 ms a frame to 225.
+ACEScct below — is never colour managed. The frame is put through the
+pipeline a second time with the output space asked for, into an RGBA16F or
+an RGBA32F texture as the file's format asks, and libplacebo writes that
+texture into the encoder's own picture with the source and the target
+tagged as the same space, so it maps nothing: no tone curve, no gamut
+mapping, no peak detection, no dither, no film simulation, no grain,
+nothing display-referred anywhere between libcraw's output and the file.
+What libplacebo does do is what the file's format needs — the turn of a
+rotated clip, the split into planes, and for ACEScct in a YCbCr format the
+matrix, the range and the chroma subsampling — through 32-bit float
+intermediates (`pl_render_params.high_bit_depth_fbos`, libplacebo 7.377),
+so a single float file holds single floats. On a Vulkan encoder the
+picture is one of the encoder's own pool and the frame never leaves the
+device; a software encoder's frame is read back plane by plane in the
+encoder's own format, and that is the only transfer. ACEScg carries the
+ACES 1.3 reference gamut compression the display hand-off carries, so the
+file holds the numbers the screen was shown; ACES2065-1 and XYZ are
+uncompressed, and none of the three clamp negatives.
 
 Because those four display-referred operators cannot reach such a file, the
 Look, Adjustments and Film grain sections grey out while one is selected,
@@ -684,7 +690,7 @@ reason rather than opened with whatever format it happened to accept. The
 scene-referred paths
 are written at the source's own resolution only; the size row is refused for
 them, while the crop rectangle still works, because a crop is a rectangle of
-the read-back and a resize is a display decision. H.273 has no code points
+the pipeline's output and a resize is a display decision. H.273 has no code points
 for the ACES spaces, so those files carry unspecified primaries with a linear
 transfer and a `COLOUR_SPACE` container tag naming the space; XYZ uses the
 ST 428-1 primaries code point and the same tag.
@@ -700,11 +706,11 @@ write it, in that format: the colour row greys it while the pixel format is
 an 8 bit one (fifteen codes a stop, which bands), so under x264, whose
 presets start on NV12, a 10 bit format is picked first, and while it is
 selected the pixel format row greys the 8 bit ones. H.264 (Vulkan), which
-has only NV12, cannot take it at all. The pipeline's half floats go through a 65,536 entry
-table of the curve during the same turned walk, into a full range 16 bit
-code, and from there to the encoder's format the way a display-referred
-frame is: by hand for packed RGB, libswscale for the rest, BT.709's matrix
-and studio range where it is YCbCr. Unspecified primaries and transfer, and
+has only NV12, cannot take it at all. The curve is a libplacebo hook on the
+same render, and the matrix is BT.709's at studio range where the format
+is YCbCr: those codecs have no RGB mode, so the RGB is packed into luma and
+chroma with the matrix the file is tagged with, and a decoder undoes it
+exactly. Unspecified primaries and transfer, and
 the `COLOUR_SPACE` tag, which an MP4 or QuickTime file carries as a
 file-level mdta key since its tracks hold nothing but a title. A 16 bit FFv1
 ACEScct file of a sideways S1II clip decodes back to within 0.009% of the

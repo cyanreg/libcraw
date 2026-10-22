@@ -671,11 +671,10 @@ struct view_gpu {
 
     /* The scene-referred export's direct path: a second pipeline writing
      * RGBA16F or RGBA32F, a texture to write into and a command buffer and
-     * fence of its own. Nothing here goes through pl_renderer, pl_shader or
-     * pl_dispatch - the only libplacebo call on these pixels is the
-     * pl_tex_download that reads them back - because linear light must
-     * reach the encoder as the numbers libcraw produced and not as
-     * something a display path had an opinion about.
+     * fence of its own. libplacebo writes that texture into the encoder's
+     * picture with nothing between two equal colour spaces to map, because
+     * linear light must reach the encoder as the numbers libcraw produced
+     * and not as something a display path had an opinion about.
      *
      * Built when such an export starts and freed when it ends: at 5.8K the
      * second pipeline's intermediates and this texture are most of a
@@ -692,9 +691,6 @@ struct view_gpu {
     VkFence direct_fence;
     /* `direct_cmd` is in a submission nothing has waited for yet. */
     bool direct_busy;
-    /* The read-back view_gpu_direct_frame() started has landed: set by
-     * libplacebo's transfer callback, from whichever thread polls it. */
-    SDL_AtomicInt direct_read;
 
     double last_gpu_ms;
     /* What libplacebo's peak detection measured for the last displayed
@@ -1566,19 +1562,23 @@ int  view_gpu_direct_open(struct view_gpu *g, bool half);
 void view_gpu_direct_close(struct view_gpu *g);
 
 /* Runs the picture on screen through that pipeline in `space` - no gamut
- * clamp, the reference gamut compression left to the space's own rule - and
- * starts reading the rectangle (x, y, w, h) back as w * h packed RGBA
- * halves or floats, the texture's own. Neither is waited for: view_gpu_direct_wait() does that, and
- * needs nothing of the viewer's state, so a video export calls it outside
- * the lock it shares with the window. `rgba` is not to be read before.
- * `ms` is the time the recording and the submission took. */
+ * clamp, the reference gamut compression left to the space's own rule -
+ * into its texture, on the device; nothing waits for it. `ms` is the time
+ * the recording and the submission took. */
 int  view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
-                           enum CRAWColorSpace space, int x, int y, int w, int h,
-                           void *rgba, double *ms);
+                           enum CRAWColorSpace space, double *ms);
 
-/* Waits for the read-back view_gpu_direct_frame() started, which is the
- * pipeline's run on the device and the transfer; `ms` is how long. */
-int  view_gpu_direct_wait(struct view_gpu *g, double *ms);
+/* The rectangle `crop` of that texture, turned by `rot`, written into
+ * `target` by libplacebo: the encoder's own Vulkan picture as
+ * pl_map_avframe_ex() maps it, or textures shaped like a software encoder's
+ * frame. The planes, the depth and, for a YCbCr format, the matrix, the
+ * range and the chroma subsampling are libplacebo's; the numbers are
+ * libcraw's, through 32-bit float intermediates. `log` puts them through
+ * the ACEScct curve first. The target's colour is overwritten. Not waited
+ * for. */
+int  view_gpu_direct_render(struct view_gpu *g, struct view_state *st,
+                            struct pl_frame *target, pl_rect2df crop,
+                            pl_rotation rot, bool log);
 
 /* A pre-roll frame through that pipeline, with the parameters the display's
  * got, for its temporal state alone: nothing is read back. */
@@ -2083,10 +2083,6 @@ void view_vwb_step(struct view_state *st, bool wait);
 /* Arms the spot white balance, or disarms it: the crosshair goes up or
  * comes down with it. Arming clears the last refusal's word. */
 void view_pick_arm(struct view_state *st, bool on);
-
-/* An IEEE half as a float, subnormals exact; the ACEScct export's table is
- * built through it too. */
-float view_half_to_float(uint16_t h);
 
 /* A left click on the picture while armed, in window pixels: maps it to
  * the source pixel under the pointer, queues the pick there, pauses the

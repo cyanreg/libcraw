@@ -2635,16 +2635,19 @@ int view_gpu_render_export(struct view_gpu *g, struct view_state *st,
 
 /* ------------------------------------------------ the direct export path */
 
-/* A scene-referred export never goes near the renderer. The picture is put
+/* A scene-referred export is never colour managed. The picture is put
  * through the pipeline a second time with CRAWFrameParams.out_space set to
  * the space asked for, into an RGBA16F or an RGBA32F texture as the file's
- * format asks - so that a half float file is read back in half the bytes
- * and never converted on the host - and the crop of that texture
- * is read straight back: the only libplacebo call these pixels see is
- * pl_tex_download, which is a copy and nothing else. Everything the display
- * path does - the scRGB scale, tone mapping, gamut mapping, the LUT, the
- * grade, the grain - is display-referred by definition and has no business
- * touching linear light on its way to an archive.
+ * format asks, and libplacebo writes the crop of that texture into the
+ * encoder's own picture - turned, split into the format's planes and, for
+ * a YCbCr format, through the matrix, the range and the chroma subsampling
+ * - with the source and the target tagged as the same space, so that it
+ * maps nothing: no tone curve, no gamut mapping, no peak detection, no
+ * dither, no look, no grade, no grain. Everything the display path does is
+ * display-referred by definition and has no business touching linear light
+ * on its way to an archive. The frame never leaves the device on the way to
+ * a Vulkan encoder; a software encoder gets its own planes read back, in
+ * its own format, and nothing else.
  *
  * It costs a second pipeline even at 16 bits, because a pipeline's
  * temporal denoise state is its own: the display's, run a second time for
@@ -2708,24 +2711,21 @@ int view_gpu_direct_open(struct view_gpu *g, bool half)
 
     view_gpu_direct_close(g);
 
-    /* "rgba16hf", not "rgba16f": libplacebo's rgba16f is the half float
-     * texture with a single float host side, so a download of it comes back
-     * twice the size, converted, which is what this is meant to avoid. */
-    plfmt = pl_find_named_fmt(g->gpu, half ? "rgba16hf" : "rgba32f");
+    plfmt = pl_find_named_fmt(g->gpu, half ? "rgba16f" : "rgba32f");
     if (!plfmt || !(plfmt->caps & PL_FMT_CAP_STORABLE) ||
-        !(plfmt->caps & PL_FMT_CAP_HOST_READABLE)) {
-        fprintf(stderr, "the GPU has no storable, readable %s format, "
+        !(plfmt->caps & PL_FMT_CAP_SAMPLEABLE)) {
+        fprintf(stderr, "the GPU has no storable, sampleable %s format, "
                         "which a scene-referred export is written through\n",
                 name);
         return CRAW_ERROR(ENOTSUP);
     }
 
     g->direct_tex = pl_tex_create(g->gpu, pl_tex_params(
-        .w             = (int)g->width,
-        .h             = (int)g->height,
-        .format        = plfmt,
-        .storable      = true,
-        .host_readable = true,
+        .w          = (int)g->width,
+        .h          = (int)g->height,
+        .format     = plfmt,
+        .storable   = true,
+        .sampleable = true,
     ));
     if (!g->direct_tex) {
         fprintf(stderr, "cannot create the %ux%u %s export texture\n",
@@ -3012,14 +3012,8 @@ release:
     return ret;
 }
 
-static void view_gpu_direct_read(void *priv)
-{
-    SDL_SetAtomicInt(priv, 1);
-}
-
 int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
-                          enum CRAWColorSpace space, int x, int y, int w, int h,
-                          void *rgba, double *ms)
+                          enum CRAWColorSpace space, double *ms)
 {
     CRAWFrameParams fp;
     int64_t t0;
@@ -3039,50 +3033,83 @@ int view_gpu_direct_frame(struct view_gpu *g, struct view_state *st,
     t0 = av_gettime_relative();
 
     ret = view_gpu_direct_record(g, st->frame, &fp);
-    if (ret < 0)
-        return ret;
-
-    /* The crop is a rectangle of the read-back and nothing else: no
-     * resample, no second pass, and the rows come out tightly packed
-     * because the default row pitch is the rectangle's own width. With a
-     * callback the transfer is asynchronous, which without one it is not:
-     * libplacebo would wait for it right here. */
-    SDL_SetAtomicInt(&g->direct_read, 0);
-    if (!pl_tex_download(g->gpu, pl_tex_transfer_params(
-            .tex      = g->direct_tex,
-            .rc       = { x, y, 0, x + w, y + h, 1 },
-            .ptr      = rgba,
-            .callback = view_gpu_direct_read,
-            .priv     = &g->direct_read,
-        ))) {
-        fprintf(stderr, "cannot read the export texture back\n");
-        return CRAW_ERROR(EIO);
-    }
-    /* On the queue now, so that the wait is for the device and not for
-     * whoever happens to flush next. */
-    pl_gpu_flush(g->gpu);
 
     if (ms)
         *ms = (double)(av_gettime_relative() - t0) / 1000.0;
 
-    return 0;
+    return ret;
 }
 
-int view_gpu_direct_wait(struct view_gpu *g, double *ms)
+int view_gpu_direct_render(struct view_gpu *g, struct view_state *st,
+                           struct pl_frame *target, pl_rect2df crop,
+                           pl_rotation rot, bool log)
 {
-    int64_t t0 = av_gettime_relative();
+    struct pl_render_params rp = pl_render_default_params;
+    const struct pl_hook *hook[1];
+    bool rgb = target->repr.sys == PL_COLOR_SYSTEM_RGB ||
+               target->repr.sys == PL_COLOR_SYSTEM_XYZ;
 
-    /* The callback runs from whichever thread polls the device next, so
-     * this one polls until it has: a poll that finds the texture idle with
-     * the flag still clear has met another thread in the middle of running
-     * it. */
-    while (!SDL_GetAtomicInt(&g->direct_read)) {
-        if (!pl_tex_poll(g->gpu, g->direct_tex, 10000000))
-            SDL_Delay(1);
+    if (!g->direct_tex)
+        return CRAW_ERROR(EINVAL);
+
+    /* The pipeline's own numbers, tagged as nothing in particular: the
+     * target below is tagged the same, and libplacebo maps nothing between
+     * two spaces that are equal. Which space it is is the file's business,
+     * and the stream's tags say it. */
+    struct pl_frame image = {
+        .num_planes = 1,
+        .planes[0] = {
+            .texture           = g->direct_tex,
+            .components        = 3,
+            .component_mapping = { 0, 1, 2, -1 },
+        },
+        .repr = {
+            .sys    = PL_COLOR_SYSTEM_RGB,
+            .levels = PL_COLOR_LEVELS_PC,
+            .alpha  = PL_ALPHA_NONE,
+        },
+        .color = {
+            .primaries = PL_COLOR_PRIM_BT_709,
+            .transfer  = PL_COLOR_TRC_LINEAR,
+        },
+        .crop     = crop,
+        .rotation = rot,
+    };
+
+    /* What the mapping read off the frame's tags is right about the planes,
+     * the depth and the chroma siting, and is overruled about the colour:
+     * an ST 428 tag on an RGB format would make libplacebo encode XYZ, and
+     * unspecified primaries leave it to guess. RGB stays RGB at full range;
+     * YCbCr is BT.709's matrix at studio range, what the frame is tagged. */
+    target->repr.sys    = rgb ? PL_COLOR_SYSTEM_RGB : PL_COLOR_SYSTEM_BT_709;
+    target->repr.levels = rgb ? PL_COLOR_LEVELS_PC : PL_COLOR_LEVELS_TV;
+    target->repr.alpha  = PL_ALPHA_NONE;
+    target->color       = image.color;
+
+    /* None of the display's processing: no peak to detect, nothing to dither
+     * or deband, no sigmoid for a scale that does not happen - the crop is
+     * the target's size, turned - and no hook but the ACEScct curve. The
+     * downscaler is libplacebo's default and only ever subsamples chroma.
+     * The intermediates are 32-bit floats: libplacebo's 16-bit default
+     * would make a single float file half floats in a float container and
+     * cost a 12 or 16 bit one codes at the top of the range. */
+    rp.high_bit_depth_fbos = true;
+    rp.peak_detect_params = NULL;
+    rp.dither_params      = NULL;
+    rp.sigmoid_params     = NULL;
+    rp.color_adjustment   = NULL;
+    if (log) {
+        hook[0] = craw_adjust_acescct(view_adjust_state(st, true));
+        if (!hook[0])
+            return CRAW_ERROR(ENOMEM);
+        rp.hooks     = hook;
+        rp.num_hooks = 1;
     }
 
-    if (ms)
-        *ms = (double)(av_gettime_relative() - t0) / 1000.0;
+    if (!pl_render_image(g->rr_export, &image, target, &rp)) {
+        fprintf(stderr, "pl_render_image failed on the scene-referred export\n");
+        return CRAW_ERROR(EIO);
+    }
 
     return 0;
 }

@@ -329,8 +329,8 @@ const struct view_preset_family view_preset_families[] = {
         .container = "mkv",
         .always = "slices=1024",
         /* The software encoder carries float too, and nothing about the
-         * direct path stops it: the read-back is the same either way and the
-         * frame it is handed is the same planar float the Vulkan one gets.
+         * direct path stops it: the frame it is handed is the same planar
+         * float the Vulkan one gets, read back plane by plane.
          * What used to rule this family out was the rendered path's 16 bit
          * unorm texture, and linear light does not go through that any
          * more. */
@@ -444,16 +444,16 @@ const int view_nb_preset_families =
  *
  * The scene entries are the pipeline's own linear light with nothing
  * display-referred on it, written by the direct path: a second pipeline run
- * per frame into a half or a single float texture, read back and handed to
- * the encoder.
+ * per frame into a half or a single float texture, which libplacebo writes
+ * into the encoder's picture between two equal colour spaces.
  * H.273 has no code points for the ACES spaces, so those go out as
  * unspecified primaries with a linear transfer and are named in container
  * metadata instead; CIE XYZ does have one, SMPTE ST 428-1's - though note
- * that libplacebo reads that tag back as PL_COLOR_SYSTEM_XYZ and means DCDM
- * X'Y'Z' by it, which is a DCI white point and an ST 428 transfer, not
- * this. That is a reason never to make XYZ a libplacebo target and no
- * reason not to write the tag, which is the only code point the standard
- * has for these values. */
+ * that libplacebo reads that tag back as PL_COLOR_SYSTEM_XYZ and would encode
+ * XYZ into such a target itself. That is why the direct path overrules the
+ * mapped target's colour (view_gpu_direct_render()), and no reason not to
+ * write the tag, which is the only code point the standard has for these
+ * values. */
 const struct view_colour view_colours[VIEW_NB_COLOURS] = {
     [VIEW_COLOUR_709] = {
         .name = "BT.709", .key = "bt709", .group = "BT.709",

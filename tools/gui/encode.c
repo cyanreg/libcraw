@@ -124,29 +124,24 @@ struct view_encode {
     AVFrame *ss;                /* the RGBA64 read-back, as libswscale input */
     SwsContext *sws;
 
-    /* The scene-referred path: the pipeline's own read-back, RGBA16F or
-     * RGBA32F as the format asks, and the frame the encoder takes - planar
-     * float for linear light, the family's own format for ACEScct. No
-     * renderer, no slots, no double buffering - the read-back is
-     * synchronous because the second pipeline run it belongs to is, and a
-     * lossless float encode is the slow end of this anyway. */
+    /* The scene-referred path: the pipeline's own texture, RGBA16F or
+     * RGBA32F as the format asks, written by libplacebo into the picture
+     * the encoder takes - planar float for linear light, the family's own
+     * format for ACEScct. For a Vulkan encoder that is a picture of its own
+     * pool and nothing leaves the device; a software encoder's frame gets
+     * textures shaped like it, read back plane by plane into it. */
     bool direct;
     enum CRAWColorSpace direct_space;
     enum AVPixelFormat direct_fmt;  /* gbrpf16, gbrpf32, or ACEScct's */
-    bool direct_half;           /* read back as RGBA16F */
-    /* ACEScct: the curve of every half float as a 16 bit code, and the
-     * read-back through it, turned, as the packed RGBA64 that
-     * view_enc_pack() and view_enc_scale() take. */
-    uint16_t *cct;
-    uint16_t *cct_rgba;
-    int crop_x, crop_y;         /* where the read-back rectangle starts */
-    int crop_w, crop_h;         /* and how big it is, in source pixels */
-    void *rgba;                 /* crop_w * crop_h packed RGBA halves or floats */
-    size_t rgba_bytes;
-    AVFrame *df;                /* direct_fmt, the staging for a Vulkan upload */
-    /* Where the time went, summed over the run: the recording, the device
-     * and the read-back, the de-interleave, the upload and the encoder. */
-    double ms_gpu, ms_dl, ms_pack, ms_up, ms_enc;
+    bool direct_half;           /* the pipeline writes RGBA16F */
+    int crop_x, crop_y;         /* the rectangle of the pipeline's output */
+    int crop_w, crop_h;         /* that is written, in source pixels */
+    AVFrame *df;                /* a software encoder's frame */
+    pl_tex dtex[4];             /* and its planes on the device */
+    struct pl_frame dframe;     /* those planes, as last rendered into */
+    /* Where the time went, summed over the run: the recording, the render,
+     * the read-back of a software encoder's planes and the encoder. */
+    double ms_gpu, ms_render, ms_dl, ms_enc;
 
     int w, h;
     /* The clip's display matrix, as quarter turns clockwise. The file is
@@ -2067,255 +2062,147 @@ static int view_enc_send_sw(struct view_encode *e, struct view_enc_slot *s,
 
 /* --------------------------------------------------- the scene-referred path */
 
-/* Packed RGBA into the encoder's three planes, turned upright on the way.
+/* One scene-referred frame, under the lock: the pipeline again in the
+ * export's own space, then libplacebo writing its texture into the
+ * encoder's picture - the crop rectangle of it, turned upright, split into
+ * the format's planes and, for ACEScct in a YCbCr format, through BT.709's
+ * matrix, studio range and the chroma subsampling. Nothing between
+ * libcraw's output and the encoder looks at a colour: the source and the
+ * target are tagged the same, so libplacebo maps nothing.
  *
- * There is nothing for libswscale to do here: same component type, same
- * size - the direct path is native resolution - same primaries, same range,
- * no alpha to keep. What is left is dropping the fourth component and
- * splitting the planes, which is a copy, and the sixteen bit path already
- * does the same thing for the packed RGB formats in view_enc_pack().
- *
- * This is also the one place the direct path meets the clip's display
- * matrix: it never goes near the renderer, so the turn is the walk through
- * the read-back rather than a pass on the device. Two strides say which
- * turn it is - how far one output pixel is from the next, and one output
- * row from the next - and a quarter turn simply makes the inner one a
- * column walk of the source. It reads the whole read-back either way and
- * writes the planes in order; what it costs is the cache, not the copy.
- *
- * `sw` and `sh` are the read-back's own dimensions, which the caller keeps
- * even, so the walk covers it exactly.
- *
- * The samples are halves for gbrpf16 and floats for gbrpf32, read back in
- * the same precision the frame holds, so either way they are moved as they
- * are and never converted.
- *
- * GBRP is G, B, R in that order, which is the one thing about the format
- * worth saying out loud.
- *
- * The strides themselves, in samples of the packed read-back, are shared
- * with the ACEScct walk below. */
-static void view_enc_strides(int sw, int sh, pl_rotation rot,
-                             ptrdiff_t *base, ptrdiff_t *step, ptrdiff_t *row)
+ * For a Vulkan encoder the picture is one of its own pool, mapped the way
+ * view_enc_render_hw() maps one, and handed over on its timeline semaphore
+ * in view_enc_send_direct() - no byte of it crosses to the host. A
+ * software encoder's frame is the one thing that has to: libplacebo
+ * renders into textures of its own planes, and view_enc_send_direct()
+ * reads exactly those back into it, outside the lock. */
+static int view_enc_render_direct(struct view_encode *e, struct view_state *st,
+                                  int64_t pts, AVFrame **out)
 {
-    switch (pl_rotation_normalize(rot)) {
-    case PL_ROTATION_90:
-        *base = (ptrdiff_t)(sh - 1) * sw * 4;
-        *step = -(ptrdiff_t)sw * 4;
-        *row  = 4;
-        break;
-    case PL_ROTATION_180:
-        *base = ((ptrdiff_t)(sh - 1) * sw + sw - 1) * 4;
-        *step = -4;
-        *row  = -(ptrdiff_t)sw * 4;
-        break;
-    case PL_ROTATION_270:
-        *base = (ptrdiff_t)(sw - 1) * 4;
-        *step = (ptrdiff_t)sw * 4;
-        *row  = -4;
-        break;
-    default:
-        *base = 0;
-        *step = 4;
-        *row  = (ptrdiff_t)sw * 4;
-        break;
-    }
-}
-
-static void view_enc_deinterleave(AVFrame *f, const void *rgba,
-                                  int sw, int sh, pl_rotation rot)
-{
-    int w = f->width, h = f->height;
-    ptrdiff_t base, step, row;
-
-    view_enc_strides(sw, sh, rot, &base, &step, &row);
-
-    for (int y = 0; y < h; y++) {
-        uint8_t *g = f->data[0] + (ptrdiff_t)y * f->linesize[0];
-        uint8_t *b = f->data[1] + (ptrdiff_t)y * f->linesize[1];
-        uint8_t *r = f->data[2] + (ptrdiff_t)y * f->linesize[2];
-
-        if (f->format == AV_PIX_FMT_GBRPF16) {
-            const uint16_t *s = (const uint16_t *)rgba + base + row * y;
-
-            for (int x = 0; x < w; x++, s += step) {
-                ((uint16_t *)r)[x] = s[0];
-                ((uint16_t *)g)[x] = s[1];
-                ((uint16_t *)b)[x] = s[2];
-            }
-        } else {
-            const float *s = (const float *)rgba + base + row * y;
-
-            for (int x = 0; x < w; x++, s += step) {
-                ((float *)r)[x] = s[0];
-                ((float *)g)[x] = s[1];
-                ((float *)b)[x] = s[2];
-            }
-        }
-    }
-}
-
-/* ACEScct, S-2016-001, of every half float, as a full range 16 bit code
- * of the curve's 0 to 1. What lies below the curve's foot - negatives,
- * which its linear segment takes down to 0 at -0.0069 - and past 222.86 is
- * clipped, which is all an integer file of it can hold; NaN is 0. */
-static void view_enc_cct_table(uint16_t *lut)
-{
-    for (uint32_t i = 0; i < 65536; i++) {
-        double lin = view_half_to_float((uint16_t)i);
-        double cct = lin <= 0.0078125 ? 10.5402377416545 * lin + 0.0729055341958355
-                                      : (log2(lin) + 9.72) / 17.52;
-
-        lut[i] = isnan(cct) ? 0 : (uint16_t)lrint(CRAW_CLAMP(cct, 0.0, 1.0) * 65535.0);
-    }
-}
-
-/* The de-interleave's walk for ACEScct: the read-back's halves through the
- * table, turned upright, into packed RGBA64 of the frame's size. */
-static void view_enc_cct(const struct view_encode *e, int w, int h)
-{
-    const uint16_t *rgba = e->rgba;
-    ptrdiff_t base, step, row;
-
-    view_enc_strides(e->crop_w, e->crop_h, e->rotation, &base, &step, &row);
-
-    for (int y = 0; y < h; y++) {
-        const uint16_t *s = rgba + base + row * y;
-        uint16_t *d = e->cct_rgba + (size_t)y * w * 4;
-
-        for (int x = 0; x < w; x++, s += step, d += 4) {
-            d[0] = e->cct[s[0]];
-            d[1] = e->cct[s[1]];
-            d[2] = e->cct[s[2]];
-            d[3] = UINT16_MAX;
-        }
-    }
-}
-
-/* One scene-referred frame, in two halves. This one, under the lock: the
- * pipeline again in the export's own space, and the read-back of it
- * started. Then, in view_enc_send_direct() and without the lock, the wait
- * for both, a de-interleave and for a Vulkan encoder an upload into a
- * picture of its own pool. Nothing between libcraw's output and the
- * encoder looks at a colour. */
-static int view_enc_read_direct(struct view_encode *e, struct view_state *st)
-{
-    double ms = 0.0;
-    /* The read-back is the source rectangle; the frame the encoder takes is
-     * that rectangle turned, which for a quarter turn is the same number of
-     * pixels the other way up. */
-    size_t need = (size_t)e->crop_w * e->crop_h * 4 * (e->direct_half ? 2 : 4);
-    int ret;
-
-    if (e->rgba_bytes < need) {
-        void *p = realloc(e->rgba, need);
-
-        if (!p)
-            return CRAW_ERROR(ENOMEM);
-        e->rgba = p;
-        e->rgba_bytes = need;
-    }
-
-    ret = view_gpu_direct_frame(e->g, st, e->direct_space, e->crop_x, e->crop_y,
-                                e->crop_w, e->crop_h, e->rgba, &ms);
-    if (ret < 0)
-        return ret;
-
-    e->ms_gpu += ms;
-
-    return 0;
-}
-
-static int view_enc_send_direct(struct view_encode *e, int64_t pts)
-{
-    AVFrame *hw = NULL;
-    AVFrame *f = e->df;
+    pl_gpu gpu = e->g->gpu;
+    pl_rect2df crop = {
+        (float)e->crop_x, (float)e->crop_y,
+        (float)(e->crop_x + e->crop_w), (float)(e->crop_y + e->crop_h),
+    };
+    struct pl_frame target;
+    AVFrame *f = NULL;
     double ms = 0.0;
     int64_t t0;
     int ret;
 
-    ret = view_gpu_direct_wait(e->g, &ms);
+    ret = view_gpu_direct_frame(e->g, st, e->direct_space, &ms);
     if (ret < 0)
         return ret;
-    e->ms_dl += ms;
-
-    /* The encoder may still hold the last one, and a float plane is worth
-     * not copying twice. */
-    if (!av_frame_is_writable(f)) {
-        av_frame_unref(f);
-        f->format = e->direct_fmt;
-        f->width  = e->w;
-        f->height = e->h;
-        ret = av_frame_get_buffer(f, 0);
-        if (ret < 0)
-            return CRAW_ERROR(ENOMEM);
-    }
+    e->ms_gpu += ms;
 
     t0 = av_gettime_relative();
-    if (e->col->log) {
-        view_enc_cct(e, f->width, f->height);
-        /* Tagged before the conversion, which reads the matrix and the
-         * range off the frame, and again after it, which copies the
-         * source's over them (view_enc_send_sw()). */
-        view_enc_tag_frame(e, f);
-        if (!view_enc_pack(f, e->cct_rgba)) {
-            ret = view_enc_scale(e, f, e->cct_rgba);
-            if (ret < 0)
-                return ret;
-        }
-    } else {
-        view_enc_deinterleave(f, e->rgba, e->crop_w, e->crop_h, e->rotation);
-    }
-    e->ms_pack += (double)(av_gettime_relative() - t0) / 1000.0;
 
-    view_enc_tag_frame(e, f);
+    if (!e->hw) {
+        if (!pl_frame_recreate_from_avframe(gpu, &e->dframe, e->dtex, e->df)) {
+            fprintf(stderr, "cannot make the %s planes of the export on the GPU\n",
+                    av_get_pix_fmt_name(e->direct_fmt));
+            return CRAW_ERROR(ENOTSUP);
+        }
+        e->dframe.crop = (pl_rect2df) { 0, 0, (float)e->w, (float)e->h };
+        pl_frame_set_chroma_location(&e->dframe, pl_chroma_from_av(e->chroma));
+
+        ret = view_gpu_direct_render(e->g, st, &e->dframe, crop, e->rotation,
+                                     e->col->log);
+        if (ret < 0)
+            return ret;
+        pl_gpu_flush(gpu);
+
+        e->ms_render += (double)(av_gettime_relative() - t0) / 1000.0;
+
+        return 0;
+    }
+
+    f = av_frame_alloc();
+    if (!f)
+        return CRAW_ERROR(ENOMEM);
+
+    ret = av_hwframe_get_buffer(e->frames, f, 0);
+    if (ret < 0) {
+        fprintf(stderr, "av_hwframe_get_buffer: %s\n", av_err2str(ret));
+        goto fail;
+    }
+
     f->pts      = pts;
     f->duration = 1;
+    view_enc_tag_frame(e, f);
 
-    if (e->hw) {
+    /* The AVVkFrame contract from the producer's side, as for a rendered
+     * frame: libplacebo takes the images at the frame's semaphore value and
+     * gives them back signalling the next. */
+    if (!pl_map_avframe_ex(gpu, &target, pl_avframe_params(.frame = f))) {
+        fprintf(stderr, "cannot map the encoder's frame for the export\n");
+        ret = CRAW_ERROR(EIO);
+        goto fail;
+    }
+    target.crop = (pl_rect2df) { 0, 0, (float)e->w, (float)e->h };
+
+    ret = view_gpu_direct_render(e->g, st, &target, crop, e->rotation, e->col->log);
+    pl_unmap_avframe(gpu, &target);
+    if (ret < 0)
+        goto fail;
+
+    /* The encoder waits on a value libplacebo has promised, so the work has
+     * to be on the queue before the frame is handed over. */
+    pl_gpu_flush(gpu);
+
+    e->ms_render += (double)(av_gettime_relative() - t0) / 1000.0;
+
+    *out = f;
+
+    return 0;
+
+fail:
+    av_frame_free(&f);
+
+    return ret;
+}
+
+static int view_enc_send_direct(struct view_encode *e, int64_t pts, AVFrame **hw)
+{
+    AVFrame *f = e->df;
+    int64_t t0;
+    int ret;
+
+    if (!e->hw) {
+        /* The encoder may still hold the last one. */
+        if (!av_frame_is_writable(f)) {
+            av_frame_unref(f);
+            f->format = e->direct_fmt;
+            f->width  = e->w;
+            f->height = e->h;
+            ret = av_frame_get_buffer(f, 0);
+            if (ret < 0)
+                return CRAW_ERROR(ENOMEM);
+            view_enc_tag_frame(e, f);
+        }
+
         t0 = av_gettime_relative();
-
-        hw = av_frame_alloc();
-        if (!hw)
-            return CRAW_ERROR(ENOMEM);
-
-        ret = av_hwframe_get_buffer(e->frames, hw, 0);
-        if (ret < 0) {
-            fprintf(stderr, "av_hwframe_get_buffer: %s\n", av_err2str(ret));
-            goto out;
+        if (!pl_download_avframe(e->g->gpu, &e->dframe, f)) {
+            fprintf(stderr, "cannot read the export's planes back\n");
+            return CRAW_ERROR(EIO);
         }
+        e->ms_dl += (double)(av_gettime_relative() - t0) / 1000.0;
 
-        /* The one copy on this path, and the only way in: a Vulkan encoder
-         * reads its own images and these floats are in host memory. A
-         * planar float output in libcraw would let the pipeline write the
-         * encoder's planes directly and make the whole read-back and upload
-         * disappear; that is a library change and not this one. */
-        ret = av_hwframe_transfer_data(hw, f, 0);
-        if (ret < 0) {
-            fprintf(stderr, "av_hwframe_transfer_data: %s\n", av_err2str(ret));
-            goto out;
-        }
-
-        ret = av_frame_copy_props(hw, f);
-        if (ret < 0)
-            goto out;
-        view_enc_tag_frame(e, hw);
-        hw->pts      = pts;
-        hw->duration = 1;
-
-        e->ms_up += (double)(av_gettime_relative() - t0) / 1000.0;
+        view_enc_tag_frame(e, f);
+        f->pts      = pts;
+        f->duration = 1;
     }
 
     t0 = av_gettime_relative();
-    ret = avcodec_send_frame(e->avc, e->hw ? hw : f);
+    ret = avcodec_send_frame(e->avc, e->hw ? *hw : f);
     e->ms_enc += (double)(av_gettime_relative() - t0) / 1000.0;
-    if (ret < 0)
+    av_frame_free(hw);
+    if (ret < 0) {
         fprintf(stderr, "avcodec_send_frame: %s\n", av_err2str(ret));
+        return ret;
+    }
 
-out:
-    av_frame_free(&hw);
-
-    return ret < 0 ? ret : 0;
+    return 0;
 }
 
 /* ---------------------------------------------------------------- the run */
@@ -2622,8 +2509,8 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
      * path is the crop's own size and nothing else, which
      * view_encode_begin() has already refused anything but.
      *
-     * Two rectangles, because the file is written upright: the read-back
-     * and the render both take the source's, and everything about the
+     * Two rectangles, because the file is written upright: the render
+     * takes the source's, and everything about the
      * output - the size row, the presets, what the encoder is opened for -
      * is about the picture after the turn. A quarter turn makes a 5760x3040
      * crop a 3040x5760 file, so "3840 wide" is 3840 across the tall side
@@ -2633,8 +2520,8 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     e->rotation = st->dec.rotation;
     e->crop_x = x;
     e->crop_y = y;
-    /* Even, so that the de-interleave's walk covers the read-back exactly
-     * however the picture is turned. */
+    /* Even, as the file's size is, so that the rectangle and the file it
+     * is written into are the same pixels however the picture is turned. */
     e->crop_w = cw & ~1;
     e->crop_h = ch & ~1;
 
@@ -2757,29 +2644,25 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
         if (ret < 0)
             goto fail;
 
-        if (e->col->log) {
-            e->ss = av_frame_alloc();
-            e->cct = malloc(65536 * sizeof(*e->cct));
-            e->cct_rgba = malloc((size_t)e->w * e->h * 4 * sizeof(*e->cct_rgba));
-            if (!e->ss || !e->cct || !e->cct_rgba) {
+        /* A software encoder's frame, which the planes are read back into;
+         * a Vulkan one takes pictures of its own pool. */
+        if (!e->hw) {
+            e->df = av_frame_alloc();
+            if (!e->df) {
                 ret = CRAW_ERROR(ENOMEM);
                 goto fail;
             }
-            view_enc_cct_table(e->cct);
-        }
-
-        e->df = av_frame_alloc();
-        if (!e->df) {
-            ret = CRAW_ERROR(ENOMEM);
-            goto fail;
-        }
-        e->df->format = e->direct_fmt;
-        e->df->width  = e->w;
-        e->df->height = e->h;
-        ret = av_frame_get_buffer(e->df, 0);
-        if (ret < 0) {
-            ret = CRAW_ERROR(ENOMEM);
-            goto fail;
+            e->df->format = e->direct_fmt;
+            e->df->width  = e->w;
+            e->df->height = e->h;
+            ret = av_frame_get_buffer(e->df, 0);
+            if (ret < 0) {
+                ret = CRAW_ERROR(ENOMEM);
+                goto fail;
+            }
+            /* Tagged from the start: libplacebo makes the planes from the
+             * frame, and its tags are what say RGB or YCbCr. */
+            view_enc_tag_frame(e, e->df);
         }
     } else if (e->pin != AV_PIX_FMT_NONE) {
         ret = view_enc_try(e, st, e->pin, v->enc);
@@ -2929,7 +2812,7 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     e->header = true;
 
     /* The rendered path's read-back frames. The direct one has its own
-     * frame, and for ACEScct the scaler's source, made with it above. */
+     * frame, made with it above. */
     if (!e->hw && !e->direct) {
         e->sf = av_frame_alloc();
         e->ss = av_frame_alloc();
@@ -3159,14 +3042,15 @@ static void view_enc_release(struct view_state *st)
             pl_tex_destroy(e->g->gpu, &e->slot[i].tex);
         free(e->slot[i].rgba);
     }
+    for (int i = 0; i < 4; i++) {
+        if (e->g && e->g->gpu)
+            pl_tex_destroy(e->g->gpu, &e->dtex[i]);
+    }
 
     sws_freeContext(e->sws);
     av_frame_free(&e->sf);
     av_frame_free(&e->ss);
     av_frame_free(&e->df);
-    free(e->rgba);
-    free(e->cct);
-    free(e->cct_rgba);
     av_packet_free(&e->pkt);
     av_packet_free(&e->apkt);
     avcodec_free_context(&e->avc);
@@ -3267,16 +3151,22 @@ static int view_enc_end(struct view_encode *e, struct view_state *st)
 
     /* Where the direct path's time went, per frame. The decode and the
      * display pass are not in here - they are the viewer's own and happen
-     * whether anything is being exported or not - so these five add up to
-     * what the export costs on top of playing the clip. The first is the
-     * recording and submission, under the lock; the second the wait for
-     * the device to run the pipeline and the transfer, outside it. */
-    if (e->direct && total > 0)
-        view_log(st, "  per frame: record %.1f ms, device and read-back %.1f, "
-                     "de-interleave %.1f, upload %.1f, encoder %.1f\n",
-                 e->ms_gpu / (double)total, e->ms_dl / (double)total,
-                 e->ms_pack / (double)total, e->ms_up / (double)total,
-                 e->ms_enc / (double)total);
+     * whether anything is being exported or not - so these add up to what
+     * the export costs on top of playing the clip: the pipeline's recording
+     * and submission and libplacebo's render into the encoder's picture,
+     * under the lock, then for a software encoder the read-back of its
+     * planes, and the encoder. */
+    if (e->direct && total > 0) {
+        if (e->hw)
+            view_log(st, "  per frame: record %.1f ms, render %.1f, encoder %.1f\n",
+                     e->ms_gpu / (double)total, e->ms_render / (double)total,
+                     e->ms_enc / (double)total);
+        else
+            view_log(st, "  per frame: record %.1f ms, render %.1f, read-back %.1f, "
+                         "encoder %.1f\n",
+                     e->ms_gpu / (double)total, e->ms_render / (double)total,
+                     e->ms_dl / (double)total, e->ms_enc / (double)total);
+    }
 
     v->progress = 1.0;
     view_enc_release(st);
@@ -3355,7 +3245,8 @@ static int view_enc_frame(struct view_state *st)
 
         /* The software path runs a frame behind the renderer, so the last
          * slot is still waiting to be encoded when the range runs out. The
-         * direct path never runs behind: its read-back is synchronous. */
+         * direct path never runs behind: each frame is sent as soon as it
+         * has been rendered. */
         prev = &e->slot[e->cur ^ 1];
         if (e->hw || e->direct || !prev->busy)
             return view_enc_end(e, st);
@@ -3387,7 +3278,7 @@ static int view_enc_frame(struct view_state *st)
 
     pts = view_enc_out_index(e, e->next);
     if (e->direct) {
-        ret = view_enc_read_direct(e, st);
+        ret = view_enc_render_direct(e, st, pts, &hw);
     } else if (e->hw) {
         ret = view_enc_render_hw(e, st, pts, &hw);
     } else {
@@ -3403,7 +3294,7 @@ static int view_enc_frame(struct view_state *st)
         return view_enc_fail(st, ret);
 
     if (e->direct) {
-        ret = view_enc_send_direct(e, pts);
+        ret = view_enc_send_direct(e, pts, &hw);
         e->encoded++;
     } else if (e->hw) {
         ret = view_enc_send_hw(e, &hw);

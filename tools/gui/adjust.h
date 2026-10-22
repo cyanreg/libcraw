@@ -218,4 +218,10 @@ const struct pl_hook *craw_adjust_softlight(craw_adjust *a, float strength);
  * returns the hook; the caller leaves an identity off the list. */
 const struct pl_hook *craw_adjust_linear(craw_adjust *a, const pl_matrix3x3 *m);
 
+/* The ACEScct curve (S-2016-001) at PL_HOOK_PRE_OUTPUT, for the
+ * scene-referred export that is written in it: the linear ACEScg the pass
+ * hands over becomes the curve's code of 0 to 1, which libplacebo then
+ * writes into the file's own format. The only hook on that render. */
+const struct pl_hook *craw_adjust_acescct(craw_adjust *a);
+
 #endif /* CINEVIEW_ADJUST_H */

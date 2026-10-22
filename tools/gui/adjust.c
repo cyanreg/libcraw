@@ -79,6 +79,8 @@ struct craw_adjust {
 
     struct pl_hook linear_hook;
     float linear[9];                        /* column major, for GLSL */
+
+    struct pl_hook cct_hook;
 };
 
 /* GLSL takes a mat3 as three columns; pl_matrix3x3 is m[row][column]. */
@@ -226,6 +228,46 @@ const struct pl_hook *craw_adjust_softlight(craw_adjust *a, float strength)
     a->soft = strength;
 
     return &a->soft_hook;
+}
+
+/* -------------------------------------------------------------- ACEScct */
+
+/* S-2016-001, for the scene-referred export written in it: the pipeline's
+ * linear ACEScg into the curve's code of 0 to 1, which is what the file's
+ * integer samples hold. What lies below the curve's foot - negatives, which
+ * its linear segment takes down to 0 at -0.0069 - and past 222.86 is
+ * clipped, which is all an integer file of it can hold; NaN is 0. */
+static const char *const adjust_cct_body =
+    "vec3 craw_lin = color.rgb;                                          \n"
+    "vec3 craw_cct = mix(10.5402377416545 * craw_lin + 0.0729055341958355,\n"
+    "                    (log2(max(craw_lin, vec3(1e-30))) + 9.72) / 17.52,\n"
+    "                    greaterThan(craw_lin, vec3(0.0078125)));        \n"
+    "color.rgb = mix(clamp(craw_cct, 0.0, 1.0), vec3(0.0), isnan(craw_lin));\n";
+
+static struct pl_hook_res adjust_cct_fn(void *priv,
+                                        const struct pl_hook_params *hp)
+{
+    if (hp->components < 3)
+        return (struct pl_hook_res) { .failed = true };
+
+    pl_shader sh = adjust_begin(hp);
+    if (!sh)
+        return (struct pl_hook_res) { .failed = true };
+
+    if (!pl_shader_custom(sh, &(struct pl_custom_shader) {
+            .description = "craw ACEScct",
+            .input       = PL_SHADER_SIG_COLOR,
+            .output      = PL_SHADER_SIG_COLOR,
+            .body        = adjust_cct_body,
+        }))
+        return (struct pl_hook_res) { .failed = true };
+
+    return adjust_finish(hp, sh);
+}
+
+const struct pl_hook *craw_adjust_acescct(craw_adjust *a)
+{
+    return a ? &a->cct_hook : NULL;
 }
 
 /* -------------------------------------------------------- linear light */
@@ -519,6 +561,15 @@ craw_adjust *craw_adjust_create(pl_gpu gpu)
         .priv      = a,
         .hook      = adjust_linear_fn,
         .signature = 0x637261776C696E65ULL,     /* "crawline" */
+    };
+    /* And this one, which is the ACEScct export's curve on the pipeline's
+     * linear light: see craw_adjust_acescct(). */
+    a->cct_hook = (struct pl_hook) {
+        .stages    = PL_HOOK_PRE_OUTPUT,
+        .input     = PL_HOOK_SIG_TEX,
+        .priv      = a,
+        .hook      = adjust_cct_fn,
+        .signature = 0x6372617761636374ULL,     /* "crawacct" */
     };
 
     return a;

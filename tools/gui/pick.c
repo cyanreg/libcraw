@@ -69,7 +69,7 @@ struct view_pick_sample {
 
 /* IEEE half to float, the way cineraw reads the same output: the exponent
  * re-biased, the mantissa shifted, subnormals scaled exactly. */
-float view_half_to_float(uint16_t h)
+static float view_half_to_float(uint16_t h)
 {
     uint32_t e = (h >> 10) & 0x1Fu;
     uint32_t m = h & 0x3FFu;
