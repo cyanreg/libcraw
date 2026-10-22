@@ -666,9 +666,13 @@ rows take no input, and the film simulation cascade will not open.
 
 Linear light needs float samples, which of the encoder families here means
 FFV1 at version 4 — `FFv1 (Vulkan)` or `FFv1` with an L4 preset, writing
-gbrpf32. Picking one of the three spaces in the panel moves the video row
-there: an L3 preset to its L4 twin (large context kept), any other family to
-`FFv1 (Vulkan)` L4, and the size row to full. A family or preset picked
+gbrpf32. Both FFv1 families offer L3 and L4, each with FFV1's normal context
+set or its small one (`context=2`), and small is the default: with a 32 by 32
+slice grid there is too little picture per slice for a bigger set to adapt,
+and it codes smaller at either level. Picking one of the three spaces in the
+panel moves the video row there: an L3 preset to its L4 twin with the same
+context, any other family to `FFv1 (Vulkan)` L4 with the small one, and the
+size row to full. A family or preset picked
 afterwards that cannot carry it, or the same choice on the command line, is
 refused with the reason rather than opened with whatever format it happened
 to accept. The scene-referred paths

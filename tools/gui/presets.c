@@ -109,14 +109,23 @@ static const struct view_preset view_presets_prores[] = {
 
 /* Only the version 4 presets can carry linear light: float samples are a
  * version 4 feature of FFV1, and both encoders refuse gbrpf32 below it.
- * Both were run. */
+ * Both were run.
+ *
+ * The context is spelled out in every entry because the two encoders
+ * disagree on its default: ffv1_vulkan's is 2, the small context set, and
+ * ffv1's is 0. Small is the default here - with a 32 by 32 slice grid
+ * there is too little picture per slice for a bigger set to adapt, and it
+ * codes smaller at both levels - and its tables travel in the stream's
+ * header, so L3 carries it as well as L4. Every pair was run through both
+ * decoders. */
 static const struct view_preset view_presets_ffv1_vk[] = {
-    { "L3",                   "level=3",           VIEW_FFV1_FMT },
-    { "L3 (large context)",   "level=3,context=1", VIEW_FFV1_FMT },
-    { "L4 (experimental)",    "strict=-2,level=4", VIEW_FFV1_FMT, true },
-    { "L4 (experimental, large context)",
-      "strict=-2,level=4,context=1", VIEW_FFV1_FMT, true },
+    { "L3",                   "level=3,context=0", VIEW_FFV1_FMT },
+    { "L3 (small context)",   "level=3,context=2", VIEW_FFV1_FMT },
+    { "L4 (experimental)",    "strict=-2,level=4,context=0", VIEW_FFV1_FMT, true },
+    { "L4 (experimental, small context)",
+      "strict=-2,level=4,context=2", VIEW_FFV1_FMT, true },
 };
+#define VIEW_FFV1_DEF 1         /* L3 (small context) */
 
 /* Same four, and the same option names: `context`, `level` and `strict`
  * all exist on the software encoder too. Only the slice grid is spelled
@@ -280,7 +289,7 @@ const struct view_preset_family view_preset_families[] = {
         VIEW_FMTS(view_fmts_ffv1_vk),
         .presets = view_presets_ffv1_vk,
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_ffv1_vk),
-        .def = 0,
+        .def = VIEW_FFV1_DEF,
         .ctrl = VIEW_CTRL_ASYNC, .container = "mkv",
         .always = "slices_h=32,slices_v=32",
         /* The one path that can write linear light: libplacebo renders
@@ -305,7 +314,7 @@ const struct view_preset_family view_preset_families[] = {
         VIEW_FMTS(view_fmts_ffv1),
         .presets = view_presets_ffv1_sw,
         .nb_presets = (int)CRAW_ARRAY_ELEMS(view_presets_ffv1_sw),
-        .def = 0,
+        .def = VIEW_FFV1_DEF,
         .container = "mkv",
         .always = "slices=1024",
         /* The software encoder carries float too, and nothing about the
@@ -1188,28 +1197,34 @@ const char *view_presets_colour_why_not(int family, int preset, int colour)
     return NULL;
 }
 
-/* Large context is the one thing the FFV1 presets differ in besides the
- * level, so a move to the level that carries float keeps it. */
-static bool view_preset_large_context(const struct view_preset *p)
+/* The context set a preset asks for, or -1 for one that names none. It is
+ * the one thing the FFV1 presets differ in besides the level, so a move to
+ * the level that carries float keeps it. */
+static int view_preset_context(const struct view_preset *p)
 {
-    return p && p->opts && strstr(p->opts, "context=1");
+    const char *c = p && p->opts ? strstr(p->opts, "context=") : NULL;
+
+    return c ? atoi(c + strlen("context=")) : -1;
 }
 
-/* The preset of `family` that can write `colour`, the one with the same
- * context as `big` if there is one, or -1. */
-static int view_presets_carrier(int family, int colour, bool big)
+/* The preset of `family` that can write `colour`, the one with context set
+ * `ctx` if there is one, or -1. A `ctx` of -1 - a move from a family that
+ * has no such thing - means the context of the family's own default. */
+static int view_presets_carrier(int family, int colour, int ctx)
 {
     const struct view_preset_family *f = view_family(family);
     int found = -1;
 
     if (!f)
         return -1;
+    if (ctx < 0)
+        ctx = view_preset_context(&f->presets[f->def]);
 
     for (int i = 0; i < f->nb_presets; i++) {
         if (view_presets_preset_why_not(family, i) ||
             view_presets_colour_why_not(family, i, colour))
             continue;
-        if (view_preset_large_context(&f->presets[i]) == big)
+        if (view_preset_context(&f->presets[i]) == ctx)
             return i;
         if (found < 0)
             found = i;
@@ -1228,11 +1243,11 @@ bool view_presets_take_colour(struct view_preset_sel *s, int colour)
     /* The family in use first, so that FFv1 stays FFv1; then the table's
      * order, which puts FFv1 (Vulkan) ahead of the software one. */
     if (view_presets_colour_why_not(family, preset, colour)) {
-        bool big = view_preset_large_context(view_preset(family, preset));
+        int ctx = view_preset_context(view_preset(family, preset));
 
-        preset = view_presets_carrier(family, colour, big);
+        preset = view_presets_carrier(family, colour, ctx);
         for (int i = 0; preset < 0 && i < view_nb_preset_families; i++)
-            preset = view_presets_carrier(family = i, colour, big);
+            preset = view_presets_carrier(family = i, colour, ctx);
         if (preset < 0)
             return false;
     }
