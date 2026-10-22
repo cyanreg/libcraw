@@ -388,6 +388,12 @@ const char *view_presets_family_why_not(int family);
 const char *view_presets_preset_why_not(int family, int preset);
 /* And with a colour space in hand, since three of them need 16 bit RGB. */
 const char *view_presets_colour_why_not(int family, int preset, int colour);
+/* Selects `colour`, and with it what it needs: a scene-referred space
+ * picked under a codec that cannot write it moves the selection to the
+ * nearest one that can (FFv1 L3 to L4, any other family to FFv1 (Vulkan)
+ * L4) and the size to full. Returns false, changing nothing, when no
+ * usable codec can write it. */
+bool view_presets_take_colour(struct view_preset_sel *s, int colour);
 
 /* The device extensions the viewer's VkDevice was created with, told once
  * at device open. A Vulkan H.264, HEVC or AV1 encoder is a hardware engine

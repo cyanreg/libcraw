@@ -1188,6 +1188,72 @@ const char *view_presets_colour_why_not(int family, int preset, int colour)
     return NULL;
 }
 
+/* Large context is the one thing the FFV1 presets differ in besides the
+ * level, so a move to the level that carries float keeps it. */
+static bool view_preset_large_context(const struct view_preset *p)
+{
+    return p && p->opts && strstr(p->opts, "context=1");
+}
+
+/* The preset of `family` that can write `colour`, the one with the same
+ * context as `big` if there is one, or -1. */
+static int view_presets_carrier(int family, int colour, bool big)
+{
+    const struct view_preset_family *f = view_family(family);
+    int found = -1;
+
+    if (!f)
+        return -1;
+
+    for (int i = 0; i < f->nb_presets; i++) {
+        if (view_presets_preset_why_not(family, i) ||
+            view_presets_colour_why_not(family, i, colour))
+            continue;
+        if (view_preset_large_context(&f->presets[i]) == big)
+            return i;
+        if (found < 0)
+            found = i;
+    }
+
+    return found;
+}
+
+bool view_presets_take_colour(struct view_preset_sel *s, int colour)
+{
+    int family = s->family, preset = s->preset;
+
+    if (colour < 0 || colour >= VIEW_NB_COLOURS)
+        return false;
+
+    /* The family in use first, so that FFv1 stays FFv1; then the table's
+     * order, which puts FFv1 (Vulkan) ahead of the software one. */
+    if (view_presets_colour_why_not(family, preset, colour)) {
+        bool big = view_preset_large_context(view_preset(family, preset));
+
+        preset = view_presets_carrier(family, colour, big);
+        for (int i = 0; preset < 0 && i < view_nb_preset_families; i++)
+            preset = view_presets_carrier(family = i, colour, big);
+        if (preset < 0)
+            return false;
+    }
+
+    if (family != s->family) {
+        s->family = family;
+        s->preset = preset;
+        view_presets_family_defaults(s);
+    } else {
+        s->preset = preset;
+    }
+
+    s->colour = colour;
+    /* The direct path writes the source's own size and nothing else. */
+    if (view_colours[colour].scene)
+        s->size = VIEW_SIZE_FULL;
+    s->set = true;
+
+    return true;
+}
+
 /* ------------------------------------------------------ the formats */
 
 int view_presets_fmts(int family, const enum AVPixelFormat **out)

@@ -666,8 +666,12 @@ rows take no input, and the film simulation cascade will not open.
 
 Linear light needs float samples, which of the encoder families here means
 FFV1 at version 4 — `FFv1 (Vulkan)` or `FFv1` with an L4 preset, writing
-gbrpf32. Any other family or preset is refused with the reason rather than
-opened with whatever format it happened to accept. The scene-referred paths
+gbrpf32. Picking one of the three spaces in the panel moves the video row
+there: an L3 preset to its L4 twin (large context kept), any other family to
+`FFv1 (Vulkan)` L4, and the size row to full. A family or preset picked
+afterwards that cannot carry it, or the same choice on the command line, is
+refused with the reason rather than opened with whatever format it happened
+to accept. The scene-referred paths
 are written at the source's own resolution only; the size row is refused for
 them, while the crop rectangle still works, because a crop is a rectangle of
 the read-back and a resize is a display decision. H.273 has no code points

@@ -920,12 +920,17 @@ static const char *view_menu_why_not(const struct view_state *st, int col, int i
         return col == 0 ? view_presets_family_why_not(i)
                         : view_presets_preset_why_not(m->sel[0], i);
 
+    /* A colour the codec in use cannot write is not greyed: picking it
+     * takes the codec that can with it. Only one no codec here can write
+     * is. */
     if (m->kind == VIEW_MENU_COLOUR) {
+        struct view_preset_sel t = *s;
+
         ix = view_menu_lut(st, col, i);
         if (ix < 0 && col == 0)
             ix = view_menu_colour_group(i, &(int) { 0 });
-        return ix < 0 ? NULL
-                      : view_presets_colour_why_not(s->family, s->preset, ix);
+        return ix < 0 || view_presets_take_colour(&t, ix)
+             ? NULL : view_presets_colour_why_not(s->family, s->preset, ix);
     }
 
     return NULL;
@@ -1057,8 +1062,7 @@ static void view_menu_select(struct view_state *st, int col, int i)
         view_presets_family_defaults(s);
         break;
     case VIEW_MENU_COLOUR:
-        s->colour = ix;
-        s->set = true;
+        view_presets_take_colour(s, ix);
         break;
     default:
 #if CINEVIEW_HAVE_LUTS
@@ -1079,6 +1083,9 @@ static int view_menu_current(const struct view_state *st, int col)
     switch (m->kind) {
     case VIEW_MENU_PIXFMT:
         n = view_menu_fmts(st, &fmts);
+        /* A scene-referred export's one format is the one in use. */
+        if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene)
+            return n ? 0 : -1;
         for (int i = 0; i < n; i++)
             if (fmts[i] == view_presets_sel_fmt(s))
                 return i;
@@ -1260,11 +1267,8 @@ static bool view_menu_click_parent(struct view_state *st, int col, int i)
 
     if (m->kind == VIEW_MENU_COLOUR && col == 0) {
         first = view_menu_colour_group(i, &n);
-        if (first < 0 ||
-            view_presets_colour_why_not(s->family, s->preset, first))
-            return true;
-        s->colour = first;
-        s->set = true;
+        if (first >= 0)
+            view_presets_take_colour(s, first);
         return true;
     }
 
@@ -2799,7 +2803,10 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
      * in use is the preset's own pin until the row is touched, after which
      * the choice outlives a preset change and dies with a family one. */
     {
-        enum AVPixelFormat f = view_presets_sel_fmt(sel);
+        /* A scene-referred export is written in the family's float format
+         * whatever the row held before: say that one. */
+        enum AVPixelFormat f = scene && fam->scene_fmt != AV_PIX_FMT_NONE
+                             ? fam->scene_fmt : view_presets_sel_fmt(sel);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
         /* The format is known from the table the moment the preset is,
