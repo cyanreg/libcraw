@@ -650,8 +650,8 @@ on the peak — bt2390 above all, and st2094-10, the default, which also
 follows the frame's average — can come out a percent or two brighter in
 the file than on a fitted window; spline is all but insensitive to it.
 
-A **scene-referred** export — ACEScg, ACES2065-1, CIE XYZ D65 — never goes
-near the renderer. The frame is put through the pipeline a second time with
+A **scene-referred** export — ACEScg, ACES2065-1, CIE XYZ D65, and
+ACEScct below — never goes near the renderer. The frame is put through the pipeline a second time with
 the output space asked for, into an RGBA16F or an RGBA32F texture as the
 file's format asks, and those floats are read back and handed to the
 encoder unconverted: no tone curve, no gamut mapping, no
@@ -690,6 +690,27 @@ the read-back and a resize is a display decision. H.273 has no code points
 for the ACES spaces, so those files carry unspecified primaries with a linear
 transfer and a `COLOUR_SPACE` container tag naming the space; XYZ uses the
 ST 428-1 primaries code point and the same tag.
+
+**ACEScct** is the fourth scene-referred space, and the one an integer
+codec can carry: ACEScg, gamut compression and all, through the ACEScct
+log curve of S-2016-001, which spreads ten bits evenly over the stops and
+reaches 222.86 in linear terms. It is what ACES footage is graded from in
+ProRes 4444, and it is still scene referred — undoing the curve gives the
+ACEScg numbers back, and the look, the adjustments and the grain stay off
+as for the other three. Any family with a format of ten bits or more takes
+it, so picking it moves no codec; the pixel format row offers the family's
+own formats with the 8 bit ones greyed (fifteen codes a stop, which bands),
+and a row on an 8 bit format moves to the first of ten or more with the same
+layout, so x264's NV12 becomes 10 bit 4:2:0. H.264 (Vulkan), which has only
+NV12, cannot take it. The pipeline's half floats go through a 65,536 entry
+table of the curve during the same turned walk, into a full range 16 bit
+code, and from there to the encoder's format the way a display-referred
+frame is: by hand for packed RGB, libswscale for the rest, BT.709's matrix
+and studio range where it is YCbCr. Unspecified primaries and transfer, and
+the `COLOUR_SPACE` tag, which an MP4 or QuickTime file carries as a
+file-level mdta key since its tracks hold nothing but a title. A 16 bit FFv1
+ACEScct file of a sideways S1II clip decodes back to within 0.009% of the
+ACEScg file of the same frame, highlights up to 97 included.
 
 The Export section's size row — full, 1/2, 1/4, 3840 wide, 1920 wide, or a
 typed WxH — applies to a display-referred export. `--size` sets the same

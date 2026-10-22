@@ -2084,6 +2084,10 @@ void view_vwb_step(struct view_state *st, bool wait);
  * comes down with it. Arming clears the last refusal's word. */
 void view_pick_arm(struct view_state *st, bool on);
 
+/* An IEEE half as a float, subnormals exact; the ACEScct export's table is
+ * built through it too. */
+float view_half_to_float(uint16_t h);
+
 /* A left click on the picture while armed, in window pixels: maps it to
  * the source pixel under the pointer, queues the pick there, pauses the
  * transport - a pick is a decision about one frame - and disarms. */

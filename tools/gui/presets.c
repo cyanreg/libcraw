@@ -489,6 +489,17 @@ const struct view_colour view_colours[VIEW_NB_COLOURS] = {
         .pri = AVCOL_PRI_UNSPECIFIED, .trc = AVCOL_TRC_LINEAR,
         .spc = AVCOL_SPC_RGB, .tag = "ACEScg",
     },
+    /* The one scene-referred entry an integer codec can carry: ACEScg
+     * through the ACEScct curve, S-2016-001, which spreads ten bits evenly
+     * over the stops and reaches 222.86 in linear terms. H.273 has no code
+     * points for it either, so it goes out as unspecified primaries and
+     * transfer, BT.709's matrix where it is YCbCr, and the container tag. */
+    [VIEW_COLOUR_ACESCCT] = {
+        .name = "ACEScct", .key = "acescct", .group = "ACEScct",
+        .scene = true, .log = true,
+        .pri = AVCOL_PRI_UNSPECIFIED, .trc = AVCOL_TRC_UNSPECIFIED,
+        .spc = AVCOL_SPC_BT709, .tag = "ACEScct",
+    },
     [VIEW_COLOUR_XYZ] = {
         .name = "XYZ linear", .key = "xyz", .group = "XYZ linear",
         .scene = true, .needs_deep_rgb = true,
@@ -1179,13 +1190,44 @@ const char *view_presets_preset_why_not(int family, int preset)
     return p ? p->why_not : "no such preset";
 }
 
+/* Eight bits of ACEScct is fifteen codes a stop, which bands; ten is
+ * where the curve was meant to start. */
+#define VIEW_LOG_MIN_BITS 10
+
+static int view_fmt_bits(enum AVPixelFormat fmt)
+{
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(fmt);
+
+    return d ? d->comp[0].depth : 0;
+}
+
+const char *view_presets_colour_fmt_why_not(int colour, enum AVPixelFormat fmt)
+{
+    if (colour < 0 || colour >= VIEW_NB_COLOURS || !view_colours[colour].log ||
+        fmt == AV_PIX_FMT_NONE || view_fmt_bits(fmt) >= VIEW_LOG_MIN_BITS)
+        return NULL;
+
+    return "ACEScct needs ten bits or more: eight is fifteen codes a stop, "
+           "which bands";
+}
+
 const char *view_presets_colour_why_not(int family, int preset, int colour)
 {
     const struct view_preset_family *f = view_family(family);
     const struct view_preset *p = view_preset(family, preset);
 
-    if (colour < 0 || colour >= VIEW_NB_COLOURS ||
-        !view_colours[colour].needs_deep_rgb)
+    if (colour < 0 || colour >= VIEW_NB_COLOURS)
+        return NULL;
+    if (view_colours[colour].log) {
+        if (!f || !p)
+            return "no such preset";
+        for (int i = 0; i < f->nb_fmts; i++)
+            if (view_fmt_bits(f->fmts[i]) >= VIEW_LOG_MIN_BITS)
+                return NULL;
+        return "ACEScct needs ten bits or more, and this family writes only "
+               "eight";
+    }
+    if (!view_colours[colour].needs_deep_rgb)
         return NULL;
     if (!f || !p)
         return "no such preset";
@@ -1219,7 +1261,9 @@ static int view_preset_context(const struct view_preset *p)
 
 /* The preset of `family` that can write `colour`, the one with context set
  * `ctx` if there is one, or -1. A `ctx` of -1 - a move from a family that
- * has no such thing - means the context of the family's own default. */
+ * has no such thing - means the context of the family's own default. The
+ * walk starts at that default, so a family with no contexts at all lands
+ * on its own default rather than on its first preset. */
 static int view_presets_carrier(int family, int colour, int ctx)
 {
     const struct view_preset_family *f = view_family(family);
@@ -1230,7 +1274,9 @@ static int view_presets_carrier(int family, int colour, int ctx)
     if (ctx < 0)
         ctx = view_preset_context(&f->presets[f->def]);
 
-    for (int i = 0; i < f->nb_presets; i++) {
+    for (int k = 0; k < f->nb_presets; k++) {
+        int i = (f->def + k) % f->nb_presets;
+
         if (view_presets_preset_why_not(family, i) ||
             view_presets_colour_why_not(family, i, colour))
             continue;
@@ -1312,6 +1358,48 @@ int view_presets_fmts(int family, const enum AVPixelFormat **out)
     return f->nb_fmts;
 }
 
+enum AVPixelFormat view_presets_sel_log_fmt(const struct view_preset_sel *s)
+{
+    const struct view_preset_family *f = view_family(s->family);
+    enum AVPixelFormat fmt = view_presets_sel_fmt(s);
+    const AVPixFmtDescriptor *want = av_pix_fmt_desc_get(fmt);
+    enum AVPixelFormat any = AV_PIX_FMT_NONE;
+
+    if (fmt != AV_PIX_FMT_NONE && view_fmt_bits(fmt) >= VIEW_LOG_MIN_BITS)
+        return fmt;
+    if (!f)
+        return AV_PIX_FMT_NONE;
+
+    for (int i = 0; i < f->nb_fmts; i++) {
+        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f->fmts[i]);
+
+        if (view_fmt_bits(f->fmts[i]) < VIEW_LOG_MIN_BITS)
+            continue;
+        if (!want || (d->log2_chroma_w == want->log2_chroma_w &&
+                      d->log2_chroma_h == want->log2_chroma_h &&
+                      !!(d->flags & AV_PIX_FMT_FLAG_RGB) ==
+                      !!(want->flags & AV_PIX_FMT_FLAG_RGB)))
+            return f->fmts[i];
+        if (any == AV_PIX_FMT_NONE)
+            any = f->fmts[i];
+    }
+
+    return any;
+}
+
+enum AVPixelFormat view_presets_sel_out_fmt(const struct view_preset_sel *s)
+{
+    const struct view_colour *c =
+        &view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)];
+
+    if (c->needs_deep_rgb)
+        return view_presets_sel_scene_fmt(s);
+    if (c->log)
+        return view_presets_sel_log_fmt(s);
+
+    return view_presets_sel_fmt(s);
+}
+
 int view_presets_scene_fmts(int family, const enum AVPixelFormat **out)
 {
     const struct view_preset_family *f = view_family(family);
@@ -1386,7 +1474,12 @@ void view_presets_list(void)
     printf("colour spaces. --colour NAME\n\n");
     for (int i = 0; i < VIEW_NB_COLOURS; i++)
         printf("  %-12s %s%s\n", view_colours[i].key, view_colours[i].name,
-               view_colours[i].scene
+               view_colours[i].log
+               ? "  (scene referred, written straight from the pipeline "
+                 "through the ACEScct curve: any family's formats of ten "
+                 "bits or more, native resolution, no look and no tone "
+                 "mapping)"
+               : view_colours[i].scene
                ? "  (scene referred, written straight from the pipeline: "
                  "float samples only, so FFv1 (Vulkan) with an L4 preset, "
                  "native resolution, no look and no tone mapping)" : "");

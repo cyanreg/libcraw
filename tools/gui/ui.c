@@ -753,8 +753,10 @@ static int view_menu_colour_group(int g, int *count)
 /* A leaf column's entries select rather than opening another column. */
 /* The pixel formats the export's format row offers, and how many.
  *
- * A scene-referred export has the family's float formats, half and single,
- * which are the only things the direct path writes. Anything else is what
+ * A linear scene-referred export has the family's float formats, half and
+ * single, which are the only things the direct path writes linear light
+ * in; ACEScct has the family's own list, under ten bits greyed. Anything
+ * else is what
  * the probe found the family's encoder opens with; a format it does not
  * open with is never offered at all, and one it opens with that the
  * preset's profile forbids is offered greyed. */
@@ -768,7 +770,7 @@ static int view_menu_fmts(const struct view_state *st,
         return 0;
     }
 
-    if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene)
+    if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].needs_deep_rgb)
         return view_presets_scene_fmts(s->family, out);
 
     return view_presets_fmts(s->family, out);
@@ -907,9 +909,14 @@ static const char *view_menu_why_not(const struct view_state *st, int col, int i
     const enum AVPixelFormat *fmts;
     int ix;
 
-    if (m->kind == VIEW_MENU_PIXFMT)
-        return i >= 0 && i < view_menu_fmts(st, &fmts)
-             ? view_presets_fmt_why_not(s->family, s->preset, fmts[i]) : NULL;
+    if (m->kind == VIEW_MENU_PIXFMT) {
+        const char *why;
+
+        if (i < 0 || i >= view_menu_fmts(st, &fmts))
+            return NULL;
+        why = view_presets_fmt_why_not(s->family, s->preset, fmts[i]);
+        return why ? why : view_presets_colour_fmt_why_not(s->colour, fmts[i]);
+    }
 
     if (m->kind == VIEW_MENU_PRESET)
         return col == 0 ? view_presets_family_why_not(i)
@@ -1043,7 +1050,7 @@ static void view_menu_select(struct view_state *st, int col, int i)
     case VIEW_MENU_PIXFMT:
         if (ix >= view_menu_fmts(st, &fmts))
             break;
-        if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene) {
+        if (view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].needs_deep_rgb) {
             s->scene_pix_fmt = fmts[ix];
             s->set = true;
             break;
@@ -1081,8 +1088,7 @@ static int view_menu_current(const struct view_state *st, int col)
     switch (m->kind) {
     case VIEW_MENU_PIXFMT:
         n = view_menu_fmts(st, &fmts);
-        cur = view_colours[CRAW_CLAMP(s->colour, 0, VIEW_NB_COLOURS - 1)].scene
-            ? view_presets_sel_scene_fmt(s) : view_presets_sel_fmt(s);
+        cur = view_presets_sel_out_fmt(s);
         for (int i = 0; i < n; i++)
             if (fmts[i] == cur)
                 return i;
@@ -2798,10 +2804,12 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
      * the choice outlives a preset change and dies with a family one. */
     {
         /* A scene-referred export is written in one of the family's float
-         * formats whatever the row held before: say which. */
-        enum AVPixelFormat f = scene && fam->nb_scene_fmts
-                             ? view_presets_sel_scene_fmt(sel)
-                             : view_presets_sel_fmt(sel);
+         * formats whatever the row held before, and ACEScct in ten bits or
+         * more: say which. */
+        enum AVPixelFormat f = view_presets_sel_out_fmt(sel);
+
+        if (f == AV_PIX_FMT_NONE)
+            f = view_presets_sel_fmt(sel);
 
         nk_layout_row_dynamic(ctx, VIEW_ROW, 2);
         /* The format is known from the table the moment the preset is,
@@ -2826,9 +2834,9 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
      * under one whose profile does not: the menu greys such an entry, but a
      * preset change can walk the selection into one all the same, and the
      * profile is the thing that has to win. */
-    if (!why && !scene)
+    if (!why && !view_colours[sel->colour].needs_deep_rgb)
         why = view_presets_fmt_why_not(sel->family, sel->preset,
-                                       view_presets_sel_fmt(sel));
+                                       view_presets_sel_out_fmt(sel));
     /* The size row and a scene-referred space cannot both have their way:
      * the direct path has nothing to resample with, and inventing a scaler
      * for linear light is a decision nobody asked this program to make. */
@@ -2865,9 +2873,14 @@ static void view_panel_export_video(struct nk_context *ctx, struct view_state *s
         nk_labelf_wrap(ctx, "cannot export: %s", why);
     } else if (scene) {
         nk_layout_row_dynamic(ctx, VIEW_ROW * 3.0f, 1);
-        nk_label_wrap(ctx, "scene referred: written straight from the "
-                           "pipeline as float, with no tone curve, no gamut "
-                           "mapping, no film simulation and no grain");
+        nk_label_wrap(ctx, view_colours[sel->colour].log
+                           ? "scene referred: written straight from the "
+                             "pipeline through the ACEScct curve, with no "
+                             "tone curve, no gamut mapping, no film "
+                             "simulation and no grain"
+                           : "scene referred: written straight from the "
+                             "pipeline as float, with no tone curve, no gamut "
+                             "mapping, no film simulation and no grain");
     }
 
     /* The size, which every export has and the direct one refuses. The

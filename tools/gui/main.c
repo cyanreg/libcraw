@@ -233,7 +233,8 @@ bool view_export_is_scene(const struct view_state *st)
 enum CRAWColorSpace view_export_craw_space(const struct view_state *st)
 {
     switch (st->look.video_preset.colour) {
-    case VIEW_COLOUR_ACESCG: return CRAW_CS_ACES_AP1_LINEAR;
+    case VIEW_COLOUR_ACESCG:
+    case VIEW_COLOUR_ACESCCT: return CRAW_CS_ACES_AP1_LINEAR;
     case VIEW_COLOUR_ACES:   return CRAW_CS_ACES_AP0_LINEAR;
     default:                 return CRAW_CS_XYZ_D65;
     }

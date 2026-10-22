@@ -125,13 +125,20 @@ struct view_encode {
     SwsContext *sws;
 
     /* The scene-referred path: the pipeline's own read-back, RGBA16F or
-     * RGBA32F as the format asks, and the planar float frame the encoder
-     * takes. No renderer, no slots, no double buffering - the read-back is
+     * RGBA32F as the format asks, and the frame the encoder takes - planar
+     * float for linear light, the family's own format for ACEScct. No
+     * renderer, no slots, no double buffering - the read-back is
      * synchronous because the second pipeline run it belongs to is, and a
      * lossless float encode is the slow end of this anyway. */
     bool direct;
     enum CRAWColorSpace direct_space;
-    enum AVPixelFormat direct_fmt;  /* gbrpf16 or gbrpf32 */
+    enum AVPixelFormat direct_fmt;  /* gbrpf16, gbrpf32, or ACEScct's */
+    bool direct_half;           /* read back as RGBA16F */
+    /* ACEScct: the curve of every half float as a 16 bit code, and the
+     * read-back through it, turned, as the packed RGBA64 that
+     * view_enc_pack() and view_enc_scale() take. */
+    uint16_t *cct;
+    uint16_t *cct_rgba;
     int crop_x, crop_y;         /* where the read-back rectangle starts */
     int crop_w, crop_h;         /* and how big it is, in source pixels */
     void *rgba;                 /* crop_w * crop_h packed RGBA halves or floats */
@@ -2084,35 +2091,44 @@ static int view_enc_send_sw(struct view_encode *e, struct view_enc_slot *s,
  * are and never converted.
  *
  * GBRP is G, B, R in that order, which is the one thing about the format
- * worth saying out loud. */
+ * worth saying out loud.
+ *
+ * The strides themselves, in samples of the packed read-back, are shared
+ * with the ACEScct walk below. */
+static void view_enc_strides(int sw, int sh, pl_rotation rot,
+                             ptrdiff_t *base, ptrdiff_t *step, ptrdiff_t *row)
+{
+    switch (pl_rotation_normalize(rot)) {
+    case PL_ROTATION_90:
+        *base = (ptrdiff_t)(sh - 1) * sw * 4;
+        *step = -(ptrdiff_t)sw * 4;
+        *row  = 4;
+        break;
+    case PL_ROTATION_180:
+        *base = ((ptrdiff_t)(sh - 1) * sw + sw - 1) * 4;
+        *step = -4;
+        *row  = -(ptrdiff_t)sw * 4;
+        break;
+    case PL_ROTATION_270:
+        *base = (ptrdiff_t)(sw - 1) * 4;
+        *step = (ptrdiff_t)sw * 4;
+        *row  = -4;
+        break;
+    default:
+        *base = 0;
+        *step = 4;
+        *row  = (ptrdiff_t)sw * 4;
+        break;
+    }
+}
+
 static void view_enc_deinterleave(AVFrame *f, const void *rgba,
                                   int sw, int sh, pl_rotation rot)
 {
     int w = f->width, h = f->height;
     ptrdiff_t base, step, row;
 
-    switch (pl_rotation_normalize(rot)) {
-    case PL_ROTATION_90:
-        base = (ptrdiff_t)(sh - 1) * sw * 4;
-        step = -(ptrdiff_t)sw * 4;
-        row  = 4;
-        break;
-    case PL_ROTATION_180:
-        base = ((ptrdiff_t)(sh - 1) * sw + sw - 1) * 4;
-        step = -4;
-        row  = -(ptrdiff_t)sw * 4;
-        break;
-    case PL_ROTATION_270:
-        base = (ptrdiff_t)(sw - 1) * 4;
-        step = (ptrdiff_t)sw * 4;
-        row  = -4;
-        break;
-    default:
-        base = 0;
-        step = 4;
-        row  = (ptrdiff_t)sw * 4;
-        break;
-    }
+    view_enc_strides(sw, sh, rot, &base, &step, &row);
 
     for (int y = 0; y < h; y++) {
         uint8_t *g = f->data[0] + (ptrdiff_t)y * f->linesize[0];
@@ -2139,6 +2155,43 @@ static void view_enc_deinterleave(AVFrame *f, const void *rgba,
     }
 }
 
+/* ACEScct, S-2016-001, of every half float, as a full range 16 bit code
+ * of the curve's 0 to 1. What lies below the curve's foot - negatives,
+ * which its linear segment takes down to 0 at -0.0069 - and past 222.86 is
+ * clipped, which is all an integer file of it can hold; NaN is 0. */
+static void view_enc_cct_table(uint16_t *lut)
+{
+    for (uint32_t i = 0; i < 65536; i++) {
+        double lin = view_half_to_float((uint16_t)i);
+        double cct = lin <= 0.0078125 ? 10.5402377416545 * lin + 0.0729055341958355
+                                      : (log2(lin) + 9.72) / 17.52;
+
+        lut[i] = isnan(cct) ? 0 : (uint16_t)lrint(CRAW_CLAMP(cct, 0.0, 1.0) * 65535.0);
+    }
+}
+
+/* The de-interleave's walk for ACEScct: the read-back's halves through the
+ * table, turned upright, into packed RGBA64 of the frame's size. */
+static void view_enc_cct(const struct view_encode *e, int w, int h)
+{
+    const uint16_t *rgba = e->rgba;
+    ptrdiff_t base, step, row;
+
+    view_enc_strides(e->crop_w, e->crop_h, e->rotation, &base, &step, &row);
+
+    for (int y = 0; y < h; y++) {
+        const uint16_t *s = rgba + base + row * y;
+        uint16_t *d = e->cct_rgba + (size_t)y * w * 4;
+
+        for (int x = 0; x < w; x++, s += step, d += 4) {
+            d[0] = e->cct[s[0]];
+            d[1] = e->cct[s[1]];
+            d[2] = e->cct[s[2]];
+            d[3] = UINT16_MAX;
+        }
+    }
+}
+
 /* One scene-referred frame, in two halves. This one, under the lock: the
  * pipeline again in the export's own space, and the read-back of it
  * started. Then, in view_enc_send_direct() and without the lock, the wait
@@ -2151,8 +2204,7 @@ static int view_enc_read_direct(struct view_encode *e, struct view_state *st)
     /* The read-back is the source rectangle; the frame the encoder takes is
      * that rectangle turned, which for a quarter turn is the same number of
      * pixels the other way up. */
-    size_t need = (size_t)e->crop_w * e->crop_h * 4 *
-                  (e->direct_fmt == AV_PIX_FMT_GBRPF16 ? 2 : 4);
+    size_t need = (size_t)e->crop_w * e->crop_h * 4 * (e->direct_half ? 2 : 4);
     int ret;
 
     if (e->rgba_bytes < need) {
@@ -2200,7 +2252,20 @@ static int view_enc_send_direct(struct view_encode *e, int64_t pts)
     }
 
     t0 = av_gettime_relative();
-    view_enc_deinterleave(f, e->rgba, e->crop_w, e->crop_h, e->rotation);
+    if (e->col->log) {
+        view_enc_cct(e, f->width, f->height);
+        /* Tagged before the conversion, which reads the matrix and the
+         * range off the frame, and again after it, which copies the
+         * source's over them (view_enc_send_sw()). */
+        view_enc_tag_frame(e, f);
+        if (!view_enc_pack(f, e->cct_rgba)) {
+            ret = view_enc_scale(e, f, e->cct_rgba);
+            if (ret < 0)
+                return ret;
+        }
+    } else {
+        view_enc_deinterleave(f, e->rgba, e->crop_w, e->crop_h, e->rotation);
+    }
     e->ms_pack += (double)(av_gettime_relative() - t0) / 1000.0;
 
     view_enc_tag_frame(e, f);
@@ -2276,7 +2341,7 @@ int view_encode_preroll(struct view_state *st, const AVFrame *f,
 
     /* Built now rather than when the output is opened, which would be
      * too late for these frames; view_enc_setup() finds it there. */
-    ret = view_gpu_direct_open(e->g, e->direct_fmt == AV_PIX_FMT_GBRPF16);
+    ret = view_gpu_direct_open(e->g, e->direct_half);
     if (ret < 0)
         return ret;
 
@@ -2402,7 +2467,7 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
      * rather than handed to an encoder that would take it and write a file
      * labelled as something it is not: the panel greys such an entry, but
      * --pix-fmt and --preset can still be combined into one. */
-    e->pin = view_presets_sel_fmt(&e->sel);
+    e->pin = view_presets_sel_out_fmt(&e->sel);
     /* A --codec that is not the family's own encoder has nothing to do with
      * the preset's pin or its profile's rules - FFV1's gbrp16 handed to
      * h264_vulkan is a refusal, not a default - so only a --pix-fmt pins
@@ -2411,9 +2476,12 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
     if (o->codec && o->codec[0] && strcmp(o->codec, view_presets_encoder(&e->sel)))
         e->pin = e->sel.pix_fmt_family == e->sel.family
                ? (enum AVPixelFormat)e->sel.pix_fmt : AV_PIX_FMT_NONE;
-    else if (!e->col->scene) {
+    else if (!e->col->needs_deep_rgb) {
         const char *why = view_presets_fmt_why_not(e->sel.family,
                                                    e->sel.preset, e->pin);
+
+        if (!why)
+            why = view_presets_colour_fmt_why_not(e->sel.colour, e->pin);
 
         if (why) {
             char what[128];
@@ -2440,7 +2508,8 @@ int view_encode_begin(struct view_state *st, const struct view_encode_opts *o)
                                                       e->sel.colour);
 
         e->direct_space = view_export_craw_space(st);
-        e->direct_fmt = view_presets_sel_scene_fmt(&e->sel);
+        e->direct_fmt = e->col->log ? e->pin : view_presets_sel_scene_fmt(&e->sel);
+        e->direct_half = e->col->log || e->direct_fmt == AV_PIX_FMT_GBRPF16;
 
         /* The panel greys a family or a preset that cannot carry float, but
          * --preset and --colour can still be combined into one, and an
@@ -2668,10 +2737,11 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     if (ret < 0)
         goto fail;
 
-    /* A scene-referred export is written in float samples whatever the
-     * preset pins, which for FFV1 is gbrpf16 or gbrpf32 at version 4, as
-     * the row chose. view_presets_colour_why_not() has already refused
-     * every family and preset that cannot open with them. */
+    /* A linear scene-referred export is written in float samples whatever
+     * the preset pins, which for FFV1 is gbrpf16 or gbrpf32 at version 4,
+     * as the row chose; ACEScct in the row's own format of ten bits or
+     * more. view_presets_colour_why_not() has already refused every family
+     * and preset that cannot open with them. */
     if (e->direct) {
         ret = view_enc_try(e, st, e->direct_fmt, v->enc);
         if (ret < 0) {
@@ -2683,9 +2753,20 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
             goto fail;
         }
 
-        ret = view_gpu_direct_open(e->g, e->direct_fmt == AV_PIX_FMT_GBRPF16);
+        ret = view_gpu_direct_open(e->g, e->direct_half);
         if (ret < 0)
             goto fail;
+
+        if (e->col->log) {
+            e->ss = av_frame_alloc();
+            e->cct = malloc(65536 * sizeof(*e->cct));
+            e->cct_rgba = malloc((size_t)e->w * e->h * 4 * sizeof(*e->cct_rgba));
+            if (!e->ss || !e->cct || !e->cct_rgba) {
+                ret = CRAW_ERROR(ENOMEM);
+                goto fail;
+            }
+            view_enc_cct_table(e->cct);
+        }
 
         e->df = av_frame_alloc();
         if (!e->df) {
@@ -2771,8 +2852,17 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     /* H.273 has no code points for the ACES spaces, so a file written in
      * one says so in words instead; anything reading it back has to be
      * told, and a tag is the only place to tell it. */
-    if (e->col->tag)
+    if (e->col->tag) {
         av_dict_set(&e->vs->metadata, "COLOUR_SPACE", e->col->tag, 0);
+        /* A QuickTime or MP4 track carries a title and no other tag, so
+         * there the name goes on the file instead, as an mdta key, which
+         * those muxers only write when told to. Only for these files: the
+         * flag moves every file-level tag into mdta keys. */
+        if (av_opt_find(e->oc->priv_data, "movflags", NULL, 0, 0)) {
+            av_dict_set(&e->oc->metadata, "COLOUR_SPACE", e->col->tag, 0);
+            av_opt_set(e->oc->priv_data, "movflags", "+use_metadata_tags", 0);
+        }
+    }
 
     /* An HDR file says what it was mastered for, which is the peak the
      * renderer just tone mapped to. Written as stream side data, which is
@@ -2839,7 +2929,7 @@ static int view_enc_setup(struct view_encode *e, struct view_state *st)
     e->header = true;
 
     /* The rendered path's read-back frames. The direct one has its own
-     * planar float frame and no scaler at all. */
+     * frame, and for ACEScct the scaler's source, made with it above. */
     if (!e->hw && !e->direct) {
         e->sf = av_frame_alloc();
         e->ss = av_frame_alloc();
@@ -3075,6 +3165,8 @@ static void view_enc_release(struct view_state *st)
     av_frame_free(&e->ss);
     av_frame_free(&e->df);
     free(e->rgba);
+    free(e->cct);
+    free(e->cct_rgba);
     av_packet_free(&e->pkt);
     av_packet_free(&e->apkt);
     avcodec_free_context(&e->avc);

@@ -145,6 +145,7 @@ enum view_colour_id {
     VIEW_COLOUR_2020_HLG,
     VIEW_COLOUR_ACES,
     VIEW_COLOUR_ACESCG,
+    VIEW_COLOUR_ACESCCT,
     VIEW_COLOUR_XYZ,
     VIEW_NB_COLOURS,
 };
@@ -162,6 +163,10 @@ struct view_colour {
     bool scene;
     bool hdr;                   /* tone mapped to an HDR target */
     bool needs_deep_rgb;        /* linear light: float RGB codecs only */
+    /* Scene referred too, but through the ACEScct curve over ACEScg rather
+     * than as linear light, which is what makes it an integer encoding:
+     * any family's own formats of ten bits or more, ProRes among them. */
+    bool log;
 
     /* The stream tags. H.273 has no code points for ACES or ACEScg, so
      * those two are written as unspecified primaries with a linear
@@ -372,6 +377,17 @@ enum AVPixelFormat view_presets_sel_fmt(const struct view_preset_sel *s);
 int  view_presets_scene_fmts(int family, const enum AVPixelFormat **out);
 enum AVPixelFormat view_presets_sel_scene_fmt(const struct view_preset_sel *s);
 
+/* The format an ACEScct export writes: the row's own, or, where that is
+ * fewer than ten bits, the first of the family's formats that is not, of
+ * the same chroma layout if there is one - so x264's 8 bit NV12 becomes
+ * 10 bit 4:2:0. AV_PIX_FMT_NONE when the family has none. */
+enum AVPixelFormat view_presets_sel_log_fmt(const struct view_preset_sel *s);
+
+/* The format the selection's colour writes, whichever kind it is: the
+ * float choice for linear light, the above for ACEScct, the row's own for
+ * the rest. */
+enum AVPixelFormat view_presets_sel_out_fmt(const struct view_preset_sel *s);
+
 /* Why this preset cannot be written in this format, or NULL. The encoder
  * would take it - a format it does not take is never offered at all - but
  * the profile the preset selects is a chroma layout in the standard, and
@@ -403,8 +419,12 @@ int view_presets_dict(const struct view_preset_sel *s, const char *extra,
  * answers only from this build. */
 const char *view_presets_family_why_not(int family);
 const char *view_presets_preset_why_not(int family, int preset);
-/* And with a colour space in hand, since three of them need 16 bit RGB. */
+/* And with a colour space in hand, since three of them need float RGB and
+ * ACEScct ten bits or more. */
 const char *view_presets_colour_why_not(int family, int preset, int colour);
+/* Why `colour` cannot be written in `fmt`, or NULL: ACEScct in fewer than
+ * ten bits. */
+const char *view_presets_colour_fmt_why_not(int colour, enum AVPixelFormat fmt);
 /* Selects `colour`, and with it what it needs: a scene-referred space
  * picked under a codec that cannot write it moves the selection to the
  * nearest one that can (FFv1 L3 to L4, any other family to FFv1 (Vulkan)
