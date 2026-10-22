@@ -295,9 +295,10 @@ setting in it is kept, so switching it back on returns the picture it had:
 Exposure off is a bias of zero at the as-shot index with the slider still
 where it was, Look off drops the film simulation or the `--lut` cube
 without unselecting it, Adjustments off drops soft light and vibrance, Film
-grain, Denoise, Lens and Sharpen off turn their stages off, and Crop is the same
-switch `c` is. Debayer has nothing to bypass, and neither has a raw clip's
-White balance, which is always applied; they carry an empty slot so the
+grain, Denoise, Lens and Sharpen off turn their stages off, and Crop is lit
+while the picture is cropped or a crop is being drawn. Debayer has nothing
+to bypass, and neither has a raw clip's White balance, which is always
+applied; they carry an empty slot so the
 titles stay in line. A developed clip's White balance does have a switch,
 and off shows the picture balanced as the camera balanced it. A lit switch
 always means the section is doing something:
@@ -532,14 +533,18 @@ clockwise is clockwise as the picture is looked at. DESIGN.md 16.9.
 
 The picture can be cropped for the export. `c` turns crop mode on, a left
 drag over the picture then draws the rectangle instead of panning, and
-everything outside it is shaded with a thin border around what is kept; the
-Crop section's switch is that same mode, and its body reports the region.
+everything outside it is shaded with a thin border around what is kept.
 Switching the mode on clears whatever rectangle there was, so the whole
 frame is back and a new one can be drawn; switching it off keeps the one
 that was drawn, shaded, for the export — `c`, draw, `c` leaves the
-rectangle in place with the mode off, and `c` again starts afresh. There
-is no clear button: on again is the clearing. The rectangle is held in
-source pixels with even edges, so zoom, pan and a resized window leave it
+rectangle in place with the mode off, and `c` again starts afresh. The
+Crop section's switch is lit for the mode and for a rectangle in use, so a
+crop on screen never sits under a switch that says off. A click on it
+turns off what is lit, the drawing first: in the middle of one it keeps
+what was drawn, as `c` does, and with a crop in use it drops it and the
+whole frame is back; from off it starts drawing. Its body reports the
+region. There is no clear button: starting to draw is the clearing. The
+rectangle is held in source pixels with even edges, so zoom, pan and a resized window leave it
 where it is, and the export writes exactly that region at source
 resolution. On a rotated clip it is drawn on the picture as it is shown and
 mapped through the turn both ways, so the shade and the readout follow what

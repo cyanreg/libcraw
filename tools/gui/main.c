@@ -4299,7 +4299,8 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
          * Switching the mode on clears whatever rectangle there was, so the
          * whole frame is back and a new one can be drawn; switching it off
          * keeps the one that was drawn, shaded, for the export. The Crop
-         * header's switch is this same switch and does the same. */
+         * header's switch is lit for this mode and for a crop in use, and
+         * a click on it ends the one and then drops the other (ui.c). */
         if (!repeat) {
             st->crop.on = !st->crop.on;
             if (st->crop.on)

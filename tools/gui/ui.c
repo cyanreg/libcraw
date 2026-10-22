@@ -3094,10 +3094,10 @@ static void view_panel_block(struct nk_context *ctx, const char *title)
     nk_label(ctx, title, NK_TEXT_LEFT);
 }
 
-/* The "Crop" section: what a left drag has drawn. The mode the drag draws
- * in is the header's switch, which `c` is the other hand on, and switching
- * it on is what clears a rectangle - so there is no clear button, only the
- * readout. The rectangle is held in source pixels and reported on the
+/* The "Crop" section: what a left drag has drawn. The header's switch is
+ * lit for a crop in use and for the mode the drag draws in, which `c` is
+ * the other hand on, and starting to draw is what clears a rectangle - so
+ * there is no clear button, only the readout. The rectangle is held in source pixels and reported on the
  * picture as it is shown, so the readout says which region the export will
  * write whatever the window is doing with it. On a rotated clip those are
  * two different rectangles and the one worth printing is the one that was
@@ -3107,9 +3107,12 @@ static void view_panel_crop(struct nk_context *ctx, struct view_state *st)
     int x, y, w, h;
 
     nk_layout_row_dynamic(ctx, VIEW_ROW, 1);
-    nk_label(ctx, st->crop.on ? "drag to draw one; c or the switch keeps it"
-                              : "crop mode is off (c); on again clears",
-             NK_TEXT_LEFT);
+    if (st->crop.on)
+        nk_label(ctx, "drag to draw one; c or the switch keeps it", NK_TEXT_LEFT);
+    else if (view_crop_rect(st, &x, &y, &w, &h))
+        nk_label(ctx, "the switch drops it; c draws a new one", NK_TEXT_LEFT);
+    else
+        nk_label(ctx, "c or the switch draws one", NK_TEXT_LEFT);
 
     /* "(clip)" while the rectangle is the one the clip's own frame header
      * marked rather than one that was drawn or asked for: it says why a
@@ -3489,19 +3492,32 @@ static void view_panel(struct nk_context *ctx, struct view_state *st)
         view_section_end(ctx);
     }
 
-    /* The crop mode is a switch like any other, and `c` is the same
-     * switch. Switching it on clears whatever rectangle there was, so the
-     * whole frame is back and a new one can be drawn; off keeps the one
-     * that was drawn, shaded, for the export. Checked before the body is
-     * laid out so that the readout under the header never shows the old
-     * rectangle for a frame. */
+    /* The switch is lit while the picture is cropped or a crop is being
+     * drawn, so a rectangle in use never sits under a switch that says off.
+     * A click turns off what is lit, the drawing first: in the middle of
+     * one it ends it and keeps what was drawn, which is what `c` does, and
+     * with a crop in use and nothing being drawn it drops the crop and the
+     * whole frame is back. From off it starts drawing, as `c` does, with
+     * the whole frame to draw on. Settled before the body is laid out so
+     * that the readout under the header never shows the old rectangle for
+     * a frame. */
     {
-        bool was = st->crop.on;
+        int cx, cy, cw, ch;
+        bool was = st->crop.on || view_crop_rect(st, &cx, &cy, &cw, &ch);
+        bool lit = was;
         bool open = view_section_header(ctx, st, VIEW_SEC_CROP, "Crop",
-                                        &st->crop.on, false);
+                                        &lit, false);
 
-        if (st->crop.on && !was)
-            view_crop_clear(st);
+        if (lit != was) {
+            if (!was) {
+                st->crop.on = true;
+                view_crop_clear(st);
+            } else if (st->crop.on) {
+                st->crop.on = false;
+            } else {
+                view_crop_clear(st);
+            }
+        }
         if (open) {
             view_panel_crop(ctx, st);
             view_section_end(ctx);
