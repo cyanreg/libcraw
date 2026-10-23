@@ -47,7 +47,14 @@
  *     maintenance4)
  *   - VkPhysicalDeviceVulkan14Features: pushDescriptor
  *   - VkPhysicalDeviceFeatures: shaderStorageImageWriteWithoutFormat,
- *     shaderStorageImageReadWithoutFormat, shaderStorageImageExtendedFormats
+ *     shaderStorageImageExtendedFormats
+ *   - VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT, in the optimal
+ *     tiling features, on R16_UNORM, R16_SFLOAT, R8_UNORM, R32_SFLOAT,
+ *     R16G16B16A16_SFLOAT and R32G32B32A32_SFLOAT: the shaders read images
+ *     declared without a format, which Vulkan 1.3 allows per format, so
+ *     shaderStorageImageReadWithoutFormat itself is not needed. Nothing to
+ *     enable; craw_vulkan_check_device() and craw_context_create() refuse
+ *     a device without it.
  *   - subgroup operations in compute shaders, Vulkan 1.1 core but reported
  *     rather than enabled (VkPhysicalDeviceSubgroupProperties, or
  *     VkPhysicalDeviceVulkan11Properties): basic, shuffle relative and
@@ -96,7 +103,8 @@ CRAW_API void craw_vulkan_get_requirements(CRAWVulkanRequirements *out);
  * exists: its API version and every required feature are queried through
  * `get_proc_addr`. Returns 0 when it can, CRAW_ERROR(ENOTSUP) otherwise
  * with `*missing` (may be NULL) pointing at a static string naming the
- * first missing feature or "apiVersion". Use it to pick a device: on a
+ * first missing feature, the first format libcraw cannot read without a
+ * format, or "apiVersion". Use it to pick a device: on a
  * machine with several GPUs the first one is not necessarily suitable. */
 CRAW_API int craw_vulkan_check_device(PFN_vkGetInstanceProcAddr get_proc_addr,
                                       VkInstance instance, VkPhysicalDevice phys_device,

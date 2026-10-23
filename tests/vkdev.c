@@ -163,9 +163,12 @@ static bool craw_td_have_layer(const char *name)
 
 /* Names the first requirement the device cannot meet, or NULL if it can.
  * The list mirrors craw_vulkan_get_requirements(); a device that fails it
- * would only fail again inside vkCreateDevice. */
-static const char *craw_td_unsupported(VkPhysicalDevice pd)
+ * would only fail again inside vkCreateDevice. What there is nothing to
+ * enable for - the subgroup operations, the formats libcraw reads without
+ * a format - is libcraw's own check, which craw_context_create() repeats. */
+static const char *craw_td_unsupported(VkInstance instance, VkPhysicalDevice pd)
 {
+    const char *missing = NULL;
     CRAWVulkanRequirements req;
     VkPhysicalDeviceVulkan14Features f14 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
@@ -197,9 +200,6 @@ static const char *craw_td_unsupported(VkPhysicalDevice pd)
         { "shaderStorageImageWriteWithoutFormat",
           req.required_features.shaderStorageImageWriteWithoutFormat,
           f2.features.shaderStorageImageWriteWithoutFormat },
-        { "shaderStorageImageReadWithoutFormat",
-          req.required_features.shaderStorageImageReadWithoutFormat,
-          f2.features.shaderStorageImageReadWithoutFormat },
         { "storageBuffer16BitAccess",
           req.required_features_11.storageBuffer16BitAccess,
           f11.storageBuffer16BitAccess },
@@ -226,6 +226,9 @@ static const char *craw_td_unsupported(VkPhysicalDevice pd)
     for (size_t i = 0; i < CRAW_ARRAY_ELEMS(checks); i++)
         if (checks[i].want && !checks[i].have)
             return checks[i].name;
+
+    if (craw_vulkan_check_device(vkGetInstanceProcAddr, instance, pd, &missing) < 0)
+        return missing ? missing : "a libcraw requirement";
 
     return NULL;
 }
@@ -280,7 +283,7 @@ static int craw_td_pick_device(CRAWTestDevice *td, const char *name_substr,
             continue;
         }
 
-        missing = craw_td_unsupported(devs[i]);
+        missing = craw_td_unsupported(td->instance, devs[i]);
         if (missing) {
             if (named || verbose)
                 fprintf(stderr, "craw: skipping \"%s\": no %s\n",

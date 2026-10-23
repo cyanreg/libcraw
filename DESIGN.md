@@ -838,12 +838,18 @@ panel's Exposure section) puts the two side by side.
 - Barriers use synchronization2 with per-image tracked layout/stage/access
   (`craw_vk_image_barrier`). External images are wrapped for the duration
   of one recording and left in the layout the caller stated.
-- Intermediates are `VK_IMAGE_LAYOUT_GENERAL` storage images. Formatless
-  reads/writes (`GL_EXT_shader_image_load_formatted`) are required, and so
-  is `shaderStorageImageExtendedFormats` for the R16 source and green plane.
-  Formatless *reads* are what exclude Intel ANV today; every image the
-  shaders read has a fixed format, so a future variant could annotate the
-  reads and require only formatless writes if that ever matters.
+- Intermediates are `VK_IMAGE_LAYOUT_GENERAL` storage images. The shaders
+  declare every image without a format (`GL_EXT_shader_image_load_formatted`),
+  so formatless writes (`shaderStorageImageWriteWithoutFormat`) are
+  required, and so is `shaderStorageImageExtendedFormats` for the R16
+  source and green plane. Formatless reads are not a device feature here:
+  since Vulkan 1.3 a read without a format is legal on any format whose
+  optimal tiling features include `VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT`,
+  and libcraw checks that bit on each format it reads - R16 UNORM, R16F,
+  R8 UNORM, R32F, RGBA16F and RGBA32F - in `craw_vulkan_check_device()`
+  and at context creation. `shaderStorageImageReadWithoutFormat` says the
+  same of every format a driver has, and Intel's ANV clears it while
+  setting the bit on all six, which is what used to exclude it.
 - Buffers for histograms are storage buffers with device addresses; the
   readback buffer is host visible and cached.
 - The pipeline records, per frame: barrier src to GENERAL/compute read,

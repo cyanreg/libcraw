@@ -105,7 +105,9 @@ struct CRAWContext {
         uint32_t max_shmem;          /* maxComputeSharedMemorySize */
         bool     float16;            /* shaderFloat16 */
         bool     int8_dot;           /* integerDotProduct4x8BitPackedSignedAccelerated */
-        bool     formatless_read;    /* shaderStorageImageReadWithoutFormat */
+        bool     formatless_read;    /* shaderStorageImageReadWithoutFormat, i.e. on
+                                      * every format; libcraw's own are checked
+                                      * format by format either way */
     } caps;
 
     CRAWVkAllocator *allocator;

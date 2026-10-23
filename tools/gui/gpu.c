@@ -118,10 +118,12 @@ static bool view_feats_ok(const void *req, const void *sup, size_t bytes, size_t
 #define VIEW_FEATS_OK(req, sup) \
     view_feats_ok(&(req), &(sup), sizeof(req), sizeof(VkBaseOutStructure))
 
-static bool view_device_ok(VkPhysicalDevice pd, const CRAWVulkanRequirements *rq,
+static bool view_device_ok(pl_vk_inst inst, VkPhysicalDevice pd,
+                           const CRAWVulkanRequirements *rq,
                            VkSurfaceKHR surface, char *name, size_t name_size,
                            int *score, bool verbose)
 {
+    const char *missing = NULL;
     VkPhysicalDeviceVulkan14Features f14 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES };
     VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &f14 };
     VkPhysicalDeviceVulkan12Features f12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13 };
@@ -159,6 +161,17 @@ static bool view_device_ok(VkPhysicalDevice pd, const CRAWVulkanRequirements *rq
         !VIEW_FEATS_OK(rq->required_features_14, f14)) {
         if (verbose)
             fprintf(stderr, "  %s: missing a feature libcraw requires\n", props.deviceName);
+        return false;
+    }
+
+    /* And what there is nothing to enable for, which only libcraw itself
+     * knows the list of: the subgroup operations, and the formats its
+     * shaders read without a format, which a device may allow format by
+     * format without the feature that allows it for all of them. */
+    if (craw_vulkan_check_device(inst->get_proc_addr, inst->instance, pd, &missing) < 0) {
+        if (verbose)
+            fprintf(stderr, "  %s: no %s, which libcraw requires\n", props.deviceName,
+                    missing ? missing : "Vulkan entry points");
         return false;
     }
 
@@ -242,10 +255,10 @@ done:
     return ok;
 }
 
-/* libplacebo would happily pick the "best" device by type, but on this
- * machine that can be an Intel iGPU, which lacks the formatless storage
- * image reads libcraw's shaders need. Choose among the devices that can
- * actually run the pipeline instead, and hand the winner to libplacebo. */
+/* libplacebo would happily pick the "best" device by type, which is not
+ * necessarily one that can run the pipeline or present to this window.
+ * Choose among the devices that can do both instead, the discrete GPU
+ * first, and hand the winner to libplacebo. */
 static VkPhysicalDevice view_pick_device(struct view_gpu *g, const struct view_cfg *cfg)
 {
     CRAWVulkanRequirements rq;
@@ -273,8 +286,8 @@ static VkPhysicalDevice view_pick_device(struct view_gpu *g, const struct view_c
         char name[256] = { 0 };
         int score = 0;
 
-        if (!view_device_ok(devs[i], &rq, g->surface, name, sizeof(name), &score,
-                            cfg->verbose))
+        if (!view_device_ok(g->inst, devs[i], &rq, g->surface, name, sizeof(name),
+                            &score, cfg->verbose))
             continue;
         if (cfg->device && !strstr(name, cfg->device)) {
             if (cfg->verbose)

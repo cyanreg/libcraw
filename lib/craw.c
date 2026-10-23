@@ -106,9 +106,13 @@ void craw_vulkan_get_requirements(CRAWVulkanRequirements *out)
         .optional_device_extensions = craw_optional_dev_extensions,
         .nb_optional_device_extensions = CRAW_ARRAY_ELEMS(craw_optional_dev_extensions),
 
+        /* Formatless reads are not here: Vulkan 1.3 allows them per format,
+         * which craw_first_unreadable_format() checks, and a driver clears
+         * shaderStorageImageReadWithoutFormat as soon as any one format of
+         * its own cannot do it - Intel's does, while reading every format
+         * libcraw uses without one. */
         .required_features = {
             .shaderStorageImageWriteWithoutFormat = VK_TRUE,
-            .shaderStorageImageReadWithoutFormat  = VK_TRUE,
             .shaderStorageImageExtendedFormats    = VK_TRUE,
         },
         .required_features_11 = {
@@ -219,9 +223,6 @@ static const char *craw_first_missing_feature(const CRAWDeviceFeatures *d)
         { "shaderStorageImageWriteWithoutFormat",
           req.required_features.shaderStorageImageWriteWithoutFormat,
           d->f2.features.shaderStorageImageWriteWithoutFormat },
-        { "shaderStorageImageReadWithoutFormat",
-          req.required_features.shaderStorageImageReadWithoutFormat,
-          d->f2.features.shaderStorageImageReadWithoutFormat },
         { "shaderStorageImageExtendedFormats",
           req.required_features.shaderStorageImageExtendedFormats,
           d->f2.features.shaderStorageImageExtendedFormats },
@@ -256,12 +257,55 @@ static const char *craw_first_missing_feature(const CRAWDeviceFeatures *d)
     return NULL;
 }
 
+/* Every format a shader reads with imageLoad() through an image declared
+ * without a format qualifier (GL_EXT_shader_image_load_formatted): the
+ * source mosaic, the intermediates lib/pipeline.c creates, and the two
+ * output formats a pipeline may be built for, whose internal copies later
+ * passes read. Since Vulkan 1.3 such a read is legal on any format that
+ * has VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT, without
+ * shaderStorageImageReadWithoutFormat; the name is what `missing` reports. */
+static const struct {
+    VkFormat format;
+    const char *name;
+} craw_read_formats[] = {
+    { VK_FORMAT_R16_UNORM,           "STORAGE_READ_WITHOUT_FORMAT on VK_FORMAT_R16_UNORM" },
+    { VK_FORMAT_R16_SFLOAT,          "STORAGE_READ_WITHOUT_FORMAT on VK_FORMAT_R16_SFLOAT" },
+    { VK_FORMAT_R8_UNORM,            "STORAGE_READ_WITHOUT_FORMAT on VK_FORMAT_R8_UNORM" },
+    { VK_FORMAT_R32_SFLOAT,          "STORAGE_READ_WITHOUT_FORMAT on VK_FORMAT_R32_SFLOAT" },
+    { VK_FORMAT_R16G16B16A16_SFLOAT, "STORAGE_READ_WITHOUT_FORMAT on VK_FORMAT_R16G16B16A16_SFLOAT" },
+    { VK_FORMAT_R32G32B32A32_SFLOAT, "STORAGE_READ_WITHOUT_FORMAT on VK_FORMAT_R32G32B32A32_SFLOAT" },
+};
+
+/* The first of those a shader cannot read without a format on this device,
+ * as optimally tiled images, which is what libcraw creates and what it is
+ * handed; NULL when it can read them all. */
+static const char *craw_first_unreadable_format(PFN_vkGetPhysicalDeviceFormatProperties2 get_fmt,
+                                                VkPhysicalDevice phys_device)
+{
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(craw_read_formats); i++) {
+        VkFormatProperties3 p3 = {
+            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3,
+        };
+        VkFormatProperties2 p2 = {
+            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+            .pNext = &p3,
+        };
+
+        get_fmt(phys_device, craw_read_formats[i].format, &p2);
+        if (!(p3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT))
+            return craw_read_formats[i].name;
+    }
+
+    return NULL;
+}
+
 int craw_vulkan_check_device(PFN_vkGetInstanceProcAddr get_proc_addr,
                              VkInstance instance, VkPhysicalDevice phys_device,
                              const char **missing)
 {
     PFN_vkGetPhysicalDeviceProperties2 get_props;
     PFN_vkGetPhysicalDeviceFeatures2 get_feats;
+    PFN_vkGetPhysicalDeviceFormatProperties2 get_fmt;
     VkPhysicalDeviceVulkan11Properties p11 = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
     };
@@ -281,7 +325,9 @@ int craw_vulkan_check_device(PFN_vkGetInstanceProcAddr get_proc_addr,
         get_proc_addr(instance, "vkGetPhysicalDeviceProperties2");
     get_feats = (PFN_vkGetPhysicalDeviceFeatures2)
         get_proc_addr(instance, "vkGetPhysicalDeviceFeatures2");
-    if (!get_props || !get_feats)
+    get_fmt = (PFN_vkGetPhysicalDeviceFormatProperties2)
+        get_proc_addr(instance, "vkGetPhysicalDeviceFormatProperties2");
+    if (!get_props || !get_feats || !get_fmt)
         return CRAW_ERROR(ENOSYS);
 
     get_props(phys_device, &props);
@@ -295,6 +341,8 @@ int craw_vulkan_check_device(PFN_vkGetInstanceProcAddr get_proc_addr,
     name = craw_first_missing_feature(&d);
     if (!name)
         name = craw_first_missing_subgroup_op(&p11);
+    if (!name)
+        name = craw_first_unreadable_format(get_fmt, phys_device);
     if (name) {
         if (missing)
             *missing = name;
@@ -387,6 +435,15 @@ static int craw_check_features(CRAWContext *ctx)
         return CRAW_ERROR(ENOTSUP);
     }
 
+    name = craw_first_unreadable_format(ctx->fn.GetPhysicalDeviceFormatProperties2,
+                                        ctx->phys_device);
+    if (name) {
+        craw_log(ctx, CRAW_LOG_ERROR,
+                 "Device cannot read an image libcraw uses without a format: no %s\n",
+                 name);
+        return CRAW_ERROR(ENOTSUP);
+    }
+
     ctx->caps.float16         = d.f12.shaderFloat16;
     ctx->caps.formatless_read = d.f2.features.shaderStorageImageReadWithoutFormat;
 
@@ -450,7 +507,7 @@ int craw_context_create(CRAWContext **out_ctx, const CRAWVulkanInitParams *param
              CRAW_VERSION_MAJOR, CRAW_VERSION_MINOR, CRAW_VERSION_MICRO,
              ctx->props.properties.deviceName, ctx->caps.subgroup_size,
              ctx->caps.float16 ? "yes" : "no",
-             ctx->caps.formatless_read ? "yes" : "no",
+             ctx->caps.formatless_read ? "on every format" : "on libcraw's formats",
              ctx->caps.int8_dot ? "accelerated" : "emulated");
 
     *out_ctx = ctx;
