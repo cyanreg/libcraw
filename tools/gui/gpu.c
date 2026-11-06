@@ -819,11 +819,9 @@ void view_gpu_close(struct view_gpu *g)
             vkDestroyImageView(g->vk->device, g->src_views[i].view, NULL);
         g->nb_src_views = 0;
 
-        view_gpu_ui_drop_old(g);
         for (int i = 0; i < VIEW_SLOTS; i++) {
             vkDestroyImageView(g->vk->device, g->slots[i].view, NULL);
-            vkDestroyImageView(g->vk->device, g->ui_views[i], NULL);
-            g->slots[i].view = g->ui_views[i] = VK_NULL_HANDLE;
+            g->slots[i].view = VK_NULL_HANDLE;
         }
     }
 
@@ -834,10 +832,9 @@ void view_gpu_close(struct view_gpu *g)
         pl_tex_destroy(g->gpu, &g->linear_tex);
         pl_tex_destroy(g->gpu, &g->probe_tex);
         pl_buf_destroy(g->gpu, &g->probe_buf);
-        for (int i = 0; i < VIEW_SLOTS; i++) {
+        for (int i = 0; i < VIEW_SLOTS; i++)
             pl_tex_destroy(g->gpu, &g->slots[i].tex);
-            pl_tex_destroy(g->gpu, &g->ui_tex[i]);
-        }
+        pl_tex_destroy(g->gpu, &g->ui_tex);
         pl_tex_destroy(g->gpu, &g->export_tex);
         pl_tex_destroy(g->gpu, &g->pic_tex);
         pl_vulkan_sem_destroy(g->gpu, &g->out_sem);
@@ -2367,21 +2364,21 @@ int view_gpu_display(struct view_gpu *g, struct view_state *st)
     g->pic_th = th;
     g->pic_have_target = true;
 
-    if (g->ui_tex[g->ui_slot]) {
+    if (g->ui_tex) {
         part = (struct pl_overlay_part) {
             .src = { 0, 0, (float)g->ui_w, (float)g->ui_h },
             .dst = { 0, 0, (float)g->ui_w, (float)g->ui_h },
         };
         overlay = (struct pl_overlay) {
-            .tex    = g->ui_tex[g->ui_slot],
+            .tex    = g->ui_tex,
             .mode   = PL_OVERLAY_NORMAL,
             .coords = PL_OVERLAY_COORDS_DST_FRAME,
             .repr = {
                 .sys    = PL_COLOR_SYSTEM_RGB,
                 .levels = PL_COLOR_LEVELS_PC,
-                /* nuklear draws into a cleared, fully transparent target
-                 * with src-alpha blending, so what lands in the texture is
-                 * colour already multiplied by coverage. */
+                /* The panel is drawn into a cleared, fully transparent
+                 * target with ImGui's blending, so what lands in the
+                 * texture is colour already multiplied by coverage. */
                 .alpha  = PL_ALPHA_PREMULTIPLIED,
             },
             .parts     = &part,
@@ -3154,78 +3151,31 @@ int view_gpu_direct_preroll(struct view_gpu *g, const AVFrame *frame,
 
 /* ------------------------------------------------------------- the UI tex */
 
-void view_gpu_ui_drop_old(struct view_gpu *g)
-{
-    for (int i = 0; i < VIEW_SLOTS; i++) {
-        if (g->ui_views_old[i] != VK_NULL_HANDLE) {
-            vkDestroyImageView(g->vk->device, g->ui_views_old[i], NULL);
-            g->ui_views_old[i] = VK_NULL_HANDLE;
-        }
-        pl_tex_destroy(g->gpu, &g->ui_tex_old[i]);
-    }
-}
-
 int view_gpu_ui_resize(struct view_gpu *g, int w, int h)
 {
-    VkFormat fmt;
-    VkImageUsageFlags usage;
-    VkImage image;
-    pl_fmt plfmt;
+    struct pl_tex_params tp;
 
     if (w <= 0 || h <= 0)
         return CRAW_ERROR(EINVAL);
-    if (g->ui_tex[0] && g->ui_w == w && g->ui_h == h)
+    if (g->ui_tex && g->ui_w == w && g->ui_h == h)
         return 0;
 
-    vkDeviceWaitIdle(g->vk->device);
-
-    /* nuklear's framebuffers still reference the current views, so they and
-     * their images have to outlive nk_sdl_resize(). */
-    view_gpu_ui_drop_old(g);
-    for (int i = 0; i < VIEW_SLOTS; i++) {
-        g->ui_views_old[i] = g->ui_views[i];
-        g->ui_tex_old[i] = g->ui_tex[i];
-        g->ui_views[i] = VK_NULL_HANDLE;
-        g->ui_tex[i] = NULL;
-    }
-
-    plfmt = pl_find_named_fmt(g->gpu, "rgba8");
-    if (!plfmt)
+    /* The old texture goes when the frames that composite it are done:
+     * libplacebo holds it until then, so a resize waits for nothing. Drawn
+     * into, blended into, cleared and sampled by the renderer. */
+    tp = (struct pl_tex_params) {
+        .w          = w,
+        .h          = h,
+        .format     = pl_find_named_fmt(g->gpu, "rgba8"),
+        .renderable = true,
+        .sampleable = true,
+        .blit_dst   = true,
+    };
+    if (!tp.format || !(tp.format->caps & PL_FMT_CAP_BLENDABLE))
         return CRAW_ERROR(ENOTSUP);
+    if (!pl_tex_recreate(g->gpu, &g->ui_tex, &tp))
+        return CRAW_ERROR(ENOMEM);
 
-    for (int i = 0; i < VIEW_SLOTS; i++) {
-        g->ui_tex[i] = pl_tex_create(g->gpu, pl_tex_params(
-            .w          = w,
-            .h          = h,
-            .format     = plfmt,
-            .renderable = true,
-            .sampleable = true,
-        ));
-        if (!g->ui_tex[i])
-            return CRAW_ERROR(ENOMEM);
-
-        image = pl_vulkan_unwrap(g->gpu, g->ui_tex[i], &fmt, &usage);
-        if (!image)
-            return CRAW_ERROR(ENOTSUP);
-
-        VkImageViewCreateInfo info = {
-            .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image    = image,
-            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-            .format   = fmt,
-            .subresourceRange = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .levelCount = 1,
-                .layerCount = 1,
-            },
-        };
-        if (vkCreateImageView(g->vk->device, &info, NULL, &g->ui_views[i]) != VK_SUCCESS)
-            return CRAW_ERROR(ENOMEM);
-
-        g->ui_format = fmt;
-    }
-
-    g->ui_slot = 0;
     g->ui_w = w;
     g->ui_h = h;
 

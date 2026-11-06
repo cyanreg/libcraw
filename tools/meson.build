@@ -49,6 +49,12 @@ libxml = dependency('libxml-2.0', required: false)
 # is the one place that knows: the same lookup every desktop application
 # makes, so the panel reads in the face the rest of the screen does.
 fontconfig = dependency('fontconfig', required: false)
+# The panel is Dear ImGui's: 1.92 for the textures the renderer creates and
+# updates itself, which is how the font atlas grows as glyphs are first
+# drawn. Its FreeType loader rasterizes the face, and a packaged ImGui
+# builds that loader in without saying that it needs FreeType.
+imgui = dependency('imgui', version: '>=1.92', required: false)
+freetype = dependency('freetype2', required: false)
 # The window's colour on Wayland (DESIGN.md 22): the colour management
 # protocol's client code is generated from the machine's own
 # wayland-protocols. Without any of the three cineview still builds, and its
@@ -66,7 +72,8 @@ have_wl_colour = wayland_client.found() and wayland_scanner.found() and \
 
 craw_tools_ffmpeg = libavformat_dep.found() and libavcodec_dep.found() and libavutil_dep.found()
 craw_tools_gui = craw_tools_ffmpeg and sdl3.found() and placebo.found() and \
-                 swscale.found() and libxml.found() and fontconfig.found()
+                 swscale.found() and libxml.found() and fontconfig.found() and \
+                 imgui.found() and freetype.found()
 
 if craw_tools_ffmpeg
     tools_args = []
@@ -160,14 +167,15 @@ if craw_tools_ffmpeg
 
     # cineview: the interactive viewer and exporter. libplacebo owns the
     # VkDevice, FFmpeg's Vulkan hwaccel decodes onto it, libcraw processes
-    # in place and nuklear draws the panel into an overlay image.
+    # in place, and the ImGui panel is drawn by libplacebo into an overlay
+    # image. ui.cpp is the one C++ file, because ImGui is C++.
     if craw_tools_gui
         executable('cineview',
             'gui/main.c',
             'gui/trace.c',
             'gui/gpu.c',
             'gui/decode.c',
-            'gui/ui.c',
+            'gui/ui.cpp',
             'gui/audio.c',
             'gui/export.c',
             'gui/still.c',
@@ -184,11 +192,12 @@ if craw_tools_ffmpeg
             'profiles.c',
             gui_wl_sources,
             c_args: gui_args,
+            cpp_args: gui_args,
             include_directories: [ craw_inc ],
             dependencies: [
                 craw_dep, vulkan_dep, sdl3, placebo,
                 libavformat_dep, libavcodec_dep, libavutil_dep, swscale,
-                libxml, fontconfig,
+                libxml, fontconfig, imgui, freetype,
                 cc.find_library('m', required: false),
             ] + gui_deps,
             install: true,

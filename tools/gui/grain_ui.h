@@ -9,17 +9,13 @@
 
 #include "view.h"
 
-/* Only ui.c has nuklear's header; for everyone else the tag has to exist at
- * file scope or the prototype below would declare it inside its own
- * parameter list. */
-struct nk_context;
-
 /* The viewer's side of the film grain model.
  *
  * grain.c holds the model itself and knows nothing about this program;
- * everything here is the part that belongs to cineview: the panel section,
- * the command line option, and the hook handed to pl_render_params. It is a
- * file of its own so that ui.c, main.c and gpu.c each need one line. */
+ * everything here is the part that belongs to cineview: the command line
+ * option, the hook handed to pl_render_params and the panel's readouts. It
+ * is a file of its own so that ui.cpp, main.c and gpu.c each need one line;
+ * the panel's rows themselves are ui.cpp's. */
 
 /* The state a fresh viewer starts with: grain off, and behind that a Super
  * 35 / VISION3 250D print look ready for when it is switched on. */
@@ -49,10 +45,5 @@ const char *view_grain_summary(const struct view_grain *g, char *buf, size_t n);
  * stock and the amount, which is the part that is a setting and carries
  * from clip to clip. Returns `buf`. */
 const char *view_grain_setting(const struct view_grain *g, char *buf, size_t n);
-
-/* The body of the panel's "Film grain" section, laid out by ui.c inside the
- * section header it owns - the switch on that header is grain.on, so there
- * is none in here. Worked with the pointer, like the rest of the panel. */
-void view_panel_grain(struct nk_context *ctx, struct view_state *st);
 
 #endif /* CINEVIEW_GRAIN_UI_H */

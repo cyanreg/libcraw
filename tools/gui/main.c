@@ -2,7 +2,7 @@
 
 /* cineview: open a camera raw clip, decode it on the GPU, run every frame
  * through libcraw on the same device and show the result through
- * libplacebo, with a nuklear panel for the grade and a still exporter.
+ * libplacebo, with an ImGui panel for the grade and a still exporter.
  *
  * cineraw is the batch tool and the reference for the profile,
  * exposure and white balance semantics; this is the interactive one. The
@@ -1207,7 +1207,7 @@ static void view_audio_start(struct view_state *st)
 
 void view_picture_area(const struct view_state *st, pl_rect2df *out)
 {
-    float w = (float)st->gpu.ui_w - VIEW_PANEL_WIDTH - 2 * VIEW_PANEL_MARGIN;
+    float w = (float)st->gpu.ui_w - VIEW_PANEL_WIDTH;
 
     *out = (pl_rect2df) {
         0.0f, 0.0f, CRAW_MAX(w, 16.0f), CRAW_MAX((float)st->gpu.ui_h, 16.0f),
@@ -2630,7 +2630,7 @@ static void view_usage(FILE *f)
 "\n"
 "Opens a camera raw clip, decodes it with FFmpeg's Vulkan hwaccel, runs\n"
 "every frame through libcraw on the same device and displays the result\n"
-"through libplacebo, with a nuklear panel for the grade. A Panasonic RW2\n"
+"through libplacebo, with an ImGui panel for the grade. A Panasonic RW2\n"
 "still is decoded on the CPU and uploaded, and developed the same way. A\n"
 "still, or any file of one frame, is shown and not looped: it pauses at\n"
 "the end of its stream, and a playlist that was playing plays on at the\n"
@@ -4310,10 +4310,8 @@ static void view_handle_key(struct view_state *st, const SDL_Event *e, bool *run
         break;
 
     case SDLK_M:
-        if (!repeat) {
+        if (!repeat)
             st->mute = !st->mute;
-            st->mute_flag = st->mute;
-        }
         break;
 
     /* The playlist, one clip per press: holding the key down would tear
@@ -4546,14 +4544,6 @@ static int view_run_window(struct view_state *st)
      * belong to the moment it reached the screen, which need not be the
      * iteration that decoded it. */
     bool stepped_pending = false;
-    /* Whether the panel has consumed nuklear's input since it was last
-     * opened. nk_input_begin() forgets the clicks and the deltas of the
-     * cycle before it, so it may only run once the panel has been built
-     * with them: an iteration that holds the picture back and builds
-     * nothing must leave the cycle open, or a click that lands during the
-     * hold - which while playing is nearly always - is wiped before any
-     * button sees it. */
-    bool ui_input_consumed = true;
     /* The rate choice and the rate as the loop last acted on them; see
      * view_rate_follow(). */
     AVRational choice_seen = { 0, 0 }, rate_seen = { 0, 0 };
@@ -4671,12 +4661,11 @@ static int view_run_window(struct view_state *st)
         if (view_colour_dispatch(&st->gpu))
             st->present_due = true;
 
-        if (ui_input_consumed) {
-            view_ui_input_begin();
-            ui_input_consumed = false;
-        }
+        /* The panel queues what it is handed until it is next built, so an
+         * iteration that holds the picture back and builds nothing loses
+         * no click. */
         while (SDL_PollEvent(&e)) {
-            bool to_nuklear = true;
+            bool to_ui = true;
             bool locked = view_ui_locked(st);
 
             /* Any event at all is a reason to draw: a key or a drag can
@@ -4696,10 +4685,10 @@ static int view_run_window(struct view_state *st)
                 }
                 break;
             case SDL_EVENT_KEY_DOWN:
-                /* Let the text field have the keys while it is being typed
-                 * into; nuklear tells us so through its own input state.
-                 * Everything else reaches the picture whatever the pointer
-                 * happens to be hovering. */
+                /* Let a field have the keys while it is being typed into;
+                 * the panel says so once it has been built. Everything
+                 * else reaches the picture whatever the pointer happens
+                 * to be hovering. */
                 if (!view_ui_wants_keys(st))
                     view_handle_key(st, &e, &running);
                 break;
@@ -4707,8 +4696,8 @@ static int view_run_window(struct view_state *st)
             /* The pointer over the picture zooms, pans and draws the crop -
              * except while a video export runs, when the picture is the
              * export's and the pointer's only business is the panel's stop
-             * button. The events still reach nuklear, whose widgets are all
-             * disabled but that one. */
+             * button. The events still reach the panel, whose widgets are
+             * all disabled but that one. */
 
             /* SDL3 puts the pointer position in the wheel event itself, so
              * zooming about the cursor no longer has to ask for the mouse
@@ -4720,7 +4709,7 @@ static int view_run_window(struct view_state *st)
 
                     view_mouse_pos(st, e.wheel.mouse_x, e.wheel.mouse_y, &px, &py);
                     view_zoom_by(st, e.wheel.y, px, py, true);
-                    to_nuklear = false;
+                    to_ui = false;
                 }
                 break;
 
@@ -4731,11 +4720,11 @@ static int view_run_window(struct view_state *st)
                  * dismisses it and goes no further: that first click is
                  * the dismissal, not a pan, a crop or a panel widget. The
                  * columns themselves, and the row that toggles them, are
-                 * left to nuklear. */
+                 * left to the panel. */
                 if (e.button.button == SDL_BUTTON_LEFT && st->menu.open &&
                     !view_ui_menu_covers(st, e.button.x, e.button.y)) {
                     view_ui_menu_close(st);
-                    to_nuklear = false;
+                    to_ui = false;
                     break;
                 }
                 if (e.button.button == SDL_BUTTON_LEFT &&
@@ -4760,7 +4749,7 @@ static int view_run_window(struct view_state *st)
                         st->view.drag_x = e.button.x;
                         st->view.drag_y = e.button.y;
                     }
-                    to_nuklear = false;
+                    to_ui = false;
                 }
                 break;
             case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -4768,7 +4757,7 @@ static int view_run_window(struct view_state *st)
                     (st->view.dragging || st->crop.dragging)) {
                     st->view.dragging = false;
                     view_crop_end(st);
-                    to_nuklear = false;
+                    to_ui = false;
                 }
                 break;
             case SDL_EVENT_MOUSE_MOTION:
@@ -4783,7 +4772,7 @@ static int view_run_window(struct view_state *st)
 
                     view_mouse_pos(st, e.motion.x, e.motion.y, &px, &py);
                     view_crop_drag(st, px, py);
-                    to_nuklear = false;
+                    to_ui = false;
                 } else if (st->view.dragging) {
                     int ax, ay, bx, by;
 
@@ -4792,7 +4781,7 @@ static int view_run_window(struct view_state *st)
                     view_pan_pixels(st, bx - ax, by - ay);
                     st->view.drag_x = e.motion.x;
                     st->view.drag_y = e.motion.y;
-                    to_nuklear = false;
+                    to_ui = false;
                 }
                 break;
 
@@ -4815,10 +4804,9 @@ static int view_run_window(struct view_state *st)
                 break;
             }
 
-            if (to_nuklear)
-                view_ui_event(&e);
+            if (to_ui)
+                view_ui_event(st, &e);
         }
-        view_ui_input_end();
 
         /* Before anything this iteration reads the clock: a key may have
          * opened another clip, and the panel may have moved the rate row
@@ -4904,7 +4892,10 @@ static int view_run_window(struct view_state *st)
         /* And a menu whose own timer has run out - an entry rested on long
          * enough to open its column - which only a rebuild acts on: a hand
          * that has stopped sends no events, and left to the idle tick the
-         * column opened up to a fifth of a second late. */
+         * column opened up to a fifth of a second late. So does input the
+         * panel still holds: a click whose press and release arrived
+         * together is seen over two builds, and a button fires on the
+         * second. */
         /* A video export on its thread owns the transport, so nothing of
          * it is asked here: the window draws when the run has written a
          * frame - the progress and the picture it last developed - or when
@@ -4913,13 +4904,13 @@ static int view_run_window(struct view_state *st)
          * export to the compositor's frame callbacks, and to none at all on
          * a window nobody could see. */
         if (st->video.thread) {
-            if (export_moved || events_seen ||
+            if (export_moved || events_seen || view_ui_input_pending() ||
                 now - st->last_present >= VIEW_IDLE_PRESENT ||
                 view_ui_menu_due(st, now))
                 st->present_due = true;
         } else if (stepped || events_seen || export_moved || !st->warm ||
                    st->gpu.pic_redrew || st->exp.active || st->need_frame ||
-                   st->seek_to >= 0 ||
+                   st->seek_to >= 0 || view_ui_input_pending() ||
                    now - st->last_present >= VIEW_IDLE_PRESENT ||
                    view_ui_menu_due(st, now)) {
             st->present_due = true;
@@ -4972,7 +4963,6 @@ static int view_run_window(struct view_state *st)
             view_encode_lock(st);
             view_ui_build(st);
             view_encode_unlock(st);
-            ui_input_consumed = true;
 
             /* A grade change while paused replays the picture on screen;
              * while playing the next frame simply uses the current look,
@@ -5023,7 +5013,6 @@ static int view_run_window(struct view_state *st)
             }
 
             ret = view_gpu_display(&st->gpu, st);
-            view_ui_rotate(&st->gpu);
             if (ret == CRAW_ERROR(EAGAIN)) {
                 SDL_Delay(10);
                 continue;

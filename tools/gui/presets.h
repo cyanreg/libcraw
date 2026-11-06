@@ -13,7 +13,7 @@
  * /home/lynne/projects/ffmpeg/libavcodec and `ffmpeg -h encoder=NAME`;
  * where a name is not obvious the table says where it came from.
  *
- * Nothing in here talks to libplacebo or nuklear: presets.c is plain
+ * Nothing in here talks to libplacebo or ImGui: presets.c is plain
  * libavcodec, so ui.c, main.c and encode.c can all include it. */
 
 #include <stdbool.h>

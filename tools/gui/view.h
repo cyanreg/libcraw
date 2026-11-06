@@ -52,10 +52,9 @@
  * panel's cascade and --preset read it. */
 #include "presets.h"
 
-/* The panel sits on the right at a fixed width; the picture gets whatever
- * is left of the window. */
-#define VIEW_PANEL_WIDTH  360.0f
-#define VIEW_PANEL_MARGIN 12.0f
+/* The panel is a sidebar against the window's right edge at a fixed width;
+ * the picture gets whatever is left of the window. */
+#define VIEW_PANEL_WIDTH  380.0f
 
 /* Hooks handed to one pl_render_params: the non-raw path's exposure on the
  * LINEAR stage, then the film simulation LUT, vibrance, soft light and film
@@ -102,14 +101,13 @@ struct view_look {
     /* False colour suppression after the debayer, DESIGN.md 17: the number
      * of median passes, 0 to CRAW_FALSE_COLOR_MAX_PASSES, and 0 is off. A
      * row of the Debayer section rather than a section of its own, because
-     * it is a property of how the mosaic comes off. An int because that is
-     * what a nuklear property wants. */
+     * it is a property of how the mosaic comes off. */
     int false_color;
     /* Highlight reconstruction before the debayer, DESIGN.md 18: nonzero
      * rebuilds what clipped instead of cutting every channel at the
      * balanced clip. A row of the Debayer section for the same reason as
-     * the false colour, and an int because nuklear's checkbox wants one. */
-    int highlights;
+     * the false colour. */
+    bool highlights;
     /* Defringe after the debayer, DESIGN.md 19: 0 to 1, 0 off. Its row
      * sits under the highlights switch, whose rebuilt edges it cleans. */
     float defringe;
@@ -197,8 +195,8 @@ struct view_name_map {
  *   column 2   Films: the category's film stocks   Looks: renderings (leaf)
  *   column 3   Films: the film's renderings (leaf)
  *
- * The geometry is kept in plain floats rather than nuklear rectangles so
- * that this header stays free of nuklear, which only ui.c includes. */
+ * The geometry is kept in plain floats rather than ImGui rectangles so
+ * that this header stays free of ImGui, which only ui.cpp includes. */
 #define VIEW_MENU_COLS 4
 
 /* Four panel rows hang a cascade off this one struct: the film
@@ -649,17 +647,10 @@ struct view_gpu {
     float *probe_rgba;
     size_t probe_values;
 
-    /* The nuklear overlay, composited by the renderer. One per slot, so the
-     * backend's command buffer for a given index is never re-recorded while
-     * it is still in flight and no full drain is needed between frames. The
-     * previous set outlives a resize until nuklear has rebuilt the
-     * framebuffers that still point at it. */
-    pl_tex ui_tex[VIEW_SLOTS];
-    VkImageView ui_views[VIEW_SLOTS];   /* nuklear keeps this array's address */
-    pl_tex ui_tex_old[VIEW_SLOTS];
-    VkImageView ui_views_old[VIEW_SLOTS];
-    int ui_slot;
-    VkFormat ui_format;
+    /* The panel's overlay, the size of the window, which ui.cpp draws into
+     * and the renderer composites. One is enough: libplacebo orders the
+     * panel's drawing into it after the last frame's read of it. */
+    pl_tex ui_tex;
     int ui_w, ui_h;
 
     /* Offscreen export target, with a renderer of its own so that the peak
@@ -960,7 +951,7 @@ struct view_zoom {
  * it always has - and the rectangle outlives the mode being turned off.
  * The export reads it. A rectangle drawn or given on the command line
  * leaves the picture on screen untouched, with the shading over it drawn
- * on the nuklear overlay; a clip's own is the picture on screen. */
+ * on the panel's overlay; a clip's own is the picture on screen. */
 struct view_crop {
     bool on;
     bool have;
@@ -1044,9 +1035,7 @@ struct view_adjust {
     float saturated;            /* -100..100 */
     float threshold;            /* 0..100, the chroma the two meet at */
     bool protect_skin;
-    int protect_skin_flag;      /* nuklear's checkbox wants an int */
     bool avoid_shift;
-    int avoid_shift_flag;
 
     /* One per renderer, the way the display and the export each own a
      * pl_renderer: the LUT hook holds the uploaded 3D texture between
@@ -1181,7 +1170,7 @@ struct view_rotate {
 struct view_sharpen {
     bool on;
     float radius;               /* sigma of the blur undone, in pixels */
-    int iterations;             /* an int because nuklear's property wants one */
+    int iterations;
     float contrast;             /* the mask's threshold, in modelled noise */
 };
 
@@ -1202,7 +1191,6 @@ struct view_grain {
     int gauge, stock, response;
     float amount, size, chroma;
     bool boil;
-    int boil_flag;              /* nuklear's checkbox wants an int */
 
     /* What the last build worked out, for the panel's readout. */
     float blob_px;              /* what the gauge asked for */
@@ -1243,9 +1231,8 @@ enum view_section {
  * of the title that bypasses the whole section while every one of its
  * parameters is kept, so switching it back on returns the picture it had.
  *
- * The open and closed state is here rather than in nuklear's own per-title
- * table because these headers are not nk_tree_push()es any more: a nuklear
- * tree header owns its whole row and cannot hold a switch beside its title.
+ * The open and closed state is here rather than in ImGui's own table, so
+ * that it carries from clip to clip like every other setting.
  *
  * Six of the switches are the sections' own flags - denoise.on, lens.on,
  * rotate.on, sharpen.on, grain.on and crop.on - which the header shows
@@ -1412,11 +1399,9 @@ struct view_state {
     struct pl_custom_lut *preview;
     int preview_sim;            /* which rendering, -1 for none */
 
-    /* Volume as the panel holds it; the callback ramps towards it.
-     * nuklear's checkbox wants an int, so the flag is mirrored. */
+    /* Volume as the panel holds it; the callback ramps towards it. */
     float volume;
     bool mute;
-    int mute_flag;
 
     /* The wall clock that stands in for the audio clock on a silent clip
      * and on a slowed one: `wall_pts` is in clip seconds, and the wall time
@@ -1618,11 +1603,8 @@ int  view_gpu_probe_start(struct view_gpu *g);
 int  view_gpu_probe_poll(struct view_gpu *g, bool wait, float **rgba,
                          int *w, int *h);
 
-/* The overlay texture nuklear draws into. On a resize the previous texture
- * and view are kept until view_gpu_ui_drop_old(), which must be called once
- * nuklear has rebuilt its framebuffers from the new view. */
+/* The overlay texture the panel is drawn into, the size of the window. */
 int  view_gpu_ui_resize(struct view_gpu *g, int w, int h);
-void view_gpu_ui_drop_old(struct view_gpu *g);
 
 /* ----------------------------------------------------------- decode.c */
 
@@ -1699,11 +1681,11 @@ void view_export_default_path(const struct view_state *st, int64_t frame,
  * name that already picks one is left alone. `size` is the buffer's. */
 void view_export_complete_path(char *path, size_t size);
 
-/* ----------------------------------------------------------- ui.c */
+/* ----------------------------------------------------------- ui.cpp */
 
 int  view_ui_open(struct view_state *st, void *sdl_window);
 void view_ui_close(struct view_state *st);
-/* True while nuklear owns the keyboard (a text field has focus). */
+/* True while the panel owns the keyboard (a field is being typed into). */
 bool view_ui_wants_keys(const struct view_state *st);
 /* True while a video export runs, which locks the whole panel and every
  * key, wheel and drag but the export's own stop button and `q`: the
@@ -1711,26 +1693,22 @@ bool view_ui_wants_keys(const struct view_state *st);
  * moved would be changing a picture nobody is looking at and a file that
  * is half written. */
 bool view_ui_locked(const struct view_state *st);
-/* Feeds one SDL_Event; returns true when nuklear consumed it. */
-bool view_ui_event(void *sdl_event);
-void view_ui_input_begin(void);
-void view_ui_input_end(void);
+/* Hands one SDL_Event to the panel; returns true when it took it. */
+bool view_ui_event(struct view_state *st, void *sdl_event);
+/* True while input the panel was handed is still waiting for a frame: a
+ * click whose press and release arrived together is seen over two. */
+bool view_ui_input_pending(void);
 /* Lays out the panel, reading and writing `st`. */
 void view_ui_build(struct view_state *st);
-/* Draws the panel into the overlay texture, chaining libplacebo's
- * semaphores around nuklear's own submission. */
+/* Draws the panel the last build laid out into the overlay texture. */
 int  view_ui_render(struct view_state *st);
 int  view_ui_resize(struct view_state *st, int w, int h);
-/* Moves to the next overlay image, after the frame that used this one has
- * been handed to the swapchain. */
-void view_ui_rotate(struct view_gpu *g);
 
 /* The cascading menus - the film simulation's and the video export's
- * three. They own their own hit testing rather than going through
- * nuklear's widgets, because a cascade is not a thing nuklear has and the
- * columns have to keep taking the pointer while the panel below them is
- * what nuklear considers active. A cascade opens by a click on its row and
- * closes by a click elsewhere, a choice, or Escape. */
+ * three. They own their own hit testing rather than going through ImGui's
+ * widgets, for the hover timing a list of a few hundred renderings needs.
+ * A cascade opens by a click on its row and closes by a click elsewhere, a
+ * choice, or Escape. */
 void view_ui_menu_open(struct view_state *st, enum view_menu_kind kind);
 void view_ui_menu_close(struct view_state *st);
 /* Whether the open menu is waiting on a timer of its own that has run out

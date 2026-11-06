@@ -73,8 +73,8 @@ struct view_encode_opts {
 struct view_video {
     bool active;
     int64_t start, end;
-    /* nuklear's property fields want ints, and the panel keeps them across
-     * a run so that the next export starts where the last one did. */
+    /* The panel's two fields, kept across a run so that the next export
+     * starts where the last one did. */
     int start_ui, end_ui;
     bool range_set;             /* the fields have been touched or set */
 

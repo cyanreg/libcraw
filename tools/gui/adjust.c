@@ -622,9 +622,7 @@ void view_adjust_defaults(struct view_adjust *a)
          * protection there is, and it costs nothing when there is no skin
          * in the frame. */
         .protect_skin      = true,
-        .protect_skin_flag = 1,
         .avoid_shift       = true,
-        .avoid_shift_flag  = 1,
     };
 }
 

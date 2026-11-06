@@ -1,7 +1,7 @@
 /* Copyright © 2026, Lynne. BSD-2-Clause, see LICENSE.md. */
 
-/* The viewer's film grain section: the panel rows, the command line option
- * and the hook the renderer runs.
+/* The viewer's film grain: the command line option, the hook the renderer
+ * runs and the readouts the panel shows. The panel's rows are ui.cpp's.
  *
  * The model lives in grain.c and knows nothing about cineview. What this
  * file adds is where the grain is applied from the viewer's point of view.
@@ -14,45 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <vulkan/vulkan.h>
-
-#include <SDL3/SDL.h>
-
-/* nuklear is a single header whose struct layout depends on which
- * NK_INCLUDE_* switches were set, so this file has to set exactly the ones
- * ui.c does - minus the two implementation switches, which belong to ui.c
- * alone. Keep the two lists in step. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wundef"
-#pragma GCC diagnostic ignored "-Wshadow"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#pragma GCC diagnostic ignored "-Wmissing-prototypes"
-#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
-#pragma GCC diagnostic ignored "-Wparentheses"
-#pragma GCC diagnostic ignored "-Wtype-limits"
-#pragma GCC diagnostic ignored "-Wconversion"
-#pragma GCC diagnostic ignored "-Wpointer-arith"
-
-#define NK_INCLUDE_FIXED_TYPES
-#define NK_INCLUDE_STANDARD_IO
-#define NK_INCLUDE_STANDARD_VARARGS
-#define NK_INCLUDE_DEFAULT_ALLOCATOR
-#define NK_INCLUDE_VERTEX_BUFFER_OUTPUT
-#define NK_INCLUDE_FONT_BAKING
-#define NK_INCLUDE_DEFAULT_FONT
-
-#include "nuklear/nuklear.h"
-
-#pragma GCC diagnostic pop
-
 #include "grain.h"
 #include "grain_ui.h"
-
-/* The row height ui.c lays the panel out with, and the height of a row in
- * a combo's dropdown, both sized for the panel's font. */
-#define GRAIN_ROW       26.0f
-#define GRAIN_COMBO_ROW 24.0f
 
 /* ------------------------------------------------------------ defaults */
 
@@ -71,7 +34,6 @@ void view_grain_defaults(struct view_grain *g)
          * model wants and what the panel shows as `auto`. */
         .chroma   = -1.0f,
         .boil     = true,
-        .boil_flag = 1,
     };
 }
 
@@ -266,94 +228,4 @@ const char *view_grain_summary(const struct view_grain *g, char *buf, size_t n)
                   * out of blobs and the picture tiles. */
                  g->subsample == 2 ? " 1/2" : g->subsample == 4 ? " 1/4" : "");
     return buf;
-}
-
-/* ------------------------------------------------------------- panel */
-
-void view_panel_grain(struct nk_context *ctx, struct view_state *st)
-{
-    struct view_grain *g = &st->grain;
-    static const char *responses[CRAW_GRAIN_RESPONSE_NB] = {
-        "negative", "print", "reversal", "flat",
-    };
-    static const char *gauges[CRAW_GRAIN_GAUGE_NB];
-    static const char *stocks[CRAW_GRAIN_STOCK_NB];
-    static bool names_done;
-    char buf[128];
-    bool grey = false;
-
-    if (!names_done) {
-        for (int i = 0; i < CRAW_GRAIN_GAUGE_NB; i++)
-            gauges[i] = craw_grain_gauge_name(i);
-        for (int i = 0; i < CRAW_GRAIN_STOCK_NB; i++)
-            stocks[i] = craw_grain_stock_name(i);
-        names_done = true;
-    }
-
-    /* Grain is applied after colour management, on display-encoded values,
-     * so a scene-referred export carries none of it and neither does the
-     * screen while one is selected. ui.c owns the greying; this is the one
-     * line of it this section needs. */
-    if (view_export_is_scene(st)) {
-        /* Two rows of height: nk_label_wrap() wraps inside the rectangle it
-         * is given and clips whatever does not fit. */
-        nk_layout_row_dynamic(ctx, GRAIN_ROW * 2.0f, 1);
-        nk_label_wrap(ctx, "not applied: the export is scene referred, and "
-                           "grain is a display-referred operator");
-        nk_widget_disable_begin(ctx);
-        grey = true;
-    }
-
-    /* Whether there is any grain at all is the header's switch; this is
-     * what the model made of the settings under it. */
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 1);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%s",
-              view_grain_summary(g, buf, sizeof(buf)));
-
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    nk_label(ctx, "gauge", NK_TEXT_LEFT);
-    g->gauge = nk_combo(ctx, gauges, CRAW_GRAIN_GAUGE_NB, g->gauge,
-                        (int)GRAIN_COMBO_ROW, nk_vec2(180, 300));
-
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    nk_label(ctx, "stock", NK_TEXT_LEFT);
-    g->stock = nk_combo(ctx, stocks, CRAW_GRAIN_STOCK_NB, g->stock,
-                        (int)GRAIN_COMBO_ROW, nk_vec2(180, 320));
-
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    nk_label(ctx, "response", NK_TEXT_LEFT);
-    g->response = nk_combo(ctx, responses, CRAW_GRAIN_RESPONSE_NB,
-                           g->response, (int)GRAIN_COMBO_ROW, nk_vec2(160, 130));
-
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 1);
-    nk_property_float(ctx, "#amount", 0.0f, &g->amount, 3.0f, 0.05f, 0.01f);
-    nk_property_float(ctx, "#size", 0.25f, &g->size, 4.0f, 0.05f, 0.01f);
-
-    /* Chroma is the one control with a meaningful "unset": below zero the
-     * stock's own figure is used, which is what most people want. */
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    if (g->chroma < 0.0f)
-        nk_label(ctx, "chroma: auto", NK_TEXT_LEFT);
-    else
-        nk_labelf(ctx, NK_TEXT_LEFT, "chroma: %.2f", (double)g->chroma);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%s", craw_grain_response_name(g->response));
-
-    nk_layout_row_dynamic(ctx, GRAIN_ROW, 2);
-    nk_checkbox_label(ctx, "boil", &g->boil_flag);
-    g->boil = g->boil_flag != 0;
-    nk_label(ctx, g->boil ? "new grain each frame" : "held still",
-             NK_TEXT_LEFT);
-
-    /* Where the numbers came from, since half the stocks are estimates.
-     * Wrapped over three rows: the notes run to a sentence or two, and a
-     * line cut mid-word at the panel's edge said less than nothing. The
-     * longest of them still loses its tail, at a line boundary. */
-    nk_layout_row_dynamic(ctx, GRAIN_ROW * 3.0f, 1);
-    nk_label_wrap(ctx, craw_grain_stock_source(g->stock));
-
-    /* Not while a running video export has the whole panel locked: the
-     * pair does not nest, and the end here would unlock everything under
-     * this section. */
-    if (grey && !view_ui_locked(st))
-        nk_widget_disable_end(ctx);
 }
