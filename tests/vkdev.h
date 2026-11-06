@@ -26,8 +26,9 @@ typedef struct CRAWTestDevice {
     CRAWVulkanInitParams init;
 } CRAWTestDevice;
 
-/* Opens the first device whose name contains `name_substr` (NULL: first
- * suitable device; the environment variable CRAW_TEST_DEVICE, if set,
+/* Opens the first device whose name contains `name_substr` (NULL: the
+ * first suitable discrete GPU, else integrated GPU, else any other, a CPU
+ * implementation last; the environment variable CRAW_TEST_DEVICE, if set,
  * overrides `name_substr`). Returns CRAW_ERROR(ENODEV) if none qualifies. */
 int  craw_testdev_open(CRAWTestDevice *td, const char *name_substr, bool verbose);
 void craw_testdev_close(CRAWTestDevice *td);

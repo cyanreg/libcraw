@@ -239,9 +239,9 @@ static int craw_td_pick_device(CRAWTestDevice *td, const char *name_substr,
     VkResult res;
     uint32_t nb = 0;
     VkPhysicalDevice *devs;
-    VkPhysicalDevice chosen = VK_NULL_HANDLE, first_gpu = VK_NULL_HANDLE;
-    VkPhysicalDevice first_cpu = VK_NULL_HANDLE;
+    VkPhysicalDevice chosen = VK_NULL_HANDLE, best = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties props;
+    int best_rank = -1;
     const bool by_name = name_substr && name_substr[0];
 
     res = vkEnumeratePhysicalDevices(td->instance, &nb, NULL);
@@ -291,18 +291,25 @@ static int craw_td_pick_device(CRAWTestDevice *td, const char *name_substr,
             continue;
         }
 
-        if (named)
+        if (named) {
             chosen = devs[i];
-        else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
-            if (!first_cpu)
-                first_cpu = devs[i];
-        } else if (!first_gpu) {
-            first_gpu = devs[i];
+        } else {
+            /* Unnamed, a discrete GPU first, then an integrated one, then
+             * whatever else there is, and a CPU implementation last; the
+             * first of a kind wins. */
+            int rank = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? 3 :
+                       props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 :
+                       props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU            ? 0 : 1;
+
+            if (rank > best_rank) {
+                best_rank = rank;
+                best = devs[i];
+            }
         }
     }
 
     if (!chosen)
-        chosen = first_gpu ? first_gpu : first_cpu;
+        chosen = best;
 
     free(devs);
 
