@@ -595,7 +595,12 @@ static int test_denoise(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile 
                         const uint16_t *mosaic, CRAWTestImage *src, CRAWTestImage *dst,
                         float *gpu, float *ref)
 {
-    static const float strengths[] = { 1.0f, 2.0f };
+    /* 0.25 for the GPU against the reference only: this mosaic's noise is
+     * the +-8 count term alone, far below the shot noise of the model it is
+     * handed, so to the filter a quarter of the model is still much more
+     * than the noise there is. What a weak strength leaves is measured on
+     * noise that follows the model, in test_denoise_weak(). */
+    static const float strengths[] = { 1.0f, 2.0f, 0.25f };
     const size_t npix = (size_t)TEST_W * TEST_H;
     uint16_t *clean = NULL;
     CRAWNoiseModel nm = { .a = (float)TEST_NOISE_A, .b = (float)TEST_NOISE_B };
@@ -665,11 +670,11 @@ static int test_denoise(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile 
         }
         err = test_max_abs(gpu, ref, npix);
 
-        printf("  denoise  strength %.1f  : max abs %.3e (tol %.1e), %.3e against the "
+        printf("  denoise  strength %.2f : max abs %.3e (tol %.1e), %.3e against the "
                "undenoised chain (floor %.3e), %.3f ms\n",
                (double)strengths[si], err, TEST_DENOISE_TOL, cross, base, ms);
         if (!(err <= TEST_DENOISE_TOL)) {
-            fprintf(stderr, "denoise at strength %.1f differs by %.3e, tolerance %.1e\n",
+            fprintf(stderr, "denoise at strength %.2f differs by %.3e, tolerance %.1e\n",
                     (double)strengths[si], err, TEST_DENOISE_TOL);
             goto done;
         }
@@ -678,6 +683,9 @@ static int test_denoise(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile 
                     "a floor of %.3e; the pass cannot have run\n", cross, base);
             goto done;
         }
+
+        if (strengths[si] < 1.0f)
+            continue;
 
         /* The reference's own denoised mosaic, so that the noise numbers
          * describe the definition rather than one of its implementations. */
@@ -898,6 +906,70 @@ static double test_tn_bias(const uint16_t *m, int x0, int y0, int x1, int y1, do
     }
 
     return (sum / n - truth) / test_tn_sigma(truth);
+}
+
+/* What a strength below the modelled level leaves, on a frame whose noise
+ * is the model's own (test_tn_gen()): a quarter of the model takes nearly
+ * all of the real noise for detail and keeps it, and 1.0 takes most of it
+ * out. The first form of the weight (DESIGN.md 14.3) averaged every
+ * neighbour inside the noise at any strength; on a real ISO 10000 frame
+ * 0.01 left 44% of the fine noise in flat areas, against 22% at 1.0.
+ * Measured on the reference, which test_denoise() holds the GPU to at 0.25
+ * as well. */
+static int test_denoise_weak(const CRAWProfile *identity)
+{
+    static const struct {
+        float strength;
+        double min_left, max_left;
+    } checks[] = {
+        { 0.25f, 0.90, 1.00 },
+        { 0.5f,  0.00, 1.00 },
+        { 1.0f,  0.00, 0.60 },
+    };
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    CRAWNoiseModel nm = { .a = (float)TEST_NOISE_A, .b = (float)TEST_NOISE_B };
+    uint16_t *noisy = malloc(npix * sizeof(*noisy));
+    uint16_t *clean = malloc(npix * sizeof(*clean));
+    double before;
+    int ret = -1;
+
+    if (!noisy || !clean)
+        goto done;
+
+    /* Frame 0's background, clear of the bars and the static detail. */
+    test_tn_gen(noisy, 0, true);
+    before = test_plane_noise(noisy, 162, 90, 221, 149);
+
+    for (size_t i = 0; i < CRAW_ARRAY_ELEMS(checks); i++) {
+        double after, left;
+
+        if (craw_ref_denoise(noisy, TEST_W, TEST_H, TEST_W, identity, &nm,
+                             checks[i].strength, clean, TEST_W) < 0) {
+            fprintf(stderr, "craw_ref_denoise failed\n");
+            goto done;
+        }
+        after = test_plane_noise(clean, 162, 90, 221, 149);
+        left = after / before;
+
+        printf("  denoise  model noise, strength %.2f: flat patch noise %.1f -> %.1f "
+               "counts (%.0f%%", (double)checks[i].strength, before, after, 100.0 * left);
+        if (checks[i].min_left > 0.0)
+            printf(", want >= %.0f%%", 100.0 * checks[i].min_left);
+        else if (checks[i].max_left < 1.0)
+            printf(", want <= %.0f%%", 100.0 * checks[i].max_left);
+        printf(")\n");
+        if (!(left >= checks[i].min_left && left <= checks[i].max_left)) {
+            fprintf(stderr, "denoise at strength %.2f left %.0f%% of the model's noise\n",
+                    (double)checks[i].strength, 100.0 * left);
+            goto done;
+        }
+    }
+
+    ret = 0;
+done:
+    free(noisy);
+    free(clean);
+    return ret;
 }
 
 /* The same over G of a camera RGB buffer, whose G is the level itself. */
@@ -5927,6 +5999,8 @@ int main(void)
     }
 
     if (test_denoise(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
+        goto done;
+    if (test_denoise_weak(&identity) < 0)
         goto done;
 
     /* Replaces the scene in `src`; the stages after it upload their own

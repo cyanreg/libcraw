@@ -1645,7 +1645,7 @@ Non-local means on each plane, in the stabilised domain. For an output at
 p, over a search window of radius S and a patch of radius P:
 
     d2(q) = (1 / (2P+1)^2) * sum over the patch k of (t(p+k) - t(q+k))^2
-    w(q)  = exp(-max(d2(q) - 2, 0) / h^2)
+    w(q)  = exp(-max(d2(q) / h^2 - 2, 0))
     t'(p) = sum over q of w(q) t(q)  /  sum over q of w(q)
 
 The 2 is `2 * sigma^2` with sigma = 1: two stabilised samples of the same
@@ -1655,13 +1655,36 @@ makes `w = 1` for every neighbour that matches within the noise, the centre
 included, so the denominator is never smaller than 1 and no guard is
 needed.
 
-`h` is the strength parameter directly. A neighbourhood that differs from
-the centre by a true step of D noise standard deviations gets
-`w = exp(-D^2 / h^2)`, so at h = 1 detail below one sigma — which is
-indistinguishable from noise anyway — is averaged away, a two sigma step
-keeps 1.8% of its weight, and anything larger is rejected outright. Larger
-h smooths across larger true differences. This is what "strength 1.0
-removes noise at the modelled level" means.
+`h` is the strength parameter directly, and it scales the noise the
+filter assumes: the patch distance is measured as though the noise were h
+times the model's, standard deviation for standard deviation, both the 2
+it allows for and the falloff past it. At h = 1 a neighbourhood that
+differs from the centre by a true step of D noise standard deviations gets
+`w = exp(-D^2)`, so detail below one sigma — which is indistinguishable
+from noise anyway — is averaged away, a two sigma step keeps 1.8% of its
+weight, and anything larger is rejected outright. This is what "strength
+1.0 removes noise at the modelled level" means. Larger h smooths across
+larger true differences; smaller h takes ever more of the real noise for
+detail, and h -> 0 leaves every sample as it came in.
+
+**The strength scales the allowance too.** The first form was
+`exp(-max(d2 - 2, 0) / h^2)`, the 2 fixed and only the falloff past it
+scaled. That gives every neighbour inside the noise a weight of 1 at any
+strength, so at h = 0.01 a flat patch was still averaged with about half
+its 7x7 search: next to no different from h = 1, and nothing like the
+pass turned off. Scaling the distance instead takes the filter smoothly
+from nothing at 0 to the modelled level at 1, and leaves h = 1 exactly
+as it was, bit for bit. On P1000165 (ISO 10000, 960x600 at 1:1, the
+3x3 high pass of G over the flattest 40%), the share of the noise left:
+
+    h        0.01   0.25   0.5    0.75   0.9    1.0    1.5    2.0
+    before   44%    42%    36%    -      -      22%    -      13%
+    now      100%   100%   78%    42%    28%    22%    12%    11%
+
+So nearly all of the change happens between 0.4 and 1.5: below that the
+filter takes almost every noise excursion for detail, and above it the
+flat areas are already as smooth as a 7x7 search makes them, and more
+strength only reaches further across real edges.
 
 S = 3 and P = 1 (a 7x7 search, a 3x3 patch) on the reference device; see
 the timings below. Both are specialization constants 2 and 3, so changing
@@ -1688,8 +1711,8 @@ two adds a sample, where each sample used to read (2P + 1)^2 = 9 values
 of shared memory per search position; and the offset column is read from
 the tile once for all 2S + 1 offsets that share its dx. The P lanes at
 either end of a subgroup have a neighbour on one side only and filter
-nothing, so a tile is 30 x 16 samples. The weight exp(-max(d2 - thr, 0)
-/ h^2) is evaluated as exp2(min(d2 c1 + c0, 0)) with the constants folded
+nothing, so a tile is 30 x 16 samples. The weight exp(-max(d2 / h^2 -
+thr, 0)) is evaluated as exp2(min(d2 c1 + c0, 0)) with the constants folded
 per sample, two multiplies fewer a neighbour. The search is then bound by
 its VALU: 13 instructions a neighbour, one of them the exp, 14.5 with a
 history, and three swizzles alongside. The sums are in
@@ -1817,7 +1840,7 @@ camera's black and white levels already fill 96.9% of the 16-bit range, so
 rescaling the encoding could buy at most 3%; the option that would actually
 add precision is a float intermediate, and the numbers say none is needed.
 
-*An NLM staircase.* With `exp(-max(d^2 - 2, 0)/h^2)`, neighbours inside a
+*An NLM staircase.* With `exp(-max(d^2 / h^2 - 2, 0))`, neighbours inside a
 slow gradient all match within the noise and all get weight 1, so the
 filter degenerates to a box mean over the search window; if the weight set
 then changed discretely from pixel to pixel the output would step. It does
@@ -2094,7 +2117,7 @@ level and v_s its variance, and the plane mirrored as in 14.1:
     tc(p)  = T(u(p))                                   this frame
     tp(p)  = T(s(p))                                   last frame, filtered
     d2(p)  = (1/9) sum over the 3x3 k of (tp(p+k) - tc(p+k))^2
-    a(p)   = alpha_max * exp(-max(d2(p) - 2, 0) / ht^2)
+    a(p)   = alpha_max * exp(-max(d2(p) / ht^2 - 2, 0))
     t'(p)  = (1 - a) tc(p) + a tp(p)
     v(p)   = max((1 - a)^2 + a^2 v_s(p), 1e-4)
     state' = (I(t'(p)), v(p))
@@ -2116,7 +2139,7 @@ where the pass had a history: the patch distance loses the noise the two
 samples actually carry, v(p) + v(q) instead of 2, and the strength is
 taken in units of the noise left in the sample being filtered:
 
-    w(q) = exp(-max(d2(q) - (v(p) + v(q)), 0) / (h^2 v(p)))
+    w(q) = exp(-max(d2(q) / h^2 - (v(p) + v(q)), 0) / v(p))
 
 Where nothing was averaged v = 1 and this is 14.3 exactly. The highlight
 guard of 14.3 compares against the sample as it came in and hands it

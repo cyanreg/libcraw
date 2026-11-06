@@ -277,9 +277,11 @@ typedef struct CRAWFrameParams {
     enum CRAWColorSpace out_space;
     bool out_space_set;
 
-    /* Denoise strength, in units of the modelled noise level: 1.0 removes
-     * noise at exactly the level the model predicts, larger values smooth
-     * across real detail, smaller ones leave noise behind. 0.0 skips the
+    /* Denoise strength, in units of the modelled noise level: the filter
+     * takes the noise to be this many times the model's. 1.0 removes noise
+     * at exactly the level the model predicts, larger values smooth across
+     * real detail, smaller ones leave more of the noise behind the closer
+     * they come to 0, where the filter changes nothing. 0.0 skips the
      * pass for this frame without rebuilding the pipeline, and is the
      * default. Ignored unless the pipeline was created with
      * CRAW_PIPELINE_FLAG_DENOISE. */

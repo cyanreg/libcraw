@@ -187,7 +187,7 @@ float craw_dn_alpha(int c, int w)
         }
     }
 
-    return pc.t_alpha * exp(-max(d2 * (1.0 / 9.0) - 2.0, 0.0) * pc.t_inv_h2);
+    return pc.t_alpha * exp(-max(d2 * (1.0 / 9.0) * pc.t_inv_h2 - 2.0, 0.0));
 }
 
 /* Near the sensor's clip point the noise distribution is truncated and the
@@ -215,13 +215,14 @@ void craw_dn_search_band(bool history, int tx, int ty0, out float res[CRAW_DN_RO
     float own[CRAW_DN_ROWS_MAX + 2 * CRAW_DN_PATCH_MAX];
     float acc[CRAW_DN_ROWS_MAX], wsum[CRAW_DN_ROWS_MAX];
 
-    /* The weight exp(-max(d2 / np - thr, 0) / h^2) is evaluated as
-     * exp2(min(d2 * c1 + c0, 0)), with k = -log2(e) / h^2 folded into
-     * c1 = k / np and c0 = -thr k once per sample rather than per
-     * neighbour: the search is bound by its ALU, and those are two
-     * multiplies of the seven instructions a neighbour costs. With a
-     * history h^2 and thr depend on the samples, so c1 is per sample and
-     * c0 = -(vc + v) k becomes kv * v + ck. */
+    /* The weight exp(-max(d2 / (np h^2) - thr, 0)) is evaluated as
+     * exp2(min(d2 * c1 + c0, 0)), with c1 = -log2(e) / (np h^2) and
+     * c0 = log2(e) thr folded once per sample rather than per neighbour:
+     * the search is bound by its ALU, and those are two multiplies of the
+     * seven instructions a neighbour costs. With a history the noise is
+     * the samples' own, vc for the centre and v for the neighbour, so the
+     * whole weight is over vc: c1 is per sample and c0 = log2(e) (vc + v)
+     * / vc becomes kv * v + ck. */
     float c1[CRAW_DN_ROWS_MAX], ck[CRAW_DN_ROWS_MAX], kv[CRAW_DN_ROWS_MAX];
     const float k0 = -1.4426950408889634 * pc.inv_h2;
 
@@ -233,11 +234,11 @@ void craw_dn_search_band(bool history, int tx, int ty0, out float res[CRAW_DN_RO
         wsum[m] = 0.0;
         if (history) {
             float vc = craw_tvar[(ty0 + m) * TX + tx];
-            float k = k0 / vc;
+            float kn = 1.4426950408889634 / vc;
 
-            c1[m] = k * inv_np;
-            kv[m] = -k;
-            ck[m] = -vc * k;
+            c1[m] = k0 * inv_np / vc;
+            kv[m] = kn;
+            ck[m] = vc * kn;
         }
     }
 
@@ -280,14 +281,15 @@ void craw_dn_search_band(bool history, int tx, int ty0, out float res[CRAW_DN_RO
                 float w;
 
                 /* Two stabilised samples of the same true value differ by
-                 * a variance of 2, so that much of the distance is noise
-                 * and is subtracted before it can count against a
-                 * neighbour. The centre itself always lands on weight 1, so
+                 * a variance of 2, so that much of the distance, taken as
+                 * though the noise were h times the model's, is noise and
+                 * is subtracted before it can count against a neighbour.
+                 * The centre itself always lands on weight 1, so
                  * wsum >= 1. */
                 if (history)
                     w = exp2(min(d2 * c1[m] + (kv[m] * tv[m + S + dy] + ck[m]), 0.0));
                 else
-                    w = exp2(min(d2 * (k0 * inv_np) - 2.0 * k0, 0.0));
+                    w = exp2(min(d2 * (k0 * inv_np) + 2.0 * 1.4426950408889634, 0.0));
 
                 wsum[m] += w;
                 acc[m] += w * ts;

@@ -93,7 +93,7 @@ static float craw_ref_alpha(const float *cur, const float *prev, int w2, int h2,
         }
     }
 
-    return alpha_max * expf(-CRAW_MAX(d2 * (1.0f / 9.0f) - 2.0f, 0.0f) * inv_h2);
+    return alpha_max * expf(-CRAW_MAX(d2 * (1.0f / 9.0f) * inv_h2 - 2.0f, 0.0f));
 }
 
 /* The variance the GPU's state keeps: its square root in eight bits. */
@@ -140,9 +140,9 @@ static float craw_ref_nlm(const float *plane, const float *var, int w2, const in
                 float vc = var[(size_t)my[0] * w2 + mx[0]];
                 float v2 = vc + var[(size_t)my[dy] * w2 + mx[dx]];
 
-                wgt = expf(-CRAW_MAX(d2 * inv_np - v2, 0.0f) * (inv_h2 / vc));
+                wgt = expf(-CRAW_MAX(d2 * inv_np * inv_h2 - v2, 0.0f) / vc);
             } else {
-                wgt = expf(-CRAW_MAX(d2 * inv_np - 2.0f, 0.0f) * inv_h2);
+                wgt = expf(-CRAW_MAX(d2 * inv_np * inv_h2 - 2.0f, 0.0f));
             }
             sv = plane[(size_t)my[dy] * w2 + mx[dx]];
             wsum += wgt;
