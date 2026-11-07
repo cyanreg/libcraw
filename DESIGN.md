@@ -175,9 +175,26 @@ estimated from what did not clip; the debayer reads it with the prep of
 For a sample at site `s` with channel `c(s)`:
 
     v  = (raw - black_level[s]) / (white_level[s] - black_level[s])
-    v  = max(v, 0)
     v  = v * wb_asshot[c(s)]
     v  = min(v, 1.0)
+
+A sample below black keeps its negative value. Read noise scatters the
+samples of a black patch evenly around the black level, so half of them
+land below it, and only with those does the patch average to black: in
+the debayer's interpolation, in a downscale, in the eye. An earlier
+revision clamped `v` at 0 here, which keeps every upward swing and none
+of the downward ones. That lifts a black patch to about 0.4 sigma of its
+noise, and lifts each channel the more, the closer its own signal sits
+to black against its noise. Red and blue read lower than green before
+the gains for the same grey, so they were lifted most, and their gains
+then multiplied the lift. On the dark leaf of P1000165 (frame at 2 s,
+denoise off, BT.709) red/green came out 1.667 and blue/green 0.674,
+against the 1.452 and 0.442 of the samples' own means; without the
+clamp they are 1.447 and 0.439. Nothing downstream can undo the clamp,
+because after it the true average is gone. The one stage that
+divides by `v`, RCD's pass B, takes its ratio of low-passes with values
+below black counted as black (5.3); every other stage after the debayer
+already guards its divisions and logarithms.
 
 `wb_asshot` is a misnomer kept for the shader field: it is
 `CRAWColorParams.wb` evaluated for the frame's own wb_mode and illuminant.
@@ -359,11 +376,26 @@ Pass B, green at R and B sites, using the neighbours' green and the
 low-pass ratio (the published RCD-LPF formula applied to both neighbours
 and averaged):
 
-    Gv = 0.5 * [ v(0,-1) * (1 + (L(0,0) - L(0,-2)) / (L(0,0) + L(0,-2) + eps))
-               + v(0, 1) * (1 + (L(0,0) - L(0, 2)) / (L(0,0) + L(0, 2) + eps)) ]
-    Gh = 0.5 * [ v(-1,0) * (1 + (L(0,0) - L(-2,0)) / (L(0,0) + L(-2,0) + eps))
-               + v( 1,0) * (1 + (L(0,0) - L( 2,0)) / (L(0,0) + L( 2,0) + eps)) ]
+    r(a, b) = (a' - b') / (a' + b' + eps),  a' = max(a, 0), b' = max(b, 0)
+    Gv = 0.5 * [ v(0,-1) * (1 + r(L(0,0), L(0,-2)))
+               + v(0, 1) * (1 + r(L(0,0), L(0, 2))) ]
+    Gh = 0.5 * [ v(-1,0) * (1 + r(L(0,0), L(-2,0)))
+               + v( 1,0) * (1 + r(L(0,0), L( 2,0))) ]
     G  = wv * Gv + (1 - wv) * Gh
+
+The ratio is one of brightnesses, so a low-pass below black counts as
+black in it. The sample it scales keeps its sign (4.1). For values at or
+above black, r is the published formula unchanged. Without the max, a
+pair of low-passes near black, one on each side, puts the denominator at
+zero and the factor anywhere. On a black patch with +-40 counts of noise
+that put a sample 240,000 counts from black. With the max the factor
+stays between 0 and 2, as the published formula's is on data that never
+goes below black. On P1000165's dark leaf a clamp of r to [-1, 1], or a
+floor on the denominator at four sigma of the low-pass's read noise,
+measured the same as this, mean and noise; a floor at sixteen sigma, or
+no ratio at all, left 4 to 7% more fine colour noise. All of them kept
+the mean within 0.4% of the samples'. This form is bit-identical to the
+published formula wherever nothing is below black.
 
 At G sites G = v(0,0). After this pass a full green plane exists.
 
@@ -654,6 +686,11 @@ Three consequences worth stating rather than discovering:
   26. A consumer that needs the output strictly non-negative under any
   chain should add `CRAW_FRAME_FLAG_CLAMP_NEGATIVE`, which then only ever
   has ringing to clamp rather than real colour.
+- The prep keeps samples below black (4.1), so in a dark scene the
+  camera RGB of the shadows is itself negative wherever their noise takes
+  it there. Those are measurements of black, not colours, and the same
+  flag clamps them. On P1000387 frame 0 nothing is dark enough for this
+  to change any of the counts above.
 
 ACES2065-1 is never compressed: every real light is inside AP0, so on real
 footage it does not need it, and compressing the archive would be exactly
@@ -3717,11 +3754,17 @@ trusted.
 Per site s at (x, y), with c = c(s) its channel and `wb` the gains the
 prep of 4.1 would apply:
 
-    u = max((raw - black_level[s]) / (white_level[s] - black_level[s]), 0)
+    u = (raw - black_level[s]) / (white_level[s] - black_level[s])
     x = u * wb[c]                           balanced, not clipped
     a = smoothstep(U_LO, U_HI, u)           how clipped the site is, 0 to 1
 
 with smoothstep(e0, e1, v) = t^2 (3 - 2t), t = clamp((v - e0) / (e1 - e0), 0, 1).
+A sample below black keeps its value in `x`, as in the prep of 4.1, so the
+rebuilt mosaic carries the same shadows the debayer would have read
+without the stage. In the colour field such samples carry next to no
+weight, because a quad's weight goes with the square of its largest u
+(and is zero when all four are below black), and the logarithms are
+guarded.
 
 **The colour field.** One texel per 4x4 block of sites, the block (bx, by)
 covering x in [4 bx, 4 bx + 3] and y in [4 by, 4 by + 3]; the grid is
@@ -3733,7 +3776,7 @@ Each quad, the 2x2 sites with an even top left corner, gives
     a_q     = the largest a over the sites of the 7x7 quads centred on this
               one, i.e. within MARGIN quads of it (those that exist; none
               outside the frame)
-    m_q     = min(the largest u of its four sites, 1)
+    m_q     = the largest u of its four sites, clamped to [0, 1]
     w_q     = (1 - a_q) * m_q^2
     r_q     = clamp(ln(max(R, EPS) / max(G, EPS)), -LOG_MAX, LOG_MAX)
     b_q     = the same with B

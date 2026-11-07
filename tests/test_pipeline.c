@@ -208,7 +208,8 @@ static float test_half_to_float(uint16_t h)
                 m <<= 1;
                 sh++;
             }
-            o = s | ((uint32_t)(127 - 15 - sh) << 23) | ((m & 0x3FFu) << 13);
+            /* m * 2^-24 is 1.f * 2^(-14 - sh) once m is normalised. */
+            o = s | ((uint32_t)(127 - 14 - sh) << 23) | ((m & 0x3FFu) << 13);
         }
     } else if (e == 31) {
         o = s | 0x7F800000u | (m << 13);
@@ -969,6 +970,117 @@ static int test_denoise_weak(const CRAWProfile *identity)
 done:
     free(noisy);
     free(clean);
+    return ret;
+}
+
+/* ------------------------------------------------------- below black */
+
+/* DESIGN.md 4.1: a black patch with read noise has half its samples below
+ * black, and averages to black only if they keep their value. A frame of
+ * nothing but that, +-40 counts uniform around black, through every
+ * debayer with and without the highlight stage: the mean of each channel
+ * against the mean of its own samples (cutting at black lifts it by about
+ * 10 counts), the GPU against the reference, and no sample further from
+ * black than a few times the noise, which is what a ratio of two values
+ * near black did before RCD took them as black (DESIGN.md 5.3). */
+static int test_below_black(CRAWTestDevice *td, CRAWContext *ctx, const CRAWProfile *identity,
+                            CRAWTestImage *src, CRAWTestImage *dst, float *gpu, float *ref)
+{
+    const size_t npix = (size_t)TEST_W * TEST_H;
+    const double range = (TEST_WHITE - TEST_BLACK) * 65535.0;
+    const int amp = 40, margin = 8;
+    uint16_t *m = malloc(npix * sizeof(*m));
+    double plane[3] = { 0.0 };
+    int nplane[3] = { 0 };
+    int ret = -1;
+
+    if (!m)
+        goto done;
+
+    for (int y = 0; y < TEST_H; y++) {
+        for (int x = 0; x < TEST_W; x++) {
+            int s = (y & 1) * 2 + (x & 1);
+            int c = s == 0 ? 0 : s == 3 ? 2 : 1;
+            int e = (int)(test_hash((uint32_t)(y * TEST_W + x) * 2246822519u) % (2u * amp + 1u)) - amp;
+
+            m[y * TEST_W + x] = (uint16_t)(256 + e);
+            if (x >= margin && x < TEST_W - margin && y >= margin && y < TEST_H - margin) {
+                plane[c] += e;
+                nplane[c]++;
+            }
+        }
+    }
+    for (int c = 0; c < 3; c++)
+        plane[c] /= nplane[c];
+
+    if (craw_testdev_image_upload(td, src, m, npix * sizeof(*m)) < 0)
+        goto done;
+
+    for (int mi = 0; mi < CRAW_DEBAYER_NB; mi++) {
+        for (int hl = 0; hl < 2; hl++) {
+            enum CRAWDebayer method = (enum CRAWDebayer)mi;
+            const char *mname = test_method_name(method);
+            CRAWPipelineParams pp;
+            CRAWFrameParams fp;
+            double ms = 0.0, err, worst = 0.0, off[3] = { 0.0 }, bias = 0.0;
+            char label[32];
+
+            craw_pipeline_params_init(&pp);
+            pp.width = TEST_W;
+            pp.height = TEST_H;
+            pp.debayer = method;
+            pp.out_space = CRAW_CS_XYZ_D65;
+            pp.flags = hl ? CRAW_PIPELINE_FLAG_HIGHLIGHT_RECONSTRUCTION : 0;
+            craw_frame_params_init(&fp);
+            fp.profile = identity;
+            fp.flags = hl ? CRAW_FRAME_FLAG_HIGHLIGHT_RECONSTRUCTION : 0;
+
+            if (test_run_config(td, ctx, src, dst, &pp, &fp, gpu, NULL, NULL, &ms) < 0)
+                goto done;
+            if (craw_ref_process(m, TEST_W, TEST_H, TEST_W, &pp, &fp, ref) < 0) {
+                fprintf(stderr, "below black: craw_ref_process failed\n");
+                goto done;
+            }
+            err = test_max_abs(gpu, ref, npix);
+
+            /* In counts above black, the gain taken back out. */
+            for (int y = margin; y < TEST_H - margin; y++)
+                for (int x = margin; x < TEST_W - margin; x++)
+                    for (int c = 0; c < 3; c++)
+                        off[c] += gpu[((size_t)y * TEST_W + x) * 4 + c] / test_wb[c] * range;
+            for (size_t i = 0; i < npix; i++)
+                for (int c = 0; c < 3; c++)
+                    worst = fmax(worst, fabs(gpu[i * 4 + c] / test_wb[c] * range));
+            for (int c = 0; c < 3; c++) {
+                off[c] = off[c] / ((TEST_W - 2 * margin) * (TEST_H - 2 * margin)) - plane[c];
+                bias = fmax(bias, fabs(off[c]));
+            }
+
+            snprintf(label, sizeof(label), "%s%s", mname, hl ? " + highlights" : "");
+            printf("  below black %-21s: mean off by %+.2f %+.2f %+.2f counts, furthest "
+                   "%.0f counts from black, max abs %.2e against the reference\n", label,
+                   off[0], off[1], off[2], worst, err);
+            if (!(bias <= 1.0)) {
+                fprintf(stderr, "below black: %s moves a black patch's mean by %.2f counts\n",
+                        label, bias);
+                goto done;
+            }
+            if (!(worst <= 4.0 * amp)) {
+                fprintf(stderr, "below black: %s puts a sample %.0f counts from black, "
+                        "noise of +-%d\n", label, worst, amp);
+                goto done;
+            }
+            if (!(err <= 1e-5)) {
+                fprintf(stderr, "below black: %s differs from the reference by %.3e\n",
+                        label, err);
+                goto done;
+            }
+        }
+    }
+
+    ret = 0;
+done:
+    free(m);
     return ret;
 }
 
@@ -6001,6 +6113,10 @@ int main(void)
     if (test_denoise(&td, ctx, &identity, mosaic, &src, &dst, gpu, ref) < 0)
         goto done;
     if (test_denoise_weak(&identity) < 0)
+        goto done;
+
+    /* Replaces the scene in `src`, as test_temporal() does next. */
+    if (test_below_black(&td, ctx, &identity, &src, &dst, gpu, ref) < 0)
         goto done;
 
     /* Replaces the scene in `src`; the stages after it upload their own

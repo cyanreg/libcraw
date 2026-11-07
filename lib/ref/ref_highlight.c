@@ -126,7 +126,7 @@ int craw_ref_highlights(const uint16_t *bayer, uint32_t width, uint32_t height,
             int s = (y & 1) * 2 + (x & 1);
             float inv_range = 1.0f / (profile->white_level[s] - profile->black_level[s]);
             float raw = bayer[(size_t)y * stride + x] * (1.0f / 65535.0f);
-            float u = CRAW_MAX((raw - profile->black_level[s]) * inv_range, 0.0f);
+            float u = (raw - profile->black_level[s]) * inv_range;
 
             uv[(size_t)y * w + x] = u;
             av[(size_t)y * w + x] = craw_hl_smoothstep(CRAW_HL_U_LO, CRAW_HL_U_HI, u);

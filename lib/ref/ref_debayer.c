@@ -50,7 +50,7 @@ static void craw_ref_prep(const uint16_t *bayer, uint32_t width,
             float t = (raw - p->black_level[s]) /
                       (p->white_level[s] - p->black_level[s]);
 
-            t = CRAW_MAX(t, 0.0f);
+            /* Below black stays below black, DESIGN.md 4.1. */
             t *= wb[craw_site_chan[s]];
 
             /* Clipping after the white balance keeps a blown highlight
@@ -189,6 +189,17 @@ static float craw_box3(const float *s, uint32_t width, uint32_t height,
     return acc * (1.0f / 9.0f);
 }
 
+/* The published RCD-LPF correction: how much brighter the low pass is here
+ * than two samples away, as a signed fraction, with a low pass below black
+ * taken as black (DESIGN.md 5.3). */
+static float craw_rcd_ratio(float a, float b)
+{
+    a = CRAW_MAX(a, 0.0f);
+    b = CRAW_MAX(b, 0.0f);
+
+    return (a - b) / (a + b + CRAW_RCD_EPS);
+}
+
 /* RCD, DESIGN.md 5.3. Three passes, each one a full sweep of the image:
  * directions and low pass, green, then chroma. The chroma pass is split in
  * two because the green sites need the red and blue estimates of their
@@ -217,10 +228,6 @@ static int craw_ref_rcd(const float *v, uint32_t width, uint32_t height,
 #define L(dx, dy) craw_fetch(lp, width, height, x + (dx), y + (dy))
 #define G(dx, dy) craw_fetch(gp, width, height, x + (dx), y + (dy))
 #define C(dx, dy) craw_fetch(cp, width, height, x + (dx), y + (dy))
-
-/* The published RCD-LPF correction: how much brighter the low pass is here
- * than two samples away, as a signed fraction. */
-#define RATIO(a, b) (((a) - (b)) / ((a) + (b) + CRAW_RCD_EPS))
 
     /* Pass A, low pass. Binomial rather than box so that the ratio the
      * green pass takes of it is not dominated by the CFA pattern itself. */
@@ -297,10 +304,10 @@ static int craw_ref_rcd(const float *v, uint32_t width, uint32_t height,
             lu = L(0, -2); ld = L(0, 2);
             ll = L(-2, 0); lr = L(2, 0);
 
-            gv = 0.5f * (V(0, -1) * (1.0f + RATIO(l00, lu))
-                       + V(0,  1) * (1.0f + RATIO(l00, ld)));
-            gh = 0.5f * (V(-1, 0) * (1.0f + RATIO(l00, ll))
-                       + V( 1, 0) * (1.0f + RATIO(l00, lr)));
+            gv = 0.5f * (V(0, -1) * (1.0f + craw_rcd_ratio(l00, lu))
+                       + V(0,  1) * (1.0f + craw_rcd_ratio(l00, ld)));
+            gh = 0.5f * (V(-1, 0) * (1.0f + craw_rcd_ratio(l00, ll))
+                       + V( 1, 0) * (1.0f + craw_rcd_ratio(l00, lr)));
 
             w = wv[i];
             gp[i] = w * gv + (1.0f - w) * gh;
@@ -374,7 +381,6 @@ static int craw_ref_rcd(const float *v, uint32_t width, uint32_t height,
 #undef L
 #undef G
 #undef C
-#undef RATIO
 
 fail:
     free(lp);

@@ -293,6 +293,7 @@ static void craw_test_prep(void)
     CHECK(ret == 0, "prep test debayer failed: %d", ret);
 
     {
+        float lo = (100.0f / 65535.0f - black) / (white - black) * wb[0];
         float mid = (32000.0f / 65535.0f - black) / (white - black);
         float hi = (60000.0f / 65535.0f - black) / (white - black) * wb[2];
         double worst_r = 0.0, worst_g = 0.0, worst_b = 0.0;
@@ -300,13 +301,14 @@ static void craw_test_prep(void)
         CHECK(hi > 1.0f, "the blue sample must exceed the clip to be a test");
 
         for (size_t i = 0; i < (size_t)w * h; i++) {
-            worst_r = fmax(worst_r, fabs(rgb[i * 4 + 0] - 0.0f));
+            worst_r = fmax(worst_r, fabs(rgb[i * 4 + 0] - lo));
             worst_g = fmax(worst_g, fabs(rgb[i * 4 + 1] - mid));
             worst_b = fmax(worst_b, fabs(rgb[i * 4 + 2] - 1.0f));
         }
 
-        CHECK(worst_r <= 1e-7, "a sample below black must clamp to 0 (%.3g)",
-              worst_r);
+        CHECK(lo < 0.0f, "the red sample must sit below black to be a test");
+        CHECK(worst_r <= 1e-7, "a sample below black must keep its value, "
+              "so that a black patch averages to black (%.3g)", worst_r);
         CHECK(worst_g <= 1e-6, "a mid scale sample must normalize (%.3g)",
               worst_g);
         CHECK(worst_b <= 1e-7, "a sample above the balanced clip must clamp "

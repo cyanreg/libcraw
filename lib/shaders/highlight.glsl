@@ -41,10 +41,10 @@ layout(push_constant, scalar) uniform CRAWHighlightPushBuf {
 } pc;
 
 /* The fraction of the sensor range: the prep of DESIGN.md 4.1 without its
- * gain and its clip. */
+ * gain and its clip, so below black where the sample is. */
 float craw_hl_u(float raw, int site)
 {
-    return max((raw - pc.black[site]) * pc.inv_range[site], 0.0);
+    return (raw - pc.black[site]) * pc.inv_range[site];
 }
 
 /* How clipped a sample is, 0 to 1. */

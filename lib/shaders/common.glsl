@@ -67,16 +67,18 @@ layout(push_constant, scalar) uniform CRAWPrepPushBuf {
     float clip;        /* 1.0, or FLT_MAX on the rebuilt mosaic */
 } pc;
 
-/* DESIGN.md 4.1. The clip at 1.0 sits after the white balance so that blown
- * highlights stay neutral; in raw units the clip point therefore differs per
- * channel. On the mosaic the highlight reconstruction of DESIGN.md 18 wrote,
- * the host makes all of this the identity: black 0, range 1, gains 1 and a
- * clip nothing reaches, because that mosaic already holds balanced values
- * and its highlights are meant to exceed 1.0. */
+/* DESIGN.md 4.1. A sample below black keeps its value: read noise puts
+ * half the samples of a black patch there, and only with them does the
+ * patch average to black, whatever averages it next. The clip at 1.0 sits
+ * after the white balance so that blown highlights stay neutral; in raw
+ * units the clip point therefore differs per channel. On the mosaic the
+ * highlight reconstruction of DESIGN.md 18 wrote, the host makes all of
+ * this the identity: black 0, range 1, gains 1 and a clip nothing reaches,
+ * because that mosaic already holds balanced values and its highlights
+ * are meant to exceed 1.0. */
 float craw_prep(float raw, int site)
 {
     float v = (raw - pc.black[site]) * pc.inv_range[site];
-    v = max(v, 0.0);
     v *= pc.wb[craw_site_channel(site)];
     return min(v, pc.clip);
 }

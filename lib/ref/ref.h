@@ -96,7 +96,8 @@ int craw_ref_noise_model(const CRAWFrameParams *fp, CRAWNoiseModel *out);
 
 /* Runs prep + debayer only. `bayer` is width*height 16-bit UNORM samples
  * with `stride` samples per row. `rgb` receives width*height*4 floats
- * (camera RGB after white balance with `wb` and clipping, alpha 1.0). */
+ * (camera RGB after white balance with `wb` and the clip at 1.0 of
+ * DESIGN.md 4.1, alpha 1.0). */
 int craw_ref_debayer_wb(const uint16_t *bayer, uint32_t width, uint32_t height,
                         size_t stride, const CRAWProfile *profile,
                         const float wb[3], enum CRAWDebayer method, float *rgb);

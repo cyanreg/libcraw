@@ -124,9 +124,13 @@ float craw_h(float x)
 
 /* Pass B's neighbour: its own sample scaled by the ratio of the low-pass
  * at the centre to the low-pass at the neighbour's own colour site two
- * pixels out. */
+ * pixels out. A ratio of brightnesses takes a low-pass below black as
+ * black (DESIGN.md 5.3); the sample it scales keeps its sign. */
 float craw_rcd_lpf(float v, float l0, float l2)
 {
+    l0 = max(l0, 0.0);
+    l2 = max(l2, 0.0);
+
     return v * (1.0 + (l0 - l2) / (l0 + l2 + CRAW_RCD_EPS));
 }
 
